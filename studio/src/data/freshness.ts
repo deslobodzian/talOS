@@ -41,8 +41,8 @@ export function chassisReading(
 export const GRAPH_STALE_AFTER_MS = 1000;
 export function graphStale(received_ms: number|null, now_ms: number,
                            connected: boolean): boolean {
-  return !connected || received_ms === null ||
-      now_ms - received_ms >= GRAPH_STALE_AFTER_MS;
+  return !connected || received_ms === null || !Number.isFinite(received_ms) ||
+      !Number.isFinite(now_ms) || now_ms - received_ms >= GRAPH_STALE_AFTER_MS;
 }
 
 // A node's liveness as far as a current graph can say. A stale graph's

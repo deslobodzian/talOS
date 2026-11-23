@@ -45,13 +45,14 @@
 set -uo pipefail
 
 base=
-case "${1:-}" in
-  --base) [ $# -eq 2 ] && [ -n "$2" ] ||
-            { echo "source-lints: --base needs one revision" >&2; exit 2; }
-          base="$2" ;;
-  "") ;;
-  *) echo "source-lints: unknown argument: $1" >&2; exit 2 ;;
-esac
+if [ $# -gt 0 ]; then
+  case "$1" in
+    --base) [ $# -eq 2 ] && [ -n "$2" ] ||
+              { echo "source-lints: --base needs one revision" >&2; exit 2; }
+            base="$2" ;;
+    *) echo "source-lints: unknown argument: $1" >&2; exit 2 ;;
+  esac
+fi
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.." ||
   { echo "source-lints: cannot enter the workspace" >&2; exit 2; }

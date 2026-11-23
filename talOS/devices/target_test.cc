@@ -883,6 +883,248 @@ TEST(TargetLane, RejectsASourceThatIsNotATopicSegment) {
   EXPECT_THROW(sim.add<BadLane>("producer"), std::invalid_argument);
 }
 
+// REQ-SAFE-14: a node that explicitly reads DriverStation (or directly
+// subscribes to /hw/state/driver_station) and publishes any target lane in the
+// target subsystem's teleop policy without OperatorArming is refused at startup
+// (regardless of member init order, raw publish / publish_bytes, or TOML remap)
+// and on lazy DriverStation / lane construction in update() (even across
+// retries). Autonomous-only lanes, internal-only DS coordinators (Target +
+// TargetLane, like Superstructure), and armed teleop lanes succeed.
+TEST(TargetLane, OperatorProducerTeleopLaneRequiresOperatorArming) {
+  const auto expect_refused = [](const auto& fn, std::string_view expected_node,
+                                 std::string_view expected_topic) {
+    try {
+      fn();
+      FAIL() << "expected std::invalid_argument for " << expected_topic;
+    } catch (const std::invalid_argument& e) {
+      const std::string msg{e.what()};
+      EXPECT_NE(msg.find(expected_node), std::string::npos) << msg;
+      EXPECT_NE(msg.find(expected_topic), std::string::npos) << msg;
+      EXPECT_NE(msg.find("OperatorArming"), std::string::npos) << msg;
+      EXPECT_NE(msg.find("REQ-SAFE-14"), std::string::npos) << msg;
+    }
+  };
+
+  {
+    SCOPED_TRACE("DriverStation before unarmed teleop TargetLane");
+    struct DsBeforeLane {
+      explicit DsBeforeLane(Node& n) : ds{n}, lane{n, "lift", "teleop"} {}
+      DriverStation ds;
+      TargetLane<Goal> lane;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    expect_refused([&] { sim.add<DsBeforeLane>("driver"); }, "driver",
+                   "/lift/target/teleop");
+  }
+
+  {
+    SCOPED_TRACE("unarmed teleop TargetLane before DriverStation");
+    struct LaneBeforeDs {
+      explicit LaneBeforeDs(Node& n) : lane{n, "lift", "teleop"}, ds{n} {}
+      TargetLane<Goal> lane;
+      DriverStation ds;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    expect_refused([&] { sim.add<LaneBeforeDs>("driver"); }, "driver",
+                   "/lift/target/teleop");
+  }
+
+  {
+    SCOPED_TRACE("two teleop lanes: one armed, one unarmed names the unarmed");
+    struct MixedLanes {
+      explicit MixedLanes(Node& n)
+          : ds{n},
+            arming{n},
+            armed_lane{n, "lift", "teleop", arming},
+            unarmed_lane{n, "wrist", "driver"} {}
+      DriverStation ds;
+      OperatorArming arming;
+      TargetLane<Goal> armed_lane;
+      TargetLane<Goal> unarmed_lane;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    try {
+      sim.add<MixedLanes>("driver");
+      FAIL() << "expected std::invalid_argument";
+    } catch (const std::invalid_argument& e) {
+      const std::string msg{e.what()};
+      EXPECT_NE(msg.find("/wrist/target/driver"), std::string::npos) << msg;
+      EXPECT_EQ(msg.find("/lift/target/teleop"), std::string::npos) << msg;
+      EXPECT_NE(msg.find("OperatorArming"), std::string::npos) << msg;
+    }
+  }
+
+  {
+    SCOPED_TRACE("DriverStation + raw publish<TargetEnvelope<Goal>>");
+    struct RawPublish {
+      explicit RawPublish(Node& n)
+          : ds{n},
+            pub{n.publish<TargetEnvelope<Goal>>("/lift/target/teleop")} {}
+      DriverStation ds;
+      Publisher<TargetEnvelope<Goal>> pub;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    expect_refused([&] { sim.add<RawPublish>("driver"); }, "driver",
+                   "/lift/target/teleop");
+  }
+
+  {
+    SCOPED_TRACE("DriverStation + raw publish_bytes on teleop lane");
+    struct RawBytePublish {
+      explicit RawBytePublish(Node& n)
+          : ds{n}, pub{n.publish_bytes("/lift/target/teleop", 64)} {}
+      DriverStation ds;
+      BytePublisher pub;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    expect_refused([&] { sim.add<RawBytePublish>("driver"); }, "driver",
+                   "/lift/target/teleop");
+  }
+
+  {
+    SCOPED_TRACE("DriverStation + remapped /lift/target/auto -> teleop");
+    struct RemappedAutoToTeleop {
+      explicit RemappedAutoToTeleop(Node& n) : ds{n}, lane{n, "lift", "auto"} {}
+      DriverStation ds;
+      TargetLane<Goal> lane;
+    };
+    const std::string toml = std::string{kRobotToml} + R"(
+[subsystems.driver.remap]
+"/lift/target/auto" = "/lift/target/teleop"
+)";
+    auto sim = Sim::FromToml(toml);
+    expect_refused([&] { sim.add<RemappedAutoToTeleop>("driver"); }, "driver",
+                   "/lift/target/teleop");
+  }
+
+  {
+    SCOPED_TRACE("direct subscribe to /hw/state/driver_station + unarmed lane");
+    struct RawDsSub {
+      explicit RawDsSub(Node& n)
+          : raw_ds{n.subscribe<hardware::Packet>(
+                hardware::kDriverStationTopic)},
+            lane{n, "lift", "teleop"} {}
+      Subscription<hardware::Packet> raw_ds;
+      TargetLane<Goal> lane;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    expect_refused([&] { sim.add<RawDsSub>("driver"); }, "driver",
+                   "/lift/target/teleop");
+  }
+
+  {
+    SCOPED_TRACE("lazy DriverStation in update() throws on every retry");
+    struct LazyDs {
+      explicit LazyDs(Node& n) : node{n}, lane{n, "lift", "teleop"} {}
+      void update() {
+        for (int attempt = 0; attempt < 2; ++attempt) {
+          try {
+            const DriverStation ds{node};
+            (void)ds.joystick(0).button(1);
+            ++succeeded;
+          } catch (const std::invalid_argument& e) {
+            if (std::string_view{e.what()}.find("OperatorArming") !=
+                std::string_view::npos) {
+              ++refused;
+            }
+          }
+        }
+      }
+      Node& node;
+      TargetLane<Goal> lane;
+      int refused = 0;
+      int succeeded = 0;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    auto& lazy = sim.add<LazyDs>("driver");
+    sim.step(10ms);
+    EXPECT_EQ(lazy.succeeded, 0);
+    EXPECT_GE(lazy.refused, 2);
+  }
+
+  {
+    SCOPED_TRACE("lazy unarmed TargetLane in update() after DriverStation");
+    struct LazyLane {
+      explicit LazyLane(Node& n) : node{n}, ds{n} {}
+      void update() {
+        try {
+          TargetLane<Goal> lane{node, "lift", "teleop"};
+          lane.send(Goal{1.0});
+          ++succeeded;
+        } catch (const std::invalid_argument& e) {
+          if (std::string_view{e.what()}.find("OperatorArming") !=
+              std::string_view::npos) {
+            ++refused;
+          }
+        }
+      }
+      Node& node;
+      DriverStation ds;
+      int refused = 0;
+      int succeeded = 0;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    auto& lazy = sim.add<LazyLane>("driver");
+    sim.step(10ms);
+    EXPECT_EQ(lazy.succeeded, 0);
+    EXPECT_GE(lazy.refused, 1);
+  }
+
+  {
+    SCOPED_TRACE("allowed: DriverStation + autonomous-only lane");
+    struct AutoDriver {
+      explicit AutoDriver(Node& n) : ds{n}, lane{n, "lift", "auto"} {}
+      DriverStation ds;
+      TargetLane<Goal> lane;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    EXPECT_NO_THROW(sim.add<AutoDriver>("autonomous"));
+    EXPECT_TRUE(
+        detail::NodeAccess::armed_target_lane_topics(sim.node("autonomous"))
+            .empty());
+    EXPECT_TRUE(detail::NodeAccess::internal_driver_station_topics(
+                    sim.node("autonomous"))
+                    .empty());
+  }
+
+  {
+    SCOPED_TRACE(
+        "allowed: coordinator (Target + unarmed teleop lane, no "
+        "DriverStation)");
+    struct Coordinator {
+      explicit Coordinator(Node& n) : target{n}, lane{n, "lift", "teleop"} {}
+      Target<Goal> target;
+      TargetLane<Goal> lane;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    EXPECT_NO_THROW(sim.add<Coordinator>("superstructure"));
+    EXPECT_TRUE(
+        detail::NodeAccess::armed_target_lane_topics(sim.node("superstructure"))
+            .empty());
+    EXPECT_EQ(detail::NodeAccess::internal_driver_station_topics(
+                  sim.node("superstructure")),
+              (std::vector<std::string_view>{"/hw/state/driver_station"}));
+  }
+
+  {
+    SCOPED_TRACE("allowed: DriverStation + armed teleop lane");
+    struct ArmedDriver {
+      explicit ArmedDriver(Node& n)
+          : ds{n}, arming{n}, lane{n, "lift", "teleop", arming} {}
+      DriverStation ds;
+      OperatorArming arming;
+      TargetLane<Goal> lane;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    EXPECT_NO_THROW(sim.add<ArmedDriver>("driver"));
+    EXPECT_EQ(detail::NodeAccess::armed_target_lane_topics(sim.node("driver")),
+              (std::vector<std::string_view>{"/lift/target/teleop"}));
+    EXPECT_TRUE(
+        detail::NodeAccess::internal_driver_station_topics(sim.node("driver"))
+            .empty());
+  }
+}
+
 // An operator producer that sends whenever joystick 0's button 1 is held and
 // ignores what evaluate() says: its arming alone holds the lane released.
 // Its 20 ms period samples the Driver Station less often than the 5 ms
@@ -1833,6 +2075,32 @@ TEST(Target, AConsumerStartedAfterATargetWasPublishedNeverDrivesOnIt) {
   PublishTarget(sim, "lift", "teleop", Goal{0.5}, generation);
   sim.step(5ms);
   EXPECT_EQ(hw.applied_motor("lift", "m").mode, hardware::Mode::kDutyCycle);
+}
+
+// REQ-CONTRACT-13: TargetEnvelopeBytes rejects sizes that would wrap size_t or
+// exceed uint32_t::max() after adding the 16-byte envelope header.
+TEST(Target, TargetEnvelopeBytesRejectsOverflowAndUint32Truncation) {
+  constexpr std::size_t kSizeWrap =
+      std::numeric_limits<std::size_t>::max() - 7;  // divisible by 8; +16 -> 8
+  constexpr std::size_t kUint32Wrap =
+      std::numeric_limits<std::uint32_t>::max() - 7;  // +16 > UINT32_MAX
+  EXPECT_THROW((void)detail::TargetEnvelopeBytes(kSizeWrap, 8),
+               std::invalid_argument);
+  EXPECT_THROW((void)detail::TargetEnvelopeBytes(kUint32Wrap, 8),
+               std::invalid_argument);
+}
+
+// REQ-SAFE-07: opening a Target after start() fails atomically without leaking
+// lane subscriptions onto the node.
+TEST(Target, LateOpenTargetFailsAtomicallyWithoutLeakingSubscriptions) {
+  struct Empty {
+    explicit Empty(Node&) {}
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Empty>("lift");
+  Node& node = sim.node("lift");
+  EXPECT_THROW((void)Target<Goal>(node), std::logic_error);
+  EXPECT_TRUE(detail::NodeAccess::optional_topics(node).empty());
 }
 
 }  // namespace

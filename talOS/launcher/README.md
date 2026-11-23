@@ -295,7 +295,8 @@ enforce that:
   `--describe`, in the first supervision pass that finds the run's registry row
   active with its sources published, the launcher compares the row's topic ends
   with the probe's: kind, topic, message size, alignment and the `external`,
-  `optional`, `observer` and `untargeted_outputs` attributes, as multisets.
+  `optional`, `observer`, `untargeted_outputs`, `operator_arming` and
+  `internal_driver_station` attributes, as multisets.
   Timers are not endpoints, and the
   loop's latest-only flag, which a probe reports, is a delivery detail, not an
   endpoint attribute. The schema hash is not in
@@ -1134,6 +1135,10 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
   bridge recorded on `/hw/status`, and under this one only when no bridge
   recorded one
   ([which logs a build can read](#which-logs-a-build-can-read)).
+- `period_us`, `command_timeout_us`: the config's `[robot] period_us` and
+  `command_timeout_us`, the bounds `session_report` judges the `/hw/state`
+  cadence against ([session measurements](#session-measurements)); absent
+  in a manifest written before the fields.
 - `config_sha256`, `git_revision`, `git_dirty` (and, when a separate robot
   repository was stamped against a talOS git checkout, `talos_git_revision`,
   `talos_git_dirty`, omitted when empty): the bundle's config identity
@@ -1972,7 +1977,8 @@ RECORDED for a manifest without `launcher_log`; informational, since the
 output logs are not the measured record), an unfinished
 session, state inter-arrival min/median/nearest-rank p99/max, missed
 `/hw/state` sequence counts per boot (`state_sequence_gaps`),
-enabled gaps of at least 100 ms, target MESSAGE receipt ages, timer dispatch
+enabled gaps of at least the manifest's `command_timeout_us`
+(`enabled_gaps` and its bound `enabled_gap_bound_ms` in `--json`, which also gives the p99 rows' bound as `state_p99_bound_ms`), target MESSAGE receipt ages, timer dispatch
 lateness, the bridge's request-to-command delay in enabled and disabled
 time, the [latency rows](#latency-rows), every scalar `/hw/status` field,
 and the alerts.
@@ -2090,7 +2096,15 @@ out; `--json` gives the counts in `intervals_across_gaps`
 exactly as before, with none of these keys.
 
 Median “about 5 ms” uses an explicitly labeled 4–6 ms analysis tolerance; p99
-must be below 10 ms. `--strict` exits 2 unless every required verdict is PASS
+must be below twice the manifest's `period_us` (the gateway's tick; 10 ms at
+the bench's 5000 µs), and an enabled interval at or past its
+`command_timeout_us` (100 ms at the bench's) is a gap. A manifest without
+`period_us` (written before the launcher recorded it, or not a positive 32-bit
+integer) leaves `overall state p99` and `enabled state p99` NOT MEASURED,
+naming `period_us`, and `state_p99_bound_ms` null; without
+`command_timeout_us`, `enabled state gaps` is NOT MEASURED, naming
+`command_timeout_us`, and `enabled_gaps` and `enabled_gap_bound_ms` are null.
+`--strict` exits 2 unless every required verdict is PASS
 and the manifest shows a finished session (`end_wall_ns` nonzero) with no
 recording node (non-empty `log_path`) `quarantined`, `recorder_failed`,
 `log_capped` or `log_gap`, and no log gap (above); host processes without

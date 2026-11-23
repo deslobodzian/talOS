@@ -67,8 +67,12 @@
 //   }
 //
 // The lane stays released until an evaluation has seen every input neutral
-// in the current Driver Station view; a TargetLane without an
-// OperatorArming is never held.
+// in the current Driver Station view. A node that explicitly reads
+// DriverStation (or subscribes directly to /hw/state/driver_station) and
+// writes a lane in the target subsystem's teleop policy must open that lane
+// with an OperatorArming (REQ-SAFE-14); otherwise startup and the graph lint
+// refuse it. A TargetLane without an OperatorArming (e.g., an autonomous lane
+// or a coordinator that reads no DriverStation) is never held.
 
 #include <array>
 #include <bit>

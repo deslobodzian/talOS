@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <limits>
 #include <vector>
 
 namespace talos::simulation {
@@ -158,6 +159,36 @@ TEST(Schedules, AdjacentFaultsRestoreBeforeActivatingInAnyInputOrder) {
   EXPECT_TRUE(state.motors[0].valid);
   EXPECT_DOUBLE_EQ(backend.supply_voltage(),
                    talos::hardware::kSimRestingSupplyV);
+}
+
+// REQ-DEV-05: non-finite elapsed_s must fail closed rather than firing every
+// future reset fault, overflowed numbers map to invalid_argument, and an
+// ambiguous motor/sensor fault target is refused.
+TEST(Schedules, RejectsNonFiniteElapsedOverflowAndAmbiguousTargets) {
+  EXPECT_THROW(ParseFaults("0:1e400:reset:drive"), std::invalid_argument);
+  EXPECT_THROW(ParseFaults(" 0:1:reset:drive"), std::invalid_argument);
+
+  talos::hardware::Config ambiguous;
+  ambiguous.motors.push_back({.id = 1, .name = "shared", .can_id = 1});
+  ambiguous.sensors.push_back({.id = 2, .name = "shared", .can_id = 2});
+  auto reset_shared = ParseFaults("1:2:reset:shared");
+  EXPECT_THROW(ResolveFaults(reset_shared, ambiguous), std::invalid_argument);
+
+  talos::hardware::Config config;
+  config.motors.push_back({.id = 1, .name = "drive", .can_id = 1});
+  talos::hardware::sim::PhysicsSimBackend backend;
+  ASSERT_TRUE(backend.Configure(config));
+  auto events = ParseFaults("1:2:reset:drive");
+  ResolveFaults(events, config);
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  EXPECT_THROW(SkipPastFaults(events, nan), std::invalid_argument);
+  EXPECT_THROW(SkipPastFaults(events, inf), std::invalid_argument);
+  EXPECT_THROW(ApplyFaults(events, nan, backend), std::invalid_argument);
+  EXPECT_THROW(ApplyFaults(events, inf, backend), std::invalid_argument);
+  std::vector<uint16_t> resets;
+  EXPECT_FALSE(backend.PollDeviceResets(resets));
+  EXPECT_FALSE(events[0].finished);
 }
 
 }  // namespace

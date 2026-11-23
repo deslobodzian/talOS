@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -1132,6 +1133,114 @@ TEST(LocalizationTest, EstimateTagPoseRejectsNonFiniteInputs) {
     bad_c[0] = bad;
     EXPECT_FALSE(EstimateTagPoseFromHomography(
         valid_homography, intr, kTagSize, &p1, &p2, &e1, &e2, &amb, &bad_c));
+  }
+}
+
+TEST(LocalizationTest,
+     EstimatePoseAndSolverRejectDegenerateExtremeAndSeededMutations) {
+  using Pose = talos::geometry::SE3<double>;
+  CameraIntrinsics intr;
+  intr.fx = 600.0;
+  intr.fy = 610.0;
+  intr.cx = 320.0;
+  intr.cy = 240.0;
+  Pose p1, p2;
+  double e1 = 0.0, e2 = 0.0, amb = 0.0;
+
+  // 1. Float sqrtf underflow/overflow in homography_to_pose (matd_svd_tall).
+  const std::array<float, 9> underflow_h = {0.0f,   0.0f, 320.0f, 0.0f, 1.0f,
+                                            240.0f, 0.0f, 0.0f,   1.0f};
+  EXPECT_FALSE(EstimateTagPoseFromHomography(underflow_h, intr, 0.1651, &p1,
+                                             &p2, &e1, &e2, &amb, nullptr));
+
+  // 2. Extreme huge/tiny scale homography (float sqrtf overflow/underflow).
+  const std::array<float, 9> extreme_h = {
+      -4.4448303e32f,  1.2081995e-41f, 0.0f,
+      -7.9435125e-11f, 5.6275689e10f,  1.21e-40f,
+      5.6103027e10f,   0.0f,           0.0f};
+  EXPECT_FALSE(EstimateTagPoseFromHomography(extreme_h, intr, 0.1651, &p1, &p2,
+                                             &e1, &e2, &amb, nullptr));
+
+  // 3. Rank-deficient exact collinear homography must be rejected cleanly, and
+  // the near-collinear libFuzzer repro (which previously aborted in
+  // fix_pose_ambiguities -> matd_vec_normalize) must never crash or leak NaN.
+  const std::array<float, 9> exact_collinear_h = {
+      1.0f, 1.0f, 320.0f, 0.0f, 0.0f, 240.0f, 0.0f, 0.0f, 1.0f};
+  EXPECT_FALSE(EstimateTagPoseFromHomography(
+      exact_collinear_h, intr, 0.1651, &p1, &p2, &e1, &e2, &amb, nullptr));
+
+  const std::array<float, 9> collinear_h = {
+      -3.3778808e22f, -3.3778664e22f, 0.1117647f,
+      -3.3778808e22f, -3.3778664e22f, 0.1117647f,
+      -3.3778808e22f, 3.7609161e10f,  0.0f};
+  if (EstimateTagPoseFromHomography(collinear_h, intr, 0.1651, &p1, &p2, &e1,
+                                    &e2, &amb, nullptr)) {
+    EXPECT_TRUE(p1.matrix().allFinite());
+    EXPECT_TRUE(p2.matrix().allFinite());
+    EXPECT_TRUE(std::isfinite(e1));
+    EXPECT_TRUE(std::isfinite(amb));
+  }
+
+  // 4. Extreme tag sizes must not overflow or crash inside apriltag_pose.c.
+  const std::array<float, 9> valid_h = {30.0f,  0.0f, 320.0f, 0.0f, 30.0f,
+                                        240.0f, 0.0f, 0.0f,   1.0f};
+  for (const double size : {1e-10, 1e10}) {
+    if (EstimateTagPoseFromHomography(valid_h, intr, size, &p1, &p2, &e1, &e2,
+                                      &amb, nullptr)) {
+      EXPECT_TRUE(p1.matrix().allFinite());
+      EXPECT_TRUE(p2.matrix().allFinite());
+      EXPECT_TRUE(std::isfinite(amb));
+    }
+  }
+
+  // 5. Deterministic seeded fuzz of homography & MultiTagPoseSolver.
+  FieldLayout layout(0.1651);
+  layout.SetTagPose(1, Pose(talos::geometry::SO3<double>::Identity(),
+                            Eigen::Vector3d(4.0, 0.0, 1.0)));
+  layout.SetTagPose(2, Pose(talos::geometry::SO3<double>::Identity(),
+                            Eigen::Vector3d(4.0, 1.0, 1.0)));
+  const auto mount = CameraMounting::Identity();
+  MultiTagPoseSolver solver(2);
+
+  uint32_t state = 0x5151a4aeU;
+  auto next = [&] {
+    state = state * 1664525U + 1013904223U;
+    return state;
+  };
+  auto next_float = [&] {
+    const uint32_t bits = next();
+    float f = 0.0f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+  };
+  for (int iter = 0; iter < 256; ++iter) {
+    std::array<float, 9> h{};
+    std::array<float, 8> corners{};
+    for (float& v : h) v = next_float();
+    for (float& v : corners) v = next_float();
+    if (EstimateTagPoseFromHomography(h, intr, 0.1651, &p1, &p2, &e1, &e2, &amb,
+                                      (iter & 1) ? &corners : nullptr)) {
+      EXPECT_TRUE(p1.matrix().allFinite());
+      EXPECT_TRUE(p2.matrix().allFinite());
+      EXPECT_TRUE(std::isfinite(amb));
+      EXPECT_GE(amb, 0.0);
+      EXPECT_LE(amb, 1.0);
+    }
+    TagDetection3D det;
+    det.tag_id = 1 + (iter % 2);
+    det.valid = true;
+    det.corners = corners;
+    det.T_camera_tag = Pose(talos::geometry::SO3<double>::Identity(),
+                            Eigen::Vector3d(static_cast<double>(next_float()),
+                                            static_cast<double>(next_float()),
+                                            static_cast<double>(next_float())));
+    const auto est = solver.Solve({det}, 0, mount, layout, intr);
+    if (est.validity.valid) {
+      EXPECT_TRUE(est.T_field_robot.matrix().allFinite());
+      EXPECT_TRUE(std::isfinite(est.std_devs.x_std_m));
+      EXPECT_TRUE(std::isfinite(est.std_devs.y_std_m));
+      EXPECT_TRUE(std::isfinite(est.std_devs.yaw_std_rad));
+    }
   }
 }
 

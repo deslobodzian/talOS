@@ -154,7 +154,8 @@ async function run() {
     clearTimeout: handle => window.clearTimeout(handle)
   });
   root.addEventListener('click', event => {
-    if ((event.target as Element).closest('[data-action="reconnect"]')) {
+    if (event.target instanceof Element &&
+        event.target.closest('[data-action="reconnect"]')) {
       model.reconnect(now());
       schedule.frame();
     }

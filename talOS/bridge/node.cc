@@ -29,6 +29,16 @@ namespace {
 constexpr std::string_view kConfigRefusedEnabledReason =
     "disable to accept the new configuration";
 
+uint64_t ElapsedUs(uint64_t now_us, uint64_t since_us) {
+  return now_us > since_us ? now_us - since_us : 0;
+}
+
+uint64_t SaturatingAdd(uint64_t a, uint64_t b) {
+  return b > std::numeric_limits<uint64_t>::max() - a
+             ? std::numeric_limits<uint64_t>::max()
+             : a + b;
+}
+
 const char* ConfigAckStatusName(ConfigAckStatus status) {
   switch (status) {
     case ConfigAckStatus::kOk:
@@ -127,6 +137,7 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
   // alone must not decide it, since nodes never see the remote.
   if (simulation_) config_.commissioned = true;
   config_id_ = ConfigurationId(config_);
+  config_chunks_ = CreateConfigChunks(config_);
   can_buses_ = CanBusTable{config_id_};
   // Heartbeat keeps a live-but-unchanged merge refreshing the gateway at 5x
   // margin inside the command timeout, whatever the config chose. The clamp
@@ -430,10 +441,10 @@ void HardwareNode::PublishIntrospection() {
 }
 
 void HardwareNode::PushConfig(uint64_t now_us) {
-  auto chunks = CreateConfigChunks(config_);
-  for (std::size_t i = 0; i < chunks.size(); ++i) {
-    SendToGateway(protocol::FrameType::kHardwareConfig, now_us,
-                  chunks[i].data(), chunks[i].size());
+  for (const auto& chunk : config_chunks_) {
+    SendToGateway(protocol::FrameType::kHardwareConfig, now_us, chunk.data(),
+                  chunk.size());
+    if (!peer_.IsOpen() && frame_sink_.send == nullptr) break;
   }
   last_push_time_us_ = now_us;
 }
@@ -482,7 +493,8 @@ protocol::UdpStatus HardwareNode::SendToGateway(protocol::FrameType type,
 
 void HardwareNode::ReopenSocket(uint64_t now_us) {
   if (peer_.IsOpen() || !socket_lost_) return;
-  if (reopen_attempted_ && now_us - last_reopen_us_ < kReopenRetryUs) return;
+  if (reopen_attempted_ && ElapsedUs(now_us, last_reopen_us_) < kReopenRetryUs)
+    return;
   reopen_attempted_ = true;
   last_reopen_us_ = now_us;
   ++socket_counters_.reopen_attempts;
@@ -531,9 +543,11 @@ void HardwareNode::TickWithBudget(uint64_t now_us, int receive_budget) {
     pending_probe_send_us_ = 0;
     probe_waiting_ = false;
   }
-  if ((!probe_waiting_ && (last_probe_send_us_ == 0 ||
-                           now_us - last_probe_send_us_ >= kProbePeriodUs)) ||
-      (probe_waiting_ && now_us - last_probe_send_us_ > kProbeRetryUs)) {
+  if ((!probe_waiting_ &&
+       (last_probe_send_us_ == 0 ||
+        ElapsedUs(now_us, last_probe_send_us_) >= kProbePeriodUs)) ||
+      (probe_waiting_ &&
+       ElapsedUs(now_us, last_probe_send_us_) > kProbeRetryUs)) {
     if (SendToGateway(protocol::FrameType::kClockProbe, now_us, nullptr, 0) ==
         protocol::UdpStatus::kOk) {
       last_probe_send_us_ = now_us;
@@ -547,12 +561,12 @@ void HardwareNode::TickWithBudget(uint64_t now_us, int receive_budget) {
   const int limit = std::clamp(receive_budget, 0, kReceiveBudget);
   // When window budget is spent (limit == 0), Pass() throttles via its budget
   // branch rather than retrying immediately on tick_receive_capped_.
-  tick_receive_capped_ = limit > 0;
+  bool hit_receive_cap = limit > 0;
   for (int i = 0; i < limit; ++i) {
     // Closed (SocketCounters), maybe by a State's config push: nothing to
     // read.
     if (!peer_.IsOpen()) {
-      tick_receive_capped_ = false;
+      hit_receive_cap = false;
       break;
     }
     protocol::DecodedFrame frame;
@@ -560,7 +574,7 @@ void HardwareNode::TickWithBudget(uint64_t now_us, int receive_budget) {
     const auto status = recv_error != 0 ? protocol::UdpStatus::kSocketError
                                         : peer_.TryReceive(&frame);
     if (status == protocol::UdpStatus::kWouldBlock) {
-      tick_receive_capped_ = false;
+      hit_receive_cap = false;
       break;
     }
     // A datagram consumed, decodable or not. A socket error need not have
@@ -586,7 +600,7 @@ void HardwareNode::TickWithBudget(uint64_t now_us, int receive_budget) {
                        "then\n",
                        std::strerror(recv_error));
         }
-        tick_receive_capped_ = false;
+        hit_receive_cap = false;
         break;
       }
       continue;
@@ -615,6 +629,10 @@ void HardwareNode::TickWithBudget(uint64_t now_us, int receive_budget) {
 
     HandleGatewayFrame(frame, now_us);
   }
+  // Only request an immediate follow-up pass when the cap actually stopped a
+  // burst of received datagrams; a loop of transient socket errors with zero
+  // datagrams consumed must not busy-spin Pass() into CPU throttling.
+  tick_receive_capped_ = hit_receive_cap && tick_datagrams_ > 0;
 
   // Refresh link readiness before evaluating owner silence in case no State
   // arrived and the last accepted State has gone stale.
@@ -668,9 +686,7 @@ void HardwareNode::TickWithBudget(uint64_t now_us, int receive_budget) {
           // A request replaces this subsystem's whole desired output, not
           // just the addressed devices. Omitted outputs are neutral.
           for (auto j : tracker.motor_slots) {
-            full_cmd_.motors[j].mode = Mode::kNeutral;
-            full_cmd_.motors[j].demand = 0.0;
-            full_cmd_.motors[j].feedforward_v = 0.0;
+            full_cmd_.motors[j] = MotorRequest{.id = full_cmd_.motors[j].id};
           }
           for (auto j : tracker.digital_output_slots) {
             full_cmd_.digital_outputs[j].value = false;
@@ -719,9 +735,7 @@ void HardwareNode::TickWithBudget(uint64_t now_us, int receive_budget) {
     if (tracker.merge.Expire(now_us)) {
       // Neutralize actuators owned by this subsystem
       for (auto j : tracker.motor_slots) {
-        full_cmd_.motors[j].mode = Mode::kNeutral;
-        full_cmd_.motors[j].demand = 0.0;
-        full_cmd_.motors[j].feedforward_v = 0.0;
+        full_cmd_.motors[j] = MotorRequest{.id = full_cmd_.motors[j].id};
       }
       for (auto j : tracker.digital_output_slots) {
         full_cmd_.digital_outputs[j].value = false;
@@ -783,7 +797,7 @@ void HardwareNode::TickWithBudget(uint64_t now_us, int receive_budget) {
 
   // 4. Bridge health, on the bridge clock.
   if (status_pub_ && (statuses_published_ == 0 ||
-                      now_us - last_status_us_ >= kStatusPeriodUs)) {
+                      ElapsedUs(now_us, last_status_us_) >= kStatusPeriodUs)) {
     // Source 3: /hw/status in BuildIntrospectionManifest's fixed ids.
     Publish(*status_pub_, 3, Status(now_us), now_us);
     ++statuses_published_;
@@ -841,9 +855,12 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
 
   if (frame.header.type == protocol::FrameType::kHardwareState) {
     State state;
-    if (!Decode({frame.payload, frame.payload_size}, state)) {
-      // Once per stretch: a gateway sending malformed States sends them
-      // every tick, and dropping them silently looks like a dead link.
+    if (!Decode({frame.payload, frame.payload_size}, state) ||
+        state.boot_id == 0) {
+      // Once per stretch: a gateway sending malformed States (including a
+      // zero boot_id, which no valid gateway issues and which would poison
+      // BootHistory) sends them every tick, and dropping them silently looks
+      // like a dead link.
       if (!state_decode_failure_logged_) {
         std::fprintf(stderr,
                      "hardware_node: dropping a State that does not decode "
@@ -907,7 +924,7 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
     }
     if (state.boot_id != last_boot_id_ || state.config_id != config_id_ ||
         !is_configured_) {
-      if (now_us - last_push_time_us_ >= config_push_backoff_us_ ||
+      if (ElapsedUs(now_us, last_push_time_us_) >= config_push_backoff_us_ ||
           state.boot_id != last_boot_id_) {
         PushConfig(now_us);
       }
@@ -1014,9 +1031,7 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
     }
   }
   const uint64_t state_age_us =
-      states_received_ > 0 && now_us > last_state_receipt_us_
-          ? now_us - last_state_receipt_us_
-          : 0;
+      state_accepted_ ? ElapsedUs(now_us, last_state_receipt_us_) : 0;
   const bool state_fresh = StateFresh(now_us);
   const bool hardware_fault = state_fresh && is_configured_ &&
                               (last_state_flags_ & kHardwareFault) != 0;
@@ -1197,7 +1212,7 @@ uint64_t HardwareNode::CommandDueUs(uint64_t now_us) const {
     unobserved.observed_time_us = last_sent_cmd_.observed_time_us;
     changed = unobserved != last_sent_cmd_;
   }
-  return changed ? now_us : last_send_us_ + heartbeat_us_;
+  return changed ? now_us : SaturatingAdd(last_send_us_, heartbeat_us_);
 }
 
 uint64_t HardwareNode::NextDutyUs(uint64_t now_us) const {
@@ -1206,22 +1221,27 @@ uint64_t HardwareNode::NextDutyUs(uint64_t now_us) const {
   if (pending_probe_send_us_ != 0) return now_us;
   uint64_t next_us = std::numeric_limits<uint64_t>::max();
   const auto due = [&next_us, now_us](uint64_t at_us) {
-    next_us = std::min(next_us, at_us > now_us ? at_us : now_us + kRetryUs);
+    next_us = std::min(
+        next_us, at_us > now_us ? at_us : SaturatingAdd(now_us, kRetryUs));
   };
   // Clock probe: every kProbePeriodUs, replaced once more than kProbeRetryUs
   // goes unanswered. A closed socket's reopen stands in for it, and for the
   // command below: neither can go out before it.
   const bool socket_closed = socket_lost_ && !peer_.IsOpen();
   if (socket_closed) {
-    due(reopen_attempted_ ? last_reopen_us_ + kReopenRetryUs : now_us);
+    due(reopen_attempted_ ? SaturatingAdd(last_reopen_us_, kReopenRetryUs)
+                          : now_us);
   } else if (!probe_waiting_) {
-    due(last_probe_send_us_ == 0 ? now_us
-                                 : last_probe_send_us_ + kProbePeriodUs);
+    due(last_probe_send_us_ == 0
+            ? now_us
+            : SaturatingAdd(last_probe_send_us_, kProbePeriodUs));
   } else {
-    due(last_probe_send_us_ + kProbeRetryUs + 1);
+    due(SaturatingAdd(last_probe_send_us_, kProbeRetryUs + 1));
   }
   if (status_pub_) {
-    due(statuses_published_ == 0 ? now_us : last_status_us_ + kStatusPeriodUs);
+    due(statuses_published_ == 0
+            ? now_us
+            : SaturatingAdd(last_status_us_, kStatusPeriodUs));
   }
   // Each merged owner's timeout. That some owner is merged is Tick's
   // any_subsystem_active, which with the boot gates every command.
@@ -1271,11 +1291,11 @@ HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
   // context switch.
   if (now_us >= next_introspection_us_) {
     PublishIntrospection();
-    next_introspection_us_ = now_us + kIntrospectionPeriodUs;
+    next_introspection_us_ = SaturatingAdd(now_us, kIntrospectionPeriodUs);
   } else {
     RefreshLiveness();
   }
-  next_liveness_us_ = now_us + kLivenessBackstopUs;
+  next_liveness_us_ = SaturatingAdd(now_us, kLivenessBackstopUs);
 
   // Every request subscriber is armed before the loop may sleep: a request
   // published after its arm notifies wake_wait_, and one published before it
@@ -1299,7 +1319,7 @@ HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
 
   const uint64_t timed_us =
       std::min({NextDutyUs(now_us), next_liveness_us_, next_introspection_us_,
-                now_us + max_wait_us_});
+                SaturatingAdd(now_us, max_wait_us_)});
 
   ++cpu_window_passes_;
   cpu_window_datagrams_ += tick_datagrams_;
@@ -1307,7 +1327,9 @@ HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
       cpu_window_datagrams_ >= kDatagramBudget) {
     // Spent: input waits for the window's end, a duty does not.
     ++wakeups_.throttled;
-    return {std::min(cpu_window_start_us_ + kCpuWindowUs, timed_us), true};
+    return {
+        std::min(SaturatingAdd(cpu_window_start_us_, kCpuWindowUs), timed_us),
+        true};
   }
 
   if (retry_immediately) {
@@ -1404,7 +1426,8 @@ int HardwareNode::Run(int duration_s) {
   const uint64_t start_us = clock_us();
   const uint64_t end_us =
       duration_s > 0
-          ? start_us + (static_cast<uint64_t>(duration_s) * 1'000'000)
+          ? SaturatingAdd(start_us,
+                          static_cast<uint64_t>(duration_s) * 1'000'000)
           : std::numeric_limits<uint64_t>::max();
   bool woke_readable = false;
   // Set where the loop ends at --duration-s, so a stop that lands after
@@ -1433,8 +1456,10 @@ int HardwareNode::Run(int duration_s) {
       continue;
     }
     if (seams_.before_wait != nullptr) seams_.before_wait();
+    constexpr uint64_t kMaxPollerUs =
+        static_cast<uint64_t>(std::numeric_limits<std::int64_t>::max()) / 1000;
     const auto reason = poller_->wait_until(event::MonotonicTime::from_nanos(
-        static_cast<std::int64_t>(until_us * 1000)));
+        static_cast<std::int64_t>(std::min(until_us, kMaxPollerUs) * 1000)));
     if (reason == event::Poller::WakeReason::DEADLINE) {
       ++wakeups_.deadline;
     } else {
@@ -1448,7 +1473,7 @@ int HardwareNode::Run(int duration_s) {
   }
   const uint64_t stop_us = clock_us();
   SendShutdownNeutral(stop_us);
-  const uint64_t ran_us = stop_us - start_us;
+  const uint64_t ran_us = ElapsedUs(stop_us, start_us);
   CloseWaits();
 
   PublishIntrospection();
@@ -1529,7 +1554,8 @@ int HardwareNode::Run(int duration_s) {
 
 bool HardwareNode::HasRequestIdentity(const SubsystemTracker& tracker,
                                       const Command& partial) const {
-  if (partial.config_id != config_id_ || partial.boot_id != last_boot_id_ ||
+  if ((state_accepted_ && latest_state_.config_id != config_id_) ||
+      partial.config_id != config_id_ || partial.boot_id != last_boot_id_ ||
       partial.epoch != last_epoch_) {
     return false;
   }
@@ -1539,7 +1565,8 @@ bool HardwareNode::HasRequestIdentity(const SubsystemTracker& tracker,
 
 bool HardwareNode::IsSupersededNeutral(const SubsystemTracker& tracker,
                                        const Command& partial) const {
-  return partial.config_id == config_id_ && partial.boot_id == last_boot_id_ &&
+  return (!state_accepted_ || latest_state_.config_id == config_id_) &&
+         partial.config_id == config_id_ && partial.boot_id == last_boot_id_ &&
          partial.epoch != 0 && partial.epoch < last_epoch_ &&
          !tracker.merge.seen &&
          tracker.merge.Admits(partial.observed_time_us, last_sample_time_us_,
@@ -1598,9 +1625,7 @@ bool HardwareNode::SendShutdownNeutral(uint64_t now_us) {
 
 void HardwareNode::NeutralizeAll() {
   for (std::size_t j = 0; j < full_cmd_.count; ++j) {
-    full_cmd_.motors[j].mode = Mode::kNeutral;
-    full_cmd_.motors[j].demand = 0.0;
-    full_cmd_.motors[j].feedforward_v = 0.0;
+    full_cmd_.motors[j] = MotorRequest{.id = full_cmd_.motors[j].id};
   }
   for (std::size_t j = 0; j < full_cmd_.digital_output_count; ++j) {
     full_cmd_.digital_outputs[j].value = false;

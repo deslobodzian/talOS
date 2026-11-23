@@ -33,6 +33,7 @@ Run from any directory.
 
 import argparse
 import json
+import math
 import os
 import re
 import selectors
@@ -144,10 +145,10 @@ DRIVEN_RPS = 1.0
 SILENT_WAIT_SECONDS = 30
 
 # What the scenario decodes of the RoboRIO link, as talOS/hardware/messages.cc
-# and talOS/protocol/frame.h encode it at protocol version 11. A frame of
+# and talOS/protocol/frame.h encode it at protocol version 12. A frame of
 # another version fails the run rather than being misread: a layout change
 # updates this decoder (RULES.md 9).
-PROTOCOL_VERSION = 11
+PROTOCOL_VERSION = 12
 FRAME_MAGIC = 0x4F4952534F4C4154
 FRAME_HEADER = struct.Struct("<QHHHHQQII")
 STATE_FRAME, COMMAND_FRAME, DRIVER_STATION_FRAME = 20, 21, 24
@@ -458,10 +459,16 @@ def _terminate_group(process, sig):
 
 
 def rotations_of(summary):
-    found = re.search(r"first_wheel_rotations=([0-9.]+)", summary)
+    found = re.search(r"first_wheel_rotations=([^\s]+)", summary)
     if not found:
         raise RuntimeError(f"Unreadable gateway summary: {summary}")
-    return float(found.group(1))
+    try:
+        value = float(found.group(1))
+    except ValueError as exc:
+        raise RuntimeError(f"Unreadable gateway summary: {summary}") from exc
+    if not math.isfinite(value):
+        raise RuntimeError(f"Non-finite wheel rotations in summary: {summary}")
+    return value
 
 
 def check_ports(ports=(5802, 5803)):
@@ -507,7 +514,9 @@ def robot_settings(config, *keys):
     return [robot[key] for key in keys]
 
 
-TOML_HEADER = re.compile(r"^\s*(\[\[?)\s*([\w.-]+)\s*\]\]?\s*(?:#.*)?$")
+TOML_HEADER = re.compile(
+    r"^\s*(?:(\[\[)\s*([\w.-]+)\s*\]\]|(\[)\s*([\w.-]+)\s*\])\s*(?:#.*)?$"
+)
 TOML_NAME = re.compile(r'^\s*name\s*=\s*"([^"]*)"\s*(?:#.*)?$')
 TOML_PATH = re.compile(r'^(\s*(?:path|defaults)\s*=\s*)"([^"]*)"(\s*(?:#.*)?)$')
 
@@ -536,7 +545,9 @@ def subject_config(config, output):
     for line in config.read_text().splitlines():
         header = TOML_HEADER.match(line)
         if header:
-            blocks.append((header.group(1), header.group(2), [line]))
+            bracket = header.group(1) or header.group(3)
+            name = header.group(2) or header.group(4)
+            blocks.append((bracket, name, [line]))
         elif line.lstrip().startswith("["):
             raise RuntimeError(f"{config}: cannot read the header "
                                f"{line.strip()!r}")
@@ -1019,9 +1030,10 @@ def judge_silence(states, commands, timeout_us, status_hz):
         # check nothing there. In a config that has them the PWM line catches
         # only a pulse other than the centre one: the State reads 0 both for
         # an output that is off and for a centre pulse.
-        live += [(i, value) for i, _, value in s["digital_outputs"] if value]
-        live += [(i, output) for i, _, output in s["pwm_outputs"]
-                 if output != 0.0]
+        live += [(i, value) for i, valid, value in s["digital_outputs"]
+                 if not valid or value]
+        live += [(i, output) for i, valid, output in s["pwm_outputs"]
+                 if not valid or output != 0.0]
         if live:
             raise RuntimeError(
                 f"State {s['sequence']}, {s['sample_us'] - stop['sample_us']}"

@@ -37,6 +37,14 @@ talos::hardware::Packet StatePacket(bool foreign = false) {
   return packet;
 }
 
+// The bounds the bench config's [robot] gives (period_us 5000,
+// command_timeout_us 100000), which every session but slow-gateway and
+// unrecorded-bounds records.
+void RecordBenchBounds(talos::launcher::SessionManifest& manifest) {
+  manifest.period_us = 5'000;
+  manifest.command_timeout_us = 100'000;
+}
+
 // A disabled session of an event-driven bridge, which has no timer, and one
 // control node: the bridge publishes a State every 5 ms after a disabled
 // Driver Station packet; the node's tick 1 ms after each State sends a
@@ -47,6 +55,7 @@ int DisabledBridgeSession(const std::string& directory) {
   talos::launcher::SessionManifest manifest;
   manifest.session_id = 43;
   manifest.end_wall_ns = 1;
+  RecordBenchBounds(manifest);
   for (const char* name : {"hardware_node", "motor"}) {
     talos::launcher::NodeProcessInfo node;
     node.name = name;
@@ -196,10 +205,68 @@ bool RecordFixtureLog(const std::string& directory, bool foreign) {
   return !writer.incomplete();
 }
 
+// A robot whose [robot] sets period_us = 10000 and command_timeout_us =
+// 250000 (so 2 * period_us = 20 ms != command_timeout_us / 10000 = 25 ms),
+// enabled throughout: its bridge publishes a State every 10 ms from 0 to
+// 1000 ms, then none until 1150 ms, then every 10 ms to 1300 ms.
+int SlowGatewaySession(const std::string& directory) {
+  using namespace talos::event;
+  talos::launcher::SessionManifest manifest;
+  manifest.session_id = 44;
+  manifest.end_wall_ns = 1;
+  manifest.period_us = 10'000;
+  manifest.command_timeout_us = 250'000;
+  talos::launcher::NodeProcessInfo node;
+  node.name = "hardware_node";
+  node.exited = true;
+  manifest.nodes.push_back(node);
+  std::ofstream{directory + "/manifest.json"} << manifest.ToJson();
+  Registration state;
+  state.id = 0;
+  state.kind = SourceKind::SENDER;
+  state.name = talos::hardware::kStateTopic;
+  state.message_bytes = sizeof(talos::hardware::Packet);
+  state.schema = talos::schema::Of<talos::hardware::Packet>();
+  Registration ds = state;
+  ds.id = 1;
+  ds.name = talos::hardware::kDriverStationTopic;
+  const auto start = MonotonicTime::from_nanos(1'000'000'000);
+  talos::event::log::LogWriter bridge{
+      directory + "/hardware_node.tlog", "hardware_node",
+      talos::event::log::LogWriterOptions{4096, 1, false}, 44};
+  bridge.start({state, ds}, start);
+  std::uint64_t index = 0;
+  auto send = [&](int ms, std::uint16_t id,
+                  const talos::hardware::Packet& packet) {
+    Context context;
+    context.kind = EventKind::SEND;
+    context.source_id = id;
+    context.dispatch_index = ++index;
+    context.now = start + std::chrono::milliseconds{ms};
+    context.event_time = context.now;
+    context.publish_time = context.now;
+    context.sequence = index;
+    bridge.send(context, id, std::as_bytes(std::span{&packet, 1}), 0, index);
+  };
+  talos::driver_station::DriverStationData enabled;
+  enabled.fms.flags =
+      talos::driver_station::kDsAttached | talos::driver_station::kEnabled;
+  talos::hardware::Packet ds_packet;
+  ds_packet.size = talos::driver_station::Encode(enabled, ds_packet.data);
+  send(0, 1, ds_packet);
+  for (int ms = 0; ms <= 1300; ms += 10) {
+    if (ms > 1000 && ms < 1150) continue;
+    send(ms, 0, StatePacket());
+  }
+  bridge.flush();
+  return bridge.incomplete() ? 1 : 0;
+}
+
 }  // namespace
 
 // session_report_fixture <directory>
-//                        [disabled-bridge | foreign-protocol | log-gap]
+//                        [disabled-bridge | foreign-protocol | log-gap |
+//                         slow-gateway | unrecorded-bounds]
 //
 // foreign-protocol: the default session recorded before manifests named
 // their hardware protocol, its States recorded under protocol 7
@@ -208,13 +275,18 @@ bool RecordFixtureLog(const std::string& directory, bool foreign) {
 // sent at 5, 10, 130 and 135 ms, all while enabled) replaced by the GAP record
 // a full writer pool leaves, and its manifest marking the gap as the launcher
 // does (log_gap, recorder_failed).
+// slow-gateway: see SlowGatewaySession.
+// unrecorded-bounds: the default session recorded before manifests named
+// the config's period_us and command_timeout_us.
 int main(int argc, char** argv) {
   if (argc != 2 && argc != 3) return 1;
   const std::string directory = argv[1];
   std::filesystem::create_directories(directory);
   const std::string mode = argc == 3 ? argv[2] : "";
   if (mode == "disabled-bridge") return DisabledBridgeSession(directory);
-  if (!mode.empty() && mode != "foreign-protocol" && mode != "log-gap") {
+  if (mode == "slow-gateway") return SlowGatewaySession(directory);
+  if (!mode.empty() && mode != "foreign-protocol" && mode != "log-gap" &&
+      mode != "unrecorded-bounds") {
     return 1;
   }
   const bool foreign = mode == "foreign-protocol";
@@ -223,6 +295,7 @@ int main(int argc, char** argv) {
   manifest.session_id = 42;
   manifest.config_sha256 = "fixture-sha256";
   manifest.end_wall_ns = 1;
+  if (mode != "unrecorded-bounds") RecordBenchBounds(manifest);
   if (foreign) manifest.hardware_protocol_version.reset();
   talos::launcher::NodeProcessInfo node;
   node.name = "fixture";

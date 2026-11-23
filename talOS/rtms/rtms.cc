@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <random>
@@ -162,7 +163,8 @@ class HeaderView {
     bool sized = false;
     for (int attempt = 0; attempt < kInitAttempts; ++attempt) {
       if (::fstat(fd, &info) < 0) break;
-      if (static_cast<std::uint64_t>(info.st_size) >= sizeof(RTMSHeader)) {
+      if (info.st_size >= 0 &&
+          static_cast<std::uint64_t>(info.st_size) >= sizeof(RTMSHeader)) {
         sized = true;
         break;
       }
@@ -253,15 +255,6 @@ RTMSQueue::RTMSQueue(std::string_view path, std::size_t message_size,
       slots_{slots},
       message_size_{message_size},
       message_alignment_{message_alignment},
-      data_offset_{is_pow_2(message_alignment)
-                       ? align_up(sizeof(RTMSHeader),
-                                  rtms_slot_alignment(message_alignment))
-                       : 0},
-      publish_time_offset_{rtms_publish_time_offset(message_size)},
-      stride_{is_pow_2(message_alignment)
-                  ? rtms_slot_stride(message_size, message_alignment)
-                  : 0},
-      total_bytes_{data_offset_ + stride_ * slots_},
       options_{options} {
   if (message_size == 0 || !is_pow_2(message_alignment)) {
     throw std::invalid_argument("message size and alignment must be valid");
@@ -276,6 +269,33 @@ RTMSQueue::RTMSQueue(std::string_view path, std::size_t message_size,
     throw std::invalid_argument(
         "RTMS topic " + std::string{path} + " needs a schema name of 1 to " +
         std::to_string(talos::schema::kMaxSchemaName) + " characters");
+  }
+
+  constexpr std::size_t kMaxSize = std::numeric_limits<std::size_t>::max();
+  constexpr auto kMaxOff =
+      static_cast<std::size_t>(std::numeric_limits<off_t>::max());
+  const std::size_t slot_align = rtms_slot_alignment(message_alignment);
+  if (sizeof(RTMSHeader) > kMaxSize - (slot_align - 1) ||
+      message_size > kMaxSize - (alignof(std::int64_t) - 1)) {
+    throw std::overflow_error("RTMS segment size exceeds address space");
+  }
+  data_offset_ = align_up(sizeof(RTMSHeader), slot_align);
+  publish_time_offset_ = rtms_publish_time_offset(message_size);
+  if (publish_time_offset_ > kMaxSize - sizeof(std::int64_t)) {
+    throw std::overflow_error("RTMS segment size exceeds address space");
+  }
+  const std::size_t unaligned_stride =
+      publish_time_offset_ + sizeof(std::int64_t);
+  if (unaligned_stride > kMaxSize - (slot_align - 1)) {
+    throw std::overflow_error("RTMS segment size exceeds address space");
+  }
+  stride_ = align_up(unaligned_stride, slot_align);
+  if (stride_ > (kMaxSize - data_offset_) / slots_) {
+    throw std::overflow_error("RTMS segment size exceeds address space");
+  }
+  total_bytes_ = data_offset_ + stride_ * slots_;
+  if (total_bytes_ > kMaxOff) {
+    throw std::overflow_error("RTMS segment size exceeds off_t range");
   }
 
   open(schema);
@@ -323,11 +343,19 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
     auto* header = static_cast<RTMSHeader*>(ptr.ptr());
 
     if (ptr.mode() == SharedMemoryMode::CREATE) {
+      std::uint64_t segment_id = 0;
+      try {
+        segment_id = NewSegmentId();
+      } catch (...) {
+        ptr = SharedMemoryPtr{};
+        ::shm_unlink(ShmObjectName(path_).c_str());
+        throw;
+      }
       // Learned about this, pretty cool, it creates the object at
       // preallocated memory
       header = std::construct_at(header);
       header->version = kRtmsVersion;
-      header->segment_id = NewSegmentId();
+      header->segment_id = segment_id;
       header->total_bytes = total_bytes_;
       header->slots = slots_;
       header->message_bytes = message_size_;
@@ -339,8 +367,9 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
       header->lifetime.store(options_.session_owner ? kLifetimeSessionOwned : 1,
                              std::memory_order_relaxed);
       counted_ = !options_.session_owner;
+      const std::uint64_t self = OwnProcess();
       header->writer.sequence.store(0, std::memory_order_relaxed);
-      header->writer.owner_pid.store(options_.publisher ? OwnProcess() : 0,
+      header->writer.owner_pid.store(options_.publisher ? self : 0,
                                      std::memory_order_relaxed);
       header->writer.reliable_sequence.store(0, std::memory_order_relaxed);
       header->writer.waiters.store(0, std::memory_order_relaxed);
@@ -351,6 +380,7 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
       }
       // Last, so an attacher that sees the magic sees everything above.
       header->magic.store(kRtmsMagic, std::memory_order_release);
+      owner_process_ = self;
       ptr_ = std::move(ptr);
       header_ = header;
       return;
@@ -464,6 +494,7 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
         throw;
       }
     }
+    owner_process_ = OwnProcess();
     ptr_ = std::move(ptr);
     header_ = header;
     if (options_.publisher) wake_all_readers();
@@ -475,21 +506,31 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
 
 void RTMSQueue::close() noexcept {
   if (header_ == nullptr) return;
-  for (std::size_t id = 0; id < MAX_READERS; ++id) {
-    if (registered_[id] != 0) release_reader(id);
+  // A forked child inherits its parent's RTMSQueue objects without having
+  // opened its own attachment: it must not release the parent's reader slots,
+  // writer claim, counted lifetime, or session-owned segment.
+  const bool owns_attachment = owner_process_ == OwnProcess();
+  std::uint64_t segment_id = 0;
+  bool unlink = false;
+  if (owns_attachment) {
+    for (std::size_t id = 0; id < MAX_READERS; ++id) {
+      if (registered_[id] != 0) release_reader(id);
+    }
+    if (options_.publisher) {
+      std::uint64_t expected = owner_process_;
+      header_->writer.owner_pid.compare_exchange_strong(
+          expected, 0, std::memory_order_acq_rel);
+    }
+    segment_id = header_->segment_id;
+    unlink = options_.session_owner;
+    if (counted_) {
+      unlink = ReleaseCountedLifetime(*header_);
+    }
   }
-  if (options_.publisher) {
-    std::uint64_t expected = OwnProcess();
-    header_->writer.owner_pid.compare_exchange_strong(
-        expected, 0, std::memory_order_acq_rel);
-  }
-  const std::uint64_t segment_id = header_->segment_id;
-  bool unlink = options_.session_owner;
-  if (counted_) {
-    unlink = ReleaseCountedLifetime(*header_);
-  }
+  registered_.fill(0);
   header_ = nullptr;
   counted_ = false;
+  owner_process_ = 0;
   ptr_ = SharedMemoryPtr{};
   if (unlink) UnlinkIfSame(path_, segment_id);
 }
@@ -507,6 +548,7 @@ RTMSQueue::RTMSQueue(RTMSQueue&& other) noexcept
       header_{std::exchange(other.header_, nullptr)},
       ptr_{std::move(other.ptr_)},
       counted_{std::exchange(other.counted_, false)},
+      owner_process_{std::exchange(other.owner_process_, 0)},
       registered_{std::exchange(other.registered_, {})},
       wake_senders_{std::move(other.wake_senders_)},
       wakes_sent_{std::exchange(other.wakes_sent_, 0)},
@@ -528,6 +570,7 @@ RTMSQueue& RTMSQueue::operator=(RTMSQueue&& other) noexcept {
     header_ = std::exchange(other.header_, nullptr);
     ptr_ = std::move(other.ptr_);
     counted_ = std::exchange(other.counted_, false);
+    owner_process_ = std::exchange(other.owner_process_, 0);
     registered_ = std::exchange(other.registered_, {});
     wake_senders_ = std::move(other.wake_senders_);
     wakes_sent_ = std::exchange(other.wakes_sent_, 0);
@@ -549,7 +592,7 @@ std::string_view RTMSQueue::schema_name() const {
 // Need to find out where the "slowest" reader is.
 uint64_t RTMSQueue::minimum_read_position() const {
   std::uint64_t minimum =
-      header_->writer.sequence.load(std::memory_order_relaxed);
+      header_->writer.sequence.load(std::memory_order_acquire);
 
   for (std::size_t i = 0; i < MAX_READERS; ++i) {
     // Sequentially consistent, completing the four-operation store-buffering
@@ -641,10 +684,14 @@ WriteStatus RTMSQueue::write(std::span<const std::byte> message,
     // Only on the full path, so the steady state makes no system call: a
     // publication makes one only to wake a reader that armed (below). A
     // refused write publishes nothing and wakes nobody.
-    if (next_position - minimum_read_position() > slots_ &&
-        (reclaim_dead_readers() == 0 ||
-         next_position - minimum_read_position() > slots_)) {
-      return {WriteResult::BUFFER_FULL, 0};
+    if (next_position - minimum_read_position() > slots_) {
+      // Re-check even when reclaim_dead_readers() returns 0: a concurrent peer
+      // may have reclaimed the blocking dead reader (or a live reader may have
+      // advanced) before our reclaim pass ran.
+      (void)reclaim_dead_readers();
+      if (next_position - minimum_read_position() > slots_) {
+        return {WriteResult::BUFFER_FULL, 0};
+      }
     }
   }
 
@@ -886,7 +933,19 @@ std::optional<std::size_t> RTMSQueue::register_reader() {
       if (!activate_reader_slot(i, *current)) continue;
       return i;
     }
-    if (reclaim_dead_readers() == 0) break;
+    if (pass == 0) {
+      // Even if reclaim_dead_readers() frees 0 slots here, a concurrent peer
+      // may have just reclaimed dead slots (or released one) after our first
+      // scan passed them; rescan once if any slot is now free.
+      const std::size_t freed = reclaim_dead_readers();
+      bool any_free = freed > 0;
+      for (std::size_t i = 0; !any_free && i < MAX_READERS; ++i) {
+        if (header_->readers[i].state.load(std::memory_order_acquire) == 0) {
+          any_free = true;
+        }
+      }
+      if (!any_free) break;
+    }
   }
   return std::nullopt;
 }
@@ -898,13 +957,22 @@ void RTMSQueue::release_reader(std::size_t id) noexcept {
   std::uint64_t expected = std::exchange(registered_[id], 0);
   if (expected != ReaderWord(ReaderState::ACTIVE)) return;
   auto& reader = header_->readers[id];
-  if (reader.state.load(std::memory_order_acquire) != expected) return;
+  // Atomically transition ACTIVE -> CLAIMING before clearing waiters/wake_id so
+  // we cannot clobber a new claimant's wake state if this slot was taken over.
+  // While CLAIMING with our live process word, no other process can claim the
+  // slot and minimum_read_position() already ignores it.
+  std::uint64_t releasing = ReaderWord(ReaderState::CLAIMING);
+  if (!reader.state.compare_exchange_strong(expected, releasing,
+                                            std::memory_order_acq_rel,
+                                            std::memory_order_acquire)) {
+    return;
+  }
   // Disarmed before the slot is freed, so no writer notifies a receiver its
   // holder may close, nor the slot's next holder for this one's arm.
   header_->writer.waiters.fetch_and(~(std::uint64_t{1} << id),
                                     std::memory_order_acq_rel);
   reader.wake_id.store(0, std::memory_order_release);
-  reader.state.compare_exchange_strong(expected, 0, std::memory_order_acq_rel,
+  reader.state.compare_exchange_strong(releasing, 0, std::memory_order_acq_rel,
                                        std::memory_order_acquire);
 }
 
@@ -913,13 +981,18 @@ void RTMSQueue::set_reader_wake(std::size_t reader_id, std::uint64_t wake_id) {
       !holds_reader(reader_id)) {
     return;
   }
-  // Release: a writer that takes this slot's waiters bit with its acquiring
-  // exchange then reads this receiver.
-  header_->readers[reader_id].wake_id.store(wake_id, std::memory_order_release);
+  const std::uint64_t clear_mask = ~(std::uint64_t{1} << reader_id);
   if (wake_id == 0) {
-    header_->writer.waiters.fetch_and(~(std::uint64_t{1} << reader_id),
-                                      std::memory_order_acq_rel);
+    header_->readers[reader_id].wake_id.store(0, std::memory_order_release);
+    header_->writer.waiters.fetch_and(clear_mask, std::memory_order_acq_rel);
+    return;
   }
+  // Disarm any stale waiters bit from an earlier receiver (or wake_id == 0)
+  // before storing the new wake_id so the next arm_wake() must run its seq_cst
+  // fetch_or after this release store, ordering wake_id before any writer
+  // notification.
+  header_->writer.waiters.fetch_and(clear_mask, std::memory_order_acq_rel);
+  header_->readers[reader_id].wake_id.store(wake_id, std::memory_order_release);
 }
 
 bool RTMSQueue::arm_wake(std::size_t reader_id) {

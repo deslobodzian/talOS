@@ -162,8 +162,10 @@ function matchKeyOf(sample: AlertSample): string|null {
   return `${sample.channels[DS + 'match_type'] ?? 0}:${number}`;
 }
 
-const flag = (sample: AlertSample, name: string) =>
-    (sample.channels[DS + name] ?? 0) !== 0;
+const flag = (sample: AlertSample, name: string) => {
+  const v = sample.channels[DS + name];
+  return v !== undefined && Number.isFinite(v) && v !== 0;
+};
 
 export class AlertTracker {
   // Bumped whenever latch() or active() would return something different.
@@ -196,9 +198,10 @@ export class AlertTracker {
     const t = sample.timestamp_ns;
     let changed = false;
 
-    // A sample without a Driver Station reading says nothing about the match.
+    // A sample without a finite Driver Station reading says nothing about the match.
     let begins = false;
-    if (sample.channels[DS + 'enabled'] !== undefined) {
+    const enabledRaw = sample.channels[DS + 'enabled'];
+    if (enabledRaw !== undefined && Number.isFinite(enabledRaw)) {
       const key = matchKeyOf(sample);
       const enabled = flag(sample, 'enabled');
       if (key !== null) {
@@ -220,7 +223,14 @@ export class AlertTracker {
       changed = true;
     }
 
-    for (const [channel, level] of Object.entries(sample.alerts ?? {})) {
+    const declared = sample.alerts ?? {};
+    for (const [channel, entry] of this.entries) {
+      if (entry.active && !Object.hasOwn(declared, channel)) {
+        entry.active = false;
+        changed = true;
+      }
+    }
+    for (const [channel, level] of Object.entries(declared)) {
       if (!isAlertLevel(level)) continue;
       const value = sample.channels[channel];
       const present = value !== undefined && !Number.isNaN(value);
@@ -246,7 +256,8 @@ export class AlertTracker {
 
     const current = activeAlerts(sample);
     if (current.length !== this.current.length ||
-        current.some((a, i) => a.channel !== this.current[i].channel)) {
+        current.some((a, i) => a.channel !== this.current[i].channel ||
+            a.level !== this.current[i].level)) {
       this.current = current;
       changed = true;
     }

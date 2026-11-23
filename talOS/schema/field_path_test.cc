@@ -360,5 +360,168 @@ TEST(FieldPath, GuardsUntrustedSchemaPointersBoundsAndDepth) {
   }
 }
 
+// VerifySchema rejects unaligned buffers without UBSan alignment faults,
+// ResolveField rejects non-scalar BaseTypes and out-of-bounds offsets,
+// EncodeField/EncodeNumber support UType and reject non-integer types, and
+// ScalarPaths bounds cycles and diamond DAGs without exponential blowup.
+TEST(FieldPath, HardensAlignmentBoundsTypesAndDagExpansion) {
+  // 1. Unaligned buffer passed to VerifySchema returns nullptr cleanly.
+  const Identity mixed_id = Of<schema_test::Mixed>();
+  std::vector<char> unaligned(mixed_id.bfbs.size() + 4);
+  std::memcpy(unaligned.data() + 1, mixed_id.bfbs.data(), mixed_id.bfbs.size());
+  EXPECT_EQ(VerifySchema({unaligned.data() + 1, mixed_id.bfbs.size()}),
+            nullptr);
+
+  // 2. Non-scalar BaseTypes (String, Union, Vector64) and out-of-bounds offsets
+  // are rejected by ResolveField.
+  for (const auto& [base, offset, bytesize, is_struct] :
+       {std::tuple{reflection::BaseType::String, std::uint16_t{0}, 8, true},
+        std::tuple{reflection::BaseType::Union, std::uint16_t{0}, 8, true},
+        std::tuple{reflection::BaseType::Vector64, std::uint16_t{0}, 8, true},
+        std::tuple{reflection::BaseType::Double, std::uint16_t{4}, 8, true},
+        std::tuple{reflection::BaseType::Double, std::uint16_t{0}, 0, true},
+        std::tuple{reflection::BaseType::Double, std::uint16_t{0}, 8, false}}) {
+    flatbuffers::FlatBufferBuilder fbb;
+    const auto ons = fbb.CreateString("bad.Obj");
+    const auto fns = fbb.CreateString("x");
+    reflection::TypeBuilder tb(fbb);
+    tb.add_base_type(base);
+    const auto ft = tb.Finish();
+    reflection::FieldBuilder fb(fbb);
+    fb.add_name(fns);
+    fb.add_type(ft);
+    fb.add_offset(offset);
+    const auto f = fb.Finish();
+    const auto fvec = fbb.CreateVector(&f, 1);
+    reflection::ObjectBuilder ob(fbb);
+    ob.add_name(ons);
+    ob.add_fields(fvec);
+    ob.add_is_struct(is_struct);
+    ob.add_bytesize(bytesize);
+    const auto o = ob.Finish();
+    const auto ovec = fbb.CreateVector(&o, 1);
+    const auto evec =
+        fbb.CreateVector(std::vector<flatbuffers::Offset<reflection::Enum>>{});
+    reflection::SchemaBuilder sb(fbb);
+    sb.add_objects(ovec);
+    sb.add_enums(evec);
+    reflection::FinishSchemaBuffer(fbb, sb.Finish());
+    const auto* schema = VerifySchema(
+        {reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()});
+    ASSERT_NE(schema, nullptr);
+    EXPECT_THROW(ResolveField(*schema, *schema->objects()->Get(0), "x", "test"),
+                 std::invalid_argument);
+  }
+
+  // 3. EncodeField / EncodeNumber support UType and reject non-integer types.
+  {
+    std::array<std::byte, 4> buf{};
+    const ResolvedField utype_field{
+        .offset = 0,
+        .base_type = reflection::BaseType::UType,
+        .size = 1,
+        .enum_def = nullptr,
+        .leaf_name = "u",
+        .enclosing_name = "Test",
+    };
+    EncodeField(buf.data(), utype_field, FieldValue{std::int64_t{200}}, "test");
+    EXPECT_EQ(ReadInt64(reflection::BaseType::UType, buf.data()), 200);
+    EXPECT_THROW(EncodeField(buf.data(), utype_field,
+                             FieldValue{std::int64_t{256}}, "test"),
+                 std::invalid_argument);
+    EXPECT_THROW(
+        EncodeNumber(buf.data(), reflection::BaseType::String, 1.0, "test"),
+        std::invalid_argument);
+  }
+
+  // 4. Two-field self-cycle and 25-level diamond DAG terminate immediately.
+  {
+    flatbuffers::FlatBufferBuilder fbb;
+    const auto ons = fbb.CreateString("bad.SelfCycle2");
+    std::vector<flatbuffers::Offset<reflection::Field>> fields;
+    for (int k = 0; k < 2; ++k) {
+      const auto fns = fbb.CreateString(k == 0 ? "a" : "b");
+      reflection::TypeBuilder tb(fbb);
+      tb.add_base_type(reflection::BaseType::Obj);
+      tb.add_index(0);
+      const auto ft = tb.Finish();
+      reflection::FieldBuilder fb(fbb);
+      fb.add_name(fns);
+      fb.add_type(ft);
+      fb.add_id(static_cast<std::uint16_t>(k));
+      fields.push_back(fb.Finish());
+    }
+    const auto fvec = fbb.CreateVector(fields);
+    reflection::ObjectBuilder ob(fbb);
+    ob.add_name(ons);
+    ob.add_fields(fvec);
+    ob.add_is_struct(true);
+    ob.add_bytesize(8);
+    const auto o = ob.Finish();
+    const auto ovec = fbb.CreateVector(&o, 1);
+    const auto evec =
+        fbb.CreateVector(std::vector<flatbuffers::Offset<reflection::Enum>>{});
+    reflection::SchemaBuilder sb(fbb);
+    sb.add_objects(ovec);
+    sb.add_enums(evec);
+    reflection::FinishSchemaBuffer(fbb, sb.Finish());
+    const auto* schema = VerifySchema(
+        {reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()});
+    ASSERT_NE(schema, nullptr);
+    EXPECT_TRUE(ScalarPaths(*schema, *schema->objects()->Get(0)).empty());
+  }
+  {
+    flatbuffers::FlatBufferBuilder fbb;
+    constexpr int kLevels = 25;
+    std::vector<flatbuffers::Offset<reflection::Object>> objs;
+    for (int i = 0; i < kLevels; ++i) {
+      const auto ons = fbb.CreateString("dag.o" + std::to_string(i));
+      std::vector<flatbuffers::Offset<reflection::Field>> fields;
+      if (i + 1 == kLevels) {
+        const auto fns = fbb.CreateString("leaf_m");
+        reflection::TypeBuilder tb(fbb);
+        tb.add_base_type(reflection::BaseType::Double);
+        const auto ft = tb.Finish();
+        reflection::FieldBuilder fb(fbb);
+        fb.add_name(fns);
+        fb.add_type(ft);
+        fields.push_back(fb.Finish());
+      } else {
+        for (int k = 0; k < 2; ++k) {
+          const auto fns = fbb.CreateString(k == 0 ? "a" : "b");
+          reflection::TypeBuilder tb(fbb);
+          tb.add_base_type(reflection::BaseType::Obj);
+          tb.add_index(i + 1);
+          const auto ft = tb.Finish();
+          reflection::FieldBuilder fb(fbb);
+          fb.add_name(fns);
+          fb.add_type(ft);
+          fb.add_id(static_cast<std::uint16_t>(k));
+          fields.push_back(fb.Finish());
+        }
+      }
+      const auto fvec = fbb.CreateVector(fields);
+      reflection::ObjectBuilder ob(fbb);
+      ob.add_name(ons);
+      ob.add_fields(fvec);
+      ob.add_is_struct(true);
+      ob.add_bytesize(8);
+      objs.push_back(ob.Finish());
+    }
+    const auto ovec = fbb.CreateVector(objs);
+    const auto evec =
+        fbb.CreateVector(std::vector<flatbuffers::Offset<reflection::Enum>>{});
+    reflection::SchemaBuilder sb(fbb);
+    sb.add_objects(ovec);
+    sb.add_enums(evec);
+    reflection::FinishSchemaBuffer(fbb, sb.Finish());
+    const auto* schema = VerifySchema(
+        {reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()});
+    ASSERT_NE(schema, nullptr);
+    const auto paths = ScalarPaths(*schema, *schema->objects()->Get(0));
+    EXPECT_LE(paths.size(), 4096u);
+  }
+}
+
 }  // namespace
 }  // namespace talos::schema

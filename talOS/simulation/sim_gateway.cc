@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -90,8 +91,17 @@ static_assert(
     talos::event::MonotonicTime::from_nanos(205'000'000));
 
 double FiniteNumber(const std::string& text) {
+  if (text.empty() ||
+      std::isspace(static_cast<unsigned char>(text.front())) != 0) {
+    throw std::invalid_argument("number must be finite: " + text);
+  }
   std::size_t used = 0;
-  const double value = std::stod(text, &used);
+  double value = 0.0;
+  try {
+    value = std::stod(text, &used);
+  } catch (const std::out_of_range&) {
+    throw std::invalid_argument("number must be finite: " + text);
+  }
   if (used != text.size() || !std::isfinite(value)) {
     throw std::invalid_argument("number must be finite: " + text);
   }
@@ -113,21 +123,51 @@ void StartPose(const std::string& text,
 }
 
 double Seconds(const std::string& text) {
-  std::size_t used = 0;
-  const double value = std::stod(text, &used);
-  if (used != text.size() || !std::isfinite(value) || value <= 0) {
+  const double value = FiniteNumber(text);
+  if (value <= 0) {
     throw std::invalid_argument("seconds must be finite and positive");
   }
   return value;
 }
 
+bool AllAsciiDigits(const std::string& text) {
+  return !text.empty() && std::all_of(text.begin(), text.end(), [](char c) {
+    return c >= '0' && c <= '9';
+  });
+}
+
 uint16_t Port(const std::string& text) {
+  if (!AllAsciiDigits(text)) {
+    throw std::invalid_argument("port must be between 1 and 65535");
+  }
   std::size_t used = 0;
-  const int value = std::stoi(text, &used);
+  int value = 0;
+  try {
+    value = std::stoi(text, &used);
+  } catch (const std::out_of_range&) {
+    throw std::invalid_argument("port must be between 1 and 65535");
+  }
   if (used != text.size() || value <= 0 || value > 65535) {
     throw std::invalid_argument("port must be between 1 and 65535");
   }
   return static_cast<uint16_t>(value);
+}
+
+uint64_t SessionId(const std::string& text) {
+  if (!AllAsciiDigits(text)) {
+    throw std::invalid_argument("--session-id must be an unsigned integer");
+  }
+  std::size_t used = 0;
+  uint64_t value = 0;
+  try {
+    value = std::stoull(text, &used);
+  } catch (const std::out_of_range&) {
+    throw std::invalid_argument("--session-id must be an unsigned integer");
+  }
+  if (used != text.size()) {
+    throw std::invalid_argument("--session-id must be an unsigned integer");
+  }
+  return value;
 }
 
 talos::event::Manifest Manifest(bool physics) {
@@ -155,10 +195,8 @@ int Describe(bool physics) {
 int main(int argc, char** argv) {
   try {
     bool describe = false;
+    bool saw_sim = false;
     bool physics = false;
-    for (int i = 1; i < argc; ++i) {
-      describe |= std::string{argv[i]} == "--describe";
-    }
     double duration_s = 0;
     std::vector<ds::SchedulePhase> phases;
     std::vector<ds::JoystickEvent> joysticks;
@@ -177,7 +215,14 @@ int main(int argc, char** argv) {
     uint16_t remote_port_flag = 0;
     for (int i = 1; i < argc; ++i) {
       const std::string arg{argv[i]};
-      if (arg == "--describe" || (describe && arg == "--sim")) continue;
+      if (arg == "--describe") {
+        describe = true;
+        continue;
+      }
+      if (arg == "--sim") {
+        saw_sim = true;
+        continue;
+      }
       if (arg == "--physics") {
         physics = true;
       } else if (arg == "--start-pose" && i + 1 < argc) {
@@ -201,13 +246,7 @@ int main(int argc, char** argv) {
         physics_options = true;
         options.gyro_drift_radps = FiniteNumber(argv[++i]);
       } else if (arg == "--session-id" && i + 1 < argc) {
-        const std::string value = argv[++i];
-        std::size_t used = 0;
-        session_id = std::stoull(value, &used);
-        if (used != value.size() || value.starts_with('-')) {
-          throw std::invalid_argument(
-              "--session-id must be an unsigned integer");
-        }
+        session_id = SessionId(argv[++i]);
       } else if (arg == "--schedule-start-file" && i + 1 < argc) {
         schedule_start_file = argv[++i];
       } else if (arg == "--port" && i + 1 < argc) {
@@ -238,6 +277,9 @@ int main(int argc, char** argv) {
       } else {
         throw std::invalid_argument(kUsage);
       }
+    }
+    if (saw_sim && !describe) {
+      throw std::invalid_argument(kUsage);
     }
     if (physics_options && !physics) {
       throw std::invalid_argument(

@@ -413,6 +413,7 @@ class DriverStation {
 
  private:
   friend struct detail::DriverStationAccess;  // the targets' side: access.h
+  explicit DriverStation(detail::DriverStationLink* link) : link_{link} {}
   bool flag(driver_station::DsFlags flag) const;
   detail::DriverStationLink* link_{nullptr};
 };

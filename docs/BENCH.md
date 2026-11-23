@@ -614,8 +614,9 @@ sleep precision. Releasing a lane is not a mechanical brake.
   upper bound. The decision is TODO.md RT-5.
 - [ ] Capture representative enabled sessions, fetch them (below) and run
   `bazel run //talOS/launcher:session_report -- --strict <session-dir>`.
-  Expected: `/hw/state` median about 5 ms, p99 <10 ms, no 100 ms gap while
-  enabled (PASS lines); `--strict` exits 2 unless every required verdict
+  Expected: `/hw/state` median about 5 ms, p99 under twice `period_us`
+  (10 ms at the bench's 5000 µs), no gap of `command_timeout_us` (100 ms)
+  while enabled (PASS lines); `--strict` exits 2 unless every required verdict
   passes and the manifest shows a finished session with no quarantined,
   recorder-failed or log-capped recording node (Studio is exempt), no
   damaged log, and a "Delivery loss" section with no node's
@@ -899,8 +900,8 @@ path 1 below), each followed by a release and a re-enable. Disable for the
 last time before the 420 s end. No other fault in this session.
 
 - [ ] `"$REPORT" --strict "$S" > "$S/session_report.md"; echo $?` prints
-  `0`: `/hw/state` enabled median about 5 ms, p99 under 10 ms, no enabled
-  gap of 100 ms, target age at tick at most 25 ms
+  `0`: `/hw/state` enabled median about 5 ms, p99 under twice `period_us`
+  (10 ms), no enabled gap of `command_timeout_us` (100 ms), target age at tick at most 25 ms
   ([session measurements](../talOS/launcher/README.md#session-measurements)),
   realtime and revision as in session A. This is REQ-RT-15's session.
   Record the `timer motor:` row's lateness (stop path 2 has no margin for
@@ -1040,8 +1041,8 @@ Each trial is a few lines of `stop_paths.txt`. Where `kraken_v` reads
   config <config_sha256>; realtime `full` for the bridge and every control
   loop. Sessions kept at <archive path>.
   - Acceptance (session B, <id>): `session_report --strict` exit <0>;
-    `/hw/state` enabled median <...> ms, p99 <...> ms (bound 10), no
-    enabled gap of 100 ms; target age at tick max <...> ms (bound 25);
+    `/hw/state` enabled median <...> ms, p99 <...> ms (bound 2 x
+    `period_us`, 10), no enabled gap of `command_timeout_us` (100 ms); target age at tick max <...> ms (bound 25);
     applied voltage within ±<cap> V. PASS
   - Latency (REQ-RT-26): accepted command age p99 <...> ms (bound 11), max
     <...> ms (bound 15); Driver Station refresh to command applied p99

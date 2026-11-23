@@ -28,6 +28,25 @@ std::string RecordingPath(std::string_view device) {
   return std::string(device);
 }
 
+std::int64_t SaturatingAddNs(std::int64_t a, std::int64_t b) {
+  if (b >= 0 && a > std::numeric_limits<std::int64_t>::max() - b) {
+    return std::numeric_limits<std::int64_t>::max();
+  }
+  if (b < 0 && a < std::numeric_limits<std::int64_t>::min() - b) {
+    return std::numeric_limits<std::int64_t>::min();
+  }
+  return a + b;
+}
+
+bool ReachedOffsetNs(std::int64_t now_ns, std::int64_t start_ns,
+                     std::int64_t offset_ns) {
+  if (offset_ns <= 0) return now_ns >= start_ns;
+  if (now_ns < start_ns) return false;
+  return static_cast<std::uint64_t>(now_ns) -
+             static_cast<std::uint64_t>(start_ns) >=
+         static_cast<std::uint64_t>(offset_ns);
+}
+
 // The realtime node clock (talOS/events pollers' now()): CLOCK_MONOTONIC on
 // Linux, CLOCK_MONOTONIC_RAW (mach continuous time) on macOS. Not
 // std::chrono::steady_clock, which on macOS stops during sleep.
@@ -194,15 +213,18 @@ std::size_t RecordedCameraSource::DeliverUntil(std::int64_t now_ns) {
   if (pacing_ != Pacing::kManual || !connected_.load() || !sequence_) return 0;
   if (!manual_start_ns_) manual_start_ns_ = now_ns;
   std::size_t delivered = 0;
-  while (next_ < sequence_->size() &&
-         *manual_start_ns_ + (*sequence_)[next_].pts_ns <= now_ns) {
+  while (
+      next_ < sequence_->size() &&
+      ReachedOffsetNs(now_ns, *manual_start_ns_, (*sequence_)[next_].pts_ns)) {
     if (Decode(*sequence_, next_)) {
-      Emit(next_, *manual_start_ns_ + (*sequence_)[next_].pts_ns);
+      Emit(next_,
+           SaturatingAddNs(*manual_start_ns_, (*sequence_)[next_].pts_ns));
       ++delivered;
     }
     ++next_;
   }
-  if (next_ == sequence_->size() && now_ns >= *manual_start_ns_ + end_ns_) {
+  if (next_ == sequence_->size() &&
+      ReachedOffsetNs(now_ns, *manual_start_ns_, end_ns_)) {
     Finish();
   }
   return delivered;
@@ -224,8 +246,8 @@ void RecordedCameraSource::Play(std::int64_t start_ns) {
   const ImageSequence& sequence = *sequence_;
   const auto period = sequence.mean_period_ns();
   for (std::size_t i = 0; i < sequence.size(); ++i) {
-    const auto due_ns = start_ns + sequence[i].pts_ns;
-    if (i > 0 && HostNowNs() > due_ns + period) {
+    const auto due_ns = SaturatingAddNs(start_ns, sequence[i].pts_ns);
+    if (i > 0 && HostNowNs() > SaturatingAddNs(due_ns, period)) {
       dropped_.fetch_add(1);
       continue;
     }
@@ -234,7 +256,7 @@ void RecordedCameraSource::Play(std::int64_t start_ns) {
     if (!WaitUntil(due_ns)) return;
     if (decoded) Emit(i, due_ns);
   }
-  if (WaitUntil(start_ns + end_ns_)) Finish();
+  if (WaitUntil(SaturatingAddNs(start_ns, end_ns_))) Finish();
 }
 
 std::unique_ptr<CameraSource> CreateCameraSource(

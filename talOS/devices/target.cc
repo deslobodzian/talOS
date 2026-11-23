@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -127,13 +128,17 @@ class ReportSelection {
 }  // namespace
 
 std::size_t TargetEnvelopeBytes(std::size_t bytes, std::size_t alignment) {
+  constexpr std::size_t kMaxPayloadBytes =
+      std::numeric_limits<std::uint32_t>::max() - kTargetEnvelopeHeaderBytes;
   if (alignment == 0 || (alignment & (alignment - 1)) != 0 ||
-      alignment > kMessageAlignment || bytes == 0 || bytes % alignment != 0) {
+      alignment > kMessageAlignment || bytes == 0 || bytes % alignment != 0 ||
+      bytes > kMaxPayloadBytes) {
     throw std::invalid_argument(
         "target message of " + std::to_string(bytes) + " bytes aligned to " +
         std::to_string(alignment) +
         ": the alignment must be a power of two at most " +
-        std::to_string(kMessageAlignment) + " that divides the size");
+        std::to_string(kMessageAlignment) +
+        " that divides the size and fits in a target envelope");
   }
   return kTargetEnvelopeHeaderBytes + bytes;
 }
@@ -164,14 +169,20 @@ std::size_t TargetAccess::open_target(Node& node, std::size_t bytes,
                                       const schema::Identity& message) {
   const std::size_t envelope = TargetEnvelopeBytes(bytes, alignment);
   const schema::Identity lane = schema::Envelope(message);
+  const config::TargetPolicy& policy =
+      NodeAccess::robot_config(node).TargetsFor(node.name());
+  std::vector<std::string> sources = policy.Sources();
+  // Register the selection first: add_selection checks that the node is still
+  // in construction before attaching extensions or subscribing to lanes.
+  const std::size_t selection = NodeAccess::add_selection(node, sources);
   // Attaches the hardware link (robot_enabled) and the Driver Station in the
   // constructor, where registration belongs.
-  const config::TargetPolicy& policy =
-      node.extension<HardwareLink>().config().TargetsFor(node.name());
+  (void)node.extension<HardwareLink>();
   TargetState state{.bytes = bytes,
                     .alignment = alignment,
-                    .sources = policy.Sources(),
-                    .ds = DriverStation{node}};
+                    .sources = std::move(sources),
+                    .ds = DriverStationAccess::internal(node),
+                    .selection = selection};
   for (const std::string& source : state.sources) {
     // Relative, so [subsystems.<name>.remap] applies. Optional: a lane with
     // no producer is normal (the graph lint warns), and no callback keeps
@@ -193,7 +204,6 @@ std::size_t TargetAccess::open_target(Node& node, std::size_t bytes,
   state.teleop = indexes(policy.teleop);
   state.autonomous = indexes(policy.autonomous);
   state.test = indexes(policy.test);
-  state.selection = NodeAccess::add_selection(node, state.sources);
   auto& targets = node.extension<Targets>().targets;
   targets.push_back(std::move(state));
   return targets.size() - 1;
@@ -281,13 +291,14 @@ std::size_t TargetAccess::open_lane(Node& node, std::string_view subsystem,
       introspect::naming::TargetLaneTopic(subsystem, source);
   auto& lanes = node.extension<Targets>().lanes;
   lanes.push_back(LaneState{
-      .publisher = NodeAccess::add_publisher(
-          node, topic, envelope, kMessageAlignment, schema::Envelope(message)),
+      .publisher = NodeAccess::add_target_lane_publisher(
+          node, topic, envelope, kMessageAlignment, schema::Envelope(message),
+          /*operator_arming=*/arming.has_value()),
       .bytes = bytes,
       .alignment = alignment,
       // Subscribed here, so the producer drains the Driver Station right
       // before its timer and send() stamps the packet it saw last.
-      .ds = DriverStation{node},
+      .ds = DriverStationAccess::internal(node),
       .envelope = std::vector<std::byte>(envelope),
       .arming = arming,
   });
@@ -329,7 +340,7 @@ bool TargetAccess::lane_release(Node& node, std::size_t lane) {
 
 std::size_t TargetAccess::open_arming(Node& node) {
   auto& armings = node.extension<Targets>().armings;
-  armings.push_back(ArmingState{.ds = DriverStation{node}});
+  armings.push_back(ArmingState{.ds = DriverStationAccess::internal(node)});
   return armings.size() - 1;
 }
 

@@ -155,9 +155,16 @@ PositionMechanism::PositionMechanism(Node& node, std::string_view name)
     }
     // A stop found no sooner than the minimum push plus the still time
     // must leave time before the timeout faults, with a tick of slack at
-    // each end for when the push and the stillness are first seen.
-    if (homing_timeout_ <=
-        homing_min_push_ + homing_stall_time_ + 2 * node.period()) {
+    // each end for when the push and the stillness are first seen. Subtract
+    // sequentially so large valid durations cannot overflow signed 64-bit ns.
+    const Duration period = node.period();
+    const bool enough_time =
+        homing_timeout_ > homing_min_push_ &&
+        homing_timeout_ - homing_min_push_ > homing_stall_time_ &&
+        homing_timeout_ - homing_min_push_ - homing_stall_time_ > period &&
+        homing_timeout_ - homing_min_push_ - homing_stall_time_ - period >
+            period;
+    if (!enough_time) {
       params.fail("homing_timeout_us",
                   "must exceed homing_min_push_us + homing_stall_us + 2 "
                   "periods");
@@ -179,8 +186,11 @@ PositionMechanism::PositionMechanism(Node& node, std::string_view name)
     const double half_rot = 0.5 * std::abs(absolute_rot_per_sensor_rot_);
     const double low = absolute_offset_rot_ - half_rot;
     const double high = absolute_offset_rot_ + half_rot;
-    if (!(min_rot_ - absolute_margin_rot_ > low &&
-          max_rot_ + absolute_margin_rot_ < high)) {
+    const double travel_low = min_rot_ - absolute_margin_rot_;
+    const double travel_high = max_rot_ + absolute_margin_rot_;
+    if (!(std::isfinite(low) && std::isfinite(high) &&
+          std::isfinite(travel_low) && std::isfinite(travel_high) &&
+          travel_low > low && travel_high < high)) {
       params.fail("absolute_offset_rot",
                   "with absolute_rot_per_sensor_rot maps sensor readings in "
                   "[-0.5, 0.5) to (" +
@@ -294,7 +304,10 @@ void PositionMechanism::update() {
   if (limit_switch_.has_value()) {
     switch_closed = limit_switch_->connected() &&
                     limit_switch_->get() == switch_closed_reads_;
-    home_count_ = !motor_.zeroed() && switch_closed ? home_count_ + 1 : 0;
+    home_count_ =
+        !motor_.zeroed() && switch_closed
+            ? (home_count_ < home_samples_ ? home_count_ + 1 : home_samples_)
+            : 0;
     if (home_count_ >= home_samples_) {
       motor_.rezero(home_rot_);
       if (motor_.zeroed()) {
@@ -313,9 +326,10 @@ void PositionMechanism::update() {
   position_rot_ = motor_.position();
   velocity_rps_ = motor_.velocity();
   if (limit_switch_.has_value()) {
-    rest_count_ = connected_ && std::abs(velocity_rps_) < homing_stall_rps_
-                      ? std::min(rest_count_ + 1, home_samples_)
-                      : 0;
+    rest_count_ =
+        connected_ && std::abs(velocity_rps_) < homing_stall_rps_
+            ? (rest_count_ < home_samples_ ? rest_count_ + 1 : home_samples_)
+            : 0;
     if (rest_count_ >= home_samples_) settling_ = false;  // at rest: homed
   }
   if (drives_home() && homed()) reset_homing_run();
@@ -451,27 +465,31 @@ void PositionMechanism::reset_homing_run() {
 
 void PositionMechanism::drive_goal(Request request, double request_rot,
                                    double request_ff_v, Time now) {
-  double goal = request_rot;
+  if (!std::isfinite(position_rot_)) {
+    idle(PositionPhase::kReady);
+    return;
+  }
+  double wrapped_goal = 0.0;
   if (request == Request::kHold) {
+    // Hold the physical position latched when this hold began, clamped to the
+    // travel without wrapping: wrapping a held position would spin a turret a
+    // full turn on slight overshoot past a stop or on back-drive past half a
+    // turn.
     if (!held_rot_) {
-      if (!std::isfinite(position_rot_)) {
-        idle(PositionPhase::kReady);
-        return;
-      }
-      held_rot_ = position_rot_;
+      held_rot_ = std::clamp(position_rot_, min_rot_, max_rot_);
     }
-    goal = *held_rot_;
+    wrapped_goal = *held_rot_;
   } else {
     held_rot_.reset();
+    wrapped_goal = std::clamp(wrap(request_rot), min_rot_, max_rot_);
   }
-  const double wrapped_goal = std::clamp(wrap(goal), min_rot_, max_rot_);
   const double gravity_v = gravity_at(position_rot_);
   const double feedforward_v = request_ff_v + gravity_v;
   if (!std::isfinite(wrapped_goal) || !std::isfinite(feedforward_v)) {
     idle(PositionPhase::kReady);
     return;
   }
-  goal = wrapped_goal;
+  const double goal = wrapped_goal;
   gravity_ff_v_ = gravity_v;
   if (motion_magic_) {
     motor_.set_motion_magic(goal, feedforward_v, slot_);
@@ -554,29 +572,51 @@ double PositionMechanism::wrap(double goal) const {
     }
   }
   if (best >= min_rot_ && best <= max_rot_) return best;
-  double below = 0.0;
-  double above = 0.0;
+  const double travel = max_rot_ - min_rot_;
   if (best > max_rot_) {
-    const double step = std::ceil((best - max_rot_) / wrap_rot_) * wrap_rot_;
-    below = std::isfinite(step) ? best - step : max_rot_;
-    if (below >= min_rot_) return below;
-    above = below + wrap_rot_;
-  } else {
-    const double step = std::ceil((min_rot_ - best) / wrap_rot_) * wrap_rot_;
-    above = std::isfinite(step) ? best + step : min_rot_;
-    if (above <= max_rot_) return above;
-    below = above - wrap_rot_;
+    double d_above = best - max_rot_;
+    if (!std::isfinite(d_above) || d_above >= wrap_rot_) {
+      const double rem = std::remainder(
+          std::remainder(goal, wrap_rot_) - std::remainder(max_rot_, wrap_rot_),
+          wrap_rot_);
+      if (rem == 0.0) return max_rot_;
+      d_above = rem > 0.0 ? rem : rem + wrap_rot_;
+    }
+    const double below = max_rot_ - (wrap_rot_ - d_above);
+    if (std::isfinite(below) && below >= min_rot_ && below <= max_rot_) {
+      return below;
+    }
+    const double d_below = (wrap_rot_ - d_above) - travel;
+    if (d_below != d_above) return d_below < d_above ? min_rot_ : max_rot_;
+    return (ref - min_rot_) <= (max_rot_ - ref) ? min_rot_ : max_rot_;
   }
-  const double d_below = min_rot_ - below;
-  const double d_above = above - max_rot_;
-  if (d_below != d_above) return d_below < d_above ? below : above;
-  return (ref - min_rot_) <= (max_rot_ - ref) ? below : above;
+  double d_below = min_rot_ - best;
+  if (!std::isfinite(d_below) || d_below >= wrap_rot_) {
+    const double rem = std::remainder(
+        std::remainder(min_rot_, wrap_rot_) - std::remainder(goal, wrap_rot_),
+        wrap_rot_);
+    if (rem == 0.0) return min_rot_;
+    d_below = rem > 0.0 ? rem : rem + wrap_rot_;
+  }
+  const double above = min_rot_ + (wrap_rot_ - d_below);
+  if (std::isfinite(above) && above >= min_rot_ && above <= max_rot_) {
+    return above;
+  }
+  const double d_above = (wrap_rot_ - d_below) - travel;
+  if (d_below != d_above) return d_below < d_above ? min_rot_ : max_rot_;
+  return (ref - min_rot_) <= (max_rot_ - ref) ? min_rot_ : max_rot_;
 }
 
 double PositionMechanism::gravity_at(double position_rot) const {
-  if (gravity_ == Gravity::kElevator) return gravity_v_;
-  return gravity_v_ *
-         std::cos(2 * std::numbers::pi * (position_rot - gravity_zero_rot_));
+  if (gravity_ == Gravity::kElevator || gravity_v_ == 0.0) return gravity_v_;
+  const double diff = position_rot - gravity_zero_rot_;
+  const double turns =
+      std::isfinite(diff)
+          ? std::remainder(diff, 1.0)
+          : std::remainder(std::remainder(position_rot, 1.0) -
+                               std::remainder(gravity_zero_rot_, 1.0),
+                           1.0);
+  return gravity_v_ * std::cos(2 * std::numbers::pi * turns);
 }
 
 }  // namespace talos::mechanisms

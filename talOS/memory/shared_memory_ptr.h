@@ -10,7 +10,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <format>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -142,6 +141,9 @@ class SharedMemoryPtr {
   static constexpr useconds_t kAttachRetryUs = 250;
 
   static off_t to_off_t(std::size_t size) {
+    if (size == 0) {
+      throw std::invalid_argument("shared-memory size must be greater than 0");
+    }
     constexpr auto max_off_t =
         static_cast<std::size_t>(std::numeric_limits<off_t>::max());
     if (size > max_off_t) {
@@ -157,12 +159,18 @@ class SharedMemoryPtr {
   int create_or_attach() {
     for (int attempt = 0; attempt < kAttachAttempts; ++attempt) {
       mode_ = SharedMemoryMode::CREATE;
-      int shm_fd = shm_open(shm_name_.c_str(), O_CREAT | O_RDWR | O_EXCL, 0666);
+      int shm_fd = -1;
+      do {
+        shm_fd = shm_open(shm_name_.c_str(), O_CREAT | O_RDWR | O_EXCL, 0666);
+      } while (shm_fd == -1 && errno == EINTR);
       if (shm_fd != -1 || errno != EEXIST) return shm_fd;
       mode_ = SharedMemoryMode::ATTACH;
-      shm_fd = shm_open(shm_name_.c_str(), O_RDWR, 0666);
+      do {
+        shm_fd = shm_open(shm_name_.c_str(), O_RDWR, 0666);
+      } while (shm_fd == -1 && errno == EINTR);
       if (shm_fd != -1 || errno != ENOENT) return shm_fd;
     }
+    errno = EAGAIN;
     return -1;
   }
 
@@ -173,12 +181,14 @@ class SharedMemoryPtr {
     switch (mode_) {
       case SharedMemoryMode::CREATE:
         if (shm_fd == -1) {
-          std::perror(std::format("shm_open failed on create for {}", shm_name_)
-                          .c_str());
+          const int err = errno;
+          std::fprintf(stderr, "shm_open failed on create for %s: %s\n",
+                       shm_name_.c_str(), std::strerror(err));
           return -1;
         }
 
-        if (ftruncate(shm_fd, file_size)) {
+        while (ftruncate(shm_fd, file_size) == -1) {
+          if (errno == EINTR) continue;
           const int err = errno;
           std::fprintf(stderr, "ftruncate: fd=%d size=%zu errno=%d (%s)\n",
                        shm_fd, size_, err, std::strerror(err));
@@ -190,8 +200,9 @@ class SharedMemoryPtr {
         break;
       case SharedMemoryMode::ATTACH: {
         if (shm_fd == -1) {
-          std::perror(std::format("shm_open failed on attach for {}", shm_name_)
-                          .c_str());
+          const int err = errno;
+          std::fprintf(stderr, "shm_open failed on attach for %s: %s\n",
+                       shm_name_.c_str(), std::strerror(err));
           return -1;
         }
 
@@ -212,7 +223,8 @@ class SharedMemoryPtr {
             close(shm_fd);
             return -1;
           }
-          if (static_cast<std::size_t>(st.st_size) >= size_) {
+          if (st.st_size >= 0 &&
+              static_cast<std::size_t>(st.st_size) >= size_) {
             sized = true;
             break;
           }
@@ -235,11 +247,18 @@ class SharedMemoryPtr {
         return -1;
     }
 
+    const auto unlink_created = [&] {
+      if (mode_ == SharedMemoryMode::CREATE) {
+        shm_unlink(shm_name_.c_str());
+      }
+    };
+
     void* shm_addr =
         mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     if (shm_addr == MAP_FAILED) {
       std::perror("mmap failed");
       close(shm_fd);
+      unlink_created();
       return -1;
     }
 
@@ -248,6 +267,7 @@ class SharedMemoryPtr {
     if (close(shm_fd) == -1) {
       std::perror("failed to close shm_fd");
       munmap(shm_addr, size_);
+      unlink_created();
       return -1;
     }
 
@@ -257,6 +277,7 @@ class SharedMemoryPtr {
       talos::memory::TrackMapping(shm_addr, size_);
     } catch (...) {
       munmap(shm_addr, size_);
+      unlink_created();
       throw;
     }
     ptr_ = shm_addr;

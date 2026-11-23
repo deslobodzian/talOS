@@ -35,6 +35,7 @@ py_test(
     ],
     deps = [
         ":messages_py",
+        "//talOS/bridge:messages_py",
         "//talOS/python:testing",
         "@rules_python//python/runfiles",
     ],

@@ -1,9 +1,12 @@
 #include "talOS/events/session_manifest.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <array>
+#include <cerrno>
 #include <charconv>
-#include <fstream>
-#include <iterator>
-#include <system_error>
 
 namespace talos::event::session_manifest {
 
@@ -274,8 +277,8 @@ class Scanner {
         value += c;
         continue;
       }
-      const char escape = Peek();
-      ++at_;
+      if (at_ >= text_.size()) Fail("a string without its closing quote");
+      const char escape = text_[at_++];
       switch (escape) {
         case '"':
         case '\\':
@@ -375,9 +378,38 @@ class Scanner {
 Fields Parse(std::string_view text) { return Scanner{text}.Manifest(); }
 
 std::optional<std::string> ReadText(const std::filesystem::path& directory) {
-  std::ifstream stream{directory / kFileName, std::ios::binary};
-  if (!stream) return std::nullopt;
-  return std::string{std::istreambuf_iterator<char>{stream}, {}};
+  struct ScopedFd {
+    explicit ScopedFd(int descriptor) : fd{descriptor} {}
+    int fd{-1};
+    ~ScopedFd() {
+      if (fd >= 0) ::close(fd);
+    }
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+  };
+  const std::filesystem::path path = directory / kFileName;
+  const ScopedFd file{::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC)};
+  if (file.fd < 0) return std::nullopt;
+  struct stat sb {};
+  if (::fstat(file.fd, &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size < 0 ||
+      static_cast<std::uintmax_t>(sb.st_size) > kMaxManifestBytes) {
+    return std::nullopt;
+  }
+  std::string text;
+  text.reserve(static_cast<std::size_t>(sb.st_size));
+  std::array<char, 8192> chunk{};
+  for (;;) {
+    const ssize_t got = ::read(file.fd, chunk.data(), chunk.size());
+    if (got == 0) break;
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      return std::nullopt;
+    }
+    const auto got_size = static_cast<std::size_t>(got);
+    if (got_size > kMaxManifestBytes - text.size()) return std::nullopt;
+    text.append(chunk.data(), got_size);
+  }
+  return text;
 }
 
 }  // namespace talos::event::session_manifest

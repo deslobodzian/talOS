@@ -97,7 +97,7 @@ class Problems {
       used_ = std::min(sizeof text_, used_ + static_cast<std::size_t>(written));
     }
   }
-  bool empty() const { return used_ == 0; }
+  bool empty() const { return refused_ == 0; }
   const char* text() const { return text_; }
   std::uint8_t refused() const { return refused_; }
 
@@ -257,9 +257,10 @@ void SetThreadPolicy(const LoopPolicy& loop, Problems& problems) {
     return;
   }
   const auto to_abs = [&](std::chrono::nanoseconds duration) {
-    return static_cast<std::uint32_t>(std::min<std::int64_t>(
-        duration.count() * timebase.denom / timebase.numer,
-        std::numeric_limits<std::uint32_t>::max()));
+    const __int128 scaled = static_cast<__int128>(duration.count()) *
+                            timebase.denom / timebase.numer;
+    return static_cast<std::uint32_t>(std::clamp<__int128>(
+        scaled, 0, std::numeric_limits<std::uint32_t>::max()));
   };
   thread_time_constraint_policy_data_t policy{};
   policy.period = to_abs(loop.period);

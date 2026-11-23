@@ -31,15 +31,15 @@ bool ClockOffsetEstimator::Observe(std::uint64_t boot_id,
   last_sample_time_us_ = sample_time_us;
   SelectExchange(receipt_us, sample_time_us);
 
-  delays_us_[next_] = static_cast<std::int64_t>(receipt_us) -
-                      static_cast<std::int64_t>(sample_time_us);
+  delays_us_[next_] = static_cast<std::int64_t>(receipt_us - sample_time_us);
   next_ = (next_ + 1) % kWindowSamples;
   count_ = std::min(count_ + 1, kWindowSamples);
 
   const auto [lowest, highest] =
       std::minmax_element(delays_us_.begin(), delays_us_.begin() + count_);
   offset_us_ = *lowest;
-  spread_us_ = static_cast<std::uint64_t>(*highest - *lowest);
+  spread_us_ = static_cast<std::uint64_t>(*highest) -
+               static_cast<std::uint64_t>(*lowest);
   return true;
 }
 
@@ -50,8 +50,7 @@ void ClockOffsetEstimator::ObserveExchange(std::uint64_t boot_id,
   const auto rtt = t4 - t1;
   if (rtt > kExchangeLifetimeUs) return;
   exchanges_[next_exchange_] = {
-      .offset_us = static_cast<std::int64_t>(t1 + rtt / 2) -
-                   static_cast<std::int64_t>(t2),
+      .offset_us = static_cast<std::int64_t>((t1 + rtt / 2) - t2),
       .round_trip_us = rtt,
       .sample_us = t2,
       .receipt_us = t4,

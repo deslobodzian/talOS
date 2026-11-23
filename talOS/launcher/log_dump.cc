@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -23,6 +24,7 @@
 #include "talOS/events/log/format.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
 #include "talOS/launcher/hardware_record.h"
 #include "talOS/launcher/log_inputs.h"
@@ -34,7 +36,14 @@ namespace {
 using talos::event::EventKind;
 
 double ToMillis(std::int64_t start_ns, std::int64_t ns) {
-  return static_cast<double>(ns - start_ns) / 1e6;
+  if (ns >= start_ns) {
+    return static_cast<double>(static_cast<std::uint64_t>(ns) -
+                               static_cast<std::uint64_t>(start_ns)) /
+           1e6;
+  }
+  return -static_cast<double>(static_cast<std::uint64_t>(start_ns) -
+                              static_cast<std::uint64_t>(ns)) /
+         1e6;
 }
 
 const char* EventKindName(std::uint16_t kind) {
@@ -150,19 +159,66 @@ bool Matches(const Options& options, const talos::launcher::MergedRecord& r,
   return ms >= options.since_ms && ms <= options.until_ms;
 }
 
+std::size_t Utf8Length(std::string_view text) {
+  const auto at = [&](std::size_t i) {
+    return static_cast<unsigned char>(text[i]);
+  };
+  const unsigned char lead = at(0);
+  std::size_t length = 0;
+  unsigned char low = 0x80;
+  unsigned char high = 0xBF;
+  if (lead >= 0xC2 && lead <= 0xDF) {
+    length = 2;
+  } else if (lead >= 0xE0 && lead <= 0xEF) {
+    length = 3;
+    if (lead == 0xE0) low = 0xA0;
+    if (lead == 0xED) high = 0x9F;
+  } else if (lead >= 0xF0 && lead <= 0xF4) {
+    length = 4;
+    if (lead == 0xF0) low = 0x90;
+    if (lead == 0xF4) high = 0x8F;
+  } else {
+    return 0;
+  }
+  if (text.size() < length) return 0;
+  if (at(1) < low || at(1) > high) return 0;
+  for (std::size_t i = 2; i < length; ++i) {
+    if (at(i) < 0x80 || at(i) > 0xBF) return 0;
+  }
+  return length;
+}
+
 std::string JsonString(std::string_view value) {
-  std::string result{"\""};
-  constexpr char hex[] = "0123456789abcdef";
-  for (const unsigned char c : value) {
-    if (c == '"' || c == '\\') {
-      result += '\\';
-      result += static_cast<char>(c);
-    } else if (c < 0x20) {
-      result += "\\u00";
-      result += hex[c >> 4];
-      result += hex[c & 15];
+  constexpr char kHex[] = "0123456789abcdef";
+  std::string result;
+  result.reserve(value.size() + 2);
+  const auto escape = [&](unsigned char c) {
+    result += "\\u00";
+    result += kHex[c >> 4];
+    result += kHex[c & 15];
+  };
+  result += '"';
+  for (std::size_t i = 0; i < value.size();) {
+    const auto c = static_cast<unsigned char>(value[i]);
+    if (c < 0x80) {
+      if (c == '"' || c == '\\') {
+        result += '\\';
+        result += static_cast<char>(c);
+      } else if (c < 0x20) {
+        escape(c);
+      } else {
+        result += static_cast<char>(c);
+      }
+      ++i;
+      continue;
+    }
+    const std::size_t length = Utf8Length(value.substr(i));
+    if (length == 0) {
+      escape(c);
+      ++i;
     } else {
-      result += static_cast<char>(c);
+      result += value.substr(i, length);
+      i += length;
     }
   }
   result += '"';
@@ -345,22 +401,28 @@ class DecodedFields {
   static void Walk(std::string_view text, const Visit& visit) {
     DecodedFields walker{text, visit};
     std::string path;
-    walker.Value(path);
+    walker.Value(path, 0);
   }
 
  private:
+  static constexpr int kMaxDepth = 64;
+
   DecodedFields(std::string_view text, const Visit& visit)
       : text_{text}, visit_{visit} {}
 
   // Past the separator after a member; false when nothing was consumed
   // since `before`, which only malformed text does.
   bool Next(std::size_t before) {
-    if (text_.substr(at_).starts_with(", ")) at_ += 2;
+    if (at_ < text_.size() && text_.substr(at_).starts_with(", ")) at_ += 2;
     return at_ > before;
   }
 
-  void Value(std::string& path) {
+  void Value(std::string& path, int depth) {
     if (at_ >= text_.size()) return;
+    if (depth >= kMaxDepth) {
+      at_ = text_.size();
+      return;
+    }
     const std::size_t length = path.size();
     if (text_[at_] == '{') {
       ++at_;
@@ -374,27 +436,35 @@ class DecodedFields {
         if (length != 0) path += '.';
         path.append(text_.substr(at_, colon - at_));
         at_ = colon + 2;
-        Value(path);
+        Value(path, depth + 1);
         path.resize(length);
         if (!Next(before)) {
           at_ = text_.size();
           return;
         }
       }
-      ++at_;
+      if (at_ < text_.size() && text_[at_] == '}') {
+        ++at_;
+      } else {
+        at_ = text_.size();
+      }
     } else if (text_[at_] == '[') {
       ++at_;
       for (std::size_t i = 0; at_ < text_.size() && text_[at_] != ']'; ++i) {
         const std::size_t before = at_;
         path += "[" + std::to_string(i) + "]";
-        Value(path);
+        Value(path, depth + 1);
         path.resize(length);
         if (!Next(before)) {
           at_ = text_.size();
           return;
         }
       }
-      ++at_;
+      if (at_ < text_.size() && text_[at_] == ']') {
+        ++at_;
+      } else {
+        at_ = text_.size();
+      }
     } else {
       std::size_t end = text_[at_] == '<' ? text_.find('>', at_)
                                           : text_.find_first_of(",}]", at_);
@@ -644,7 +714,7 @@ std::optional<talos::launcher::DeviceNames> LoadDeviceNames(
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int RunLogDump(int argc, char** argv) {
   Options options;
   std::string error;
   if (!ParseOptions(argc, argv, options, error)) {
@@ -839,4 +909,13 @@ int main(int argc, char** argv) {
   }
 
   return 0;
+}
+
+int main(int argc, char** argv) {
+  try {
+    return RunLogDump(argc, argv);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "log_dump error: %s\n", e.what());
+    return 1;
+  }
 }

@@ -33,10 +33,13 @@
  */
 
 #include <cctype>
+#include <charconv>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #include "talOS/events/manifest.h"
@@ -160,19 +163,71 @@ inline bool FromBase64(std::string_view text, std::string& out) {
   return true;
 }
 
+namespace detail {
+
+// Length of a well-formed RFC 3629 UTF-8 sequence starting at `text[0]` (a
+// non-ASCII byte), or 0 if invalid.
+inline std::size_t Utf8Length(std::string_view text) {
+  if (text.empty()) return 0;
+  const auto at = [&](std::size_t i) {
+    return static_cast<unsigned char>(text[i]);
+  };
+  const unsigned char lead = at(0);
+  std::size_t length = 0;
+  unsigned char low = 0x80;
+  unsigned char high = 0xBF;
+  if (lead >= 0xC2 && lead <= 0xDF) {
+    length = 2;
+  } else if (lead >= 0xE0 && lead <= 0xEF) {
+    length = 3;
+    if (lead == 0xE0) low = 0xA0;
+    if (lead == 0xED) high = 0x9F;
+  } else if (lead >= 0xF0 && lead <= 0xF4) {
+    length = 4;
+    if (lead == 0xF0) low = 0x90;
+    if (lead == 0xF4) high = 0x8F;
+  } else {
+    return 0;
+  }
+  if (text.size() < length) return 0;
+  if (at(1) < low || at(1) > high) return 0;
+  for (std::size_t i = 2; i < length; ++i) {
+    if (at(i) < 0x80 || at(i) > 0xBF) return 0;
+  }
+  return length;
+}
+
+}  // namespace detail
+
 inline void AppendJsonString(std::string& out, std::string_view value) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  const auto escape = [&](unsigned char c) {
+    out += "\\u00";
+    out += kHex[(c >> 4) & 0xF];
+    out += kHex[c & 0xF];
+  };
   out += '"';
-  for (const char c : value) {
-    if (c == '"' || c == '\\') {
-      out += '\\';
-      out += c;
-    } else if (static_cast<unsigned char>(c) < 0x20) {
-      static constexpr char kHex[] = "0123456789abcdef";
-      out += "\\u00";
-      out += kHex[(static_cast<unsigned char>(c) >> 4) & 0xF];
-      out += kHex[static_cast<unsigned char>(c) & 0xF];
+  for (std::size_t i = 0; i < value.size();) {
+    const auto c = static_cast<unsigned char>(value[i]);
+    if (c < 0x80) {
+      if (c == '"' || c == '\\') {
+        out += '\\';
+        out += static_cast<char>(c);
+      } else if (c < 0x20) {
+        escape(c);
+      } else {
+        out += static_cast<char>(c);
+      }
+      ++i;
+      continue;
+    }
+    const std::size_t length = detail::Utf8Length(value.substr(i));
+    if (length == 0) {
+      escape(c);
+      ++i;
     } else {
-      out += c;
+      out += value.substr(i, length);
+      i += length;
     }
   }
   out += '"';
@@ -235,6 +290,14 @@ inline std::string DescribeToJson(const Description& description) {
     // Only on a request publisher that lifted the live-target gate.
     if ((source.flags & naming::kSourceFlagUntargetedOutputs) != 0)
       out += ", \"untargeted_outputs\": true";
+    // Only on a target-lane publisher opened with OperatorArming; absent means
+    // unarmed.
+    if ((source.flags & naming::kSourceFlagOperatorArming) != 0)
+      out += ", \"operator_arming\": true";
+    // Only on `/hw/state/driver_station` subscribed solely by internal
+    // Target/TargetLane/OperatorArming plumbing; absent means explicit reader.
+    if ((source.flags & naming::kSourceFlagInternalDriverStation) != 0)
+      out += ", \"internal_driver_station\": true";
     // Only on a latest-only watcher; absent means a sequence watcher.
     if ((source.flags & naming::kSourceFlagLatestOnly) != 0)
       out += ", \"latest_only\": true";
@@ -339,7 +402,11 @@ class DescribeReader {
       error = "no describe_version field; the binary did not answer --describe";
       return false;
     }
-    const std::int64_t version = Number(text, at);
+    std::int64_t version = 0;
+    if (!Number(text, at, version)) {
+      error = "invalid describe_version";
+      return false;
+    }
     if (version != kDescribeVersion) {
       error = "describe_version " + std::to_string(version) + ", expected " +
               std::to_string(kDescribeVersion);
@@ -429,7 +496,10 @@ class DescribeReader {
         error = "source '" + source.name + "' has no message_bytes";
         return false;
       }
-      source.message_bytes = static_cast<std::uint32_t>(Number(entry, field));
+      if (!Uint32(entry, field, source.message_bytes)) {
+        error = "source '" + source.name + "' has invalid message_bytes";
+        return false;
+      }
 
       // Absent attributes mean "neither".
       std::size_t attribute = 0;
@@ -449,6 +519,14 @@ class DescribeReader {
       if (Field(entry, "untargeted_outputs", attribute) &&
           Boolean(entry, attribute))
         source.flags |= naming::kSourceFlagUntargetedOutputs;
+      attribute = 0;
+      if (Field(entry, "operator_arming", attribute) &&
+          Boolean(entry, attribute))
+        source.flags |= naming::kSourceFlagOperatorArming;
+      attribute = 0;
+      if (Field(entry, "internal_driver_station", attribute) &&
+          Boolean(entry, attribute))
+        source.flags |= naming::kSourceFlagInternalDriverStation;
       attribute = 0;
       if (Field(entry, "latest_only", attribute) && Boolean(entry, attribute))
         source.flags |= naming::kSourceFlagLatestOnly;
@@ -477,9 +555,11 @@ class DescribeReader {
           error = "source '" + source.name + "' has no ring layout";
           return false;
         }
-        source.alignment =
-            static_cast<std::uint32_t>(Number(entry, at_alignment));
-        source.slots = static_cast<std::uint32_t>(Number(entry, at_slots));
+        if (!Uint32(entry, at_alignment, source.alignment) ||
+            !Uint32(entry, at_slots, source.slots)) {
+          error = "source '" + source.name + "' has invalid ring layout";
+          return false;
+        }
         // Absent means a layout without reflection bytes.
         std::size_t at_bfbs = 0;
         if (Field(entry, "bfbs", at_bfbs)) {
@@ -633,18 +713,41 @@ class DescribeReader {
     return true;
   }
 
-  static std::int64_t Number(std::string_view text, std::size_t& at) {
+  static bool Number(std::string_view text, std::size_t& at,
+                     std::int64_t& out) {
+    std::size_t cursor = at;
+    if (cursor < text.size() && text[cursor] == '-') ++cursor;
+    const std::size_t digits_start = cursor;
+    while (cursor < text.size() &&
+           (std::isdigit(static_cast<unsigned char>(text[cursor])) != 0)) {
+      ++cursor;
+    }
+    if (cursor == digits_start) return false;
+    if (cursor < text.size()) {
+      const auto next = static_cast<unsigned char>(text[cursor]);
+      if (std::isspace(next) == 0 && next != ',' && next != '}' &&
+          next != ']') {
+        return false;
+      }
+    }
     std::int64_t value = 0;
-    bool negative = false;
-    if (at < text.size() && text[at] == '-') {
-      negative = true;
-      ++at;
+    const auto [end, ec] =
+        std::from_chars(text.data() + at, text.data() + cursor, value);
+    if (ec != std::errc{} || end != text.data() + cursor) return false;
+    out = value;
+    at = cursor;
+    return true;
+  }
+
+  static bool Uint32(std::string_view text, std::size_t& at,
+                     std::uint32_t& out) {
+    std::int64_t value = 0;
+    if (!Number(text, at, value) || value < 0 ||
+        value > std::numeric_limits<std::uint32_t>::max()) {
+      return false;
     }
-    while (at < text.size() &&
-           (std::isdigit(static_cast<unsigned char>(text[at])) != 0)) {
-      value = value * 10 + (text[at++] - '0');
-    }
-    return negative ? -value : value;
+    out = static_cast<std::uint32_t>(value);
+    return true;
   }
 
   // By value: nothing reads the cursor afterwards, and a reference here would

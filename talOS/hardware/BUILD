@@ -221,6 +221,7 @@ cc_test(
     size = "small",
     srcs = ["codec_fuzz_test.cc"],
     deps = [
+        ":clock_offset",
         ":hardware",
         "//talOS/protocol:fuzz_corpus",
         "@googletest//:gtest_main",

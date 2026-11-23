@@ -1449,4 +1449,93 @@ TEST_F(NodeApi, OperatorArmingBlockerRoundTripsAndValidatesKind) {
   talos_sim_hardware_destroy(hw);
 }
 
+// REQ-SAFE-14, REQ-CONTRACT-14: C ABI enforces OperatorArming when a node
+// reading DriverStation opens a teleop-policy target lane, both at startup
+// (talos_sim_add) and on lazy talos_driver_station_read in update().
+TEST_F(NodeApi, OperatorProducerTeleopLaneRequiresOperatorArming) {
+  {
+    SCOPED_TRACE("talos_driver_station + unarmed teleop lane fails sim_add");
+    auto build = [](TalosNode* node, void*) -> int32_t {
+      if (talos_driver_station(node, nullptr, nullptr) != TALOS_OK) return 1;
+      if (talos_target_lane_open(node, "roller", "teleop", sizeof(float),
+                                 alignof(float), &kFloatSchema, -1) < 0) {
+        return 1;
+      }
+      return 0;
+    };
+    EXPECT_EQ(talos_sim_add(sim_, "driver", build, nullptr), nullptr);
+    const std::string err = talos_last_error();
+    EXPECT_NE(err.find("OperatorArming"), std::string::npos) << err;
+    EXPECT_NE(err.find("REQ-SAFE-14"), std::string::npos) << err;
+    EXPECT_NE(err.find("/roller/target/teleop"), std::string::npos) << err;
+  }
+
+  {
+    SCOPED_TRACE("lazy talos_driver_station_read in update returns TALOS_ERR");
+    struct LazyState {
+      TalosNode* node = nullptr;
+      int attempts = 0;
+      int failures = 0;
+      std::string last_err;
+    } state;
+    auto update = [](void* user) -> int32_t {
+      auto& s = *static_cast<LazyState*>(user);
+      for (int i = 0; i < 2; ++i) {
+        ++s.attempts;
+        TalosDriverStation ds{};
+        if (talos_driver_station_read(s.node, &ds) == TALOS_ERR) {
+          ++s.failures;
+          s.last_err = talos_last_error();
+        }
+      }
+      return 0;
+    };
+    TalosSim* sim2 = talos_sim_from_toml(kRobotToml);
+    ASSERT_NE(sim2, nullptr) << talos_last_error();
+    struct LazyBundle {
+      LazyState* state;
+      TalosCallback update_fn;
+    } bundle{&state, update};
+    auto build_with_update = [](TalosNode* n, void* user) -> int32_t {
+      auto& b = *static_cast<LazyBundle*>(user);
+      b.state->node = n;
+      if (talos_target_lane_open(n, "roller", "teleop", sizeof(float),
+                                 alignof(float), &kFloatSchema, -1) < 0) {
+        return 1;
+      }
+      return talos_node_set_update(n, b.update_fn, b.state);
+    };
+    ASSERT_NE(talos_sim_add(sim2, "lazy_driver", build_with_update, &bundle),
+              nullptr)
+        << talos_last_error();
+    ASSERT_EQ(talos_sim_step(sim2, 20 * kMs), TALOS_OK) << talos_last_error();
+    EXPECT_GE(state.attempts, 2);
+    EXPECT_EQ(state.failures, state.attempts);
+    EXPECT_NE(state.last_err.find("OperatorArming"), std::string::npos)
+        << state.last_err;
+    talos_sim_destroy(sim2);
+  }
+
+  {
+    SCOPED_TRACE("armed teleop lane and autonomous lane succeed");
+    auto build_armed = [](TalosNode* node, void*) -> int32_t {
+      if (talos_driver_station(node, nullptr, nullptr) != TALOS_OK) return 1;
+      const int64_t arming = talos_operator_arming_open(node);
+      if (arming < 0) return 1;
+      if (talos_target_lane_open(node, "roller", "teleop", sizeof(float),
+                                 alignof(float), &kFloatSchema, arming) < 0) {
+        return 1;
+      }
+      if (talos_target_lane_open(node, "roller", "auto", sizeof(float),
+                                 alignof(float), &kFloatSchema, -1) < 0) {
+        return 1;
+      }
+      return 0;
+    };
+    EXPECT_NE(talos_sim_add(sim_, "armed_driver", build_armed, nullptr),
+              nullptr)
+        << talos_last_error();
+  }
+}
+
 }  // namespace

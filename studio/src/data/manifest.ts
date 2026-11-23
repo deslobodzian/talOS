@@ -189,19 +189,28 @@ function topLevelIntegers(raw: string): Map<string, string> {
   return out;
 }
 
+const MAX_U64 = 18446744073709551615n;
+const MIN_I64 = -9223372036854775808n;
+
 // A uint64/int64 field kept as a string. Prefers the exact raw spelling, and
-// falls back to a string or number field for documents that already carry it
-// as a string.
+// falls back to a string or safe-integer number field for documents that
+// already carry it as a string.
 function u64Field(integers: ReadonlyMap<string, string>,
                   source: Record<string, unknown>, key: string): string {
   const exact = integers.get(key);
   if (exact !== undefined) {
-    if (/^-?\d{1,20}$/.test(exact)) return exact;
+    if (/^-?\d{1,20}$/.test(exact)) {
+      const n = BigInt(exact);
+      if (n >= MIN_I64 && n <= MAX_U64) return exact;
+    }
     fail(`${key} must be a decimal integer`);
   }
   const value = source[key];
-  if (typeof value === 'string' && /^-?\d{1,20}$/.test(value)) return value;
-  if (typeof value === 'number' && Number.isInteger(value)) return String(value);
+  if (typeof value === 'string' && /^-?\d{1,20}$/.test(value)) {
+    const n = BigInt(value);
+    if (n >= MIN_I64 && n <= MAX_U64) return value;
+  }
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return String(value);
   fail(`${key} must be a decimal integer`);
   return '';
 }
@@ -209,7 +218,7 @@ function u64Field(integers: ReadonlyMap<string, string>,
 // A non-negative count that is 0 when absent.
 function countNumber(source: Record<string, unknown>, key: string): number {
   const value = source[key] ?? 0;
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0)
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0)
     fail(`${key} must be a non-negative integer`);
   return value as number;
 }
@@ -217,16 +226,21 @@ function countNumber(source: Record<string, unknown>, key: string): number {
 // A nested uint64 (per-node record_count), too small to need raw-text recovery.
 function countString(source: Record<string, unknown>, key: string): string {
   const value = source[key];
-  if (typeof value === 'string' && /^\d{1,20}$/.test(value)) return value;
-  if (typeof value === 'number' && Number.isInteger(value) && value >= 0)
+  if (typeof value === 'string' && /^\d{1,20}$/.test(value) && BigInt(value) <= MAX_U64)
+    return value;
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0)
     return String(value);
   fail(`${key} must be a non-negative integer`);
   return '';
 }
 
+// Wall-clock nanoseconds as a JSON number (~1.7e18 exceeds MAX_SAFE_INTEGER, so
+// bound against uint64 max rather than MAX_SAFE_INTEGER).
+const MAX_WALL_NS = 18446744073709551615;
 function wallNs(source: Record<string, unknown>, key: string): number {
   const value = source[key];
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0)
+  if (typeof value !== 'number' || !Number.isFinite(value) ||
+      !Number.isInteger(value) || value < 0 || value > MAX_WALL_NS)
     fail(`${key} must be a non-negative integer`);
   return value as number;
 }
