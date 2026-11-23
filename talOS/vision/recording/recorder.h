@@ -7,9 +7,9 @@
 // (no allocation after construction) and never blocks on disk I/O; when the
 // queue is full the frame is dropped and counted.
 
-#include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -27,9 +27,12 @@ class FrameRecorder {
     std::uint64_t max_bytes{268435456};  // 256 MiB per camera
     std::size_t queue_slots{8};
     CameraContext context;  // camera name, size, intrinsics, mounting, detector
-    // Test-only: the writer sleeps this long before each pair's PNG encode,
-    // modelling a slow disk. Zero (the default) in production.
-    std::chrono::nanoseconds test_write_delay{0};
+    // Test-only: the writer thread calls this after taking each pair off the
+    // queue and before writing it, outside the queue lock. `stop_requested`
+    // reports, under that lock, whether the destructor or a write failure has
+    // asked the writer to stop. Null (the default) in production.
+    std::function<void(const std::function<bool()>& stop_requested)>
+        test_before_pair;
   };
 
   explicit FrameRecorder(Options options);

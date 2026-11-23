@@ -9,12 +9,14 @@
 #include <unistd.h>
 #endif
 
+#include <atomic>
 #include <cerrno>
 #include <cfenv>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <optional>
 #include <set>
 #include <string>
@@ -345,30 +347,48 @@ TEST_F(RecorderTest, WritesPairsAtomicallyAndDeletesOldestUnderMaxBytes) {
 
 // The recorder's destructor must be bounded: on stop it finishes at most the
 // pair in progress and drops the rest, so a slow disk never makes shutdown
-// block while draining a full queue. A full queue plus a 100 ms per-pair
-// writer would otherwise take ~800 ms; the fixed destructor finishes one pair.
-TEST_F(RecorderTest, DestructorIsBoundedWithAFullQueueAndSlowWriter) {
+// block while draining a full queue. The writer's first pair is held until
+// the destructor has asked it to stop, so that pair is by construction the
+// one in progress at stop and the queue is still full behind it. Counting
+// the pairs the writer starts holds in every thread schedule, where a
+// wall-clock bound on the destructor cannot tell a drained queue from one
+// slow write.
+TEST_F(RecorderTest, DestructorFinishesOnlyThePairInProgress) {
   FrameRecorder::Options opts;
   opts.output_dir = dir_;
   opts.context = MakeContext();
   opts.sample_hz = 1e12;
   opts.rejected_hz = 1e12;
   opts.queue_slots = 8;
-  opts.test_write_delay = std::chrono::milliseconds{100};
+  std::atomic<int> pairs_started{0};
+  opts.test_before_pair =
+      [&pairs_started](const std::function<bool()>& stop_requested) {
+        if (pairs_started.fetch_add(1) == 0) {
+          while (!stop_requested()) {
+            std::this_thread::yield();
+          }
+        }
+      };
 
   const Frame frame = MakeGrayFrame();
-  std::chrono::steady_clock::time_point before;
   {
     FrameRecorder rec{std::move(opts)};
     for (int i = 0; i < 64; ++i) {
       rec.Record(frame, MakeRecord(static_cast<std::uint64_t>(i), "sampled"));
     }
-    before = std::chrono::steady_clock::now();
-  }  // destructor: finish at most one 100 ms pair, drop the rest
-  const auto elapsed = std::chrono::steady_clock::now() - before;
-  EXPECT_LT(elapsed, std::chrono::milliseconds{500})
-      << "destructor took " << static_cast<double>(elapsed.count()) / 1e6
-      << " ms";
+  }  // destructor: finish the pair in progress, drop the full queue behind it
+
+  EXPECT_EQ(pairs_started.load(), 1)
+      << "the writer started queued pairs after stop";
+  std::size_t json_count = 0;
+  std::size_t png_count = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(dir_)) {
+    const std::string ext = entry.path().extension().string();
+    json_count += ext == ".json" ? 1 : 0;
+    png_count += ext == ".png" ? 1 : 0;
+  }
+  EXPECT_EQ(json_count, 1u);
+  EXPECT_EQ(png_count, 1u);
 }
 
 TEST_F(RecorderTest, BackwardTimestampDoesNotUnderflowRateLimit) {

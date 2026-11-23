@@ -18,7 +18,10 @@ py_library(
     data = ["//talOS/node_api:libtalos_node.so"],
     imports = ["."],
     visibility = ["//visibility:public"],
-    deps = ["//talOS/schema:reflection_py"],
+    deps = [
+        "//talOS/schema:reflection_py",
+        "//talOS/schema:talos_schema",
+    ],
 )
 
 # `talos.testing`: Sim and SimHardware.
