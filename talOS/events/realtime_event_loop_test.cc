@@ -316,6 +316,112 @@ TEST(RealtimeEventLoop, LatestBacklogDispatchesNewestWithPublicationAge) {
   EXPECT_EQ(loop.source_counters()[watcher].dropped.load(), 129u);
 }
 
+// REQ-SAFE-08: both sequence and latest-only watchers on RealtimeEventLoop
+// populate Context::publish_time from each RTMS slot's publish_time_ns rather
+// than drain time (Context::now) or tick deadline (Context::event_time), under
+// both BEFORE_TIMERS and ON_PUBLISH delivery.
+TEST(RealtimeEventLoop,
+     SequenceAndLatestWatchersPreserveSlotPublishTimeOverDrainTime) {
+  const std::string pid = std::to_string(::getpid());
+  int index = 0;
+  for (const auto delivery : {Delivery::BEFORE_TIMERS, Delivery::ON_PUBLISH}) {
+    SCOPED_TRACE(static_cast<int>(delivery));
+    const std::string suffix = std::to_string(index++);
+    const std::string latest_topic = "/ts08l_" + pid + "_" + suffix;
+    const std::string seq_topic = "/ts08s_" + pid + "_" + suffix;
+
+    RealtimeEventLoop<> loop{on_publish()};
+    loop.set_delivery(delivery);
+
+    std::vector<Context> latest_contexts;
+    std::vector<std::int32_t> latest_values;
+    auto on_latest = [&](const Context& context,
+                         std::span<const std::byte> bytes) {
+      ASSERT_EQ(bytes.size(), sizeof(EventsTest::SensorMessage));
+      EventsTest::SensorMessage msg{};
+      std::memcpy(&msg, bytes.data(), sizeof(msg));
+      latest_contexts.push_back(context);
+      latest_values.push_back(msg.sensor_id());
+    };
+    loop.register_watcher(latest_topic, sizeof(EventsTest::SensorMessage),
+                          alignof(EventsTest::SensorMessage),
+                          talos::schema::Of<EventsTest::SensorMessage>(),
+                          make_thunk(&on_latest), /*latest_only=*/true);
+
+    std::vector<Context> seq_contexts;
+    std::vector<std::int32_t> seq_values;
+    auto on_seq = [&](const Context& context,
+                      std::span<const std::byte> bytes) {
+      ASSERT_EQ(bytes.size(), sizeof(EventsTest::SensorMessage));
+      EventsTest::SensorMessage msg{};
+      std::memcpy(&msg, bytes.data(), sizeof(msg));
+      seq_contexts.push_back(context);
+      seq_values.push_back(msg.sensor_id());
+      if (delivery == Delivery::ON_PUBLISH && seq_contexts.size() == 2u) {
+        loop.exit();
+      }
+    };
+    const auto seq_id =
+        register_sensor_watcher(loop, seq_topic, make_thunk(&on_seq));
+    auto stop = [&](const Context&) { loop.exit(); };
+    if (delivery == Delivery::ON_PUBLISH) {
+      loop.set_prompt(seq_id);
+    } else {
+      const auto timer = loop.register_timer("stop", make_thunk(&stop));
+      loop.arm_timer(timer, loop.monotonic_now(), Duration::zero());
+    }
+
+    RTMSQueue latest_pub{latest_topic,
+                         sizeof(EventsTest::SensorMessage),
+                         alignof(EventsTest::SensorMessage),
+                         talos::schema::Of<EventsTest::SensorMessage>(),
+                         MAX_SLOTS,
+                         RTMSOptions{.publisher = true}};
+    RTMSQueue seq_pub{seq_topic,
+                      sizeof(EventsTest::SensorMessage),
+                      alignof(EventsTest::SensorMessage),
+                      talos::schema::Of<EventsTest::SensorMessage>(),
+                      MAX_SLOTS,
+                      RTMSOptions{.publisher = true}};
+
+    const MonotonicTime t0 = Poller::now();
+    const MonotonicTime older_pub = t0 - 500ms;
+    const MonotonicTime newer_pub = t0 - 200ms;
+    const auto write_at = [](RTMSQueue& queue, std::int32_t id,
+                             MonotonicTime at) {
+      const EventsTest::SensorMessage msg{id, 0.0F, 0.0F};
+      return queue.write(
+          std::as_bytes(std::span<const EventsTest::SensorMessage, 1>{&msg, 1}),
+          at.nanos());
+    };
+    ASSERT_EQ(write_at(latest_pub, 1, older_pub), WriteResult::SUCCESS);
+    ASSERT_EQ(write_at(latest_pub, 2, newer_pub), WriteResult::SUCCESS);
+    ASSERT_EQ(write_at(seq_pub, 10, older_pub), WriteResult::SUCCESS);
+    ASSERT_EQ(write_at(seq_pub, 11, newer_pub), WriteResult::SUCCESS);
+
+    loop.run_for(kHangBound);  // Bound only; exits once drained.
+
+    ASSERT_EQ(latest_contexts.size(), 1u);
+    EXPECT_EQ(latest_values[0], 2);
+    EXPECT_EQ(latest_contexts[0].publish_time, newer_pub);
+    EXPECT_GE(latest_contexts[0].now - latest_contexts[0].publish_time, 200ms);
+    if (delivery == Delivery::BEFORE_TIMERS) {
+      EXPECT_GT(latest_contexts[0].event_time, latest_contexts[0].publish_time);
+    }
+
+    ASSERT_EQ(seq_contexts.size(), 2u);
+    EXPECT_EQ(seq_values, (std::vector<std::int32_t>{10, 11}));
+    EXPECT_EQ(seq_contexts[0].publish_time, older_pub);
+    EXPECT_EQ(seq_contexts[1].publish_time, newer_pub);
+    EXPECT_GE(seq_contexts[0].now - seq_contexts[0].publish_time, 500ms);
+    EXPECT_GE(seq_contexts[1].now - seq_contexts[1].publish_time, 200ms);
+    if (delivery == Delivery::BEFORE_TIMERS) {
+      EXPECT_GT(seq_contexts[0].event_time, seq_contexts[0].publish_time);
+      EXPECT_GT(seq_contexts[1].event_time, seq_contexts[1].publish_time);
+    }
+  }
+}
+
 // A publisher overwrites the oldest slot when a sequence watcher stalls past
 // the ring's capacity, so every publish succeeds and the lapped watcher
 // receives the retained tail in strict sequence order with the exact loss

@@ -1685,5 +1685,244 @@ TEST(NodeDetail, RefusesPublisherSendOnHardwareRequestSlot) {
                                                  sizeof(msg)));
 }
 
+// REQ-SAFE-08: on the real RealtimeEventLoop + RTMSQueue path (not only
+// SimulatedEventLoop), Subscription::age() and Subscription::fresh() compute
+// from each RTMS slot's publish_time_ns rather than the reader's drain time,
+// across latest-only, Wake::kAtDrain sequence, and Wake::kOnPublish prompt
+// subscriptions.
+TEST(Node, RealtimeSubscriptionFreshnessAndAgeUseRtmsSlotPublishTime) {
+  struct ShmUnlinkGuard {
+    std::vector<std::string> topics;
+    ~ShmUnlinkGuard() {
+      for (const std::string& topic : topics) {
+        ::shm_unlink(ShmObjectName(topic).c_str());
+      }
+    }
+  };
+
+  constexpr const char* kRealtimeFreshnessToml = R"(
+[robot]
+period_us = 1000
+command_timeout_us = 500000
+
+[subsystems.rt_freshness]
+period_us = 1000
+
+[subsystems.mechanism.motors.unused]
+can_id = 1
+)";
+  Sim config_holder = Sim::FromToml(kRealtimeFreshnessToml);
+  const std::string& config_path =
+      detail::SimAccess::config_path(config_holder);
+  const auto robot_config = std::make_shared<const config::RobotConfig>(
+      config::ParseRobotConfig(config_path));
+  const std::string pid = std::to_string(::getpid());
+
+  // Subcase 1: BEFORE_TIMERS (plain latest_only + Wake::kAtDrain sequence).
+  {
+    const std::string expired_latest_topic = "/t/s08el_" + pid;
+    const std::string fresh_latest_topic = "/t/s08fl_" + pid;
+    const std::string seq_topic = "/t/s08sq_" + pid;
+    ShmUnlinkGuard cleanup{
+        {expired_latest_topic, fresh_latest_topic, seq_topic}};
+
+    event::RealtimeEventLoop<> loop;
+    detail::LoopPortFor<event::RealtimeEventLoop<>> port{loop};
+    auto node = detail::NodeAccess::create(detail::NodeSetup{
+        .name = "rt_freshness",
+        .config_path = config_path,
+        .config = robot_config,
+        .loop = &port,
+    });
+
+    struct CallbackSample {
+      std::int64_t value;
+      Time now;
+      Duration age;
+      bool fresh;
+    };
+    struct TickSnapshot {
+      Time now;
+      bool expired_has_value{false};
+      bool expired_updated{false};
+      std::int64_t expired_value{0};
+      Duration expired_age{};
+      bool expired_fresh{true};
+      bool expired_fresh_at_exact_age{true};
+      bool expired_fresh_above_age{false};
+      bool fresh_has_value{false};
+      bool fresh_updated{false};
+      std::int64_t fresh_value{0};
+      Duration fresh_age{};
+      bool fresh_is_fresh{false};
+      std::int64_t seq_last_value{0};
+      Duration seq_last_age{};
+      bool seq_last_fresh{true};
+    };
+
+    std::vector<CallbackSample> seq_samples;
+    std::optional<TickSnapshot> snapshot;
+    Subscription<Count> expired_latest =
+        node->subscribe<Count>(expired_latest_topic);
+    Subscription<Count> fresh_latest =
+        node->subscribe<Count>(fresh_latest_topic);
+    Subscription<Count> seq;
+    seq = node->subscribe<Count>(
+        seq_topic,
+        [&](const Count& c) {
+          seq_samples.push_back(
+              {c.tick_count(), node->now(), seq.age(), seq.fresh()});
+        },
+        Wake::kAtDrain);
+
+    detail::NodeAccess::set_update(*node, [&] {
+      const Duration expired_age = expired_latest.age();
+      snapshot = TickSnapshot{
+          .now = node->now(),
+          .expired_has_value = expired_latest.has_value(),
+          .expired_updated = expired_latest.updated(),
+          .expired_value = expired_latest->tick_count(),
+          .expired_age = expired_age,
+          .expired_fresh = expired_latest.fresh(),
+          .expired_fresh_at_exact_age = expired_latest.fresh(expired_age),
+          .expired_fresh_above_age = expired_latest.fresh(expired_age + 1ns),
+          .fresh_has_value = fresh_latest.has_value(),
+          .fresh_updated = fresh_latest.updated(),
+          .fresh_value = fresh_latest->tick_count(),
+          .fresh_age = fresh_latest.age(),
+          .fresh_is_fresh = fresh_latest.fresh(),
+          .seq_last_value = seq->tick_count(),
+          .seq_last_age = seq.age(),
+          .seq_last_fresh = seq.fresh(),
+      };
+      loop.exit();
+    });
+    detail::NodeAccess::start(*node);
+    ASSERT_EQ(loop.delivery(), event::Delivery::BEFORE_TIMERS);
+
+    const auto open_publisher = [](const std::string& topic) {
+      return RTMSQueue{topic,
+                       sizeof(Count),
+                       kMessageAlignment,
+                       schema::Of<Count>(),
+                       MAX_SLOTS,
+                       RTMSOptions{.publisher = true}};
+    };
+    RTMSQueue expired_pub = open_publisher(expired_latest_topic);
+    RTMSQueue fresh_pub = open_publisher(fresh_latest_topic);
+    RTMSQueue seq_pub = open_publisher(seq_topic);
+
+    const Time t0 = event::Poller::now();
+    const Time older_pub = t0 - 900ms;
+    const Time newer_expired_pub = t0 - 600ms;
+
+    const auto write_at = [](RTMSQueue& queue, std::int64_t value, Time at) {
+      const Count msg{value, at.nanos()};
+      return queue.write(std::as_bytes(std::span<const Count, 1>{&msg, 1}),
+                         at.nanos());
+    };
+    ASSERT_EQ(write_at(expired_pub, 10, older_pub), WriteResult::SUCCESS);
+    ASSERT_EQ(write_at(expired_pub, 11, newer_expired_pub),
+              WriteResult::SUCCESS);
+    ASSERT_EQ(write_at(seq_pub, 20, older_pub), WriteResult::SUCCESS);
+    ASSERT_EQ(write_at(seq_pub, 21, newer_expired_pub), WriteResult::SUCCESS);
+
+    // 1-arg RTMSQueue::write stamps the monotonic clock itself.
+    const Time before_fresh = event::Poller::now();
+    const Count fresh_msg{30, 0};
+    ASSERT_EQ(fresh_pub.write(
+                  std::as_bytes(std::span<const Count, 1>{&fresh_msg, 1})),
+              WriteResult::SUCCESS);
+    const Time after_fresh = event::Poller::now();
+
+    loop.run_for(10s);  // Bound only; update() exits on the first tick.
+
+    ASSERT_TRUE(snapshot.has_value());
+    // Latest-only expired slot: newly drained (updated == true), yet stale
+    // because age() counts from slot publish_time_ns (t0 - 600ms), not drain
+    // time.
+    EXPECT_TRUE(snapshot->expired_has_value);
+    EXPECT_TRUE(snapshot->expired_updated);
+    EXPECT_EQ(snapshot->expired_value, 11);
+    EXPECT_EQ(snapshot->now - snapshot->expired_age, newer_expired_pub);
+    EXPECT_GE(snapshot->expired_age, 600ms);
+    EXPECT_FALSE(snapshot->expired_fresh);
+    EXPECT_FALSE(snapshot->expired_fresh_at_exact_age);
+    EXPECT_TRUE(snapshot->expired_fresh_above_age);
+
+    // Latest-only fresh slot written via 1-arg RTMSQueue::write.
+    EXPECT_TRUE(snapshot->fresh_has_value);
+    EXPECT_TRUE(snapshot->fresh_updated);
+    EXPECT_EQ(snapshot->fresh_value, 30);
+    EXPECT_GE(snapshot->now - snapshot->fresh_age, before_fresh);
+    EXPECT_LE(snapshot->now - snapshot->fresh_age, after_fresh);
+    EXPECT_TRUE(snapshot->fresh_is_fresh);
+
+    // Wake::kAtDrain sequence subscription: each callback observes its own
+    // slot's publish_time_ns, and update() sees the newest slot's.
+    ASSERT_EQ(seq_samples.size(), 2u);
+    EXPECT_EQ(seq_samples[0].value, 20);
+    EXPECT_EQ(seq_samples[0].now - seq_samples[0].age, older_pub);
+    EXPECT_GE(seq_samples[0].age, 900ms);
+    EXPECT_FALSE(seq_samples[0].fresh);
+    EXPECT_EQ(seq_samples[1].value, 21);
+    EXPECT_EQ(seq_samples[1].now - seq_samples[1].age, newer_expired_pub);
+    EXPECT_GE(seq_samples[1].age, 600ms);
+    EXPECT_FALSE(seq_samples[1].fresh);
+    EXPECT_EQ(snapshot->seq_last_value, 21);
+    EXPECT_EQ(snapshot->now - snapshot->seq_last_age, newer_expired_pub);
+    EXPECT_FALSE(snapshot->seq_last_fresh);
+  }
+
+  // Subcase 2: ON_PUBLISH (prompt callback subscription).
+  {
+    const std::string prompt_topic = "/t/s08pr_" + pid;
+    ShmUnlinkGuard cleanup{{prompt_topic}};
+
+    event::RealtimeEventLoop<> loop;
+    detail::LoopPortFor<event::RealtimeEventLoop<>> port{loop};
+    auto node = detail::NodeAccess::create(detail::NodeSetup{
+        .name = "rt_freshness",
+        .config_path = config_path,
+        .config = robot_config,
+        .loop = &port,
+    });
+
+    struct PromptSample {
+      std::int64_t value;
+      Time now;
+      Duration age;
+      bool fresh;
+    };
+    std::optional<PromptSample> heard;
+    Subscription<Count> prompt;
+    prompt = node->subscribe<Count>(prompt_topic, [&](const Count& c) {
+      heard = PromptSample{c.tick_count(), node->now(), prompt.age(),
+                           prompt.fresh()};
+      loop.exit();
+    });
+    detail::NodeAccess::start(*node);
+    ASSERT_EQ(loop.delivery(), event::Delivery::ON_PUBLISH);
+
+    RTMSQueue prompt_pub{prompt_topic,      sizeof(Count),
+                         kMessageAlignment, schema::Of<Count>(),
+                         MAX_SLOTS,         RTMSOptions{.publisher = true}};
+    const Time expired_pub = event::Poller::now() - 600ms;
+    const Count msg{40, expired_pub.nanos()};
+    ASSERT_EQ(
+        prompt_pub.write(std::as_bytes(std::span<const Count, 1>{&msg, 1}),
+                         expired_pub.nanos()),
+        WriteResult::SUCCESS);
+
+    loop.run_for(10s);  // Bound only; prompt callback exits immediately.
+
+    ASSERT_TRUE(heard.has_value());
+    EXPECT_EQ(heard->value, 40);
+    EXPECT_EQ(heard->now - heard->age, expired_pub);
+    EXPECT_GE(heard->age, 600ms);
+    EXPECT_FALSE(heard->fresh);
+  }
+}
+
 }  // namespace
 }  // namespace talos

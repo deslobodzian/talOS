@@ -777,6 +777,250 @@ TEST(TeleopNode, OwnEvaluationGapRequiresNeutralEvenWithFreshDs) {
   ASSERT_TRUE(arm.seen);
 }
 
+// REQ-SAFE-14: gateway reboot (boot_id change), Driver Station dropout, and
+// producer evaluation stall each disarm teleop and keep every lane inactive
+// until the held axis, button (while_held / on_toggle), or POV input returns
+// to neutral.
+TEST(TeleopNode, HeldInputsWaitForNeutralAcrossRebootDsDropoutAndStall) {
+  struct InputSpec {
+    const char* name;
+    const char* binding_toml;
+    bool is_toggle;
+    bool is_pov;
+    ds::JoystickData held;
+    ds::JoystickData alt_non_neutral;
+  };
+  const auto neutral_stick = [] {
+    auto s = MakeStick();
+    s.pov_count = 2;
+    s.povs[0] = -1;
+    s.povs[1] = -1;
+    return s;
+  };
+  auto held_axis = neutral_stick();
+  held_axis.axes[0] = 1.0f;
+  auto held_button = neutral_stick();
+  held_button.buttons = 1u;
+  auto held_pov = neutral_stick();
+  held_pov.povs[1] = 90;
+  auto alt_pov = neutral_stick();
+  alt_pov.povs[1] = 180;
+
+  const InputSpec inputs[] = {
+      {"axis",
+       "axis = 0\nfield = \"velocity_rps\"\nscale = 10.0\n"
+       "deadband_frac = 0.125\n",
+       false, false, held_axis, neutral_stick()},
+      {"button while_held",
+       "button = 1\nwhile_held = { velocity_rps = 60.0 }\n", false, false,
+       held_button, neutral_stick()},
+      {"button on_toggle", "button = 1\non_toggle = { velocity_rps = 60.0 }\n",
+       true, false, held_button, neutral_stick()},
+      {"pov while_held",
+       "pov = 90\npov_index = 1\nwhile_held = { velocity_rps = 60.0 }\n", false,
+       true, held_pov, alt_pov},
+      {"pov on_toggle",
+       "pov = 90\npov_index = 1\non_toggle = { velocity_rps = 60.0 }\n", true,
+       true, held_pov, alt_pov},
+  };
+  enum class Transition { kGatewayReboot, kDsDropout, kProducerStall };
+  const std::pair<const char*, Transition> transitions[] = {
+      {"gateway reboot", Transition::kGatewayReboot},
+      {"ds dropout", Transition::kDsDropout},
+      {"producer stall", Transition::kProducerStall},
+  };
+
+  for (const InputSpec& input : inputs) {
+    for (const auto& [transition_name, transition] : transitions) {
+      SCOPED_TRACE(std::string{input.name} + " across " + transition_name);
+      const std::string config =
+          "[robot]\nperiod_us = 20000\ncommand_timeout_us = 100000\n"
+          "[subsystems.roller]\nperiod_us = 20000\n"
+          "[subsystems.roller.teleop]\n"
+          "defaults = { feedforward_v = 0.0 }\n"
+          "[[subsystems.roller.teleop.bindings]]\n" +
+          std::string{input.binding_toml} +
+          "[subsystems.teleop]\nperiod_us = 20000\n";
+      Sim sim = MakeSim(config);
+      auto& roller = sim.add<ConsumerNode<control::VelocityTarget>>("roller");
+      auto& teleop = sim.add<PausableTeleop>("teleop");
+      SimHardware hw{sim};
+      hw.enable();
+
+      const auto latest_status = [&sim] {
+        return sim.latest<::teleop::TeleopStatus>(::teleop::topics::kStatus);
+      };
+
+      // Arm at neutral, then hold the input and confirm the lane is active.
+      Push(hw, sim, DsPacket(kTeleopEnabled, neutral_stick()));
+      Push(hw, sim, DsPacket(kTeleopEnabled, input.held));
+      ASSERT_TRUE(roller.seen.has_value());
+      ASSERT_TRUE(RollerLane(sim).has_value());
+      EXPECT_EQ(RollerLane(sim)->active, 1);
+      ASSERT_TRUE(latest_status().has_value());
+      EXPECT_TRUE(latest_status()->armed());
+
+      switch (transition) {
+        case Transition::kGatewayReboot:
+          hw.reboot();
+          sim.step(60ms);
+          break;
+        case Transition::kDsDropout:
+          hw.stop_driver_station();
+          sim.step(150ms);
+          EXPECT_FALSE(roller.seen.has_value());
+          ASSERT_TRUE(RollerLane(sim).has_value());
+          EXPECT_EQ(RollerLane(sim)->active, 0);
+          Push(hw, sim, DsPacket(kTeleopEnabled, input.held));
+          break;
+        case Transition::kProducerStall:
+          teleop.paused = true;
+          sim.step(150ms);
+          teleop.paused = false;
+          sim.step(60ms);
+          break;
+      }
+
+      // Still held: teleop must stay disarmed and keep the target lane
+      // inactive.
+      EXPECT_FALSE(roller.seen.has_value());
+      ASSERT_TRUE(RollerLane(sim).has_value());
+      EXPECT_EQ(RollerLane(sim)->active, 0);
+      ASSERT_TRUE(latest_status().has_value());
+      EXPECT_FALSE(latest_status()->armed());
+      EXPECT_TRUE(latest_status()->alert_warning_disarmed());
+
+      // Continuing to hold the input never rearms.
+      Push(hw, sim, DsPacket(kTeleopEnabled, input.held));
+      EXPECT_FALSE(roller.seen.has_value());
+      EXPECT_EQ(RollerLane(sim)->active, 0);
+      EXPECT_FALSE(latest_status()->armed());
+
+      // For POVs, moving to a different non-neutral angle does not rearm.
+      if (input.is_pov) {
+        Push(hw, sim, DsPacket(kTeleopEnabled, input.alt_non_neutral));
+        EXPECT_FALSE(roller.seen.has_value());
+        EXPECT_EQ(RollerLane(sim)->active, 0);
+        EXPECT_FALSE(latest_status()->armed());
+        Push(hw, sim, DsPacket(kTeleopEnabled, input.held));
+        EXPECT_FALSE(roller.seen.has_value());
+        EXPECT_EQ(RollerLane(sim)->active, 0);
+        EXPECT_FALSE(latest_status()->armed());
+      }
+
+      // Returning to neutral rearms without commanding or synthesizing a
+      // toggle.
+      Push(hw, sim, DsPacket(kTeleopEnabled, neutral_stick()));
+      EXPECT_FALSE(roller.seen.has_value());
+      EXPECT_EQ(RollerLane(sim)->active, 0);
+      ASSERT_TRUE(latest_status().has_value());
+      EXPECT_TRUE(latest_status()->armed());
+      EXPECT_FALSE(latest_status()->alert_warning_disarmed());
+
+      // Fresh input after neutral drives the lane again.
+      Push(hw, sim, DsPacket(kTeleopEnabled, input.held));
+      ASSERT_TRUE(roller.seen.has_value());
+      EXPECT_EQ(RollerLane(sim)->active, 1);
+
+      // For on_toggle, releasing after the fresh press keeps it latched.
+      if (input.is_toggle) {
+        Push(hw, sim, DsPacket(kTeleopEnabled, neutral_stick()));
+        EXPECT_TRUE(roller.seen.has_value());
+        EXPECT_EQ(RollerLane(sim)->active, 1);
+      }
+    }
+  }
+}
+
+// REQ-SAFE-14: an on_toggle binding latched on and then released must clear its
+// latch and release the target lane across gateway reboot, DS dropout, and
+// producer stall, staying inactive until freshly pressed again.
+TEST(TeleopNode, LatchedToggleClearsAcrossRebootDsDropoutAndStallWhenReleased) {
+  const auto neutral_stick = [] {
+    auto s = MakeStick();
+    s.pov_count = 2;
+    s.povs[0] = -1;
+    s.povs[1] = -1;
+    return s;
+  };
+  auto pressed_button = neutral_stick();
+  pressed_button.buttons = 1u;
+  auto pressed_pov = neutral_stick();
+  pressed_pov.povs[1] = 90;
+
+  struct TriggerSpec {
+    const char* name;
+    const char* binding_toml;
+    ds::JoystickData pressed;
+  };
+  const TriggerSpec triggers[] = {
+      {"button", "button = 1\non_toggle = { velocity_rps = 60.0 }\n",
+       pressed_button},
+      {"pov", "pov = 90\npov_index = 1\non_toggle = { velocity_rps = 60.0 }\n",
+       pressed_pov},
+  };
+  enum class Transition { kGatewayReboot, kDsDropout, kProducerStall };
+  const std::pair<const char*, Transition> transitions[] = {
+      {"gateway reboot", Transition::kGatewayReboot},
+      {"ds dropout", Transition::kDsDropout},
+      {"producer stall", Transition::kProducerStall},
+  };
+
+  for (const TriggerSpec& trigger : triggers) {
+    for (const auto& [transition_name, transition] : transitions) {
+      SCOPED_TRACE(std::string{trigger.name} + " across " + transition_name);
+      const std::string config =
+          "[robot]\nperiod_us = 20000\ncommand_timeout_us = 100000\n"
+          "[subsystems.roller]\nperiod_us = 20000\n"
+          "[subsystems.roller.teleop]\n"
+          "defaults = { feedforward_v = 0.0 }\n"
+          "[[subsystems.roller.teleop.bindings]]\n" +
+          std::string{trigger.binding_toml} +
+          "[subsystems.teleop]\nperiod_us = 20000\n";
+      Sim sim = MakeSim(config);
+      auto& roller = sim.add<ConsumerNode<control::VelocityTarget>>("roller");
+      auto& teleop = sim.add<PausableTeleop>("teleop");
+      SimHardware hw{sim};
+      hw.enable();
+
+      // Arm, press to latch on, then release trigger while staying latched.
+      Push(hw, sim, DsPacket(kTeleopEnabled, neutral_stick()));
+      Push(hw, sim, DsPacket(kTeleopEnabled, trigger.pressed));
+      Push(hw, sim, DsPacket(kTeleopEnabled, neutral_stick()));
+      ASSERT_TRUE(roller.seen.has_value());
+      ASSERT_TRUE(RollerLane(sim).has_value());
+      EXPECT_EQ(RollerLane(sim)->active, 1);
+
+      switch (transition) {
+        case Transition::kGatewayReboot:
+          hw.reboot();
+          sim.step(60ms);
+          break;
+        case Transition::kDsDropout:
+          hw.stop_driver_station();
+          sim.step(150ms);
+          Push(hw, sim, DsPacket(kTeleopEnabled, neutral_stick()));
+          break;
+        case Transition::kProducerStall:
+          teleop.paused = true;
+          sim.step(150ms);
+          teleop.paused = false;
+          sim.step(60ms);
+          break;
+      }
+
+      // Latch must be cleared and the lane inactive until pressed again.
+      EXPECT_FALSE(roller.seen.has_value());
+      ASSERT_TRUE(RollerLane(sim).has_value());
+      EXPECT_EQ(RollerLane(sim)->active, 0);
+
+      Push(hw, sim, DsPacket(kTeleopEnabled, trigger.pressed));
+      ASSERT_TRUE(roller.seen.has_value());
+      EXPECT_EQ(RollerLane(sim)->active, 1);
+    }
+  }
+}
+
 // REQ-SAFE-13: a disable shorter than one teleop period (a radio blip) is
 // drained together with the re-enable, so no update() samples it; the new
 // mode generation alone must disarm a held stick until it returns to neutral.
