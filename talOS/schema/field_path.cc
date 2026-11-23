@@ -113,13 +113,49 @@ void AppendScalarPaths(const reflection::Schema& schema,
   }
 }
 
+bool ValidBaseTypeByte(std::int8_t raw) {
+  return raw >= static_cast<std::int8_t>(BaseType::None) &&
+         raw <= static_cast<std::int8_t>(BaseType::MaxBaseType);
+}
+
+bool ValidType(const reflection::Type& type) {
+  // Read the raw int8_t bytes directly from the verified Table before any
+  // accessor casts them to the unscoped enum reflection::BaseType (whose valid
+  // C++ value range does not cover all int8_t values).
+  const auto* table = reinterpret_cast<const flatbuffers::Table*>(&type);
+  return ValidBaseTypeByte(
+             table->GetField<std::int8_t>(reflection::Type::VT_BASE_TYPE, 0)) &&
+         ValidBaseTypeByte(
+             table->GetField<std::int8_t>(reflection::Type::VT_ELEMENT, 0));
+}
+
 }  // namespace
 
 const reflection::Schema* VerifySchema(std::string_view bfbs) {
   flatbuffers::Verifier verifier{
       reinterpret_cast<const std::uint8_t*>(bfbs.data()), bfbs.size()};
   if (!reflection::VerifySchemaBuffer(verifier)) return nullptr;
-  return reflection::GetSchema(bfbs.data());
+  const reflection::Schema* schema = reflection::GetSchema(bfbs.data());
+  if (schema->objects() != nullptr) {
+    for (const auto* object : *schema->objects()) {
+      if (object == nullptr || object->fields() == nullptr) continue;
+      for (const auto* field : *object->fields()) {
+        if (field != nullptr && field->type() != nullptr &&
+            !ValidType(*field->type())) {
+          return nullptr;
+        }
+      }
+    }
+  }
+  if (schema->enums() != nullptr) {
+    for (const auto* enum_def : *schema->enums()) {
+      if (enum_def != nullptr && enum_def->underlying_type() != nullptr &&
+          !ValidType(*enum_def->underlying_type())) {
+        return nullptr;
+      }
+    }
+  }
+  return schema;
 }
 
 ResolvedField ResolveField(const reflection::Schema& schema,

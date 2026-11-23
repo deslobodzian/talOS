@@ -118,12 +118,30 @@ TEST(TelemetryChannels, EnvelopeChannelsReadTheHeaderAndTheMessageBehindIt) {
   }
 }
 
-// One field of a crafted reflection struct.
+// One field of a crafted reflection struct. Stores raw int8_t bytes so hostile
+// out-of-range BaseType values can be written to the FlatBuffer without UB.
 struct CraftedField {
-  reflection::BaseType base;
-  reflection::BaseType element;
+  std::int8_t base;
+  std::int8_t element;
   std::int32_t index;  // object index for Obj, or Obj elements
   std::uint16_t fixed_length;
+
+  constexpr CraftedField(reflection::BaseType b, reflection::BaseType e,
+                         std::int32_t idx, std::uint16_t len)
+      : base(static_cast<std::int8_t>(b)),
+        element(static_cast<std::int8_t>(e)),
+        index(idx),
+        fixed_length(len) {}
+
+  static constexpr CraftedField Raw(std::int8_t b, std::int8_t e,
+                                    std::int32_t idx, std::uint16_t len) {
+    return CraftedField{b, e, idx, len};
+  }
+
+ private:
+  constexpr CraftedField(std::int8_t b, std::int8_t e, std::int32_t idx,
+                         std::uint16_t len)
+      : base(b), element(e), index(idx), fixed_length(len) {}
 };
 
 // A reflection schema of structs "t.o00", "t.o01", ... (so object i is at
@@ -137,8 +155,16 @@ std::string CraftSchema(const std::vector<std::vector<CraftedField>>& objects,
     std::vector<flatbuffers::Offset<reflection::Field>> fields;
     for (std::size_t k = 0; k < objects[i].size(); ++k) {
       const CraftedField& f = objects[i][k];
-      const auto type = reflection::CreateType(fbb, f.base, f.element, f.index,
-                                               f.fixed_length, 1, 1);
+      const auto type_start = fbb.StartTable();
+      fbb.AddElement<std::int8_t>(reflection::Type::VT_BASE_TYPE, f.base, 0);
+      fbb.AddElement<std::int8_t>(reflection::Type::VT_ELEMENT, f.element, 0);
+      fbb.AddElement<std::int32_t>(reflection::Type::VT_INDEX, f.index, -1);
+      fbb.AddElement<std::uint16_t>(reflection::Type::VT_FIXED_LENGTH,
+                                    f.fixed_length, 0);
+      fbb.AddElement<std::uint32_t>(reflection::Type::VT_BASE_SIZE, 1, 4);
+      fbb.AddElement<std::uint32_t>(reflection::Type::VT_ELEMENT_SIZE, 1, 0);
+      const flatbuffers::Offset<reflection::Type> type{
+          fbb.EndTable(type_start)};
       const std::string name = "f" + std::to_string(k) + "_m";
       fields.push_back(reflection::CreateFieldDirect(
           fbb, name.c_str(), type, static_cast<std::uint16_t>(k), 0));
@@ -193,10 +219,15 @@ TEST(TelemetryChannels, HostileSchemaIsRefusedNamingTheTopic) {
         {}},
        {}},
       {"array element has negative out-of-range BaseType (-128)",
-       {{{BaseType::Array, static_cast<BaseType>(-128), -1, 2}}},
+       {{CraftedField::Raw(static_cast<std::int8_t>(BaseType::Array), -128, -1,
+                           2)}},
        {}},
       {"array element has positive out-of-range BaseType (127)",
-       {{{BaseType::Array, static_cast<BaseType>(127), -1, 2}}},
+       {{CraftedField::Raw(static_cast<std::int8_t>(BaseType::Array), 127, -1,
+                           2)}},
+       {}},
+      {"array element is non-scalar sentinel (MaxBaseType)",
+       {{{BaseType::Array, BaseType::MaxBaseType, -1, 2}}},
        {}},
       {"array element is non-scalar non-Obj (String)",
        {{{BaseType::Array, BaseType::String, -1, 2}}},
@@ -220,7 +251,7 @@ TEST(TelemetryChannels, HostileSchemaIsRefusedNamingTheTopic) {
        {{{BaseType::String, kNone, -1, 0}}},
        {}},
       {"field has out-of-range BaseType (127)",
-       {{{static_cast<BaseType>(127), kNone, -1, 0}}},
+       {{CraftedField::Raw(127, static_cast<std::int8_t>(kNone), -1, 0)}},
        {}},
   };
   for (const auto& c : cases) {
