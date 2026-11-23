@@ -98,6 +98,9 @@ struct MotorModel {
   // Free (no-load) stator current at 12 V, which sets the back-EMF constant,
   // k_e = (12 V - free current * R) / free speed.
   double free_current_a_at_12v{2.0};
+  // Stall torque at 12 V, which sets the torque constant,
+  // k_t = stall_torque_nm_at_12v / stall_current_a_at_12v.
+  double stall_torque_nm_at_12v{7.09};
   // First-order lag at nominal_inertia_kg_m2.
   double time_constant_s{0.02};
   double nominal_inertia_kg_m2{0.002};
@@ -112,13 +115,28 @@ struct MotorModel {
     return (12.0 - free_current_a_at_12v * resistance_ohm()) /
            free_speed_rps_at_12v;
   }
+  double back_emf_v_per_radps() const {
+    constexpr double kTau = 6.28318530717958647692;
+    return back_emf_v_per_rps() / kTau;
+  }
+  double torque_constant_nm_per_a() const {
+    return stall_torque_nm_at_12v / stall_current_a_at_12v;
+  }
+  // No-load internal viscous damping on the rotor shaft (N*m / (rad/s)),
+  // chosen so 12 V unloaded steady state matches free_speed_rps_at_12v and
+  // free_current_a_at_12v exactly.
+  double no_load_damping_nm_per_radps() const {
+    constexpr double kTau = 6.28318530717958647692;
+    return torque_constant_nm_per_a() * free_current_a_at_12v /
+           (kTau * free_speed_rps_at_12v);
+  }
 };
 
-// The published 12 V free speed, stall current and free current of each motor
-// type (CTRE manufacturer specifications / ReCalc, reca.lc):
-//   Kraken X60: 6000 rpm, 366 A stall, 2.0 A free
-//   Kraken X44: 7530 rpm, 275 A stall, 2.0 A free
-//   Falcon 500: 6380 rpm, 257 A stall, 1.5 A free
+// The published 12 V free speed, stall current, free current, and stall torque
+// of each motor type (CTRE manufacturer specifications / ReCalc, reca.lc):
+//   Kraken X60: 6000 rpm, 366 A stall, 2.0 A free, 7.09 N*m stall
+//   Kraken X44: 7530 rpm, 275 A stall, 2.0 A free, 4.05 N*m stall
+//   Falcon 500: 6380 rpm, 257 A stall, 1.5 A free, 4.69 N*m stall
 inline MotorModel MotorModelFor(MotorType type) {
   MotorModel model;
   switch (type) {
@@ -126,16 +144,19 @@ inline MotorModel MotorModelFor(MotorType type) {
       model.free_speed_rps_at_12v = 6000.0 / 60.0;
       model.stall_current_a_at_12v = 366.0;
       model.free_current_a_at_12v = 2.0;
+      model.stall_torque_nm_at_12v = 7.09;
       break;
     case MotorType::kKrakenX44:
       model.free_speed_rps_at_12v = 7530.0 / 60.0;
       model.stall_current_a_at_12v = 275.0;
       model.free_current_a_at_12v = 2.0;
+      model.stall_torque_nm_at_12v = 4.05;
       break;
     case MotorType::kFalcon500:
       model.free_speed_rps_at_12v = 6380.0 / 60.0;
       model.stall_current_a_at_12v = 257.0;
       model.free_current_a_at_12v = 1.5;
+      model.stall_torque_nm_at_12v = 4.69;
       break;
   }
   return model;
@@ -338,6 +359,39 @@ struct HardStop {
   std::optional<double> max_rot;
 };
 
+// Battery internal-resistance sag and automatic brownout model.
+// Default values (internal_resistance_ohm == 0, nominal_voltage_v == 12.8)
+// preserve bit-for-bit legacy resting supply behavior.
+struct BatteryModel {
+  double nominal_voltage_v{12.8};
+  double internal_resistance_ohm{0.0};
+  double base_current_a{0.0};
+  double brownout_voltage_v{6.75};
+};
+
+// Coupled 2D rigid-body chassis mass and wheel traction model for swerve.
+// Survives every Configure().
+struct ChassisDynamics {
+  double mass_kg{
+      0.0};  // > 0 activates dynamic chassis; <= 0 keeps legacy kinematics
+  double moment_of_inertia_kg_m2{
+      0.0};  // <= 0 defaults to mass_kg * mean(x_i^2 + y_i^2)
+  double traction_coefficient{
+      0.0};  // <= 0 means infinite traction (mass-only limit)
+};
+
+// Mechanism inertia and friction parameters for rigid-body rotor ODE on a
+// master motor (matched by CAN id) and its follower chain. Survives every
+// Configure().
+struct MechanismSpec {
+  std::uint8_t motor_can_id{0};
+  double inertia_kg_m2{
+      0.0};  // > 0 activates rigid-body ODE on this master motor
+  LoadKind load{LoadKind::kRoller};
+  double viscous_damping_nm_per_radps{0.0};
+  double static_friction_nm{0.0};
+};
+
 // Physics-backed Backend. See the header comment for the item-by-item map.
 class PhysicsSimBackend final : public SimBackendBase {
  public:
@@ -392,6 +446,66 @@ class PhysicsSimBackend final : public SimBackendBase {
     BindHardStops();
   }
 
+  // Battery sag and brownout model. Survives every later Configure().
+  // Inactive while an explicit SetSupplyVoltage / SetPowerHealth override is
+  // set; ClearSupplyVoltageOverride() resumes it.
+  void SetBatteryModel(const BatteryModel& model) {
+    battery_model_.nominal_voltage_v =
+        std::isfinite(model.nominal_voltage_v)
+            ? std::clamp(model.nominal_voltage_v, 0.0, 16.0)
+            : kSimRestingSupplyV;
+    battery_model_.internal_resistance_ohm =
+        std::isfinite(model.internal_resistance_ohm) &&
+                model.internal_resistance_ohm > 0.0
+            ? model.internal_resistance_ohm
+            : 0.0;
+    battery_model_.base_current_a =
+        std::isfinite(model.base_current_a) && model.base_current_a > 0.0
+            ? model.base_current_a
+            : 0.0;
+    battery_model_.brownout_voltage_v =
+        std::isfinite(model.brownout_voltage_v) &&
+                model.brownout_voltage_v >= 0.0
+            ? model.brownout_voltage_v
+            : 0.0;
+    if (!supply_voltage_override_) {
+      ApplyRestingBattery();
+    }
+  }
+
+  // Clears any explicit SetSupplyVoltage override and resumes the configured
+  // BatteryModel.
+  void ClearSupplyVoltageOverride() {
+    supply_voltage_override_.reset();
+    ApplyRestingBattery();
+  }
+
+  // Coupled 2D swerve chassis mass, rotational inertia, and tire traction
+  // model. Survives every later Configure().
+  void SetChassisDynamics(const ChassisDynamics& dynamics) {
+    chassis_dynamics_.mass_kg =
+        std::isfinite(dynamics.mass_kg) && dynamics.mass_kg > 0.0
+            ? dynamics.mass_kg
+            : 0.0;
+    chassis_dynamics_.moment_of_inertia_kg_m2 =
+        std::isfinite(dynamics.moment_of_inertia_kg_m2) &&
+                dynamics.moment_of_inertia_kg_m2 > 0.0
+            ? dynamics.moment_of_inertia_kg_m2
+            : 0.0;
+    chassis_dynamics_.traction_coefficient =
+        std::isfinite(dynamics.traction_coefficient) &&
+                dynamics.traction_coefficient > 0.0
+            ? dynamics.traction_coefficient
+            : 0.0;
+  }
+
+  // Rigid-body mechanism specs (matched by master motor CAN id), replacing any
+  // set before. Survives every later Configure().
+  void SetMechanisms(std::vector<MechanismSpec> specs) {
+    mechanisms_ = std::move(specs);
+    BindMechanisms();
+  }
+
   bool Configure(const Config& config) override {
     config_ = config;
     can_bus_count_ = CanBuses(config_).count;
@@ -403,6 +517,7 @@ class PhysicsSimBackend final : public SimBackendBase {
     }
     BindHomeSwitches();
     BindHardStops();
+    BindMechanisms();
     axes_.fill(AxisState{});
     profiles_.fill(Profile{});
     gyro_override_ = false;
@@ -427,11 +542,15 @@ class PhysicsSimBackend final : public SimBackendBase {
     pwm_outputs_.clear();
     pending_resets_.clear();
     restoring_.fill(false);
-    supply_v_ = kSimRestingSupplyV;
-    brownout_ = false;
+    supply_voltage_override_.reset();
+    explicit_brownout_ = false;
+    ApplyRestingBattery();
     yaw_rot_ = 0.0;
     yaw_rate_rps_ = 0.0;
     truth_ = {options_.start_x_m, options_.start_y_m, options_.start_yaw_rad};
+    chassis_vx_body_mps_ = 0.0;
+    chassis_vy_body_mps_ = 0.0;
+    chassis_omega_radps_ = 0.0;
     gyro_zero_yaw_rad_ = truth_.yaw_rad;
     elapsed_s_ = 0.0;
     for (std::size_t i = 0; i < config.motors.size(); ++i) {
@@ -452,7 +571,6 @@ class PhysicsSimBackend final : public SimBackendBase {
   }
 
   bool Read(State& state) override {
-    ReadPower(state.health, {true, supply_v_, brownout_});
     ReadSimulatedCanBus(state.health, can_bus_count_);
     double dt = 0.0;
     if (previous_time_) {
@@ -463,6 +581,7 @@ class PhysicsSimBackend final : public SimBackendBase {
     }
     previous_time_ = state.sample_time_us;
     StepModels(dt);
+    ReadPower(state.health, {true, supply_v_, brownout_});
     bool healthy = config_.motors.empty() && config_.sensors.empty();
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
       const auto& m = config_.motors[i];
@@ -605,6 +724,9 @@ class PhysicsSimBackend final : public SimBackendBase {
     powered_.fill(false);
     digital_outputs_.clear();
     pwm_outputs_.clear();
+    if (!supply_voltage_override_) {
+      ApplyRestingBattery();
+    }
   }
 
   // Deterministic stepping without a Gateway: advances the models
@@ -677,12 +799,15 @@ class PhysicsSimBackend final : public SimBackendBase {
     }
   }
   void SetSupplyVoltage(double volts) {
-    supply_v_ = std::clamp(volts, 0.0, 16.0);
+    const double clamped = std::clamp(volts, 0.0, 16.0);
+    supply_voltage_override_ = clamped;
+    supply_v_ = clamped;
+    brownout_ = explicit_brownout_;
   }
   double supply_voltage() const { return supply_v_; }
   void SetPowerHealth(double battery_v, bool brownout) {
+    explicit_brownout_ = brownout;
     SetSupplyVoltage(battery_v);
-    brownout_ = brownout;
   }
   // Zeroes rotor states, latched commands, reported gyro, and fault flags.
   // The physical field pose survives a controller restart; subsequent gyro
@@ -699,12 +824,20 @@ class PhysicsSimBackend final : public SimBackendBase {
     restoring_.fill(false);
     motor_connected_.fill(true);
     sensor_connected_.fill(true);
-    brownout_ = false;
+    explicit_brownout_ = false;
+    if (supply_voltage_override_) {
+      brownout_ = false;
+    } else {
+      ApplyRestingBattery();
+    }
     yaw_rot_ = 0.0;
     yaw_rate_rps_ = 0.0;
     gyro_zero_yaw_rad_ = truth_.yaw_rad;
     elapsed_s_ = 0.0;
     truth_.vx_mps = truth_.vy_mps = truth_.omega_radps = 0.0;
+    chassis_vx_body_mps_ = 0.0;
+    chassis_vy_body_mps_ = 0.0;
+    chassis_omega_radps_ = 0.0;
     for (auto& module : modules_) module.previous_surface_speed_mps = 0.0;
   }
   // Explicit reported-gyro overrides, in rotations/s. These do not teleport
@@ -1133,22 +1266,59 @@ class PhysicsSimBackend final : public SimBackendBase {
     return flags;
   }
 
-  // Effective winding voltage in motor i's configured direction after
-  // enforcing the voltage ceiling, stator_limit_a (|V_rotor - back_emf| / R <=
-  // stator_limit_a), and supply_limit_a (power drawn from supply_v_ capped to
-  // supply_limit_a * supply_v_). Fed into StepAxis and recorded in
-  // applied_volts_ so rotor dynamics, voltage, stator current, and supply
-  // current stay mutually consistent.
-  double LimitWindingVoltage(std::size_t i, const MotorConfig& m,
-                             double volts) const {
+  // Resolves mechanisms_ by master motor CAN id against config_. Follower
+  // motors and non-positive / non-finite inertias are ignored.
+  void BindMechanisms() {
+    bound_mechanisms_.fill(BoundMechanism{});
+    for (const MechanismSpec& spec : mechanisms_) {
+      if (!std::isfinite(spec.inertia_kg_m2) || spec.inertia_kg_m2 <= 0.0) {
+        continue;
+      }
+      const double viscous = std::isfinite(spec.viscous_damping_nm_per_radps) &&
+                                     spec.viscous_damping_nm_per_radps > 0.0
+                                 ? spec.viscous_damping_nm_per_radps
+                                 : 0.0;
+      const double static_fric = std::isfinite(spec.static_friction_nm) &&
+                                         spec.static_friction_nm > 0.0
+                                     ? spec.static_friction_nm
+                                     : 0.0;
+      for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+        if (config_.motors[i].can_id == static_cast<int>(spec.motor_can_id) &&
+            config_.motors[i].master_id == 0) {
+          bound_mechanisms_[i] = {true, spec.inertia_kg_m2, spec.load, viscous,
+                                  static_fric};
+          break;
+        }
+      }
+    }
+  }
+
+  void ApplyRestingBattery() {
+    const double v_oc = battery_model_.nominal_voltage_v;
+    const double r_int = battery_model_.internal_resistance_ohm;
+    const double base_a = battery_model_.base_current_a;
+    const bool sag_active = r_int > 0.0;
+    supply_v_ = std::clamp(v_oc - r_int * base_a, 0.0, 16.0);
+    brownout_ = explicit_brownout_ ||
+                (sag_active && supply_v_ < battery_model_.brownout_voltage_v);
+  }
+
+  bool DynamicChassisActive() const {
+    return chassis_dynamics_.mass_kg > 0.0 && !modules_.empty();
+  }
+
+  // Effective winding voltage in motor i's configured direction at an explicit
+  // bus voltage and physical rotor velocity.
+  double LimitWindingVoltageAt(std::size_t i, const MotorConfig& m,
+                               double volts, double supply_v,
+                               double rotor_velocity_rps) const {
     const MotorModel motor = MotorModelFor(m.motor_type.value);
     const double dir = Direction(i);
-    const double supply = std::max(0.0, supply_v_);
+    const double supply = std::max(0.0, supply_v);
     const double ceiling =
         std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0, supply);
     double rotor_volts = std::clamp(dir * volts, -ceiling, ceiling);
-    const double back_emf_v =
-        motor.back_emf_v_per_rps() * axes_[i].rotor_velocity_rps;
+    const double back_emf_v = motor.back_emf_v_per_rps() * rotor_velocity_rps;
     const double resistance_ohm = motor.resistance_ohm();
     if (m.stator_limit_a > 0.0) {
       const double max_drop_v = m.stator_limit_a * resistance_ohm;
@@ -1170,16 +1340,36 @@ class PhysicsSimBackend final : public SimBackendBase {
     return dir * rotor_volts;
   }
 
+  // Effective winding voltage in motor i's configured direction after
+  // enforcing the voltage ceiling, stator_limit_a (|V_rotor - back_emf| / R <=
+  // stator_limit_a), and supply_limit_a (power drawn from supply_v_ capped to
+  // supply_limit_a * supply_v_). Fed into StepAxis and recorded in
+  // applied_volts_ so rotor dynamics, voltage, stator current, and supply
+  // current stay mutually consistent.
+  double LimitWindingVoltage(std::size_t i, const MotorConfig& m,
+                             double volts) const {
+    return LimitWindingVoltageAt(i, m, volts, supply_v_,
+                                 axes_[i].rotor_velocity_rps);
+  }
+
+  // Signed stator current in motor i's physical rotor frame at explicit
+  // applied voltage and rotor velocity.
+  double SignedStatorCurrentAt(std::size_t i, const MotorConfig& m,
+                               double applied_v, bool powered,
+                               double rotor_velocity_rps) const {
+    if (!powered) return 0.0;
+    const MotorModel motor = MotorModelFor(m.motor_type.value);
+    const double back_emf_v = motor.back_emf_v_per_rps() * rotor_velocity_rps;
+    const double rotor_volts = Direction(i) * applied_v;
+    return (rotor_volts - back_emf_v) / motor.resistance_ohm();
+  }
+
   // Signed stator current in motor i's physical rotor frame:
   // (rotor_volts - back_emf) / R, with R = 12 V / stall current and
   // k_e = (12 V - free current * R) / free speed; 0 while unpowered.
   double SignedStatorCurrent(std::size_t i, const MotorConfig& m) const {
-    if (!powered_[i]) return 0.0;
-    const MotorModel motor = MotorModelFor(m.motor_type.value);
-    const double back_emf_v =
-        motor.back_emf_v_per_rps() * axes_[i].rotor_velocity_rps;
-    const double rotor_volts = Direction(i) * applied_volts_[i];
-    return (rotor_volts - back_emf_v) / motor.resistance_ohm();
+    return SignedStatorCurrentAt(i, m, applied_volts_[i], powered_[i],
+                                 axes_[i].rotor_velocity_rps);
   }
 
   // Stator current magnitude from the actual applied_volts_ and back-EMF:
@@ -1193,6 +1383,19 @@ class PhysicsSimBackend final : public SimBackendBase {
     return std::abs(SignedStatorCurrent(i, m));
   }
 
+  double SupplyCurrentAt(std::size_t i, const MotorConfig& m, double applied_v,
+                         bool powered, double supply_v,
+                         double rotor_velocity_rps) const {
+    if (!powered || supply_v <= 0.0) return 0.0;
+    const double rotor_volts = Direction(i) * applied_v;
+    const double current_a =
+        rotor_volts *
+        SignedStatorCurrentAt(i, m, applied_v, powered, rotor_velocity_rps) /
+        supply_v;
+    return m.supply_limit_a > 0.0 ? std::min(m.supply_limit_a, current_a)
+                                  : current_a;
+  }
+
   // Signed power-conservation supply current:
   // (rotor_volts * signed_stator_current) / supply_v_ (positive = battery
   // draw, negative = regenerative braking). Positive draw is clamped to
@@ -1200,12 +1403,24 @@ class PhysicsSimBackend final : public SimBackendBase {
   // regen), while negative regen stays signed, matching Phoenix 6. 0 when
   // unpowered or supply_v_ <= 0.
   double SupplyCurrent(std::size_t i, const MotorConfig& m) const {
-    if (!powered_[i] || supply_v_ <= 0.0) return 0.0;
-    const double rotor_volts = Direction(i) * applied_volts_[i];
-    const double current_a =
-        rotor_volts * SignedStatorCurrent(i, m) / supply_v_;
-    return m.supply_limit_a > 0.0 ? std::min(m.supply_limit_a, current_a)
-                                  : current_a;
+    return SupplyCurrentAt(i, m, applied_volts_[i], powered_[i], supply_v_,
+                           axes_[i].rotor_velocity_rps);
+  }
+
+  double TorqueCurrentVoltsAt(std::size_t i, const MotorConfig& m,
+                              double amperes, double supply_v,
+                              double rotor_velocity_rps) const {
+    const MotorModel motor = MotorModelFor(m.motor_type.value);
+    const double peak_a =
+        std::max(0.0, std::min(m.max_torque_current_a, m.stator_limit_a));
+    const double current_a = std::clamp(amperes, -peak_a, peak_a);
+    const double back_emf_v = motor.back_emf_v_per_rps() * rotor_velocity_rps;
+    const double supply = std::max(0.0, supply_v);
+    const double ceiling =
+        std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0, supply);
+    return std::clamp(
+        current_a * motor.resistance_ohm() + Direction(i) * back_emf_v,
+        -ceiling, ceiling);
   }
 
   // The volts TorqueCurrentFOC applies for a demand of `amperes`: the volts
@@ -1217,17 +1432,8 @@ class PhysicsSimBackend final : public SimBackendBase {
   // battery does. FOC itself is not modelled.
   double TorqueCurrentVolts(std::size_t i, const MotorConfig& m,
                             double amperes) const {
-    const MotorModel motor = MotorModelFor(m.motor_type.value);
-    const double peak_a =
-        std::max(0.0, std::min(m.max_torque_current_a, m.stator_limit_a));
-    const double current_a = std::clamp(amperes, -peak_a, peak_a);
-    const double back_emf_v =
-        motor.back_emf_v_per_rps() * axes_[i].rotor_velocity_rps;
-    const double ceiling =
-        std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0, supply_v_);
-    return std::clamp(
-        current_a * motor.resistance_ohm() + Direction(i) * back_emf_v,
-        -ceiling, ceiling);
+    return TorqueCurrentVoltsAt(i, m, amperes, supply_v_,
+                                axes_[i].rotor_velocity_rps);
   }
 
   bool FeedbackValid(std::size_t i) const {
@@ -1237,67 +1443,65 @@ class PhysicsSimBackend final : public SimBackendBase {
     return sensor >= 0 && sensor_connected_[sensor];
   }
 
-  void StepModels(double dt_s) {
-    if (dt_s < 0.0) return;
-    applied_volts_.fill(0.0);
-    powered_.fill(false);
+  // Resolves master and follower command voltages and current-limited winding
+  // voltages at an explicit candidate bus voltage, without mutating backend
+  // state. Returns the signed sum of motor supply currents (amperes).
+  double ResolveCommandsAtSupply(
+      double supply_v, const std::array<double, kMaxMotors>& profile_accel,
+      const std::array<bool, kMaxMotors>& profiled,
+      std::array<bool, kMaxMotors>& powered_out,
+      std::array<double, kMaxMotors>& raw_volts_out,
+      std::array<double, kMaxMotors>& applied_volts_out) const {
+    powered_out.fill(false);
+    raw_volts_out.fill(0.0);
+    applied_volts_out.fill(0.0);
     std::array<bool, kMaxMotors> resolved{};
+    const double supply = std::max(0.0, supply_v);
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
       const auto& m = config_.motors[i];
       if (m.master_id != 0) continue;
       resolved[i] = true;
-      MechanismModel mech;
-      mech.gear_ratio = Gear(i);
-      mech.brake = m.brake;
-      // Heavier current limits imply a beefier mechanism; flywheels coast.
-      mech.load = LoadKind::kRoller;
       double volts = 0.0;
-      const double gear = mech.gear_ratio;
+      const double gear = Gear(i);
       const double mech_pos = MechPosition(i);
       const double mech_vel =
           axes_[i].rotor_velocity_rps * FeedbackDirection(i) / gear;
-      auto& profile = profiles_[i];
       const auto& req = commands_[i];
-      bool want_power;
-      if (req.mode == Mode::kMotionMagic && m.cruise_velocity_rps > 0.0 &&
-          m.acceleration_rps2 > 0.0) {
-        if (!profile.active) profile = {mech_pos, mech_vel, true};
-        const double goal =
-            m.continuous_wrap
-                ? profile.profile_pos_rot +
-                      std::remainder(req.demand - profile.profile_pos_rot, 1.0)
-                : req.demand;
-        const double accel = AdvanceProfile(profile, m, goal, dt_s);
+      bool want_power = false;
+      if (profiled[i]) {
+        const auto& profile = profiles_[i];
         const auto& gains = m.slots[req.slot < 3 ? req.slot : 0];
         const double velocity = profile.profile_vel_rps;
         const double sign = velocity > 0.0 ? 1.0 : velocity < 0.0 ? -1.0 : 0.0;
         const double ceiling =
-            std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0,
-                     std::max(0.0, supply_v_));
+            std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0, supply);
         const double pos_error =
             m.continuous_wrap
                 ? std::remainder(profile.profile_pos_rot - mech_pos, 1.0)
                 : (profile.profile_pos_rot - mech_pos);
         volts =
             std::clamp(req.feedforward_v + gains.p * pos_error +
-                           gains.v * velocity + gains.a * accel +
+                           gains.v * velocity + gains.a * profile_accel[i] +
                            gains.s * sign + gains.d * (velocity - mech_vel) +
                            GravityVoltage(gains, mech_pos),
                        -ceiling, ceiling);
         want_power = FeedbackValid(i);
       } else if (req.mode == Mode::kTorqueCurrent) {
         // Powered at any demand: 0 A is zero torque, not neutral.
-        profile.active = false;
-        volts = TorqueCurrentVolts(i, m, req.demand);
+        volts = TorqueCurrentVoltsAt(i, m, req.demand, supply,
+                                     axes_[i].rotor_velocity_rps);
         want_power = FeedbackValid(i);
       } else {
-        profile.active = false;
         want_power = FeedbackValid(i) &&
-                     DriveVoltage(req, m, mech_pos, mech_vel, supply_v_, volts);
+                     DriveVoltage(req, m, mech_pos, mech_vel, supply, volts);
       }
       want_power = want_power && !LimitSwitchBlocks(i, volts);
-      applied_volts_[i] = want_power ? LimitWindingVoltage(i, m, volts) : 0.0;
-      powered_[i] = want_power;
+      powered_out[i] = want_power;
+      raw_volts_out[i] = want_power ? volts : 0.0;
+      applied_volts_out[i] =
+          want_power ? LimitWindingVoltageAt(i, m, volts, supply,
+                                             axes_[i].rotor_velocity_rps)
+                     : 0.0;
     }
     // Resolve follower chains before integrating any axis: configuration order
     // cannot introduce a one-step delay. Missing masters/cycles stay neutral.
@@ -1310,18 +1514,465 @@ class PhysicsSimBackend final : public SimBackendBase {
         if (master < 0 || !resolved[master]) continue;
         resolved[i] = true;
         progress = true;
-        powered_[i] = commands_[i].mode != Mode::kNeutral && FeedbackValid(i) &&
-                      powered_[master];
-        applied_volts_[i] =
-            powered_[i]
-                ? LimitWindingVoltage(
-                      i, m,
-                      applied_volts_[master] * (m.oppose_master ? -1.0 : 1.0))
-                : 0.0;
+        powered_out[i] = commands_[i].mode != Mode::kNeutral &&
+                         FeedbackValid(i) && powered_out[master];
+        const double follower_raw =
+            applied_volts_out[master] * (m.oppose_master ? -1.0 : 1.0);
+        raw_volts_out[i] = powered_out[i] ? follower_raw : 0.0;
+        applied_volts_out[i] =
+            powered_out[i] ? LimitWindingVoltageAt(i, m, follower_raw, supply,
+                                                   axes_[i].rotor_velocity_rps)
+                           : 0.0;
       }
       if (!progress) break;
     }
+    double total_supply_a = 0.0;
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+      total_supply_a +=
+          SupplyCurrentAt(i, config_.motors[i], applied_volts_out[i],
+                          powered_out[i], supply, axes_[i].rotor_velocity_rps);
+    }
+    return total_supply_a;
+  }
+
+  // Exact analytical solution of J * d(omega)/dt + B * omega = T over step h.
+  // Unconditionally stable for all J > 0, B >= 0, h >= 0.
+  static std::pair<double, double> ExponentialStep(double omega, double torque,
+                                                   double damping,
+                                                   double inertia, double h) {
+    if (h <= 0.0) return {omega, 0.0};
+    const double rate = damping / inertia;
+    const double x = rate * h;
+    if (x > 40.0 && damping > 0.0) {
+      const double omega_inf = torque / damping;
+      const double dtheta =
+          omega_inf * h + (omega - omega_inf) * (inertia / damping);
+      return {omega_inf, dtheta};
+    }
+    const double phi1 = x < 1e-5 ? 1.0 - x * (0.5 - x * (1.0 / 6.0 - x / 24.0))
+                                 : -std::expm1(-x) / x;
+    const double phi2 =
+        x < 1e-4 ? 0.5 - x * (1.0 / 6.0 - x * (1.0 / 24.0 - x / 120.0))
+                 : (1.0 - phi1) / x;
+    const double accel0 = (torque - damping * omega) / inertia;
+    const double omega_next = omega + accel0 * h * phi1;
+    const double dtheta = omega * h + accel0 * h * h * phi2;
+    return {omega_next, dtheta};
+  }
+
+  // Time in (0, rem_h) when J * d(omega)/dt + B * omega = T crosses
+  // omega_target, given omega_target lies strictly between omega and
+  // omega_cand.
+  static double TimeToCrossOmega(double omega, double omega_target,
+                                 double torque, double damping, double inertia,
+                                 double rem_h) {
+    const double rate = damping / inertia;
+    if (rate * rem_h < 1e-5) {
+      const double accel0 = (torque - damping * omega) / inertia;
+      if (std::abs(accel0) > 1e-18) {
+        return std::clamp((omega_target - omega) / accel0, 0.0, rem_h);
+      }
+      return rem_h;
+    }
+    const double omega_inf = torque / damping;
+    const double denom = omega - omega_inf;
+    if (std::abs(denom) <= 1e-18) return rem_h;
+    const double ratio = (omega_target - omega_inf) / denom;
+    if (ratio <= 0.0 || ratio >= 1.0) return rem_h;
+    return std::clamp(-std::log(ratio) / rate, 0.0, rem_h);
+  }
+
+  // Integrates one rigid-body mechanism shaft (root master + all followers on
+  // its chain) over dt_s using fixed sub-steps and unconditionally stable
+  // exponential stepping with exact current-limit exit and static-friction
+  // zero-crossing splits.
+  void StepRigidBodyShaft(std::size_t root,
+                          const std::array<double, kMaxMotors>& raw_volts,
+                          double dt_s, std::array<bool, kMaxMotors>& stepped) {
+    constexpr int kSubSteps = 10;
+    const BoundMechanism& spec = bound_mechanisms_[root];
+    const double gear = Gear(root);
+    const double j_rotor = spec.inertia_kg_m2 / (gear * gear);
+    const double b_ext = spec.viscous_damping_nm_per_radps / (gear * gear);
+    const double tau_static = spec.static_friction_nm / gear;
+
+    // Gather root + all followers in its chain without heap allocation.
+    std::array<std::pair<std::size_t, double>, kMaxMotors> members{};
+    std::size_t member_count = 0;
+    members[member_count++] = {root, 1.0};
+    stepped[root] = true;
+    for (std::size_t k = 0; k < config_.motors.size(); ++k) {
+      if (k == root || config_.motors[k].master_id == 0) continue;
+      const auto [resolved_root, oppose_sign] = ResolveRootMaster(k);
+      if (resolved_root == root) {
+        members[member_count++] = {k, oppose_sign};
+        stepped[k] = true;
+      }
+    }
+
+    if (dt_s <= 0.0) {
+      const bool stopped = EnforceHardStop(root);
+      for (std::size_t m_idx = 1; m_idx < member_count; ++m_idx) {
+        const auto [k, s_k] = members[m_idx];
+        axes_[k].rotor_position_rot = s_k * axes_[root].rotor_position_rot;
+        axes_[k].rotor_velocity_rps = s_k * axes_[root].rotor_velocity_rps;
+      }
+      if (stopped && powered_[root]) {
+        const auto& m_root = config_.motors[root];
+        if (commands_[root].mode == Mode::kTorqueCurrent) {
+          applied_volts_[root] = LimitWindingVoltage(
+              root, m_root,
+              TorqueCurrentVolts(root, m_root, commands_[root].demand));
+        } else {
+          applied_volts_[root] =
+              LimitWindingVoltage(root, m_root, raw_volts[root]);
+        }
+        for (std::size_t m_idx = 1; m_idx < member_count; ++m_idx) {
+          const auto [k, s_k] = members[m_idx];
+          if (powered_[k]) {
+            applied_volts_[k] = LimitWindingVoltage(k, config_.motors[k],
+                                                    applied_volts_[root] * s_k);
+          }
+        }
+      }
+      return;
+    }
+
+    const double h = dt_s / static_cast<double>(kSubSteps);
+    const double supply = std::max(0.0, supply_v_);
+
+    for (int sub = 0; sub < kSubSteps; ++sub) {
+      double omega = axes_[root].rotor_velocity_rps * kTau;
+      double dtheta_rot = 0.0;
+      double rem_h = h;
+
+      for (int seg = 0; seg < 4 && rem_h > 1e-12; ++seg) {
+        double total_torque = 0.0;
+        double total_damping = b_ext;
+        double root_v_lim_cfg = 0.0;
+
+        // Collect candidate current-limit exit speeds (rotor rad/s).
+        std::array<double, kMaxMotors * 3> exit_omegas{};
+        std::size_t exit_count = 0;
+        bool any_current_limited = false;
+        double max_ceil_omega = std::numeric_limits<double>::infinity();
+        double min_ceil_omega = -std::numeric_limits<double>::infinity();
+
+        for (std::size_t idx = 0; idx < member_count; ++idx) {
+          const auto [k, s_k] = members[idx];
+          const auto& mk = config_.motors[k];
+          const MotorModel motor = MotorModelFor(mk.motor_type.value);
+          const double r_ohm = motor.resistance_ohm();
+          const double ke_rad = motor.back_emf_v_per_radps();
+          const double kt = motor.torque_constant_nm_per_a();
+          const double b_m = motor.no_load_damping_nm_per_radps();
+          const double b_em = (kt * ke_rad) / r_ohm;
+          const double omega_k = s_k * omega;
+          const double rps_k = omega_k / kTau;
+
+          total_damping += b_m;
+
+          if (!powered_[k]) {
+            if (mk.brake) {
+              // Shorted-winding back-EMF braking (V = 0).
+              total_damping += b_em;
+            }
+            // Coast neutral: I = 0, decays via b_m + b_ext + static_friction.
+            continue;
+          }
+
+          const double ceiling =
+              std::min(mk.max_voltage > 0.0 ? mk.max_voltage : 12.0, supply);
+          const double dir_k = Direction(k);
+          const bool is_tc =
+              (k == root && commands_[k].mode == Mode::kTorqueCurrent);
+          double cmd_v_cfg = 0.0;
+          if (k == root) {
+            cmd_v_cfg = is_tc ? TorqueCurrentVoltsAt(k, mk, commands_[k].demand,
+                                                     supply, rps_k)
+                              : raw_volts[k];
+          } else {
+            cmd_v_cfg = root_v_lim_cfg * s_k;
+          }
+          const double v_lim_cfg =
+              LimitWindingVoltageAt(k, mk, cmd_v_cfg, supply, rps_k);
+          if (k == root) root_v_lim_cfg = v_lim_cfg;
+
+          const double v_lim_rotor = dir_k * v_lim_cfg;
+          const double v_bemf = ke_rad * omega_k;
+          double v_ceil_rotor =
+              std::clamp(dir_k * cmd_v_cfg, -ceiling, ceiling);
+          bool current_limited = false;
+          if (is_tc) {
+            const double peak_a = std::max(
+                0.0, std::min(mk.max_torque_current_a, mk.stator_limit_a));
+            const double i_req =
+                std::clamp(commands_[k].demand, -peak_a, peak_a);
+            if (std::abs(i_req) > 1e-12) {
+              v_ceil_rotor = dir_k * (i_req > 0.0 ? ceiling : -ceiling);
+              current_limited = std::abs(v_lim_rotor - v_ceil_rotor) > 1e-9;
+            } else {
+              // 0 A torque-current demand: zero electromagnetic torque unless
+              // overspeeding past the voltage ceiling.
+              if (std::abs(v_bemf) <= ceiling + 1e-9) {
+                continue;
+              }
+              v_ceil_rotor = std::clamp(v_bemf, -ceiling, ceiling);
+              current_limited = false;
+            }
+          } else {
+            current_limited = std::abs(v_lim_rotor - v_ceil_rotor) > 1e-9;
+          }
+
+          if (!current_limited) {
+            total_torque += s_k * (kt / r_ohm) * v_lim_rotor;
+            total_damping += b_em;
+          } else {
+            any_current_limited = true;
+            const double i_stator = (v_lim_rotor - v_bemf) / r_ohm;
+            total_torque += s_k * kt * i_stator;
+
+            if (ke_rad > 1e-12) {
+              // Stator/TC ceiling exit: where back-EMF + I*R hits v_ceil_rotor.
+              const double w_exit_stat =
+                  s_k * (v_ceil_rotor - i_stator * r_ohm) / ke_rad;
+              exit_omegas[exit_count++] = w_exit_stat;
+              // Supply-limit exit: where v_ceil_rotor * (v_ceil_rotor - bemf)
+              // equals supply_limit_a * supply * R.
+              if (mk.supply_limit_a > 0.0 && supply > 0.0 &&
+                  std::abs(v_ceil_rotor) > 1e-9) {
+                const double p_max_r = mk.supply_limit_a * supply * r_ohm;
+                const double v_bemf_sup = v_ceil_rotor - p_max_r / v_ceil_rotor;
+                exit_omegas[exit_count++] = s_k * v_bemf_sup / ke_rad;
+                // Stator-to-supply transition: where |v_lim * i_stator| = Pmax.
+                if (std::abs(i_stator) > 1e-9) {
+                  const double v_lim_s2s = p_max_r / (i_stator * r_ohm);
+                  const double v_bemf_s2s = v_lim_s2s - i_stator * r_ohm;
+                  exit_omegas[exit_count++] = s_k * v_bemf_s2s / ke_rad;
+                }
+              }
+              const double w_ceil = s_k * v_ceil_rotor / ke_rad;
+              if (s_k * i_stator > 0.0) {
+                max_ceil_omega = std::min(max_ceil_omega, w_ceil);
+              } else if (s_k * i_stator < 0.0) {
+                min_ceil_omega = std::max(min_ceil_omega, w_ceil);
+              }
+            }
+          }
+        }
+
+        // Static friction (Coulomb + stiction at zero velocity).
+        bool stuck_at_zero = false;
+        if (tau_static > 0.0) {
+          if (std::abs(omega) < 1e-9) {
+            if (std::abs(total_torque) <= tau_static) {
+              omega = 0.0;
+              stuck_at_zero = true;
+            } else {
+              total_torque -= std::copysign(tau_static, total_torque);
+            }
+          } else {
+            total_torque -= std::copysign(tau_static, omega);
+          }
+        }
+        if (stuck_at_zero) break;
+
+        const auto [omega_cand, dtheta_cand] =
+            ExponentialStep(omega, total_torque, total_damping, j_rotor, rem_h);
+
+        // Find the earliest regime event inside (0, rem_h).
+        double event_h = rem_h;
+        bool is_zero_cross = false;
+        double nudge = 0.0;
+
+        if (tau_static > 0.0 && std::abs(omega) >= 1e-9 &&
+            omega * omega_cand <= 0.0) {
+          const double hz = TimeToCrossOmega(omega, 0.0, total_torque,
+                                             total_damping, j_rotor, rem_h);
+          if (hz < event_h) {
+            event_h = hz;
+            is_zero_cross = true;
+            nudge = 0.0;
+          }
+        }
+
+        if (any_current_limited) {
+          const double delta_w = omega_cand - omega;
+          for (std::size_t e = 0; e < exit_count; ++e) {
+            const double w_e = exit_omegas[e];
+            const bool between =
+                (delta_w > 0.0 && w_e > omega + 1e-7 && w_e < omega_cand) ||
+                (delta_w < 0.0 && w_e < omega - 1e-7 && w_e > omega_cand);
+            if (!between) continue;
+            const double he = TimeToCrossOmega(omega, w_e, total_torque,
+                                               total_damping, j_rotor, rem_h);
+            if (he < event_h) {
+              event_h = he;
+              is_zero_cross = false;
+              nudge = std::copysign(1e-6, delta_w);
+            }
+          }
+        }
+
+        if (event_h < rem_h && seg < 3) {
+          const auto [w_step, dth_step] = ExponentialStep(
+              omega, total_torque, total_damping, j_rotor, event_h);
+          dtheta_rot += dth_step / kTau;
+          omega = is_zero_cross ? 0.0 : (w_step + nudge);
+          rem_h -= event_h;
+        } else {
+          double w_final = omega_cand;
+          if (any_current_limited) {
+            if (omega <= max_ceil_omega && w_final > max_ceil_omega) {
+              w_final = max_ceil_omega;
+            }
+            if (omega >= min_ceil_omega && w_final < min_ceil_omega) {
+              w_final = min_ceil_omega;
+            }
+          }
+          dtheta_rot += dtheta_cand / kTau;
+          omega = w_final;
+          rem_h = 0.0;
+        }
+      }
+
+      if (!powered_[root] && std::abs(omega) < 1e-9) {
+        omega = 0.0;
+      }
+      axes_[root].rotor_position_rot += dtheta_rot;
+      axes_[root].rotor_velocity_rps = omega / kTau;
+      EnforceHardStop(root);
+      for (std::size_t idx = 1; idx < member_count; ++idx) {
+        const auto [k, s_k] = members[idx];
+        axes_[k].rotor_position_rot = s_k * axes_[root].rotor_position_rot;
+        axes_[k].rotor_velocity_rps = s_k * axes_[root].rotor_velocity_rps;
+      }
+    }
+
+    // Re-evaluate final applied_volts_ at the post-step rotor velocity so
+    // reported voltage, stator current, and supply current are mutually
+    // consistent.
+    if (powered_[root]) {
+      const auto& m_root = config_.motors[root];
+      if (commands_[root].mode == Mode::kTorqueCurrent) {
+        applied_volts_[root] = LimitWindingVoltage(
+            root, m_root,
+            TorqueCurrentVolts(root, m_root, commands_[root].demand));
+      } else {
+        applied_volts_[root] =
+            LimitWindingVoltage(root, m_root, raw_volts[root]);
+      }
+    }
+    for (std::size_t idx = 1; idx < member_count; ++idx) {
+      const auto [k, s_k] = members[idx];
+      if (powered_[k]) {
+        applied_volts_[k] = LimitWindingVoltage(k, config_.motors[k],
+                                                applied_volts_[root] * s_k);
+      }
+    }
+  }
+
+  void StepModels(double dt_s) {
+    if (dt_s < 0.0) return;
+
+    // Advance Motion Magic profiles once per tick before battery sag iteration
+    // (profile kinematics are independent of supply voltage).
+    std::array<double, kMaxMotors> profile_accel{};
+    std::array<bool, kMaxMotors> profiled{};
+    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+      const auto& m = config_.motors[i];
+      if (m.master_id != 0) continue;
+      const auto& req = commands_[i];
+      if (req.mode == Mode::kMotionMagic && m.cruise_velocity_rps > 0.0 &&
+          m.acceleration_rps2 > 0.0) {
+        const double gear = Gear(i);
+        const double mech_pos = MechPosition(i);
+        const double mech_vel =
+            axes_[i].rotor_velocity_rps * FeedbackDirection(i) / gear;
+        auto& profile = profiles_[i];
+        if (!profile.active) profile = {mech_pos, mech_vel, true};
+        const double goal =
+            m.continuous_wrap
+                ? profile.profile_pos_rot +
+                      std::remainder(req.demand - profile.profile_pos_rot, 1.0)
+                : req.demand;
+        profile_accel[i] = AdvanceProfile(profile, m, goal, dt_s);
+        profiled[i] = true;
+      } else {
+        profiles_[i].active = false;
+      }
+    }
+
+    // Solve battery sag & auto-brownout when no explicit supply override is
+    // active. Bisection on [0, V_oc] converges deterministically in 28 steps
+    // with zero oscillation even when equivalent load resistance < R_int.
+    std::array<double, kMaxMotors> raw_volts{};
+    if (!supply_voltage_override_) {
+      const double v_oc = battery_model_.nominal_voltage_v;
+      const double r_int = battery_model_.internal_resistance_ohm;
+      const double base_a = battery_model_.base_current_a;
+      if (r_int > 0.0) {
+        std::array<bool, kMaxMotors> tmp_powered{};
+        std::array<double, kMaxMotors> tmp_raw{};
+        std::array<double, kMaxMotors> tmp_applied{};
+        double v_solved = 0.0;
+        if (r_int * base_a < v_oc) {
+          const double motor_a_at_voc = ResolveCommandsAtSupply(
+              v_oc, profile_accel, profiled, tmp_powered, tmp_raw, tmp_applied);
+          if (base_a + motor_a_at_voc <= 0.0) {
+            v_solved = v_oc;
+          } else {
+            double lo = 0.0;
+            double hi = v_oc;
+            for (int iter = 0; iter < 28; ++iter) {
+              const double mid = 0.5 * (lo + hi);
+              const double motor_a =
+                  ResolveCommandsAtSupply(mid, profile_accel, profiled,
+                                          tmp_powered, tmp_raw, tmp_applied);
+              const double i_total = std::max(0.0, base_a + motor_a);
+              const double residual = mid + r_int * i_total - v_oc;
+              if (residual < 0.0) {
+                lo = mid;
+              } else {
+                hi = mid;
+              }
+            }
+            v_solved = 0.5 * (lo + hi);
+          }
+        }
+        supply_v_ = std::clamp(v_solved, 0.0, 16.0);
+        brownout_ = explicit_brownout_ ||
+                    (supply_v_ < battery_model_.brownout_voltage_v);
+      } else {
+        supply_v_ = v_oc;
+        brownout_ = explicit_brownout_;
+      }
+    }
+    ResolveCommandsAtSupply(supply_v_, profile_accel, profiled, powered_,
+                            raw_volts, applied_volts_);
+
+    std::array<bool, kMaxMotors> stepped{};
+    const bool dynamic_chassis = DynamicChassisActive();
+    if (dynamic_chassis) {
+      // Dynamic swerve drive motors are integrated together with chassis mass
+      // and wheel traction in StepChassisDynamic().
+      for (const auto& module : modules_) {
+        stepped[module.drive] = true;
+      }
+    }
+
+    // Step rigid-body mechanisms (master + followers on shared shaft).
+    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+      if (stepped[i] || config_.motors[i].master_id != 0) continue;
+      if (bound_mechanisms_[i].active) {
+        StepRigidBodyShaft(i, raw_volts, dt_s, stepped);
+      }
+    }
+
+    // Legacy StepAxis for all motors without a MechanismSpec (and not driven
+    // by dynamic chassis).
+    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+      if (stepped[i]) continue;
       const auto& m = config_.motors[i];
       const MotorModel motor = MotorModelFor(m.motor_type.value);
       MechanismModel mech;
@@ -1343,7 +1994,12 @@ class PhysicsSimBackend final : public SimBackendBase {
         }
       }
     }
-    StepChassis(dt_s);
+
+    if (dynamic_chassis) {
+      StepChassisDynamic(raw_volts, dt_s);
+    } else {
+      StepChassis(dt_s);
+    }
     elapsed_s_ += dt_s;
     if (gyro_override_) {
       yaw_rot_ += yaw_rate_rps_ * dt_s;
@@ -1352,6 +2008,322 @@ class PhysicsSimBackend final : public SimBackendBase {
                   options_.gyro_drift_radps * elapsed_s_) /
                  kTau;
       yaw_rate_rps_ = (truth_.omega_radps + options_.gyro_drift_radps) / kTau;
+    }
+  }
+
+  // Coupled 2D rigid-body swerve chassis + wheel friction-circle dynamics.
+  void StepChassisDynamic(const std::array<double, kMaxMotors>& raw_volts,
+                          double dt_s) {
+    if (dt_s <= 0.0 || modules_.empty()) return;
+    constexpr double kGravityMps2 = 9.80665;
+    constexpr double kDefaultWheelInertiaKgM2 = 0.004;
+    constexpr int kSubSteps = 10;
+
+    const std::size_t n_mod = modules_.size();
+    const double n_mod_d = static_cast<double>(n_mod);
+    const double mass = chassis_dynamics_.mass_kg;
+    const double r_true =
+        std::max(1e-6, options_.wheel_radius_m *
+                           (1.0 + options_.wheel_radius_error_frac));
+
+    double moi = chassis_dynamics_.moment_of_inertia_kg_m2;
+    if (moi <= 0.0) {
+      double mean_r2 = 0.0;
+      for (const auto& mod : modules_) {
+        mean_r2 += mod.x_m * mod.x_m + mod.y_m * mod.y_m;
+      }
+      mean_r2 /= n_mod_d;
+      moi = std::max(1e-6, mass * mean_r2);
+    }
+
+    const bool has_traction_limit =
+        chassis_dynamics_.traction_coefficient > 0.0;
+    const double f_max = has_traction_limit
+                             ? chassis_dynamics_.traction_coefficient * mass *
+                                   kGravityMps2 / n_mod_d
+                             : std::numeric_limits<double>::infinity();
+
+    const double h = dt_s / static_cast<double>(kSubSteps);
+    const double supply = std::max(0.0, supply_v_);
+
+    double vx = chassis_vx_body_mps_;
+    double vy = chassis_vy_body_mps_;
+    double omega = chassis_omega_radps_;
+
+    for (int sub = 0; sub < kSubSteps; ++sub) {
+      double fx_total = 0.0;
+      double fy_total = 0.0;
+      double tau_z_total = 0.0;
+      double d_xx = 0.0;
+      double d_yy = 0.0;
+      double d_ww = 0.0;
+
+      // Per-module sub-step workspace (fixed stack arrays, zero heap alloc).
+      std::array<bool, kMaxMotors> slipping{};
+      std::array<bool, kMaxMotors> curr_limited{};
+      std::array<double, kMaxMotors> tau_wheel_arr{};
+      std::array<double, kMaxMotors> f_long_arr{};
+      std::array<double, kMaxMotors> j_wheel_arr{};
+      std::array<double, kMaxMotors> b_wheel_em_arr{};
+      std::array<double, kMaxMotors> v_long_old_arr{};
+      std::array<double, kMaxMotors> v_wheel_old_arr{};
+      std::array<double, kMaxMotors> w_ceil_wheel_arr{};
+      std::array<double, kMaxMotors> ux_arr{};
+      std::array<double, kMaxMotors> uy_arr{};
+
+      for (std::size_t idx = 0; idx < n_mod; ++idx) {
+        const auto& mod = modules_[idx];
+        const std::size_t d = mod.drive;
+        const auto& md = config_.motors[d];
+        const MotorModel motor = MotorModelFor(md.motor_type.value);
+        const double r_ohm = motor.resistance_ohm();
+        const double ke_rad = motor.back_emf_v_per_radps();
+        const double kt = motor.torque_constant_nm_per_a();
+        const double b_m = motor.no_load_damping_nm_per_radps();
+        const double b_em = (kt * ke_rad) / r_ohm;
+        const double dir_d = Direction(d);
+        const double gear_d = Gear(d);
+        const double j_wheel = bound_mechanisms_[d].active
+                                   ? bound_mechanisms_[d].inertia_kg_m2
+                                   : kDefaultWheelInertiaKgM2;
+        j_wheel_arr[idx] = j_wheel;
+
+        const double angle = MechPosition(mod.steer) * kTau;
+        const double ux = std::cos(angle);
+        const double uy = std::sin(angle);
+        const double vx_lat_dir = -uy;
+        const double vy_lat_dir = ux;
+        ux_arr[idx] = ux;
+        uy_arr[idx] = uy;
+
+        const double v_patch_x = vx - omega * mod.y_m;
+        const double v_patch_y = vy + omega * mod.x_m;
+        const double v_long = v_patch_x * ux + v_patch_y * uy;
+        const double v_lat = v_patch_x * vx_lat_dir + v_patch_y * vy_lat_dir;
+        v_long_old_arr[idx] = v_long;
+
+        const double rps_d = axes_[d].rotor_velocity_rps;
+        const double omega_r = rps_d * kTau;
+        const double omega_wheel = dir_d * omega_r / gear_d;
+        const double v_wheel = omega_wheel * r_true;
+        v_wheel_old_arr[idx] = v_wheel;
+
+        double tau_rotor = 0.0;
+        bool is_cl = false;
+        double wheel_em_damp = 0.0;
+        double w_ceil_wheel = std::numeric_limits<double>::infinity();
+
+        if (powered_[d]) {
+          const double ceiling =
+              std::min(md.max_voltage > 0.0 ? md.max_voltage : 12.0, supply);
+          const bool is_tc = (commands_[d].mode == Mode::kTorqueCurrent);
+          const double cmd_v =
+              is_tc ? TorqueCurrentVoltsAt(d, md, commands_[d].demand, supply,
+                                           rps_d)
+                    : raw_volts[d];
+          const double v_lim_cfg =
+              LimitWindingVoltageAt(d, md, cmd_v, supply, rps_d);
+          const double v_lim_rotor = dir_d * v_lim_cfg;
+          const double v_bemf = ke_rad * omega_r;
+          const double i_stator = (v_lim_rotor - v_bemf) / r_ohm;
+          tau_rotor = kt * i_stator - b_m * omega_r;
+
+          double v_ceil_rotor = std::clamp(dir_d * cmd_v, -ceiling, ceiling);
+          if (is_tc) {
+            const double peak_a = std::max(
+                0.0, std::min(md.max_torque_current_a, md.stator_limit_a));
+            const double i_req =
+                std::clamp(commands_[d].demand, -peak_a, peak_a);
+            v_ceil_rotor = dir_d * (i_req > 0.0   ? ceiling
+                                    : i_req < 0.0 ? -ceiling
+                                                  : 0.0);
+          }
+          is_cl = std::abs(v_lim_rotor - v_ceil_rotor) > 1e-9;
+          wheel_em_damp = gear_d * gear_d * (is_cl ? b_m : (b_em + b_m));
+          if (ke_rad > 1e-12) {
+            w_ceil_wheel = std::abs(v_ceil_rotor / ke_rad) / gear_d;
+          }
+        } else {
+          if (md.brake) {
+            tau_rotor = -(b_em + b_m) * omega_r;
+            wheel_em_damp = gear_d * gear_d * (b_em + b_m);
+          } else {
+            tau_rotor = -b_m * omega_r;
+            wheel_em_damp = gear_d * gear_d * b_m;
+          }
+        }
+
+        double tau_wheel = dir_d * gear_d * tau_rotor;
+        if (bound_mechanisms_[d].active) {
+          tau_wheel -=
+              bound_mechanisms_[d].viscous_damping_nm_per_radps * omega_wheel;
+          wheel_em_damp += bound_mechanisms_[d].viscous_damping_nm_per_radps;
+          const double sf = bound_mechanisms_[d].static_friction_nm;
+          if (sf > 0.0) {
+            if (std::abs(omega_wheel) < 1e-9) {
+              if (std::abs(tau_wheel) <= sf) {
+                tau_wheel = 0.0;
+              } else {
+                tau_wheel -= std::copysign(sf, tau_wheel);
+              }
+            } else {
+              tau_wheel -= std::copysign(sf, omega_wheel);
+            }
+          }
+        }
+
+        curr_limited[idx] = is_cl;
+        tau_wheel_arr[idx] = tau_wheel;
+        b_wheel_em_arr[idx] = wheel_em_damp;
+        w_ceil_wheel_arr[idx] = w_ceil_wheel;
+
+        // Longitudinal force: wheel drive torque plus any slip reconciliation
+        // impulse when the wheel is currently spinning relative to ground.
+        const double inv_m_eff_long =
+            (r_true * r_true) / j_wheel + n_mod_d / mass;
+        const double f_sync = (v_wheel - v_long) / (inv_m_eff_long * h);
+        const double f_long_des = tau_wheel / r_true + f_sync;
+
+        // Lateral scrub resistance opposing perpendicular patch velocity.
+        const double lat_arm = mod.x_m * vy_lat_dir - mod.y_m * vx_lat_dir;
+        const double inv_m_lat =
+            n_mod_d * (1.0 / mass + (lat_arm * lat_arm) / moi);
+        const double f_lat_des = -v_lat / (inv_m_lat * h);
+
+        double f_long = f_long_des;
+        double f_lat = f_lat_des;
+        bool is_slip = false;
+        if (has_traction_limit) {
+          const double f_mag = std::hypot(f_long_des, f_lat_des);
+          if (f_mag > f_max) {
+            const double scale = f_max / f_mag;
+            f_long = f_long_des * scale;
+            f_lat = f_lat_des * scale;
+            is_slip = true;
+          }
+        }
+        slipping[idx] = is_slip;
+        f_long_arr[idx] = f_long;
+
+        const double fx_i = f_long * ux + f_lat * vx_lat_dir;
+        const double fy_i = f_long * uy + f_lat * vy_lat_dir;
+        fx_total += fx_i;
+        fy_total += fy_i;
+        tau_z_total += mod.x_m * fy_i - mod.y_m * fx_i;
+
+        // Implicit linear back-EMF damping for non-slipping, voltage-clamped
+        // wheels keeps integration unconditionally stable even at small mass.
+        if (!is_slip && !is_cl) {
+          const double c_long = wheel_em_damp / (r_true * r_true);
+          const double long_arm = mod.x_m * uy - mod.y_m * ux;
+          d_xx += c_long * ux * ux;
+          d_yy += c_long * uy * uy;
+          d_ww += c_long * long_arm * long_arm;
+        }
+      }
+
+      const double vx_old = vx;
+      const double vy_old = vy;
+      const double omega_old = omega;
+
+      const double vx_step = vx + (fx_total * h) / (mass + d_xx * h);
+      const double vy_step = vy + (fy_total * h) / (mass + d_yy * h);
+      const double omega_new = omega + (tau_z_total * h) / (moi + d_ww * h);
+
+      // Exact constant-twist SE(2) pose step using midpoint twist over h.
+      const double vx_avg = 0.5 * (vx_old + vx_step);
+      const double vy_avg = 0.5 * (vy_old + vy_step);
+      const double omega_avg = 0.5 * (omega_old + omega_new);
+      const double d_yaw = omega_avg * h;
+      const double sinc = std::abs(d_yaw) < 1e-6 ? 1.0 - d_yaw * d_yaw / 6.0
+                                                 : std::sin(d_yaw) / d_yaw;
+      const double cosc = std::abs(d_yaw) < 1e-6
+                              ? d_yaw / 2.0 - d_yaw * d_yaw * d_yaw / 24.0
+                              : (1.0 - std::cos(d_yaw)) / d_yaw;
+      const double dx = h * (sinc * vx_avg - cosc * vy_avg);
+      const double dy = h * (cosc * vx_avg + sinc * vy_avg);
+      const double c_yaw = std::cos(truth_.yaw_rad);
+      const double s_yaw = std::sin(truth_.yaw_rad);
+      truth_.x_m += c_yaw * dx - s_yaw * dy;
+      truth_.y_m += s_yaw * dx + c_yaw * dy;
+      truth_.yaw_rad += d_yaw;
+
+      // Rotate body velocity by -d_yaw so inertial field momentum is preserved
+      // as the robot body frame rotates.
+      const double cd = std::cos(d_yaw);
+      const double sd = std::sin(d_yaw);
+      vx = cd * vx_step + sd * vy_step;
+      vy = -sd * vx_step + cd * vy_step;
+      omega = omega_new;
+
+      // Update each drive motor's wheel speed and integrate encoder position.
+      for (std::size_t idx = 0; idx < n_mod; ++idx) {
+        const auto& mod = modules_[idx];
+        const std::size_t d = mod.drive;
+        const double dir_d = Direction(d);
+        const double gear_d = Gear(d);
+        const double old_rps = axes_[d].rotor_velocity_rps;
+        const double v_patch_x = vx - omega * mod.y_m;
+        const double v_patch_y = vy + omega * mod.x_m;
+        const double v_long_new =
+            v_patch_x * ux_arr[idx] + v_patch_y * uy_arr[idx];
+
+        double v_wheel_new = v_long_new;
+        if (slipping[idx]) {
+          // Excess torque spins the wheel independently of ground speed.
+          const double omega_w_old = v_wheel_old_arr[idx] / r_true;
+          const double tau_excess =
+              tau_wheel_arr[idx] - f_long_arr[idx] * r_true;
+          const double damp = curr_limited[idx] ? 0.0 : b_wheel_em_arr[idx];
+          double omega_w_new =
+              omega_w_old + (tau_excess * h) / (j_wheel_arr[idx] + damp * h);
+          const double w_ceil = w_ceil_wheel_arr[idx];
+          if (std::isfinite(w_ceil)) {
+            if (omega_w_old <= w_ceil && omega_w_new > w_ceil) {
+              omega_w_new = w_ceil;
+            } else if (omega_w_old >= -w_ceil && omega_w_new < -w_ceil) {
+              omega_w_new = -w_ceil;
+            }
+          }
+          v_wheel_new = omega_w_new * r_true;
+          // Clean re-adhesion if the slipping wheel crossed ground speed.
+          const double slip_old = v_wheel_old_arr[idx] - v_long_old_arr[idx];
+          const double slip_new = v_wheel_new - v_long_new;
+          if (slip_old * slip_new < 0.0) {
+            v_wheel_new = v_long_new;
+          }
+        }
+
+        const double new_rps = (v_wheel_new / r_true) * gear_d / (dir_d * kTau);
+        axes_[d].rotor_velocity_rps = new_rps;
+        axes_[d].rotor_position_rot += 0.5 * (old_rps + new_rps) * h;
+      }
+    }
+
+    chassis_vx_body_mps_ = vx;
+    chassis_vy_body_mps_ = vy;
+    chassis_omega_radps_ = omega;
+    const double c_end = std::cos(truth_.yaw_rad);
+    const double s_end = std::sin(truth_.yaw_rad);
+    truth_.vx_mps = c_end * vx - s_end * vy;
+    truth_.vy_mps = s_end * vx + c_end * vy;
+    truth_.omega_radps = omega;
+
+    // Update final applied_volts_ on each dynamic drive motor for consistent
+    // voltage/current reporting.
+    for (auto& mod : modules_) {
+      const std::size_t d = mod.drive;
+      mod.previous_surface_speed_mps =
+          axes_[d].rotor_velocity_rps * Direction(d) / Gear(d) * kTau * r_true;
+      if (powered_[d]) {
+        const auto& md = config_.motors[d];
+        if (commands_[d].mode == Mode::kTorqueCurrent && md.master_id == 0) {
+          applied_volts_[d] = LimitWindingVoltage(
+              d, md, TorqueCurrentVolts(d, md, commands_[d].demand));
+        } else {
+          applied_volts_[d] = LimitWindingVoltage(d, md, raw_volts[d]);
+        }
+      }
     }
   }
 
@@ -1468,6 +2440,22 @@ class PhysicsSimBackend final : public SimBackendBase {
   };
   std::vector<HardStop> hard_stops_;
   std::array<BoundHardStop, kMaxMotors> bound_hard_stops_{};
+  struct BoundMechanism {
+    bool active{false};
+    double inertia_kg_m2{0.0};
+    LoadKind load{LoadKind::kRoller};
+    double viscous_damping_nm_per_radps{0.0};
+    double static_friction_nm{0.0};
+  };
+  std::vector<MechanismSpec> mechanisms_;
+  std::array<BoundMechanism, kMaxMotors> bound_mechanisms_{};
+  BatteryModel battery_model_{};
+  std::optional<double> supply_voltage_override_;
+  bool explicit_brownout_{false};
+  ChassisDynamics chassis_dynamics_{};
+  double chassis_vx_body_mps_{0.0};
+  double chassis_vy_body_mps_{0.0};
+  double chassis_omega_radps_{0.0};
   std::vector<SwerveModuleSpec> configured_modules_;
   double supply_v_{kSimRestingSupplyV};
   double yaw_rot_{0.0};
