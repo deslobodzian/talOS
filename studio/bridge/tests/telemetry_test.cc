@@ -1809,5 +1809,204 @@ TEST(ClientFeed, CoalescedAlertActivationIsDeliveredBeforeClearing) {
   EXPECT_TRUE(mirror.Equals(state));
 }
 
+// REQ-CONTRACT-28, REQ-OPS-23
+// A dictionary re-sent with the same (stream_id, dictionary_id) is accepted
+// without mutating cached state only when its decoded channels are identical;
+// a mismatched dictionary under the same id is rejected so state.dictionary
+// never diverges from state.values/state.present or a ClientFeed's arrays.
+TEST(TelemetryJson, RejectsSameIdDictionaryMismatchWithoutMutatingState) {
+  TelemetryState state = SmallState();
+  ClientFeed feed;
+  Mirror mirror;
+  const auto pump = [&](std::int64_t now) {
+    feed.Pump(
+        state, now, [](std::size_t) { return true; },
+        [&](std::string_view page) {
+          mirror.Apply(page);
+          return true;
+        });
+  };
+  pump(0);
+  ASSERT_TRUE(feed.current(state));
+  ASSERT_EQ(state.dictionary.size(), 4u);
+  ASSERT_EQ(state.values.size(), 4u);
+  ASSERT_EQ(state.present.size(), 4u);
+
+  // Larger dictionary claiming the exact same (stream_id, dictionary_id).
+  std::vector<ChannelDef> larger = SmallDictionary();
+  larger.push_back({"extra/a", "m", {}, Talos::Telemetry::ChannelKind_Double});
+  larger.push_back({"extra/b", "m", {}, Talos::Telemetry::ChannelKind_Double});
+  EXPECT_FALSE(IngestAll(state, DictionaryPages(larger, kStream, kDictionaryId),
+                         1'100'000'000));
+  EXPECT_EQ(state.dictionary.size(), 4u);
+  EXPECT_EQ(state.values.size(), 4u);
+  EXPECT_EQ(state.present.size(), 4u);
+  EXPECT_TRUE(state.has_frame);
+
+  // Same channel count and (stream_id, dictionary_id), but different channel.
+  std::vector<ChannelDef> altered = SmallDictionary("pose/other");
+  EXPECT_FALSE(IngestAll(
+      state, DictionaryPages(altered, kStream, kDictionaryId), 1'200'000'000));
+  EXPECT_EQ(state.dictionary[2].name, "pose/valid");
+  EXPECT_TRUE(state.has_frame);
+
+  // Identical dictionary repeat (even with a newer sequence_id / timestamp_ns)
+  // succeeds and preserves cached frame state.
+  {
+    std::vector<std::string> repeat_pages;
+    flatbuffers::FlatBufferBuilder builder;
+    const auto dict = SmallDictionary();
+    talos::telemetry::EncodeDictionaryPages(
+        builder,
+        PageHeader{kStream, 99, 999'999, kDictionaryId,
+                   static_cast<std::uint32_t>(dict.size())},
+        dict, [&](std::span<const std::uint8_t> page) {
+          repeat_pages.emplace_back(reinterpret_cast<const char*>(page.data()),
+                                    page.size());
+        });
+    EXPECT_TRUE(IngestAll(state, repeat_pages, 1'300'000'000));
+    EXPECT_TRUE(state.has_frame);
+  }
+
+  // A subsequent delta value page and ClientFeed::Pump stay in bounds.
+  {
+    flatbuffers::FlatBufferBuilder builder;
+    const Talos::Telemetry::Pose chassis{1.5, 2.5, 0, 0, 0, 0.5};
+    const std::uint32_t ch = 0;
+    const std::uint64_t val = RawFromDouble(3.25);
+    std::vector<std::string> delta_pages;
+    ASSERT_TRUE(talos::telemetry::EncodeValuePages(
+        builder, PageHeader{kStream, 8, 123456800, kDictionaryId, 4}, chassis,
+        /*keyframe=*/false, {&ch, 1}, {&val, 1}, {},
+        [&](std::span<const std::uint8_t> page,
+            const talos::telemetry::PageSpan&) {
+          delta_pages.emplace_back(reinterpret_cast<const char*>(page.data()),
+                                   page.size());
+        }));
+    ASSERT_TRUE(IngestAll(state, delta_pages, 1'400'000'000));
+  }
+  pump(1'400'000'000);
+  EXPECT_TRUE(feed.current(state));
+  EXPECT_TRUE(mirror.Equals(state));
+  EXPECT_EQ(state.values[0], RawFromDouble(3.25));
+}
+
+// REQ-CONTRACT-28
+// Multi-page dictionary assembly rejects empty pages, page_count exceeding
+// channel_count (or kMaxChannels), oversized pages, and cumulative buffered
+// bytes past the pending-dictionary cap, while still accepting a single-page
+// empty dictionary.
+TEST(TelemetryPages, RejectsEmptyMultiPageAndOversizedPendingDictionary) {
+  const auto raw_dict_page =
+      [](std::uint16_t page, std::uint16_t page_count,
+         std::uint32_t channel_count, std::uint32_t first_channel,
+         std::span<const ChannelDef> entries, std::uint32_t dict_id = 777) {
+        flatbuffers::FlatBufferBuilder builder;
+        talos::telemetry::DictionaryScratch scratch;
+        talos::telemetry::detail::FinishDictionaryPage(
+            builder, scratch, PageHeader{kStream, 0, 1, dict_id, channel_count},
+            page, page_count, first_channel, entries);
+        return std::string{
+            reinterpret_cast<const char*>(builder.GetBufferPointer()),
+            builder.GetSize()};
+      };
+
+  // 1. Empty page with huge page_count (65535) is rejected without buffering.
+  {
+    TelemetryState state;
+    EXPECT_FALSE(IngestTelemetry(state, raw_dict_page(0, 65535, 0, 0, {}), 0));
+    EXPECT_TRUE(state.pending_dictionary.pages.empty());
+  }
+
+  // 2. Empty page with page_count > 1 and channel_count > 0 is rejected.
+  {
+    TelemetryState state;
+    EXPECT_FALSE(IngestTelemetry(state, raw_dict_page(0, 2, 2, 0, {}), 0));
+    EXPECT_TRUE(state.pending_dictionary.pages.empty());
+  }
+
+  // 3. page_count > channel_count is rejected immediately on page 0.
+  {
+    TelemetryState state;
+    const std::vector<ChannelDef> one{
+        {"test/ch0", "", {}, Talos::Telemetry::ChannelKind_Double}};
+    EXPECT_FALSE(IngestTelemetry(state, raw_dict_page(0, 3, 2, 0, one), 0));
+    EXPECT_TRUE(state.pending_dictionary.pages.empty());
+  }
+
+  // 4. Multi-page dictionary whose buffered bytes exceed the 4 MiB cap is
+  //    rejected and pending pages are cleared.
+  {
+    TelemetryState state;
+    // Build a ~15 KiB single-channel entry (under kMaxDictionaryPageBytes).
+    constexpr std::uint16_t kPages = 300;  // ~4.5 MiB total > 4 MiB cap
+    std::vector<std::string> big_labels;
+    big_labels.reserve(70);
+    for (int i = 0; i < 70; ++i) {
+      big_labels.emplace_back(200, static_cast<char>('a' + (i % 26)));
+    }
+    bool rejected = false;
+    for (std::uint16_t p = 0; p < kPages; ++p) {
+      const std::vector<ChannelDef> one{{"test/enum_" + std::to_string(p), "",
+                                         big_labels,
+                                         Talos::Telemetry::ChannelKind_UInt}};
+      const std::string bytes = raw_dict_page(p, kPages, kPages, p, one, 888);
+      ASSERT_LE(bytes.size(), talos::telemetry_wire::kMaxDictionaryPageBytes);
+      ASSERT_GT(bytes.size(), 14000u);
+      if (!IngestTelemetry(state, bytes, p)) {
+        rejected = true;
+        break;
+      }
+    }
+    EXPECT_TRUE(rejected);
+    EXPECT_TRUE(state.pending_dictionary.pages.empty());
+  }
+
+  // 5. A legitimate single-page empty dictionary (0 channels) is still valid.
+  {
+    TelemetryState state;
+    EXPECT_TRUE(IngestTelemetry(state, raw_dict_page(0, 1, 0, 0, {}, 999), 0));
+    EXPECT_TRUE(state.has_dictionary);
+    EXPECT_TRUE(state.dictionary.empty());
+  }
+}
+
+// REQ-OPS-23, REQ-OPS-30, REQ-OPS-36
+// A one-shot deadline timer that fires even 1 ns before its recorded due_ns
+// (e.g. timer coalescing or clock slack) must clear due_ns in OnFired() so the
+// next pass re-arms the timer instead of hanging permanently.
+TEST(DeadlineTimer, RearmsAfterEarlyOneShotFire) {
+  DeadlineTimer timer;
+  constexpr std::int64_t kT0 = 1'000'000'000;
+  constexpr std::int64_t kDuty = 250'000'000;
+
+  // Initial arm: 250 ms.
+  ASSERT_EQ(timer.ArmMs(kT0, kT0 + kDuty), std::optional<int>{250});
+  EXPECT_EQ(timer.due_ns, kT0 + kDuty);
+
+  // Mid-interval non-timer wake with unchanged next_ns keeps existing arm.
+  EXPECT_EQ(timer.ArmMs(kT0 + 100'000'000, kT0 + kDuty), std::nullopt);
+
+  // Earlier duty re-arms sooner.
+  EXPECT_EQ(timer.ArmMs(kT0 + 100'000'000, kT0 + 150'000'000),
+            std::optional<int>{50});
+  EXPECT_EQ(timer.due_ns, kT0 + 150'000'000);
+
+  // One-shot fires 1 ns early; service advances next_ns past the old due_ns.
+  // Without OnFired(), ArmMs would see due_ns > now_ns && next_ns >= due_ns
+  // and skip arming permanently.
+  const std::int64_t early_now = timer.due_ns - 1;
+  timer.OnFired();
+  EXPECT_EQ(timer.due_ns, 0);
+  EXPECT_EQ(timer.ArmMs(early_now, early_now + kDuty + 1),
+            std::optional<int>{251});
+
+  // Even when the next duty is still just 1 ns away after an early fire, ArmMs
+  // returns at least 1 ms (never 0, which disarms us_timer_set).
+  const std::int64_t early_again = timer.due_ns - 1;
+  timer.OnFired();
+  EXPECT_EQ(timer.ArmMs(early_again, early_again + 1), std::optional<int>{1});
+}
+
 }  // namespace
 }  // namespace studio

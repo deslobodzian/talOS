@@ -1,13 +1,16 @@
 #include "studio/review/session.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <charconv>
 #include <cmath>
 #include <cstring>
-#include <fstream>
 #include <iostream>
-#include <iterator>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -143,42 +146,114 @@ bool SelectCanonicalAlertStream(TopicBuild& topic,
 constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{4} << 20;
 constexpr std::uintmax_t kMaxConfigBytes = std::uintmax_t{1} << 20;
 
-// Reads a regular TOML file up to kMaxConfigBytes without hanging on FIFOs or
-// device nodes or allocating unbounded memory (REQ-OPS-42).
-std::optional<toml::table> ReadBoundedToml(const fs::path& path) {
+// Reads a non-symlink regular file up to `max_bytes` using O_NOFOLLOW +
+// O_NONBLOCK + fstat + bounded chunked reads so symlinks, FIFOs, device nodes,
+// and growing files never escape confinement, hang, or allocate unbounded
+// memory (REQ-OPS-42, REQ-SAFE-35).
+std::optional<std::string> ReadBoundedRegularFile(const fs::path& path,
+                                                  std::uintmax_t max_bytes) {
   std::error_code ec;
-  const fs::file_status st = fs::status(path, ec);
-  if (ec || !fs::is_regular_file(st)) return std::nullopt;
-  const std::uintmax_t bytes = fs::file_size(path, ec);
-  if (ec || bytes == 0 || bytes > kMaxConfigBytes) return std::nullopt;
-  std::ifstream stream{path, std::ios::binary};
-  if (!stream.is_open()) return std::nullopt;
+  const fs::file_status st = fs::symlink_status(path, ec);
+  if (ec || fs::is_symlink(st) || !fs::is_regular_file(st)) return std::nullopt;
+  struct ScopedFd {
+    int fd{-1};
+    ~ScopedFd() {
+      if (fd >= 0) ::close(fd);
+    }
+  };
+  const ScopedFd file{
+      ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)};
+  if (file.fd < 0) return std::nullopt;
+  struct stat sb {};
+  if (::fstat(file.fd, &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size <= 0 ||
+      static_cast<std::uintmax_t>(sb.st_size) > max_bytes) {
+    return std::nullopt;
+  }
   std::string content;
-  content.reserve(static_cast<std::size_t>(bytes));
+  content.reserve(static_cast<std::size_t>(sb.st_size));
   std::array<char, 8192> chunk{};
-  while (stream) {
-    stream.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
-    const std::streamsize got = stream.gcount();
-    if (got <= 0) break;
-    if (content.size() + static_cast<std::size_t>(got) > kMaxConfigBytes) {
+  for (;;) {
+    const ssize_t got = ::read(file.fd, chunk.data(), chunk.size());
+    if (got == 0) break;
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      return std::nullopt;
+    }
+    if (content.size() + static_cast<std::size_t>(got) > max_bytes) {
       return std::nullopt;
     }
     content.append(chunk.data(), static_cast<std::size_t>(got));
   }
-  if (stream.bad() || content.empty()) return std::nullopt;
+  if (content.empty()) return std::nullopt;
+  return content;
+}
+
+// Resolves `target` strictly within `session_dir` (`canonical_root` is
+// fs::canonical(session_dir)), rejecting any symlink leaf, any symlink
+// directory component inside `session_dir`, non-regular files, and any path
+// escaping `canonical_root` (REQ-OPS-42, REQ-SAFE-35).
+std::optional<fs::path> ConfinedRegularFile(const fs::path& session_dir,
+                                            const fs::path& canonical_root,
+                                            const fs::path& target) {
+  std::error_code ec;
+  const fs::path abs_dir = fs::absolute(session_dir, ec).lexically_normal();
+  if (ec) return std::nullopt;
+  const fs::path path = target.is_absolute() ? target : abs_dir / target;
+  const fs::file_status leaf_st = fs::symlink_status(path, ec);
+  if (ec || fs::is_symlink(leaf_st) || !fs::is_regular_file(leaf_st)) {
+    return std::nullopt;
+  }
+  fs::path canonical_path = fs::canonical(path, ec);
+  if (ec) return std::nullopt;
+  const fs::path rel = canonical_path.lexically_relative(canonical_root);
+  if (rel.empty() || rel == "." || rel.is_absolute() || *rel.begin() == "..") {
+    return std::nullopt;
+  }
+  // Reject any symlink component inside the session directory (while allowing
+  // OS-level symlink ancestors above `session_dir`, e.g. /var -> /private/var).
+  const fs::path norm = path.lexically_normal();
+  fs::path check_base;
+  fs::path check_rel = norm.lexically_relative(abs_dir);
+  if (!check_rel.empty() && !check_rel.is_absolute() &&
+      *check_rel.begin() != "..") {
+    check_base = abs_dir;
+  } else {
+    check_rel = norm.lexically_relative(canonical_root);
+    if (check_rel.empty() || check_rel.is_absolute() ||
+        *check_rel.begin() == "..") {
+      return std::nullopt;
+    }
+    check_base = canonical_root;
+  }
+  fs::path cur = check_base;
+  for (const fs::path& part : check_rel) {
+    cur /= part;
+    const fs::file_status st = fs::symlink_status(cur, ec);
+    if (ec || fs::is_symlink(st)) return std::nullopt;
+  }
+  return canonical_path;
+}
+
+// Reads a confined, non-symlink regular TOML file up to kMaxConfigBytes
+// without hanging on FIFOs or device nodes or allocating unbounded memory
+// (REQ-OPS-42, REQ-SAFE-35).
+std::optional<toml::table> ReadBoundedToml(const fs::path& path) {
+  const auto content = ReadBoundedRegularFile(path, kMaxConfigBytes);
+  if (!content) return std::nullopt;
   try {
-    return toml::parse(content, path.string());
+    return toml::parse(*content, path.string());
   } catch (const toml::parse_error&) {
     return std::nullopt;
   }
 }
 
-// Extracts `[studio] pose_topic` from `config_path` (following at most one
-// direct top-level `include`, matching ResolveRobotConfig without expanding
-// subsystem manifests or unbounded includes). Returns std::nullopt on any
-// missing, non-regular, oversized, or unparseable file.
+// Extracts `[studio] pose_topic` from `config_path` confined within
+// `session_dir` (following at most one direct top-level `include`, also
+// confined within `session_dir`, without following symlinks or expanding
+// subsystem manifests). Returns std::nullopt on any missing, symlinked,
+// out-of-session, non-regular, oversized, or unparseable file.
 std::optional<std::string> ReadPoseTopicFromConfig(
-    const fs::path& config_path) {
+    const fs::path& session_dir, const fs::path& config_path) {
   const auto extract =
       [](const toml::table& tbl,
          bool& explicit_invalid) -> std::optional<std::string> {
@@ -197,7 +272,13 @@ std::optional<std::string> ReadPoseTopicFromConfig(
     return val;
   };
 
-  const auto root = ReadBoundedToml(config_path);
+  std::error_code ec;
+  const fs::path canonical_root = fs::canonical(session_dir, ec);
+  if (ec) return std::nullopt;
+  const auto confined_root =
+      ConfinedRegularFile(session_dir, canonical_root, config_path);
+  if (!confined_root) return std::nullopt;
+  const auto root = ReadBoundedToml(*confined_root);
   if (!root) return std::nullopt;
   bool explicit_invalid = false;
   if (auto pose = extract(*root, explicit_invalid)) return pose;
@@ -206,12 +287,15 @@ std::optional<std::string> ReadPoseTopicFromConfig(
   if (root->contains("include")) {
     const auto inc = (*root)["include"].value_exact<std::string>();
     if (!inc || inc->empty()) return std::nullopt;
-    const fs::path base_dir = config_path.parent_path();
+    const fs::path base_dir = confined_root->parent_path();
     const fs::path inc_rel{*inc};
     const fs::path inc_path = inc_rel.is_absolute() || base_dir.empty()
                                   ? inc_rel
                                   : base_dir / inc_rel;
-    const auto base = ReadBoundedToml(inc_path);
+    const auto confined_inc =
+        ConfinedRegularFile(session_dir, canonical_root, inc_path);
+    if (!confined_inc) return std::nullopt;
+    const auto base = ReadBoundedToml(*confined_inc);
     if (!base) return std::nullopt;
     return extract(*base, explicit_invalid);
   }
@@ -260,18 +344,10 @@ void ReadManifestRuns(const fs::path& manifest_path,
                       std::int64_t origin_wall_ns,
                       std::vector<RunInterval>& runs,
                       std::uint64_t& runs_dropped) {
-  std::error_code error;
-  if (fs::is_symlink(manifest_path, error) ||
-      !fs::is_regular_file(manifest_path, error)) {
-    return;
-  }
-  const auto bytes = fs::file_size(manifest_path, error);
-  if (error || bytes == 0 || bytes > kMaxManifestBytes) return;
-  std::ifstream stream{manifest_path};
-  if (!stream.is_open()) return;
-  const auto manifest = nlohmann::json::parse(
-      std::string{std::istreambuf_iterator<char>{stream}, {}}, nullptr,
-      /*allow_exceptions=*/false);
+  const auto content = ReadBoundedRegularFile(manifest_path, kMaxManifestBytes);
+  if (!content) return;
+  const auto manifest = nlohmann::json::parse(*content, nullptr,
+                                              /*allow_exceptions=*/false);
   if (!manifest.is_object()) return;
   const auto nodes = manifest.find("nodes");
   if (nodes == manifest.end() || !nodes->is_array()) return;
@@ -566,10 +642,6 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
       log_file.max_lag_s =
           std::max(log_file.max_lag_s, publish_second - cp_second);
     }
-    log_file.checkpoints[cp_idx].sources |= SourceBit(r.header.source_id);
-    if (r.header.source_id >= 63) {
-      RecordOverflowSource(log_file, builds[file], cp_idx, r.header.source_id);
-    }
     if (r.source == nullptr || r.payload.empty()) return true;
     FileBuild& build = builds[file];
     const std::uint16_t id = r.header.source_id;
@@ -588,48 +660,58 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
                    r.payload);
     }
     if (build.topic[id] < 0) return true;
+    log_file.checkpoints[cp_idx].sources |= SourceBit(id);
+    if (id >= 63) {
+      RecordOverflowSource(log_file, build, cp_idx, id);
+    }
     const bool is_send =
         r.header.kind == static_cast<std::uint16_t>(EventKind::SEND);
     build.kinds[id] |= is_send ? 1 : 2;
     const auto topic_idx = static_cast<std::size_t>(build.topic[id]);
     TopicBuild& topic = indexer.topics[topic_idx];
     // A hardware topic's channels are what its packets hold: learned from
-    // its first packet in each second.
-    if (topic.decoder == Decoder::kHardware && topic.decoded_second != second) {
-      topic.decoded_second = second;
-      FlattenHardware(topic.name, topic.hardware, r.payload, samples);
-      for (const HardwareSample& sample : samples) {
-        if (!sample.null)
-          topic.hardware_channels.emplace(sample.name, sample.kind);
+    // its first packet in each second. Never decode foreign-protocol hardware
+    // or Driver Station packets (REQ-OPS-51).
+    if (topic.decoder == Decoder::kHardware) {
+      if (!protocol.foreign() && topic.decoded_second != second) {
+        topic.decoded_second = second;
+        FlattenHardware(topic.name, topic.hardware, r.payload, samples);
+        for (const HardwareSample& sample : samples) {
+          if (!sample.null)
+            topic.hardware_channels.emplace(sample.name, sample.kind);
+        }
       }
     } else if (topic.decoder == Decoder::kDriverStation) {
-      std::array<std::uint64_t, talos::telemetry::kDriverStationChannelCount>
-          values{};
-      if (talos::telemetry::ReadDriverStation(r.payload, values)) {
-        const std::int64_t publish_ns = r.header.publish_time_ns;
-        ModeStream& stream = mode_streams[{log_file.process, is_send}];
-        if (publish_ns >= stream.last_publish_ns) {
-          stream.last_publish_ns = publish_ns;
-          const ModeKind mode = ModeFromDriverStation(values);
-          const bool fms = values[6] != 0;
-          if (stream.intervals.empty()) {
-            stream.intervals.push_back({publish_ns, publish_ns, mode, fms});
-            stream.last_mode = mode;
-            stream.last_fms = fms;
-          } else if (mode != stream.last_mode || fms != stream.last_fms) {
-            if (!stream.closed_last) {
-              stream.intervals.back().end_ns = publish_ns;
-              if (stream.intervals.size() < kMaxTimelineModes) {
-                stream.intervals.push_back({publish_ns, publish_ns, mode, fms});
+      if (!protocol.foreign()) {
+        std::array<std::uint64_t, talos::telemetry::kDriverStationChannelCount>
+            values{};
+        if (talos::telemetry::ReadDriverStation(r.payload, values)) {
+          const std::int64_t publish_ns = r.header.publish_time_ns;
+          ModeStream& stream = mode_streams[{log_file.process, is_send}];
+          if (publish_ns >= stream.last_publish_ns) {
+            stream.last_publish_ns = publish_ns;
+            const ModeKind mode = ModeFromDriverStation(values);
+            const bool fms = values[6] != 0;
+            if (stream.intervals.empty()) {
+              stream.intervals.push_back({publish_ns, publish_ns, mode, fms});
+              stream.last_mode = mode;
+              stream.last_fms = fms;
+            } else if (mode != stream.last_mode || fms != stream.last_fms) {
+              if (!stream.closed_last) {
+                stream.intervals.back().end_ns = publish_ns;
+                if (stream.intervals.size() < kMaxTimelineModes) {
+                  stream.intervals.push_back(
+                      {publish_ns, publish_ns, mode, fms});
+                } else {
+                  stream.closed_last = true;
+                  ++stream.dropped;
+                }
               } else {
-                stream.closed_last = true;
                 ++stream.dropped;
               }
-            } else {
-              ++stream.dropped;
+              stream.last_mode = mode;
+              stream.last_fms = fms;
             }
-            stream.last_mode = mode;
-            stream.last_fms = fms;
           }
         }
       }
@@ -853,11 +935,17 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
   }
   ReadManifestRuns(dir / "manifest.json", session->origin_wall_ns_,
                    session->runs_, session->runs_dropped_);
-  const std::string config_path =
-      talos::launcher::SessionConfigPath("", {dir.string()});
-  if (!config_path.empty()) {
-    if (auto pose = ReadPoseTopicFromConfig(config_path)) {
-      session->pose_topic_ = std::move(*pose);
+  std::error_code manifest_ec;
+  const fs::file_status manifest_st =
+      fs::symlink_status(dir / "manifest.json", manifest_ec);
+  if (!manifest_ec && !fs::is_symlink(manifest_st) &&
+      fs::is_regular_file(manifest_st)) {
+    const std::string config_path =
+        talos::launcher::SessionConfigPath("", {dir.string()});
+    if (!config_path.empty()) {
+      if (auto pose = ReadPoseTopicFromConfig(dir, config_path)) {
+        session->pose_topic_ = std::move(*pose);
+      }
     }
   }
   return session;

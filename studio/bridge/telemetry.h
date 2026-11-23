@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -39,6 +40,13 @@
 
 namespace studio {
 
+// Upper bound on total buffered bytes across an in-progress multi-page
+// dictionary (REQ-CONTRACT-28). At 16 KiB per slot, this allows 256 full
+// dictionary pages (far above any robot's 2048-channel dictionary) while
+// preventing unbounded buffering from malformed or adversarial multi-page
+// streams.
+inline constexpr std::size_t kMaxPendingDictionaryBytes = std::size_t{4} << 20;
+
 struct TelemetryChannelInfo {
   std::string name;
   std::string unit;
@@ -46,6 +54,7 @@ struct TelemetryChannelInfo {
   ChannelKind kind{Talos::Telemetry::ChannelKind_Double};
   // Not None: a Bool alert channel of that level (talOS/NAMING.md).
   AlertLevel alert{Talos::Telemetry::AlertLevel_None};
+  bool operator==(const TelemetryChannelInfo&) const = default;
 };
 
 struct TelemetryPose {
@@ -94,6 +103,9 @@ struct TelemetryState {
     std::uint64_t stream_id{0};
     std::uint32_t dictionary_id{0};
     std::uint32_t page_count{0};
+    std::uint32_t expected_channels{0};
+    std::uint32_t received_channels{0};
+    std::size_t bytes{0};
     std::vector<std::string> pages;
   } pending_dictionary;
   struct {
@@ -178,42 +190,87 @@ inline bool IngestTelemetry(TelemetryState& state, std::string_view payload,
   }
 
   if (frame->dictionary() != nullptr) {
-    if (frame->values() != nullptr || frame->channels() != nullptr) {
+    auto& pending = state.pending_dictionary;
+    const auto reset_pending = [&pending] {
+      pending.pages.clear();
+      pending.bytes = 0;
+      pending.expected_channels = 0;
+      pending.received_channels = 0;
+    };
+    if (frame->values() != nullptr || frame->channels() != nullptr ||
+        payload.size() > talos::telemetry_wire::kMaxDictionaryPageBytes) {
       return false;
     }
-    auto& pending = state.pending_dictionary;
+    const auto page_entries =
+        static_cast<std::uint32_t>(frame->dictionary()->size());
+    if (frame->page_count() > 1 &&
+        (page_entries == 0 || frame->page_count() > frame->channel_count())) {
+      if (pending.stream_id == frame->stream_id() &&
+          pending.dictionary_id == frame->dictionary_id()) {
+        reset_pending();
+      }
+      return false;
+    }
     if (frame->page() == 0) {
+      const std::uint32_t remaining_pages = frame->page_count() - 1;
+      if (frame->first_channel() != 0 ||
+          page_entries > frame->channel_count() ||
+          (frame->page_count() > 1 &&
+           page_entries + remaining_pages > frame->channel_count()) ||
+          payload.size() > kMaxPendingDictionaryBytes) {
+        reset_pending();
+        return false;
+      }
       pending.stream_id = frame->stream_id();
       pending.dictionary_id = frame->dictionary_id();
       pending.page_count = frame->page_count();
+      pending.expected_channels = frame->channel_count();
+      pending.received_channels = 0;
+      pending.bytes = 0;
       pending.pages.clear();
     } else if (pending.pages.size() != frame->page() ||
                pending.stream_id != frame->stream_id() ||
                pending.dictionary_id != frame->dictionary_id() ||
                pending.page_count != frame->page_count()) {
-      pending.pages.clear();  // A page went missing; wait for the next one.
+      reset_pending();  // A page went missing; wait for the next one.
       return true;
+    } else {
+      const std::uint32_t remaining_pages =
+          pending.page_count - 1 - frame->page();
+      if (frame->channel_count() != pending.expected_channels ||
+          frame->first_channel() != pending.received_channels ||
+          page_entries >
+              pending.expected_channels - pending.received_channels ||
+          pending.received_channels + page_entries + remaining_pages >
+              pending.expected_channels ||
+          payload.size() > kMaxPendingDictionaryBytes - pending.bytes) {
+        reset_pending();
+        return false;
+      }
     }
     pending.pages.emplace_back(payload);
+    pending.bytes += payload.size();
+    pending.received_channels += page_entries;
     if (pending.pages.size() < pending.page_count) return true;
 
     std::vector<TelemetryChannelInfo> dictionary;
     std::vector<std::string> pages = std::move(pending.pages);
-    pending.pages.clear();
+    reset_pending();
     if (!detail::DecodeDictionary(pages, frame->channel_count(), dictionary)) {
       return false;
     }
-    if (!state.has_dictionary || frame->stream_id() != state.stream_id ||
-        frame->dictionary_id() != state.dictionary_id) {
-      state.has_frame = false;
-      state.values.clear();
-      state.present.clear();
-      state.pending_tick.active = false;
-      state.alerts.clear();
-      for (std::uint32_t i = 0; i < dictionary.size(); ++i) {
-        if (dictionary[i].alert != Talos::Telemetry::AlertLevel_None) {
-          state.alerts.push_back({.channel = i});
-        }
+    if (state.has_dictionary && frame->stream_id() == state.stream_id &&
+        frame->dictionary_id() == state.dictionary_id) {
+      return dictionary == state.dictionary;
+    }
+    state.has_frame = false;
+    state.values.clear();
+    state.present.clear();
+    state.pending_tick.active = false;
+    state.alerts.clear();
+    for (std::uint32_t i = 0; i < dictionary.size(); ++i) {
+      if (dictionary[i].alert != Talos::Telemetry::AlertLevel_None) {
+        state.alerts.push_back({.channel = i});
       }
     }
     state.dictionary = std::move(dictionary);
@@ -1118,6 +1175,31 @@ struct WakeSchedule {
       }
     });
     return std::max(next, now_ns + 1);
+  }
+};
+
+// Tracks the one-shot OS deadline timer (us_timer_set with repeat == 0) so
+// an early wake (clock slack or timer coalescing firing before due_ns) never
+// leaves the event loop permanently disarmed (REQ-OPS-23, REQ-OPS-30,
+// REQ-OPS-36).
+struct DeadlineTimer {
+  std::int64_t due_ns{0};
+
+  // Called by the one-shot timer callback once the OS has fired and disarmed
+  // the timer.
+  void OnFired() { due_ns = 0; }
+
+  // Returns the millisecond delay (>= 1) to arm via us_timer_set when the
+  // timer has fired, is past due, or would fire after `next_ns`; returns
+  // std::nullopt when the currently armed one-shot still fires in time.
+  std::optional<int> ArmMs(std::int64_t now_ns, std::int64_t next_ns) {
+    if (due_ns > now_ns && next_ns >= due_ns) return std::nullopt;
+    const std::int64_t delta_ns = std::max<std::int64_t>(1, next_ns - now_ns);
+    const std::int64_t ms_i64 = (delta_ns + 999'999) / 1'000'000;
+    const int ms = static_cast<int>(
+        std::min<std::int64_t>(ms_i64, std::numeric_limits<int>::max()));
+    due_ns = now_ns + std::int64_t{ms} * 1'000'000;
+    return ms;
   }
 };
 

@@ -3183,5 +3183,295 @@ TEST_F(ReviewTest, BridgeVsManifestProtocolDisagreementWarnsAndUsesBridge) {
   }
 }
 
+// Guards REQ-OPS-42, REQ-SAFE-35: manifest.json config_path and TOML includes
+// cannot escape the session directory or follow symlinks; IsSession and
+// ReadEntry reject symlinked manifest.json and .tlog entries.
+// REQ-OPS-42, REQ-SAFE-35
+TEST_F(ReviewTest, RejectsSymlinksAndOutsideConfigPathsInSessionAndManifest) {
+  const std::filesystem::path outside_toml =
+      Directory() + "/outside_robot.toml";
+  std::ofstream{outside_toml}
+      << "[studio]\npose_topic = \"/leaked/state\"\n\n[subsystems]\n";
+
+  // 1. config_path pointing outside the session directory (absolute or ../)
+  //    or via a symlink is refused -> pose_topic == null.
+  {
+    const std::string dir = Library() + "/pose_escape";
+    testing::WriteFixtureSession(dir);
+    std::filesystem::create_symlink(outside_toml, dir + "/link_out.toml");
+    std::ofstream{dir + "/real_in.toml"}
+        << "[studio]\npose_topic = \"/inside/state\"\n";
+    std::filesystem::create_symlink(dir + "/real_in.toml",
+                                    dir + "/link_in.toml");
+    std::ofstream{dir + "/inc_rel.toml"}
+        << "include = \"../../outside_robot.toml\"\n";
+    std::ofstream{dir + "/inc_abs.toml"} << "include = \""
+                                         << outside_toml.string() << "\"\n";
+    std::ofstream{dir + "/inc_sym.toml"} << "include = \"link_in.toml\"\n";
+
+    const std::string base_manifest = ReadFile(dir + "/manifest.json");
+    for (const std::string& cfg : {
+             outside_toml.string(),
+             dir + "/../../outside_robot.toml",
+             dir + "/link_out.toml",
+             dir + "/link_in.toml",
+             dir + "/inc_rel.toml",
+             dir + "/inc_abs.toml",
+             dir + "/inc_sym.toml",
+         }) {
+      SCOPED_TRACE(cfg);
+      std::string manifest = base_manifest;
+      manifest.insert(1, "\n  \"config_path\": \"" + cfg + "\",");
+      std::ofstream{dir + "/manifest.json"} << manifest;
+      Review review{Library(), 1u << 20};
+      const Response resp = review.Get("/review/pose_escape/bounds.json", "");
+      ASSERT_EQ(resp.status, 200) << resp.body;
+      const json bounds = json::parse(resp.body);
+      ASSERT_TRUE(bounds.contains("pose_topic")) << resp.body;
+      EXPECT_TRUE(bounds["pose_topic"].is_null()) << cfg << ": " << bounds;
+    }
+    std::filesystem::remove_all(dir);
+  }
+
+  // 2. IsSession / ReadEntry reject symlinked manifest.json and symlinked
+  //    .tlog files: a directory with only symlinks is not a session, and a
+  //    real session ignores a symlinked manifest.json.
+  {
+    const std::filesystem::path outside_manifest =
+        Directory() + "/outside_sess_manifest.json";
+    std::ofstream{outside_manifest}
+        << R"({"start_wall_ns": 123456789, "end_wall_ns": 223456789, "nodes": [{"name": "evil", "runs": [{"start_wall_ns": 123456789, "end_wall_ns": 223456789, "reason": "leaked"}]}]})";
+    const std::filesystem::path outside_tlog =
+        Directory() + "/outside_fake.tlog";
+    std::ofstream{outside_tlog} << "not a real log";
+
+    const std::string sym_manifest_only = Library() + "/sym_manifest_only";
+    std::filesystem::create_directories(sym_manifest_only);
+    std::filesystem::create_symlink(outside_manifest,
+                                    sym_manifest_only + "/manifest.json");
+
+    const std::string sym_tlog_only = Library() + "/sym_tlog_only";
+    std::filesystem::create_directories(sym_tlog_only);
+    std::filesystem::create_symlink(outside_tlog, sym_tlog_only + "/fake.tlog");
+
+    const std::string real_with_sym_manifest =
+        Library() + "/real_with_sym_manifest";
+    testing::WriteFixtureSession(real_with_sym_manifest);
+    std::filesystem::remove(real_with_sym_manifest + "/manifest.json");
+    std::filesystem::create_symlink(outside_manifest,
+                                    real_with_sym_manifest + "/manifest.json");
+
+    Review review{Library(), 1u << 20};
+    const Response list_resp = review.Get("/review/sessions.json", "");
+    ASSERT_EQ(list_resp.status, 200) << list_resp.body;
+    const json sessions = json::parse(list_resp.body);
+    bool found_real = false;
+    for (const auto& entry : sessions) {
+      const std::string id = entry["id"];
+      EXPECT_NE(id, "sym_manifest_only");
+      EXPECT_NE(id, "sym_tlog_only");
+      if (id == "real_with_sym_manifest") {
+        found_real = true;
+        EXPECT_EQ(entry["start_wall_ns"], "0");
+        EXPECT_EQ(entry["end_wall_ns"], "0");
+        for (const auto& f : entry["files"]) {
+          EXPECT_NE(f["path"], "manifest.json");
+        }
+      }
+    }
+    EXPECT_TRUE(found_real);
+
+    EXPECT_EQ(review.Get("/review/sym_manifest_only/bounds.json", "").status,
+              404);
+    EXPECT_EQ(review.Get("/review/sym_tlog_only/bounds.json", "").status, 404);
+
+    const Response tl_resp =
+        review.Get("/review/real_with_sym_manifest/timeline.json", "");
+    ASSERT_EQ(tl_resp.status, 200) << tl_resp.body;
+    const json tl = json::parse(tl_resp.body);
+    EXPECT_TRUE(tl["runs"].empty()) << tl.dump();
+
+    std::filesystem::remove_all(sym_manifest_only);
+    std::filesystem::remove_all(sym_tlog_only);
+    std::filesystem::remove_all(real_with_sym_manifest);
+    std::filesystem::remove(outside_manifest);
+    std::filesystem::remove(outside_tlog);
+  }
+  std::filesystem::remove(outside_toml);
+}
+
+// Guards REQ-OPS-42: undeclared source_ids >= 63 and declared unreviewed
+// sources (e.g. raw talos.Bytes) never allocate overflow_source_ids or
+// overflow_bits during Session::Open().
+// REQ-OPS-42
+TEST_F(ReviewTest, UndeclaredAndUnreviewedHighSourceIdsDoNotAllocateOverflow) {
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+  using D = talos::Descriptor<review_test::Shot>;
+
+  const std::string dir = Library() + "/undeclared_high_sources";
+  std::filesystem::create_directories(dir);
+  {
+    talos::event::Registration reviewed;
+    reviewed.id = 0;
+    reviewed.kind = SourceKind::SENDER;
+    reviewed.name = "/reviewed/state";
+    reviewed.message_bytes = sizeof(review_test::Shot);
+    reviewed.schema = {
+        std::string{D::kName}, D::kHash,
+        std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                    D::kBfbs.size()}};
+
+    talos::event::Registration raw_bytes;
+    raw_bytes.id = 200;
+    raw_bytes.kind = SourceKind::SENDER;
+    raw_bytes.name = "/raw/telemetry";
+    raw_bytes.message_bytes = 8;
+    raw_bytes.schema = talos::schema::Bytes();
+
+    tlog::LogWriter writer{dir + "/node.tlog", "node",
+                           tlog::LogWriterOptions{65536, 1, false}, 1};
+    writer.start({reviewed, raw_bytes}, MonotonicTime::from_nanos(kStartNs));
+
+    std::uint64_t seq = 0;
+    const std::array<std::byte, 8> dummy{};
+    for (std::int64_t s = 0; s < 10; ++s) {
+      review_test::Shot shot{static_cast<double>(s),
+                             static_cast<std::uint32_t>(s),
+                             review_test::Mode::IDLE, true, ++seq};
+      Context ctx{};
+      ctx.dispatch_index = seq;
+      ctx.event_time = ctx.now =
+          MonotonicTime::from_nanos(kStartNs + s * kSecond);
+      writer.send(ctx, 0, std::as_bytes(std::span{&shot, 1}), 0, seq);
+      // Unreviewed declared source_id >= 63.
+      writer.send(ctx, 200, dummy, 0, ++seq);
+      // Undeclared source_ids >= 63 (not in the registration manifest).
+      for (std::uint16_t id = 100; id < 180; ++id) {
+        writer.send(ctx, id, dummy, 0, ++seq);
+      }
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+
+  const auto session = Session::Open(dir);
+  ASSERT_EQ(session->files().size(), 1u);
+  const LogFile& file = session->files()[0];
+  EXPECT_TRUE(file.overflow_source_ids.empty());
+  EXPECT_TRUE(file.overflow_bits.empty());
+  EXPECT_EQ(file.overflow_words_per_cp, 0u);
+
+  const auto ref = session->Find("reviewed/state/position_m");
+  ASSERT_TRUE(ref.has_value());
+  const auto series = session->ReadSeries(std::span{&*ref, 1}, kStartNs,
+                                          kStartNs + 10 * kSecond, 10);
+  EXPECT_EQ(series[0].count[0], 1u);
+  EXPECT_EQ(series[0].last[9], 9.0);
+  std::filesystem::remove_all(dir);
+}
+
+// Guards REQ-OPS-51: a foreign-protocol session refuses hardware and Driver
+// Station packets without decoding them while still serving non-hardware
+// struct topics.
+// REQ-OPS-51
+TEST_F(ReviewTest, ForeignProtocolRefusesHardwareAndDriverStationTopics) {
+  namespace ds = talos::driver_station;
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+  using D = talos::Descriptor<review_test::Shot>;
+  using P = talos::Descriptor<talos::hardware::Packet>;
+
+  const std::uint16_t build = talos::protocol::kProtocolVersion;
+  const std::uint16_t foreign_ver = static_cast<std::uint16_t>(build - 1);
+  const std::string dir = Library() + "/foreign_hw_ds";
+  std::filesystem::create_directories(dir);
+  std::ofstream{dir + "/manifest.json"}
+      << "{\n  \"session_id\": 1,\n  \"hardware_protocol_version\": "
+      << foreign_ver << ",\n  \"nodes\": []\n}\n";
+  {
+    talos::event::Registration hw_src;
+    hw_src.id = 0;
+    hw_src.kind = SourceKind::SENDER;
+    hw_src.name = "/hw/state";
+    hw_src.message_bytes = sizeof(talos::hardware::Packet);
+    hw_src.schema = {std::string{P::kName}, P::kHash, {}};
+
+    talos::event::Registration ds_src;
+    ds_src.id = 1;
+    ds_src.kind = SourceKind::SENDER;
+    ds_src.name = "/hw/state/driver_station";
+    ds_src.message_bytes = sizeof(talos::hardware::Packet);
+    ds_src.schema = {std::string{P::kName}, P::kHash, {}};
+
+    talos::event::Registration shot_src;
+    shot_src.id = 2;
+    shot_src.kind = SourceKind::SENDER;
+    shot_src.name = "/shooter/state";
+    shot_src.message_bytes = sizeof(review_test::Shot);
+    shot_src.schema = {
+        std::string{D::kName}, D::kHash,
+        std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                    D::kBfbs.size()}};
+
+    tlog::LogWriter writer{dir + "/hardware_node.tlog", "hardware_node",
+                           tlog::LogWriterOptions{16384, 1, false}, 1};
+    writer.start({hw_src, ds_src, shot_src},
+                 MonotonicTime::from_nanos(kStartNs));
+
+    talos::hardware::Packet hw_pkt{};
+    hw_pkt.size = 16;
+    std::memset(hw_pkt.data.data(), 0xA5, hw_pkt.size);
+
+    ds::DriverStationData ds_data{};
+    ds_data.fms.flags = ds::kDsAttached | ds::kEnabled | ds::kTeleop;
+    ds_data.fms.match_time_s = 12.0f;
+    talos::hardware::Packet ds_pkt{};
+    ds_pkt.size = static_cast<std::uint32_t>(ds::Encode(ds_data, ds_pkt.data));
+
+    review_test::Shot shot{3.5, 1, review_test::Mode::IDLE, true, 1};
+    Context ctx{};
+    ctx.dispatch_index = 1;
+    ctx.event_time = ctx.now = MonotonicTime::from_nanos(kStartNs);
+    writer.send(ctx, 0, std::as_bytes(std::span{&hw_pkt, 1}), 0, 1);
+    writer.send(ctx, 1, std::as_bytes(std::span{&ds_pkt, 1}), 0, 2);
+    writer.send(ctx, 2, std::as_bytes(std::span{&shot, 1}), 0, 3);
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+
+  Review review{Library(), 1u << 20};
+  const Response bounds_resp =
+      review.Get("/review/foreign_hw_ds/bounds.json", "");
+  ASSERT_EQ(bounds_resp.status, 200) << bounds_resp.body;
+  const json bounds = json::parse(bounds_resp.body);
+  ASSERT_TRUE(bounds["hardware_not_decoded"].is_string()) << bounds;
+
+  const Response channels_resp =
+      review.Get("/review/foreign_hw_ds/channels.json", "");
+  ASSERT_EQ(channels_resp.status, 200) << channels_resp.body;
+  const json channels = json::parse(channels_resp.body);
+  bool found_shot = false;
+  for (const auto& ch : channels["channels"]) {
+    const std::string name = ch["name"];
+    EXPECT_FALSE(name.starts_with("hw/")) << name;
+    if (name == "shooter/state/position_m") found_shot = true;
+  }
+  EXPECT_TRUE(found_shot);
+
+  const Response tl_resp =
+      review.Get("/review/foreign_hw_ds/timeline.json", "");
+  ASSERT_EQ(tl_resp.status, 200) << tl_resp.body;
+  const json tl = json::parse(tl_resp.body);
+  EXPECT_EQ(tl["hardware_not_decoded"], true);
+  EXPECT_TRUE(tl["modes"].empty());
+  EXPECT_EQ(tl["modes_dropped"], 0);
+  std::filesystem::remove_all(dir);
+}
+
 }  // namespace
 }  // namespace studio::review
