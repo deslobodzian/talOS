@@ -456,5 +456,49 @@ TEST(TagRasterizer, ClampsExtremeProjectedPixelCoordinatesWithoutWraparound) {
   }
 }
 
+TEST(FieldLayoutLoader, SeededFuzzMutationsNeverCrashOrLeakNonFinite) {
+  const std::vector<std::string> seeds = {kClassicJson, kNewSchemaJson};
+  uint32_t state = 0x74616c6fU;
+  auto next = [&] {
+    state = state * 1664525U + 1013904223U;
+    return state;
+  };
+  for (const std::string& seed : seeds) {
+    for (int iter = 0; iter < 256; ++iter) {
+      std::string mutated = seed;
+      const int edits = 1 + static_cast<int>(next() % 6);
+      for (int e = 0; e < edits; ++e) {
+        const std::size_t pos = next() % (mutated.size() + 1);
+        switch (next() % 4) {
+          case 0:
+            if (pos < mutated.size()) {
+              mutated[pos] = static_cast<char>(next() & 0xffU);
+            }
+            break;
+          case 1:
+            mutated.insert(pos, 1, static_cast<char>(next() & 0xffU));
+            break;
+          case 2:
+            if (pos < mutated.size()) mutated.erase(pos, 1);
+            break;
+          case 3:
+            if (pos < mutated.size()) mutated[pos] = '[';
+            break;
+          default:
+            break;
+        }
+      }
+      FieldLayoutData data;
+      std::string err;
+      if (LoadFieldLayoutFromJson(mutated, kTagSize, &data, &err)) {
+        EXPECT_TRUE(std::isfinite(data.dims.length_m));
+        EXPECT_TRUE(std::isfinite(data.dims.width_m));
+        EXPECT_GT(data.dims.length_m, 0.0);
+        EXPECT_GT(data.dims.width_m, 0.0);
+      }
+    }
+  }
+}
+
 }  // namespace
 }  // namespace talos::vision::field_sim

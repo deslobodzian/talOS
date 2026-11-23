@@ -240,10 +240,37 @@ void CpuAprilTagBackend::SetOptions(const DetectorOptions& options) {
   impl_->Initialize(options_);
 }
 
+static bool ImageDimensionsSupported(const apriltag_detector_t* td, int width,
+                                     int height) {
+  if (width < 4 || height < 4 || width >= 32768 || height >= 32768) {
+    return false;
+  }
+  int quad_w = width;
+  int quad_h = height;
+  if (td->quad_decimate > 1.0f) {
+    if (td->quad_decimate == 1.5f) {
+      quad_w = (width / 3) * 2;
+      quad_h = (height / 3) * 2;
+    } else {
+      const int factor = static_cast<int>(td->quad_decimate);
+      if (factor > 1) {
+        quad_w = 1 + (width - 1) / factor;
+        quad_h = 1 + (height - 1) / factor;
+      }
+    }
+  }
+  // apriltag_quad_thresh's threshold() divides dimensions by tilesz=4 and
+  // indexes im_max[(th - 1) * tw + ...], overflowing heap buffers if < 4.
+  return quad_w >= 4 && quad_h >= 4 && quad_w < 32768 && quad_h < 32768;
+}
+
 static std::vector<Detection> ProcessDetections(
     const CpuAprilTagBackend& backend, apriltag_detector_t* td, image_u8_t* im,
     const CameraIntrinsics* intrinsics = nullptr,
     double tag_size_meters = 0.0) {
+  if (!ImageDimensionsSupported(td, im->width, im->height)) {
+    return {};
+  }
   EnsureBackgroundWorkerPool(td);
   zarray_t* raw_detections = apriltag_detector_detect(td, im);
   return ExtractDetections(raw_detections, backend, intrinsics,
