@@ -138,6 +138,10 @@ namespace talos::introspect {
 // which reads as "no gap seen" -- all an earlier build could have said (its
 // writer stopped capture instead, kFlagRecorderFailed) -- and every earlier
 // reader tests only the bits it knows.
+//
+// Nor did kFlagQuiesced: a bit of `flags` that every earlier writer left clear,
+// which reads as "not quiesced" -- failing closed so the launcher waits for
+// process exit -- and every earlier reader ignores.
 inline constexpr std::uint32_t kRegistryVersion = 6;
 inline constexpr const char* kRegistryPath = "/talos_registry.6";
 // The segment's mode, whatever the creator's umask: every node registers,
@@ -241,6 +245,19 @@ static_assert((kFlagLogGap & kFlagRealtimeMask) == 0,
               "kFlagLogGap must not share a bit with the realtime outcome");
 static_assert((kFlagLogGap & kFlagOutputsHeld) == 0,
               "kFlagLogGap must not share a bit with kFlagOutputsHeld");
+
+// The node has quiesced its realtime/hardware side on shutdown (for the
+// hardware bridge: exited its loop, sent its shutdown neutral, closed waits
+// and UDP socket, and published introspection) and is only finishing teardown
+// such as flushing its event log. Set once per claim via
+// NodeRegistration::mark_quiesced() and never cleared.
+inline constexpr std::uint32_t kFlagQuiesced = 1u << 15;
+static_assert((kFlagQuiesced & kFlagRealtimeMask) == 0,
+              "kFlagQuiesced must not share a bit with the realtime outcome");
+static_assert((kFlagQuiesced & kFlagOutputsHeld) == 0,
+              "kFlagQuiesced must not share a bit with kFlagOutputsHeld");
+static_assert((kFlagQuiesced & kFlagLogGap) == 0,
+              "kFlagQuiesced must not share a bit with kFlagLogGap");
 
 static_assert(process::kAllSteps < (1u << 5),
               "the refused steps must fit the five bits kFlagRealtimeMask "
@@ -778,6 +795,11 @@ class NodeRegistration {
 
   void activate();
 
+  // Marks this row as quiesced (kFlagQuiesced) with release ordering, once
+  // shutdown has finished its hardware/realtime side and only teardown (such
+  // as flushing its event log) remains. Never cleared for this claim.
+  void mark_quiesced();
+
   // The row's `flags` word, for a writer that ORs an event log flag in the
   // moment it applies (event::log::LogWriterOptions::gap_flags with
   // kFlagLogGap) rather than at the next sample, with the row's
@@ -971,6 +993,8 @@ struct NodeSnapshot {
   // kFlagLogGap: the node's event log has dropped records (set as a gap
   // opens).
   bool log_gap() const { return (flags & kFlagLogGap) != 0; }
+  // kFlagQuiesced: the node has quiesced on shutdown (teardown/flush only).
+  bool quiesced() const { return (flags & kFlagQuiesced) != 0; }
   std::vector<SourceSnapshot> sources;
   std::uint32_t declared_selection_count{0};
   std::vector<SelectionSnapshot> selections;
