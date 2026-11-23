@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <deque>
 #include <iterator>
+#include <limits>
 
 namespace talos::hardware {
 namespace {
@@ -345,6 +346,20 @@ TEST(ClockOffset, BridgeCadenceExchangesKeepTheBoundValidWithoutGaps) {
   EXPECT_LT(valid_from_us, kGatewayBootUs + 100'000);
   EXPECT_EQ(invalid_after_valid, 0u);
   EXPECT_EQ(outside_bound, 0u);
+}
+
+TEST(ClockOffset, ExtremeTimestampsDoNotOverflowSignedArithmetic) {
+  Estimator clock;
+  const std::uint64_t max_u64 = std::numeric_limits<std::uint64_t>::max();
+  const std::uint64_t max_i64 =
+      static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+  // Difference > INT64_MAX between receipt_us and sample_time_us, and spread
+  // spanning INT64_MIN..INT64_MAX across samples.
+  EXPECT_TRUE(clock.Observe(1, 0, max_i64));
+  EXPECT_TRUE(clock.Observe(1, 1, 0));
+  EXPECT_TRUE(clock.Observe(1, max_u64 / 2, max_u64));
+  EXPECT_GT(clock.spread_us(), max_i64);
+  clock.ObserveExchange(1, 1000, max_u64 - 10, 2000);
 }
 
 }  // namespace
