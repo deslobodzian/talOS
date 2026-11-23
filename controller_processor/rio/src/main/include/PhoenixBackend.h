@@ -110,6 +110,10 @@ class PhoenixBackend final : public talos::hardware::Backend {
                                      ctre::phoenix::StatusCode& status);
   void RefuseProLicence(std::size_t index, bool record_error);
   bool RestoreProLicence(std::size_t index);
+  // Copies licence_refused_ into foc_unlicensed_ (reserved at Configure) and
+  // erases every unlicensed id from unavailable_, so an unlicensed motor or
+  // follower never churns the restore loop. Loop-thread safe (no allocation).
+  void SyncUnlicensedAndPruneUnavailable();
 
   // Declared first, so destroyed last: the configure worker (configure_) may
   // still post while the backend is destroyed.
@@ -241,11 +245,17 @@ class PhoenixBackend final : public talos::hardware::Backend {
   double sim_yaw_deg_{0.0};
   double last_sim_supply_v_{0.0};
 #endif
+  using RestoreTask = std::function<std::optional<std::vector<uint16_t>>()>;
+  // Launches the restore worker; empty calls std::async(std::launch::async).
+  // phoenixTest sets it to inject thread-exhaustion (EAGAIN) failures.
+  std::function<std::future<std::optional<std::vector<uint16_t>>>(RestoreTask)>
+      launch_restore_;
+  bool restore_launch_failed_{false};
   // Held by Configure while it rebuilds the device lists, and by
   // WatchdogNeutral, which only tries it: it never waits on a configure.
   // Declared before configure_, whose destruction waits for a Configure
   // still holding it.
   std::mutex devices_mutex_;
   std::future<bool> configure_;
-  std::future<std::vector<uint16_t>> restore_;
+  std::future<std::optional<std::vector<uint16_t>>> restore_;
 };
