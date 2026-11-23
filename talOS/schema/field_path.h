@@ -46,7 +46,9 @@ struct ResolvedField {
   std::string enclosing_name;
 };
 
-// The schema in `bfbs` once it verifies as a reflection.Schema, else null.
+// The schema in `bfbs` once it verifies as a reflection.Schema and every
+// Type's base_type and element bytes are within reflection::BaseType's defined
+// range, else null.
 const reflection::Schema* VerifySchema(std::string_view bfbs);
 
 // Bytes of a scalar base type (Bool through Double, UType included); 0 for
