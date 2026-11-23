@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cmath>
+#include <stdexcept>
+
 #include "demo/elevator_generated.h"
 #include "demo/intake_generated.h"
 #include "demo/superstructure_generated.h"
@@ -32,12 +35,17 @@ class Superstructure {
         status_{
             node.publish<SuperstructureStatus>(topics::kSuperstructureStatus)},
         sm_{node, State::STOWED},
-        high_rot_{node.param<double>("high_rot")} {}
+        high_rot_{node.param<double>("high_rot")} {
+    if (!std::isfinite(high_rot_) || high_rot_ <= 0.0) {
+      throw std::invalid_argument("high_rot must be finite and > 0");
+    }
+  }
 
   void update() {
     const SuperstructureGoal* goal = goal_.get();
     const SuperstructureCommand command =
-        goal != nullptr ? goal->command() : SuperstructureCommand::STOW;
+        goal != nullptr ? NormalizeCommand(goal->command())
+                        : SuperstructureCommand::STOW;
     const bool intake_fresh = intake_.fresh();
     const bool fresh = intake_fresh && elevator_.fresh();
     // Cancellation never waits for a dependency. Forget an interrupted step:
@@ -74,6 +82,16 @@ class Superstructure {
   }
 
  private:
+  static SuperstructureCommand NormalizeCommand(SuperstructureCommand command) {
+    switch (command) {
+      case SuperstructureCommand::STOW:
+      case SuperstructureCommand::INTAKE:
+      case SuperstructureCommand::SCORE_HIGH:
+        return command;
+    }
+    return SuperstructureCommand::STOW;
+  }
+
   void advance(SuperstructureCommand command) {
     const bool has_piece = intake_->has_piece();
     switch (sm_.state()) {
