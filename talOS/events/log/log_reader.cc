@@ -880,12 +880,16 @@ std::string DescribeGap(const LogGap& gap) {
 
 std::vector<std::string> FindLogFiles(const std::string& path_or_dir) {
   std::error_code ec;
-  if (!std::filesystem::is_directory(path_or_dir, ec)) return {path_or_dir};
+  if (!std::filesystem::is_directory(path_or_dir, ec) || ec) {
+    return {path_or_dir};
+  }
   std::vector<std::string> result;
-  for (const auto& entry :
-       std::filesystem::directory_iterator(path_or_dir, ec)) {
-    if (entry.path().extension() == ".tlog") {
-      result.push_back(entry.path().string());
+  ec.clear();
+  for (auto it = std::filesystem::directory_iterator(path_or_dir, ec);
+       !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+    const std::filesystem::path& path = it->path();
+    if (path.extension() == ".tlog") {
+      result.push_back(path.string());
     }
   }
   std::sort(result.begin(), result.end());
@@ -904,8 +908,10 @@ std::vector<std::string> LogSegmentFiles(const std::string& log_path) {
 
   std::vector<std::pair<std::uint64_t, std::string>> segments;
   std::error_code ec;
-  for (const auto& entry : std::filesystem::directory_iterator(directory, ec)) {
-    const std::string name = entry.path().filename().string();
+  for (auto it = std::filesystem::directory_iterator(directory, ec);
+       !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+    const std::filesystem::path& entry_path = it->path();
+    const std::string name = entry_path.filename().string();
     if (name.size() <= head.size() + tail.size() || !name.starts_with(head) ||
         !name.ends_with(tail))
       continue;
@@ -915,13 +921,16 @@ std::vector<std::string> LogSegmentFiles(const std::string& log_path) {
     const auto [end, error] =
         std::from_chars(digits.data(), digits.data() + digits.size(), k);
     if (error != std::errc{} || end != digits.data() + digits.size()) continue;
-    segments.emplace_back(k, entry.path().string());
+    segments.emplace_back(k, entry_path.string());
   }
   std::sort(segments.begin(), segments.end());
   std::vector<std::string> result;
   result.reserve(segments.size() + 1);
   for (auto& [k, path] : segments) result.push_back(std::move(path));
-  if (std::filesystem::exists(log_path, ec)) result.push_back(log_path);
+  std::error_code exists_ec;
+  if (std::filesystem::exists(log_path, exists_ec) && !exists_ec) {
+    result.push_back(log_path);
+  }
   return result;
 }
 
