@@ -44,9 +44,27 @@ network. The workflow does this for a branch, and then runs one lane:
 gh workflow run "Cloud Build" --ref my-branch -f lane=fast   # replay (default), fast, full, asan, tsan
 ```
 
-`-f max_minutes=40` gives a lane that does not fit in the default 20 minutes
-(a sanitizer build with a cold cache) a longer-lived VM. When a lane fails,
-the run's artifact holds every test's log. The address in `build:gcp` is `CACHE_IP` in `gcp-cicd.env.sh`;
+Three more lanes check what the per-push workflows do not, and take a count:
+
+```sh
+gh workflow run "Cloud Build" --ref main -f lane=soak   -f count=8  -f max_minutes=40   # the bench soak, seeds 0 to 7
+gh workflow run "Cloud Build" --ref main -f lane=stress -f count=20 -f max_minutes=60   # every test 20 times, cores loaded
+gh workflow run "Cloud Build" --ref main -f lane=rtprio                                 # //talOS/process under a realtime grant
+```
+
+One lane runs at a time: the project's quota is 16 N2D CPUs in the region,
+which one build VM uses, so a lane started while another runs fails at
+"Create the Spot VM" with the quota error. `soak` takes about four minutes a
+seed. `stress` reports a test that fails
+even once, which is a flake to fix ([docs/TESTING.md §8](../docs/TESTING.md#8-flakes)).
+`rtprio` raises the realtime limit before Bazel starts and fails unless
+`ProcessTest.BackgroundThreadLeavesAnInheritedRealtimePolicy`, which skips
+on every host without that grant, ran.
+
+`-f max_minutes=40` or `60` gives a lane that does not fit in the default 20
+minutes (a sanitizer build with a cold cache, several soak seeds) a
+longer-lived VM. When a lane fails, the run's artifact holds every test's
+log, and each failed soak seed's. The address in `build:gcp` is `CACHE_IP` in `gcp-cicd.env.sh`;
 change both together. It is not reachable from a laptop, whose builds keep
 using the local disk cache.
 
