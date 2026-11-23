@@ -721,20 +721,21 @@ std::vector<NodeSnapshot> RegistryReader::nodes() const {
 // once per process start, not per read.
 std::optional<RegistryReader::StableRow> RegistryReader::read_stable_row(
     const NodeRecord& record, std::size_t slot) {
-  if (record.state.load(std::memory_order_acquire) !=
-      static_cast<std::uint64_t>(SlotState::ACTIVE)) {
-    return std::nullopt;
-  }
   for (int attempt = 0; attempt < 2; ++attempt) {
     const std::uint64_t generation =
         record.generation.load(std::memory_order_acquire);
+    if (record.state.load(std::memory_order_acquire) !=
+        static_cast<std::uint64_t>(SlotState::ACTIVE)) {
+      return std::nullopt;
+    }
     auto node = copy_stable(record, slot);
     const std::uint64_t claimant =
         (record.pid_start << kProcessPidBits) | record.pid;
+    std::atomic_thread_fence(std::memory_order_acquire);
     if (!node ||
-        record.state.load(std::memory_order_acquire) !=
+        record.state.load(std::memory_order_relaxed) !=
             static_cast<std::uint64_t>(SlotState::ACTIVE) ||
-        record.generation.load(std::memory_order_acquire) != generation) {
+        record.generation.load(std::memory_order_relaxed) != generation) {
       continue;
     }
     node->generation = generation;
@@ -752,19 +753,24 @@ std::optional<RegistryReader::StableRow> RegistryReader::read_stable_row(
 std::optional<NodeSnapshot> RegistryReader::copy_stable(
     const NodeRecord& record, std::size_t slot) {
   const auto generation = record.generation.load(std::memory_order_acquire);
+  if (record.state.load(std::memory_order_acquire) !=
+      static_cast<std::uint64_t>(SlotState::ACTIVE)) {
+    return std::nullopt;
+  }
   for (int attempt = 0; attempt < 4; ++attempt) {
     const std::uint32_t before =
         record.sample_seq.load(std::memory_order_acquire);
     // Retain the bounded plain-copy fallback for a stalled sample writer.
     if ((before & 1u) != 0u && attempt < 3) continue;
     NodeSnapshot node = copy(record, slot);
-    if (record.state.load(std::memory_order_acquire) !=
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (record.state.load(std::memory_order_relaxed) !=
             static_cast<std::uint64_t>(SlotState::ACTIVE) ||
-        record.generation.load(std::memory_order_acquire) != generation) {
+        record.generation.load(std::memory_order_relaxed) != generation) {
       return std::nullopt;
     }
     if (attempt == 3 ||
-        record.sample_seq.load(std::memory_order_acquire) == before) {
+        record.sample_seq.load(std::memory_order_relaxed) == before) {
       return node;
     }
   }

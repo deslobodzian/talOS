@@ -389,7 +389,8 @@ int SummarizeLogs(std::vector<NodeProcessInfo>& procs,
     auto& proc = procs[i];
     // Every run's log: a restarted node's records are the sum of its runs.
     for (const auto& path : proc.log_paths) {
-      if (std::filesystem::exists(event::log::CappedMarkerPath(path)))
+      std::error_code ec;
+      if (std::filesystem::exists(event::log::CappedMarkerPath(path), ec))
         proc.log_capped = true;
       bool gapped = false;
       // The segments a capped log kept, then the newest (LogSegmentFiles).
@@ -1245,6 +1246,16 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   // off this thread (PersistManifest).
   PersistManifest(procs, /*durable=*/true);
   manifest_writer_->Start();
+  struct StopManifestWriter {
+    explicit StopManifestWriter(std::unique_ptr<ManifestWriter>& writer_ref)
+        : writer{writer_ref} {}
+    ~StopManifestWriter() {
+      if (writer) writer->Stop();
+    }
+    StopManifestWriter(const StopManifestWriter&) = delete;
+    StopManifestWriter& operator=(const StopManifestWriter&) = delete;
+    std::unique_ptr<ManifestWriter>& writer;
+  } stop_manifest_writer{manifest_writer_};
 
   // Hold a macOS IOKit PreventSystemSleep assertion for the running session's
   // lifetime (no-op on Linux) as defense-in-depth independent of `pmset sleep
@@ -1879,10 +1890,10 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
   const auto read_row = [&]() -> RowObservation {
     if (registry == nullptr) return {};
     for (const auto& record : registry->header()->nodes) {
+      const auto generation = record.generation.load(std::memory_order_acquire);
       if (record.state.load(std::memory_order_acquire) !=
           static_cast<uint64_t>(introspect::SlotState::ACTIVE))
         continue;
-      const auto generation = record.generation.load(std::memory_order_acquire);
       if (record.pid != static_cast<uint64_t>(proc.pid) ||
           record.session_id != options_.session_id)
         continue;
@@ -1906,8 +1917,9 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
           (flags & introspect::kFlagConstructing) == 0 &&
           (introspect::RealtimeOf(flags).has_value() || dispatch > 0);
       DeliveryCounts loss = DeliveryCountsOf(record);
-      if (record.generation.load(std::memory_order_acquire) != generation ||
-          record.state.load(std::memory_order_acquire) !=
+      std::atomic_thread_fence(std::memory_order_acquire);
+      if (record.generation.load(std::memory_order_relaxed) != generation ||
+          record.state.load(std::memory_order_relaxed) !=
               static_cast<uint64_t>(introspect::SlotState::ACTIVE))
         continue;
       live = std::move(published);

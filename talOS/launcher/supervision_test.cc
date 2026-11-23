@@ -35,6 +35,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -6134,6 +6135,216 @@ TEST(Supervision, AdvancingDispatchCountPreventsStallKillWithFrozenHeartbeat) {
   std::filesystem::remove_all(options.output_dir);
   ::remove(pid_file.c_str());
   ::remove(runs.c_str());
+}
+
+// REQ-SAFE-30: SpawnProcess's guardian must ignore SIGHUP alongside SIGINT and
+// SIGTERM so a process-group SIGHUP cannot disarm orphan cleanup before the
+// launcher dies.
+TEST(Supervision, GuardianIgnoresSighupAndStillKillsOrphanGroup) {
+  int info_pipe[2];
+  int gc_alive[2];
+  int gc_block[2];
+  ASSERT_EQ(::pipe(info_pipe), 0);
+  ASSERT_EQ(::pipe(gc_alive), 0);
+  ASSERT_EQ(::pipe(gc_block), 0);
+
+  // Move gc_alive[1] and gc_block[0] to fds 7 and 8 (below 10 so /bin/sh
+  // never reuses them for its own script fd) inside the helper parent so the
+  // spawned child and its grandchild inherit them while the guardian closes
+  // every descriptor except lifetime[0].
+  const std::string script = TempPath("guardian_sighup.sh");
+  {
+    std::ofstream out{script};
+    out << "#!/bin/sh\n"
+           "trap 'echo hup' HUP\n"
+           "(trap '' HUP; echo \"gc_ready\"; read ignored <&8) &\n"
+           "echo \"ready $!\"\n"
+           "while :; do\n"
+           "  read ignored <&8 || exit 0\n"
+           "done\n";
+  }
+  ASSERT_EQ(::chmod(script.c_str(), 0755), 0);
+
+  std::fflush(nullptr);
+  const pid_t helper = ::fork();
+  ASSERT_GE(helper, 0);
+  if (helper == 0) {
+    ::close(info_pipe[0]);
+    ::close(gc_alive[0]);
+    ::close(gc_block[1]);
+    // Move above 8 first so dup2(..., 7/8) never collides with pipe fds.
+    const int alive_tmp = ::fcntl(gc_alive[1], F_DUPFD, 12);
+    const int block_tmp = ::fcntl(gc_block[0], F_DUPFD, 12);
+    ::close(gc_alive[1]);
+    ::close(gc_block[0]);
+    if (alive_tmp < 0 || block_tmp < 0 || ::dup2(alive_tmp, 7) < 0 ||
+        ::dup2(block_tmp, 8) < 0)
+      ::_exit(100);
+    ::close(alive_tmp);
+    ::close(block_tmp);
+    std::string error;
+    int child_out = -1;
+    const pid_t child = SpawnProcess({script}, error, SpawnOutput::kPipe,
+                                     &child_out, nullptr, /*hold_stop=*/false);
+    if (child <= 0) ::_exit(101);
+    // Wait for both "ready <gc_pid>\n" and "gc_ready\n" so the grandchild has
+    // installed its SIGHUP trap before we send group SIGHUP.
+    std::string lines;
+    char buf[128];
+    while (lines.find("ready ") == std::string::npos ||
+           lines.find("gc_ready\n") == std::string::npos) {
+      const ssize_t n = ::read(child_out, buf, sizeof buf);
+      if (n < 0 && errno == EINTR) continue;
+      if (n <= 0) ::_exit(102);
+      lines.append(buf, static_cast<std::size_t>(n));
+    }
+    // Close our copies of fds 7/8 so only the spawned group holds them.
+    ::close(7);
+    ::close(8);
+    const std::string msg =
+        "child " + std::to_string(child) + "\n" + lines + "done\n";
+    [[maybe_unused]] const ssize_t w =
+        ::write(info_pipe[1], msg.data(), msg.size());
+    // Wait for child to echo "hup\n" after the test sends group SIGHUP, then
+    // report "hup\n" to the test and wait until SIGKILLed.
+    std::string after;
+    while (after.find("hup\n") == std::string::npos) {
+      const ssize_t n = ::read(child_out, buf, sizeof buf);
+      if (n < 0 && errno == EINTR) continue;
+      if (n <= 0) break;
+      after.append(buf, static_cast<std::size_t>(n));
+    }
+    [[maybe_unused]] const ssize_t w2 = ::write(info_pipe[1], "hup\n", 4);
+    for (;;) ::pause();
+  }
+
+  ::close(info_pipe[1]);
+  ::close(gc_alive[1]);
+  ::close(gc_block[0]);
+
+  const auto read_until = [&](int fd, std::string& acc,
+                              std::string_view marker) {
+    while (acc.find(marker) == std::string::npos) {
+      pollfd pfd{fd, POLLIN, 0};
+      const int r = ::poll(&pfd, 1, kHangSeconds * 1000);
+      if (r < 0 && errno == EINTR) continue;
+      if (r <= 0) return false;
+      char buf[128];
+      const ssize_t n = ::read(fd, buf, sizeof buf);
+      if (n < 0 && errno == EINTR) continue;
+      if (n <= 0) return false;
+      acc.append(buf, static_cast<std::size_t>(n));
+    }
+    return true;
+  };
+
+  std::string info;
+  ASSERT_TRUE(read_until(info_pipe[0], info, "done\n")) << info;
+  pid_t child_pid = -1;
+  pid_t gc_pid = -1;
+  {
+    std::istringstream in{info};
+    std::string tok;
+    while (in >> tok) {
+      if (tok == "child") in >> child_pid;
+      if (tok == "ready") in >> gc_pid;
+    }
+  }
+  ASSERT_GT(child_pid, 0) << info;
+  ASSERT_GT(gc_pid, 0) << info;
+
+  // Send SIGHUP to the child's process group (child, grandchild, guardian).
+  ASSERT_EQ(::kill(-child_pid, SIGHUP), 0);
+  ASSERT_TRUE(read_until(info_pipe[0], info, "hup\n")) << info;
+
+  // Grandchild must still be alive before we kill helper.
+  pollfd before_kill{gc_alive[0], POLLIN, 0};
+  ASSERT_EQ(::poll(&before_kill, 1, 0), 0)
+      << "grandchild exited before parent SIGKILL";
+
+  // Now SIGKILL the helper parent: its death closes lifetime[1]. If the
+  // guardian survived SIGHUP, it immediately SIGKILLs the process group,
+  // killing the grandchild and closing gc_alive[1] (EOF on gc_alive[0]).
+  ::kill(helper, SIGKILL);
+  int helper_status = 0;
+  while (::waitpid(helper, &helper_status, 0) < 0 && errno == EINTR) {
+  }
+  ::close(info_pipe[0]);
+
+  pollfd alive_pfd{gc_alive[0], POLLIN, 0};
+  int poll_rc = 0;
+  do {
+    poll_rc = ::poll(&alive_pfd, 1, 2000);
+  } while (poll_rc < 0 && errno == EINTR);
+
+  bool gc_killed = false;
+  if (poll_rc > 0) {
+    char c = 0;
+    gc_killed = ::read(gc_alive[0], &c, 1) == 0;
+  }
+
+  // Clean up any surviving orphan process group on failure.
+  if (!gc_killed) ::kill(-child_pid, SIGKILL);
+  ::close(gc_alive[0]);
+  ::close(gc_block[1]);
+  ::remove(script.c_str());
+
+  EXPECT_TRUE(gc_killed)
+      << "grandchild survived parent SIGKILL after group SIGHUP (guardian "
+         "likely died on SIGHUP)";
+}
+
+// REQ-OPS-07, REQ-OPS-45: ServiceNotifier rejects negative, zero, 1-us,
+// overflowing, or malformed WATCHDOG_USEC values instead of turning them into a
+// <= 0 watchdog interval busy-spin, and accepts valid values >= 2 us.
+TEST(Supervision, ServiceNotifierRejectsInvalidOrTinyWatchdogUsec) {
+  const std::string sock_path = "/tmp/twp_" + std::to_string(::getpid());
+  ::unlink(sock_path.c_str());
+  const int sock = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+  ASSERT_GE(sock, 0);
+  sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  std::memcpy(addr.sun_path, sock_path.c_str(), sock_path.size() + 1);
+  ASSERT_EQ(::bind(sock, reinterpret_cast<const sockaddr*>(&addr),
+                   static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                          sock_path.size() + 1)),
+            0);
+
+  struct Case {
+    const char* raw;
+    std::optional<std::chrono::microseconds> expected;
+  };
+  const std::vector<Case> cases = {
+      {"-100000", std::nullopt},
+      {"0", std::nullopt},
+      {"1", std::nullopt},
+      {"2", std::chrono::microseconds{1}},
+      {"99999999999999999999999", std::nullopt},
+      {"1000000", std::chrono::microseconds{500000}},
+      {"", std::nullopt},
+      {" 1000000", std::nullopt},
+      {"+1000000", std::nullopt},
+      {"1000000abc", std::nullopt},
+      {"9223372036854775808", std::nullopt},
+      {"9223372036854775807",
+       std::chrono::microseconds{std::numeric_limits<int64_t>::max() / 2}},
+  };
+
+  ::setenv("NOTIFY_SOCKET", sock_path.c_str(), 1);
+  for (const auto& c : cases) {
+    SCOPED_TRACE(std::string{"WATCHDOG_USEC="} + c.raw);
+    ::setenv("WATCHDOG_USEC", c.raw, 1);
+    ServiceNotifier notifier;
+    const auto interval = notifier.watchdog_interval();
+    EXPECT_EQ(interval, c.expected);
+    if (interval) {
+      EXPECT_GE(*interval, std::chrono::microseconds{1});
+    }
+  }
+  ::unsetenv("NOTIFY_SOCKET");
+  ::unsetenv("WATCHDOG_USEC");
+  ::close(sock);
+  ::unlink(sock_path.c_str());
 }
 
 }  // namespace
