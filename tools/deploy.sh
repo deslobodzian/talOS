@@ -38,18 +38,33 @@ validate_prefix() {
     /*) ;;
     *) die "invalid --prefix '$p': must be an absolute path" ;;
   esac
-  local bad
-  bad="$(LC_ALL=C; case "$p" in *[[:space:][:cntrl:]]*|*[\<\>\&\"\'\\]*) echo 1 ;; esac)"
-  [ -z "$bad" ] ||
+  if (
+    LC_ALL=C
+    case "$p" in
+      *[[:space:][:cntrl:]]*|*[\<\>\&\"\'\\]*) exit 0 ;;
+      *) exit 1 ;;
+    esac
+  ); then
     die "invalid --prefix: must not contain whitespace, control, quote, backslash, or XML-special characters"
+  fi
 }
 
 validate_user() {
   local u="$1"
-  local bad
-  bad="$(LC_ALL=C; case "$u" in [a-z_]*) case "$u" in *[!a-z0-9_.-]*) echo 1 ;; esac ;; *) echo 1 ;; esac)"
-  [ -z "$bad" ] ||
+  if (
+    LC_ALL=C
+    case "$u" in
+      [a-z_]*)
+        case "$u" in
+          *[!a-z0-9_.-]*) exit 0 ;;
+          *) exit 1 ;;
+        esac
+        ;;
+      *) exit 0 ;;
+    esac
+  ); then
     die "invalid --user: must match ^[a-z_][a-z0-9_.-]*$"
+  fi
 }
 
 # Rename the link itself even when the destination names a directory.

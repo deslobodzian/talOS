@@ -3491,8 +3491,9 @@ TEST(LogBackgroundWriter, HealthyIdleWriterProducesZeroWakeupsAfterBurst) {
              status.st_size >= expected_bytes;
     }));
 
-    // Wait past the post-burst write_interval and its single empty timed wake:
-    // stop_checks goes quiet once the writer enters idle sleep (capped at 100
+    // Wait past the post-burst write_interval and its single empty timed wake
+    // (on macOS QOS_CLASS_BACKGROUND, a 10 ms timed wait can coalesce >30 ms):
+    // stop_checks goes quiet once the writer enters idle sleep (capped at 400
     // polls so a polling bug still reaches the assertion below quickly).
     std::uint64_t last_checks = stop_checks.load(std::memory_order_relaxed);
     int quiet_polls = 0;
@@ -3505,7 +3506,7 @@ TEST(LogBackgroundWriter, HealthyIdleWriterProducesZeroWakeupsAfterBurst) {
         last_checks = current;
         quiet_polls = 0;
       }
-      return quiet_polls >= 30 || ++settle_polls >= 100;
+      return quiet_polls >= 150 || ++settle_polls >= 400;
     }));
 
     // Observe ~20 write intervals (~200 ms) of idle time: 0 wakeups allowed.

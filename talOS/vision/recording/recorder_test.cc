@@ -534,14 +534,14 @@ TEST_F(RecorderTest,
   }
 
   // Out-of-int64-range finite doubles read via AsInt() must return fallback
-  // without undefined float-to-int conversion.
-  std::feclearexcept(FE_ALL_EXCEPT);
+  // without undefined float-to-int conversion (verified by ASan/UBSan; do not
+  // assert FE_INVALID because ARM64 clang speculatively hoists fcvtzs before
+  // csel without FENV_ACCESS).
   ASSERT_TRUE(
       ParseRecord("{\"width\":1e30,\"height\":-1e30,"
                   "\"capture_ns\":9223372036854775808.0}",
                   &ctx, &rec, &error))
       << error;
-  EXPECT_EQ(std::fetestexcept(FE_INVALID), 0);
   EXPECT_EQ(ctx.width, 0);
   EXPECT_EQ(ctx.height, 0);
   EXPECT_EQ(rec.capture_ns, 0u);
