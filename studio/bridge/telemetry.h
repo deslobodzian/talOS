@@ -1290,32 +1290,8 @@ inline std::string TelemetryJson(const TelemetryState& state,
 inline std::string ChannelsJson(const TelemetryState& state) {
   std::string out;
   out.reserve(2048);
-  out += "{\"kind\":\"talos.telemetry.channels\",\"version\":";
-  out += std::to_string(kTelemetryVersion);
-  out += ",\"stream_id\":";
-  AppendU64(out, state.stream_id);
-  out += ",\"dictionary_id\":";
-  out += std::to_string(state.dictionary_id);
-  out += ",\"channels\":[";
-  for (std::size_t i = 0; i < state.dictionary.size(); ++i) {
-    if (i != 0) out += ',';
-    const TelemetryChannelInfo& channel = state.dictionary[i];
-    out += "{\"name\":";
-    AppendEscaped(out, channel.name);
-    out += ",\"unit\":";
-    AppendEscaped(out, channel.unit);
-    out += ",\"kind\":";
-    AppendEscaped(out, ChannelKindName(channel.kind));
-    out += ",\"labels\":[";
-    for (std::size_t j = 0; j < channel.labels.size(); ++j) {
-      if (j != 0) out += ',';
-      AppendEscaped(out, channel.labels[j]);
-    }
-    out += "],\"alert\":";
-    AppendEscaped(out, AlertLevelName(channel.alert));
-    out += '}';
-  }
-  out += "]}";
+  AppendChannelsDocument(out, state.stream_id, state.dictionary_id,
+                         state.dictionary);
   return out;
 }
 

@@ -334,33 +334,9 @@ Response Review::Channels(const Session& session) const {
                             channel.kind, channel.alert});
     }
   }
-  std::string out{"{\"kind\":\"talos.telemetry.channels\",\"version\":"};
-  out += std::to_string(kTelemetryVersion);
-  out += ",\"stream_id\":";
-  AppendU64(out, 0);
-  out += ",\"dictionary_id\":";
-  out += std::to_string(talos::telemetry::DictionaryId(dictionary));
-  out += ",\"channels\":[";
-  for (std::size_t i = 0; i < dictionary.size(); ++i) {
-    if (i != 0) out += ',';
-    const auto& channel = dictionary[i];
-    out += "{\"name\":";
-    AppendEscaped(out, channel.name);
-    out += ",\"unit\":";
-    AppendEscaped(out, channel.unit);
-    out += ",\"kind\":";
-    AppendEscaped(out, ChannelKindName(channel.kind));
-    out += ",\"labels\":[";
-    for (std::size_t j = 0; j < channel.labels.size(); ++j) {
-      if (j != 0) out += ',';
-      AppendEscaped(out, channel.labels[j]);
-    }
-    // Where and as the bridge's ChannelsJson writes it.
-    out += "],\"alert\":";
-    AppendEscaped(out, AlertLevelName(channel.alert));
-    out += '}';
-  }
-  out += "]}";
+  std::string out;
+  AppendChannelsDocument(out, 0, talos::telemetry::DictionaryId(dictionary),
+                         dictionary);
   return {200, "application/json", std::move(out)};
 }
 

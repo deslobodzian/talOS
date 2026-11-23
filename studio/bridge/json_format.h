@@ -8,6 +8,7 @@
  */
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -107,6 +108,44 @@ inline std::string_view AlertLevelName(AlertLevel level) {
     default:
       return "none";
   }
+}
+
+// The /channels.json document: its header (the feed's stream id and the
+// dictionary's id), then each channel's name, unit, kind, enum labels and
+// alert level, in dictionary order. The live bridge (ChannelsJson) and the
+// offline reviewer (Review::Channels) both write it here; `Channels` is a
+// range of either's channel struct (name, unit, labels, kind, alert).
+template <class Channels>
+void AppendChannelsDocument(std::string& out, std::uint64_t stream_id,
+                            std::uint32_t dictionary_id,
+                            const Channels& channels) {
+  out += "{\"kind\":\"talos.telemetry.channels\",\"version\":";
+  out += std::to_string(kTelemetryVersion);
+  out += ",\"stream_id\":";
+  AppendU64(out, stream_id);
+  out += ",\"dictionary_id\":";
+  out += std::to_string(dictionary_id);
+  out += ",\"channels\":[";
+  bool first = true;
+  for (const auto& channel : channels) {
+    if (!first) out += ',';
+    first = false;
+    out += "{\"name\":";
+    AppendEscaped(out, channel.name);
+    out += ",\"unit\":";
+    AppendEscaped(out, channel.unit);
+    out += ",\"kind\":";
+    AppendEscaped(out, ChannelKindName(channel.kind));
+    out += ",\"labels\":[";
+    for (std::size_t j = 0; j < channel.labels.size(); ++j) {
+      if (j != 0) out += ',';
+      AppendEscaped(out, channel.labels[j]);
+    }
+    out += "],\"alert\":";
+    AppendEscaped(out, AlertLevelName(channel.alert));
+    out += '}';
+  }
+  out += "]}";
 }
 
 }  // namespace studio

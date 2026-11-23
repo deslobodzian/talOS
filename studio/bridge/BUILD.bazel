@@ -13,8 +13,8 @@ exports_files([
 # Pure JSON formatting helpers shared by :system, :telemetry and
 # //studio/review: escaping (//talOS/telemetry:json_string's, which the
 # dashboard layout also writes with), 64-bit integer strings, telemetry sample
-# formatting and channel/alert enum names. Zero registry or shared-memory
-# dependency (REQ-SAFE-35).
+# formatting, channel/alert enum names and the channels document both
+# endpoints serve. Zero registry or shared-memory dependency (REQ-SAFE-35).
 cc_library(
     name = "json_format",
     hdrs = ["json_format.h"],
