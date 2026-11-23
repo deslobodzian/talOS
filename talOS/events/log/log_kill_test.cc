@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <exception>
 #include <new>
-#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -106,11 +105,12 @@ std::uint64_t IntactPrefix(const std::string& path, bool& in_order) {
 // hardware_node lost the last 826 ms of its log on the bench (2026-11-11).
 // Here the parent verifies the default 10 ms write_interval, waits until the
 // child has written kRecords so the file and writer thread are live, notes a
-// later committed index (committed_before_kill) from shared memory without
-// polling the file again, waits > 1 write_interval (100 ms, leaving scheduling
-// margin while still orders of magnitude below the 1 h sync and 15 s chunk),
-// and SIGKILLs the child: every record committed up to committed_before_kill
-// must be intact and in order in `.tlog`.
+// later committed index (committed_before_kill) from shared memory, waits
+// until the writer flushes through committed_before_kill to `.tlog` (still
+// orders of magnitude below the 1 h sync and 15 s chunk, bounded only by the
+// 10 s hang deadline per docs/TESTING.md §6.3), and SIGKILLs the child mid-
+// stream: every record up to committed_before_kill must remain intact and in
+// order in `.tlog`.
 // REQ-OPS-31
 TEST(LogKill, KilledWriterKeepsRecordsWrittenBeforeTheKill) {
   constexpr auto kExpectedWriteInterval = std::chrono::milliseconds{10};
@@ -118,7 +118,6 @@ TEST(LogKill, KilledWriterKeepsRecordsWrittenBeforeTheKill) {
 
   constexpr std::uint64_t kRecords = 20;
   constexpr std::uint64_t kAdditionalRecords = 10;
-  constexpr auto kGraceAfterCommit = 10 * kExpectedWriteInterval;
   const std::string path = ::testing::TempDir() + "/talos_log_kill_" +
                            std::to_string(::getpid()) + ".tlog";
 
@@ -135,23 +134,19 @@ TEST(LogKill, KilledWriterKeepsRecordsWrittenBeforeTheKill) {
   bool in_order = true;
   std::uint64_t seen = 0;
   std::uint64_t committed_before_kill = 0;
-  std::optional<std::chrono::steady_clock::time_point> kill_at;
-  while (true) {
-    const auto now = std::chrono::steady_clock::now();
-    if (now >= deadline) break;
-    if (!kill_at.has_value()) {
-      if (seen < kRecords) {
-        seen = IntactPrefix(path, in_order);
-      } else {
-        const std::uint64_t committed =
-            progress.ptr->committed.load(std::memory_order_acquire);
-        if (committed >= seen + kAdditionalRecords) {
-          committed_before_kill = committed;
-          kill_at = now + kGraceAfterCommit;
-        }
+  std::uint64_t flushed = 0;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (seen < kRecords) {
+      seen = IntactPrefix(path, in_order);
+    } else if (committed_before_kill == 0) {
+      const std::uint64_t committed =
+          progress.ptr->committed.load(std::memory_order_acquire);
+      if (committed >= seen + kAdditionalRecords) {
+        committed_before_kill = committed;
       }
-    } else if (now >= *kill_at) {
-      break;
+    } else {
+      flushed = IntactPrefix(path, in_order);
+      if (flushed >= committed_before_kill) break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
@@ -161,14 +156,18 @@ TEST(LogKill, KilledWriterKeepsRecordsWrittenBeforeTheKill) {
   ASSERT_TRUE(WIFSIGNALED(status)) << "child exited with " << status;
   ASSERT_GE(seen, kRecords) << "the log held " << seen << " records after 10 s"
                             << " of logging at 200 Hz with no sync due";
-  ASSERT_TRUE(kill_at.has_value())
+  ASSERT_GE(committed_before_kill, seen + kAdditionalRecords)
       << "child did not commit " << kAdditionalRecords << " records after seen";
-  ASSERT_GE(committed_before_kill, seen + kAdditionalRecords);
+  ASSERT_GE(flushed, committed_before_kill)
+      << "writer did not flush committed records within 10 s "
+      << "(flushed=" << flushed
+      << ", committed_before_kill=" << committed_before_kill
+      << ", seen=" << seen << ")";
 
   const std::uint64_t kept = IntactPrefix(path, in_order);
   EXPECT_TRUE(in_order) << "records out of order, damaged or wrong";
   EXPECT_GE(kept, committed_before_kill)
-      << "SIGKILL lost records committed > 1 write_interval earlier "
+      << "SIGKILL lost records already flushed to the log "
       << "(kept=" << kept << ", committed_before_kill=" << committed_before_kill
       << ", seen=" << seen << ")";
   ::unlink(path.c_str());
