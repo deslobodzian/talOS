@@ -1,9 +1,10 @@
-"""Lints tests and node code for wall-clock time, randomness, and test retries.
+"""Lints tests and node code for wall-clock time, randomness, blocking I/O,
+locks, and test retries.
 
     python3 tools/lint_test_time.py   # from the workspace root
 
-docs/TESTING.md §6.1 and §8.1, docs/METHODOLOGY.md §9 (REQ-RT-17). Over the
-tracked files it finds:
+RULES.md 3, docs/TESTING.md §6.1 and §8.1, docs/METHODOLOGY.md §9 and §10
+(REQ-RT-06, REQ-RT-17). Over the tracked files it finds:
 
 - `sleep`: a sleep call (`sleep_for`, `sleep_until`, `usleep`, `nanosleep`,
   `sleep(`, `time.sleep(`) in a test source or a node package's source;
@@ -21,6 +22,15 @@ tracked files it finds:
   `mt19937[_64]`, `default_random_engine`, `minstd_rand[0]`, `ranlux*`,
   `knuth_b`, and in Python `random.*`, `import random`, `from random import`,
   `os.urandom(`, `secrets.*`);
+- `io`: blocking I/O, logging, or `print` in node code (C++ `std::cout`/
+  `cerr`/`clog`/`cin`, `printf`/`fprintf`/`puts`/`fopen`,
+  `std::ifstream`/`ofstream`/`fstream`, bare POSIX `socket`/`bind`/`listen`/
+  `accept`/`connect`/`sendto`/`recvfrom`; Python `print(`, bare `open(`,
+  imports of `socket`/`urllib`/`requests`/`subprocess`/`logging`);
+- `lock`: mutexes or condition variables in node code (C++ `std::mutex`/
+  `shared_mutex`/`recursive_mutex`/`lock_guard`/`unique_lock`/`scoped_lock`/
+  `condition_variable[_any]`, `pthread_mutex_lock`; Python
+  `threading.Lock`/`RLock`/`Semaphore`/`BoundedSemaphore`/`Condition`);
 - `retry`: `flaky = True` or `--flaky_test_attempts` in a BUILD or `.bzl`
   file, `.bazelrc`, a workflow or a shell script.
 
@@ -40,11 +50,14 @@ talOS/node_api) do so only for test fixtures beside framework code that
 runs on the real clock, so only their test sources are scanned.
 Studio's TypeScript tests (`studio/tests/**/*.ts`, `*.tsx`) are test
 sources too: there `sleep` is a `setTimeout(` call and `clock` a
-`Date.now(` or `performance.now(` call. Comment lines are skipped.
+`Date.now(` or `performance.now(` call. Comments and non-executing string
+literals in C++/Python sources are skipped.
 
-An integration, e2e, soak or perf test may use the real clock (§2); it is
-listed in tools/lint_test_time_allowlist.txt, one `<path> <kind> [<count>]
-<reason>` per line, where kind is sleep, clock, random or retry and count, a
+An integration, e2e, soak or perf test may use the real clock (§2), and
+non-`update()` helpers (such as construction-only setup or a CLI beside a
+node) may use I/O or locks; each is listed in
+tools/lint_test_time_allowlist.txt, one `<path> <kind> [<count>] <reason>`
+per line, where kind is sleep, clock, random, io, lock or retry and count, a
 positive number, is how many lines of that file hit that kind (a reason
 therefore does not start with a digit). A hit not listed fails, and so does
 a listed (path, kind) with no hit left; with a count, so do more hits than
@@ -73,7 +86,9 @@ TIME_PATTERNS = {
                         r"\s*::\s*now\s*\(|\btime\.(time|monotonic)\s*\("),
 }
 # Node code (non-test sources in node packages) is additionally barred from
-# POSIX/Poller/Python wall-clock APIs and randomness (REQ-RT-17; METHODOLOGY §9).
+# POSIX/Poller/Python wall-clock APIs, randomness (REQ-RT-17; METHODOLOGY §9),
+# and blocking I/O, locks, logging, or print (RULES.md 3; METHODOLOGY §10;
+# REQ-RT-06, REQ-RT-17).
 NODE_TIME_PATTERNS = {
     "sleep": TIME_PATTERNS["sleep"],
     "clock": re.compile(
@@ -93,6 +108,18 @@ NODE_TIME_PATTERNS = {
         r"minstd_rand0?|ranlux24_base|ranlux48_base|ranlux24|ranlux48|"
         r"knuth_b)\b"
     ),
+    "io": re.compile(
+        r"\bstd\s*::\s*(?:cout|cerr|clog|cin|ifstream|ofstream|fstream)\b" +
+        r"|(?:\bstd\s*::\s*|(?<![\w.>])::\s*|(?<![.>])(?<!::)\b)"
+        r"(?:printf|fprintf|puts|fopen)\s*\(" +
+        r"|(?:(?<![\w.>])::\s*|(?<![.>])(?<!::)\b)"
+        r"(?:socket|bind|listen|accept|connect|sendto|recvfrom)\s*\("
+    ),
+    "lock": re.compile(
+        r"\bstd\s*::\s*(?:mutex|shared_mutex|recursive_mutex|"
+        r"lock_guard|unique_lock|scoped_lock|condition_variable(?:_any)?)\b" +
+        r"|\bpthread_mutex_lock\b"
+    ),
 }
 # Python-only node patterns (scoped to `.py` files so C++ struct members such
 # as `random.value` never false-positive).
@@ -109,6 +136,18 @@ PY_NODE_RANDOM_PATTERN = re.compile(
     r"|\bsecrets\.\w+"
     r"|(?:^|;)\s*from\s+secrets\s+import\b"
     r"|(?:^|;)\s*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*secrets\b"
+)
+PY_NODE_IO_PATTERN = re.compile(
+    r"(?<!\.)(?<!def )\b(?:print|open)\s*\("
+    r"|(?:^|;)\s*from\s+(?:socket|urllib|requests|subprocess|logging)"
+    r"(?:\.[\w.]+)?\s+import\b"
+    r"|(?:^|;)\s*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*"
+    r"(?:socket|urllib|requests|subprocess|logging)\b"
+)
+PY_NODE_LOCK_PATTERN = re.compile(
+    r"\bthreading\.(?:Lock|RLock|Semaphore|BoundedSemaphore|Condition)\b"
+    r"|(?:^|;)\s*from\s+threading\s+import\b[^\n;#]*\b"
+    r"(?:Lock|RLock|Semaphore|BoundedSemaphore|Condition)\b"
 )
 # `using Clock = std::chrono::steady_clock;` or a typedef of one: the alias's
 # `::now(` is a clock read too.
@@ -185,8 +224,9 @@ PY_COMMENT_SUFFIXES = (".py", ".bzl")
 PY_COMMENT_NAMES = ("BUILD", "BUILD.bazel")
 
 
-def _strip_c_comments(text, is_ts=False):
-    """Replaces `// ...` and `/* ... */` comments with spaces, preserving
+def _strip_c_comments(text, is_ts=False, strip_strings=False):
+    """Replaces `// ...` and `/* ... */` comments (and, when `strip_strings` is
+    set, non-template string/char literal interiors) with spaces, preserving
     newlines so 1-based line numbers remain exact."""
     out = []
     i = 0
@@ -224,7 +264,13 @@ def _strip_c_comments(text, is_ts=False):
                     end = text.find(end_marker, paren + 1)
                     if end != -1:
                         end_idx = end + len(end_marker)
-                        out.append(text[i:end_idx])
+                        if strip_strings:
+                            out.append('"')
+                            for c in text[i + 1:end_idx - 1]:
+                                out.append("\n" if c == "\n" else " ")
+                            out.append('"')
+                        else:
+                            out.append(text[i:end_idx])
                         i = end_idx
                         continue
         # C++ numeric literal with optional `'` digit separators (e.g. `1'000`)
@@ -252,32 +298,43 @@ def _strip_c_comments(text, is_ts=False):
                     continue
                 break
             continue
-        # Quoted string / char / template literals: keep verbatim so `/*` or
-        # `//` inside a literal does not start a comment.
+        # Quoted string / char / template literals: keep delimiters so `/*` or
+        # `//` inside a literal does not start a comment; blank out interior
+        # characters when `strip_strings` is set (except TS template literals,
+        # which can evaluate `${...}`).
         if ch in ('"', "'") or (is_ts and ch == "`"):
             quote = ch
+            blank = strip_strings and quote != "`"
             out.append(ch)
             i += 1
             while i < n:
                 c = text[i]
-                out.append(c)
                 i += 1
                 if c == "\\" and i < n:
-                    out.append(text[i])
+                    escaped = text[i]
                     i += 1
+                    if blank:
+                        out.append("\n" if escaped == "\n" else "  ")
+                    else:
+                        out.append(c)
+                        out.append(escaped)
                     continue
                 if c == quote:
+                    out.append(c)
                     break
                 if c == "\n" and quote != "`":
+                    out.append(c)
                     break
+                out.append(("\n" if c == "\n" else " ") if blank else c)
             continue
         out.append(ch)
         i += 1
     return "".join(out)
 
 
-def _strip_hash_comments(text, python_strings=True):
-    """Replaces `# ...` comments with spaces, preserving newlines."""
+def _strip_hash_comments(text, python_strings=True, strip_strings=False):
+    """Replaces `# ...` comments (and, when `strip_strings` is set, non-f-string
+    Python string literal interiors) with spaces, preserving newlines."""
     out = []
     i = 0
     n = len(text)
@@ -290,20 +347,38 @@ def _strip_hash_comments(text, python_strings=True):
                 i += 1
             continue
         if ch in ('"', "'"):
+            # Python f-strings (`f"..."`, `rf"..."`, `fr"..."`, case-insensitive)
+            # can execute arbitrary code inside `{...}`, so keep them verbatim.
+            blank = False
+            if python_strings and strip_strings:
+                p = i
+                while p > 0 and text[p - 1] in "rRuUbBfF" and i - p < 2:
+                    p -= 1
+                is_fstring = (
+                    p < i and
+                    (p == 0 or not (text[p - 1].isalnum() or text[p - 1] == "_"))
+                    and text[p:i].lower() in ("f", "fr", "rf")
+                )
+                blank = not is_fstring
             if python_strings and text[i:i + 3] == ch * 3:
                 quote = ch * 3
                 out.append(quote)
                 i += 3
                 while i < n:
                     if text[i] == "\\" and i + 1 < n:
-                        out.append(text[i:i + 2])
+                        escaped = text[i + 1]
+                        if blank:
+                            out.append("\n" if escaped == "\n" else "  ")
+                        else:
+                            out.append(text[i:i + 2])
                         i += 2
                         continue
                     if text[i:i + 3] == quote:
                         out.append(quote)
                         i += 3
                         break
-                    out.append(text[i])
+                    c = text[i]
+                    out.append(("\n" if c == "\n" else " ") if blank else c)
                     i += 1
                 continue
             quote = ch
@@ -311,29 +386,37 @@ def _strip_hash_comments(text, python_strings=True):
             i += 1
             while i < n:
                 c = text[i]
-                out.append(c)
                 i += 1
                 if c == "\\" and (python_strings or quote == '"') and i < n:
-                    out.append(text[i])
+                    escaped = text[i]
                     i += 1
+                    if blank:
+                        out.append("\n" if escaped == "\n" else "  ")
+                    else:
+                        out.append(c)
+                        out.append(escaped)
                     continue
                 if c == quote or c == "\n":
+                    out.append(c)
                     break
+                out.append(" " if blank else c)
             continue
         out.append(ch)
         i += 1
     return "".join(out)
 
 
-def strip_comments(text, path):
-    """Strips comments from `text` according to `path`'s syntax while keeping
-    exact line numbers."""
+def strip_comments(text, path, strip_strings=False):
+    """Strips comments (and optionally non-executing string literals) from
+    `text` according to `path`'s syntax while keeping exact line numbers."""
     if path.endswith(C_COMMENT_SUFFIXES):
-        return _strip_c_comments(text, is_ts=path.endswith((".ts", ".tsx")))
+        return _strip_c_comments(text, is_ts=path.endswith((".ts", ".tsx")),
+                                 strip_strings=strip_strings)
     name = os.path.basename(path)
     python_strings = (path.endswith(PY_COMMENT_SUFFIXES) or
                       name in PY_COMMENT_NAMES)
-    return _strip_hash_comments(text, python_strings=python_strings)
+    return _strip_hash_comments(text, python_strings=python_strings,
+                                strip_strings=strip_strings)
 
 
 def scan(files, read):
@@ -355,8 +438,10 @@ def scan(files, read):
                     patterns["clock"].pattern + "|" +
                     PY_NODE_CLOCK_EXTRA.pattern)
                 patterns["random"] = PY_NODE_RANDOM_PATTERN
+                patterns["io"] = PY_NODE_IO_PATTERN
+                patterns["lock"] = PY_NODE_LOCK_PATTERN
         if is_test or is_node:
-            stripped = strip_comments(read(path), path)
+            stripped = strip_comments(read(path), path, strip_strings=True)
             aliases = {a or b for a, b in CLOCK_ALIAS.findall(stripped)}
             if is_node:
                 aliases |= {
@@ -383,6 +468,9 @@ def scan(files, read):
     return hits
 
 
+ALLOWED_KINDS = ("sleep", "clock", "random", "io", "lock", "retry")
+
+
 def parse_allowlist(text):
     """({(path, kind): count or None}, [errors]) from the allowlist's text."""
     entries, errors = {}, []
@@ -397,9 +485,9 @@ def parse_allowlist(text):
             count = int(first) if first.isdigit() and int(first) > 0 else 0
             fields[2] = reason.strip()
         if (len(fields) < 3 or not fields[2] or count == 0 or
-                fields[1] not in ("sleep", "clock", "random", "retry")):
+                fields[1] not in ALLOWED_KINDS):
             errors.append(f"{ALLOWLIST}:{number}: want `<path> sleep|clock|"
-                          f"random|retry [<count>] <reason>`: {line}")
+                          f"random|io|lock|retry [<count>] <reason>`: {line}")
             continue
         entries[(fields[0], fields[1])] = count
     return entries, errors
@@ -421,6 +509,12 @@ def lint(files, read, allowlist_text, out=sys.stdout):
                       f" Node code must be deterministic; remove randomness "
                       f"or list it in {ALLOWLIST} with its reason.",
                       file=out)
+            elif kind in ("io", "lock"):
+                print(f"{path}:{where}: {kind} (RULES.md 3; METHODOLOGY.md §10;"
+                      f" REQ-RT-06, REQ-RT-17). Node code must not do blocking"
+                      f" I/O, locks, logging, or print; move it out of node"
+                      f" code or list non-update() uses in {ALLOWLIST} with a"
+                      f" count and reason.", file=out)
             else:
                 print(f"{path}:{where}: {kind} (docs/TESTING.md §6.1, §8.1; "
                       f"METHODOLOGY.md §9). Wait on an event, take the clock "
@@ -430,9 +524,19 @@ def lint(files, read, allowlist_text, out=sys.stdout):
         count = allowed[(path, kind)]
         if count is not None and len(lines) > count:
             failures += 1
-            print(f"{path}:{where}: {len(lines)} {kind} hits, {count} allowed "
-                  f"by {ALLOWLIST} (docs/TESTING.md §6.1, §8.1). Wait on an "
-                  f"event or take the clock as a parameter.", file=out)
+            if kind in ("io", "lock"):
+                print(f"{path}:{where}: {len(lines)} {kind} hits, {count} "
+                      f"allowed by {ALLOWLIST} (RULES.md 3; METHODOLOGY.md "
+                      f"§10).", file=out)
+            elif kind == "random":
+                print(f"{path}:{where}: {len(lines)} {kind} hits, {count} "
+                      f"allowed by {ALLOWLIST} (METHODOLOGY.md §9; REQ-RT-17).",
+                      file=out)
+            else:
+                print(f"{path}:{where}: {len(lines)} {kind} hits, {count} "
+                      f"allowed by {ALLOWLIST} (docs/TESTING.md §6.1, §8.1). "
+                      f"Wait on an event or take the clock as a parameter.",
+                      file=out)
         elif count is not None and len(lines) < count:
             failures += 1
             print(f"{ALLOWLIST}: `{path} {kind} {count}` allows more than "
