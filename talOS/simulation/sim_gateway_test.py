@@ -443,12 +443,30 @@ class SimGatewayStartup(unittest.TestCase):
             post_pause_gaps = gaps[pause_indices[0] + 1:]
             self.assertGreaterEqual(len(post_pause_gaps), 5)
             # Without realignment, ~15 missed ticks fire back-to-back (< 1 ms
-            # apart). With end + period_us realignment, every post-pause tick
-            # waits its period.
+            # apart) right after SIGCONT. With NextTickDeadline's end + period
+            # realignment, the first post-pause tick waits a full period, and a
+            # later single-tick host stall (< 1 period late) may legitimately
+            # recover phase on the very next tick (e.g. 15.8 ms + 4.2 ms =
+            # 20.0 ms). Assert both the realigned first gap and that no
+            # multi-tick catch-up burst occurs (5-gap span and every 2-gap
+            # pair stay on period).
             self.assertGreaterEqual(
-                min(post_pause_gaps),
+                post_pause_gaps[0],
                 period_us // 2,
-                f"catch-up burst after host pause: post-pause gaps = {post_pause_gaps[:15]}",
+                f"immediate catch-up after host pause: post-pause gaps = {post_pause_gaps[:15]}",
+            )
+            self.assertGreaterEqual(
+                sum(post_pause_gaps[:5]),
+                4 * period_us,
+                f"catch-up burst across first 5 post-pause ticks: {post_pause_gaps[:15]}",
+            )
+            two_tick_spans = [
+                a + b for a, b in zip(post_pause_gaps, post_pause_gaps[1:])
+            ]
+            self.assertGreaterEqual(
+                min(two_tick_spans),
+                3 * period_us // 2,
+                f"catch-up burst in post-pause pair: gaps = {post_pause_gaps[:15]}",
             )
 
 
