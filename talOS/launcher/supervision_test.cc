@@ -6155,13 +6155,14 @@ TEST(Supervision, GuardianIgnoresSighupAndStillKillsOrphanGroup) {
   const std::string script = TempPath("guardian_sighup.sh");
   {
     std::ofstream out{script};
+    // Only the grandchild ignores SIGHUP; the child leaves SIGHUP at its
+    // default action so group SIGHUP terminates it synchronously in the kernel
+    // (avoiding a bash race where a trapped SIGHUP arriving between echo and
+    // read leaves pending_traps deferred while read blocks forever).
     out << "#!/bin/sh\n"
-           "trap 'echo hup' HUP\n"
            "(trap '' HUP; echo \"gc_ready\"; read ignored <&8) &\n"
            "echo \"ready $!\"\n"
-           "while :; do\n"
-           "  read ignored <&8 || exit 0\n"
-           "done\n";
+           "read ignored <&8\n";
   }
   ASSERT_EQ(::chmod(script.c_str(), 0755), 0);
 
@@ -6172,13 +6173,17 @@ TEST(Supervision, GuardianIgnoresSighupAndStillKillsOrphanGroup) {
     ::close(info_pipe[0]);
     ::close(gc_alive[0]);
     ::close(gc_block[1]);
-    // Move above 8 first so dup2(..., 7/8) never collides with pipe fds.
+    // Move every kept descriptor above 8 first so dup2(..., 7/8) never collides
+    // with pipe fds, and mark info_out close-on-exec so spawned processes do
+    // not inherit it.
+    const int info_out = ::fcntl(info_pipe[1], F_DUPFD_CLOEXEC, 12);
     const int alive_tmp = ::fcntl(gc_alive[1], F_DUPFD, 12);
     const int block_tmp = ::fcntl(gc_block[0], F_DUPFD, 12);
+    ::close(info_pipe[1]);
     ::close(gc_alive[1]);
     ::close(gc_block[0]);
-    if (alive_tmp < 0 || block_tmp < 0 || ::dup2(alive_tmp, 7) < 0 ||
-        ::dup2(block_tmp, 8) < 0)
+    if (info_out < 0 || alive_tmp < 0 || block_tmp < 0 ||
+        ::dup2(alive_tmp, 7) < 0 || ::dup2(block_tmp, 8) < 0)
       ::_exit(100);
     ::close(alive_tmp);
     ::close(block_tmp);
@@ -6204,17 +6209,15 @@ TEST(Supervision, GuardianIgnoresSighupAndStillKillsOrphanGroup) {
     const std::string msg =
         "child " + std::to_string(child) + "\n" + lines + "done\n";
     [[maybe_unused]] const ssize_t w =
-        ::write(info_pipe[1], msg.data(), msg.size());
-    // Wait for child to echo "hup\n" after the test sends group SIGHUP, then
-    // report "hup\n" to the test and wait until SIGKILLed.
-    std::string after;
-    while (after.find("hup\n") == std::string::npos) {
-      const ssize_t n = ::read(child_out, buf, sizeof buf);
-      if (n < 0 && errno == EINTR) continue;
-      if (n <= 0) break;
-      after.append(buf, static_cast<std::size_t>(n));
+        ::write(info_out, msg.data(), msg.size());
+    // Wait for group SIGHUP to terminate child, then report "hup\n" to the
+    // test and wait until SIGKILLed.
+    int child_status = 0;
+    while (::waitpid(child, &child_status, 0) < 0 && errno == EINTR) {
     }
-    [[maybe_unused]] const ssize_t w2 = ::write(info_pipe[1], "hup\n", 4);
+    if (WIFSIGNALED(child_status) && WTERMSIG(child_status) == SIGHUP) {
+      [[maybe_unused]] const ssize_t w2 = ::write(info_out, "hup\n", 4);
+    }
     for (;;) ::pause();
   }
 
