@@ -1,0 +1,47 @@
+# Google Cloud CI scripts
+
+A Bazel remote cache and on-demand build VMs in Google Cloud (`us-east4`),
+used by the manually started workflow `.github/workflows/ci-cd.yml`. The
+workflows in [docs/TESTING.md §9](../docs/TESTING.md#9-lanes-and-ci) remain
+what gates a push; this one adds nothing to them.
+
+Every script prints the `gcloud` commands it would run and changes nothing
+until it is given `--apply`. Settings (project, region, names, the cache's
+address) are in `gcp-cicd.env.sh` and can be overridden from the environment.
+
+| Step | Script | Creates | Costs money |
+|---|---|---|---|
+| 1 | `setup-gcp-cicd.sh` | APIs, the `talos-ci` network with Cloud NAT, firewall rules, the cache bucket (objects deleted 14 days after upload), the Artifact Registry Docker repository, two VM service accounts | Cloud NAT, storage |
+| 2 | `create-bazel-cache-vm.sh` | the persistent `e2-medium` Container-Optimized OS VM running `bazel-remote` (`cache-vm-cloud-init.yaml`) | the VM and its disk, until deleted |
+| 3 | `setup-gcp-wif.sh` | the Workload Identity pool and provider for the GitHub repository, and the `github-ci` service account | no |
+
+```sh
+scripts/setup-gcp-cicd.sh                       # read the commands
+PROJECT_ID=my-project scripts/setup-gcp-cicd.sh --apply
+```
+
+After step 3, set the three repository variables it prints, then start the
+workflow from the Actions tab.
+
+## Access
+
+- No VM has an external address. Outbound traffic goes through Cloud NAT.
+- The cache's gRPC port (9092) accepts connections only from VMs tagged
+  `ci-build` in the same network. Its HTTP port listens on loopback.
+- SSH to either kind of VM goes through Identity-Aware Proxy with OS Login.
+- Only the cache VM's service account can read or write the bucket.
+- The Workload Identity provider accepts tokens of the one repository named
+  in `GITHUB_REPO`. The workflow is started by hand because it writes the
+  shared cache: a trigger that runs code from a fork would let that code
+  write cache entries later builds trust.
+
+## Using the cache
+
+`bazel build --config=gcp //...` (`.bazelrc`) on a VM in the `talos-ci`
+network. The address in `build:gcp` is `CACHE_IP` in `gcp-cicd.env.sh`;
+change both together. It is not reachable from a laptop, whose builds keep
+using the local disk cache.
+
+The bucket's lifecycle rule deletes an object 14 days after it was uploaded,
+whether or not it is still used; `bazel-remote` uploads it again on the next
+build that produces it.
