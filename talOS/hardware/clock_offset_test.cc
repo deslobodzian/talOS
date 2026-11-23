@@ -382,7 +382,7 @@ TEST(ClockOffset, ExtremeTimestampsDoNotOverflowSignedArithmetic) {
 // (including UINT64_MAX) must be ignored rather than advancing
 // last_sample_time_us_ and permanently locking out subsequent valid States or
 // poisoning the one-way offset estimate.
-// REQ-RT-20
+// REQ-RT-27
 TEST(ClockOffset, FarFutureSampleJumpIsIgnoredWithoutLockingOutLaterSamples) {
   Estimator clock;
   for (std::uint64_t i = 0; i < Estimator::kConvergedSamples; ++i) {
@@ -436,7 +436,7 @@ TEST(ClockOffset, FarFutureSampleJumpIsIgnoredWithoutLockingOutLaterSamples) {
 // backward and lock out the live frame immediately behind it, while sustained
 // bridge-fast oscillator drift refreshes the anchor over normal streaming so
 // the drift allowance never grows unboundedly.
-// REQ-RT-20
+// REQ-RT-27
 TEST(ClockOffset, DelayedFrameAfterLongOutageDoesNotLockOutLiveSamples) {
   // 1. 1000 s outage + 1.5 s delayed buffered packet + live frame 5 ms later.
   // Because 1000 s / 500 (2 s) > 1.5 s, a naive anchor-retreat check would
@@ -483,7 +483,7 @@ TEST(ClockOffset, DelayedFrameAfterLongOutageDoesNotLockOutLiveSamples) {
 // leaves the initial anchor behind live time, so the first live frame is held
 // as a jump candidate and the second live frame (5 ms later, consistent at
 // physical clock rate) immediately re-syncs the anchor and resumes acceptance.
-// REQ-RT-20
+// REQ-RT-27
 TEST(ClockOffset, UnseenBootStallTailDropRecoversOnTwoConsistentLiveFrames) {
   {
     Estimator clock;
@@ -548,7 +548,7 @@ TEST(ClockOffset, UnseenBootStallTailDropRecoversOnTwoConsistentLiveFrames) {
 // long outages with up to 1000 ppm relative oscillator drift in either
 // direction, backward bridge clock without underflow, and arbitrary starting
 // sample_time_us on a new boot.
-// REQ-RT-20
+// REQ-RT-27
 TEST(ClockOffset, JumpGuardAcceptsOutagesJitterAndNewBootWhileEnforcingBound) {
   // 1. Exact boundary at receipt_delta == 0 and burst jitter catch-up.
   {
@@ -634,11 +634,47 @@ TEST(ClockOffset, JumpGuardAcceptsOutagesJitterAndNewBootWhileEnforcingBound) {
 // fault shapes).
 // Property A (no corruption): never refuses two legitimate frames in a row.
 // Property B (single corrupt frame during streaming): every injection recovers
-// and worst lockout stays <= 1.5 s.
-// REQ-RT-20
+// and worst lockout stays within the derived bound (~1.032 s).
+// REQ-RT-27
 TEST(
     ClockOffset,
     RandomizedPhysicalModelNeverRefusesTwoLegitFramesInARowAndBoundsCorruptLockout) {
+  constexpr std::array<std::uint64_t, 4> kPeriods = {5'000, 5'000, 10'000,
+                                                     20'000};
+  constexpr std::uint64_t kMaxPeriodUs = kPeriods.back();
+  constexpr std::uint64_t kMinDeliveryJitterUs = 50;
+  constexpr std::uint64_t kMaxDeliveryJitterUs = 2'000;
+  constexpr std::uint64_t kMaxModelDriftPpm = 1'000;
+  // Derived Property B lockout ceiling for a single corrupt frame injected
+  // during steady streaming:
+  //   - kMaxSampleJumpMarginUs (1,000,000 us): maximum jump accepted directly
+  //     above the prompt anchor before the gate rejects it.
+  //   - kMaxPeriodUs (20,000 us): up to one gateway tick after real gateway
+  //     time catches up before the next legitimate sample strictly exceeds the
+  //     accepted corrupt timestamp.
+  //   - 2 * kMaxDeliveryJitterUs (4,000 us): corrupt-frame delivery jitter
+  //     widening receipt_delta plus recovering-frame delivery jitter widening
+  //     measured lockout.
+  //   - Drift overhead (<= 8,120 us): under steady -1000 ppm (bridge fast),
+  //     the prompt anchor refreshes every kAnchorRefreshUs (1 s), so at
+  //     injection receipt_delta is at most 2 * kAnchorRefreshUs +
+  //     2 * kMaxPeriodUs (~2.04 s); the gate's 2000 ppm drift allowance
+  //     (~4.08 ms), the gateway's 1000 ppm lag since the anchor (~2.04 ms),
+  //     and its 1000 ppm lag while catching up across the 1 s margin (~1.0 ms
+  //     plus 1 ms for integer rounding and 1/(1 - 1e-3)) sum to 8.12 ms.
+  // Theoretical ceiling is ~1.032 s (single-margin + period + jitter + 1 s
+  // drift is ~1.025 s; measured worst across the 40-boot suite is ~1.021 s).
+  constexpr std::uint64_t kMaxAnchorAgeUs =
+      2 * Estimator::kAnchorRefreshUs + 2 * kMaxPeriodUs;
+  constexpr std::uint64_t kMaxDriftOverheadUs =
+      kMaxAnchorAgeUs / Estimator::kMaxClockDriftDivisor +
+      (kMaxAnchorAgeUs + Estimator::kMaxSampleJumpMarginUs) *
+          kMaxModelDriftPpm / 1'000'000 +
+      1'000;
+  constexpr std::uint64_t kMaxCorruptLockoutUs =
+      Estimator::kMaxSampleJumpMarginUs + kMaxPeriodUs +
+      2 * kMaxDeliveryJitterUs + kMaxDriftOverheadUs;
+
   struct Frame {
     std::uint64_t sample_us;
     bool corrupt;
@@ -651,8 +687,8 @@ TEST(
     std::array<std::uint64_t, 6> corrupt_shapes{};
   };
 
-  const auto run_boot = [](std::uint64_t seed, bool inject_corrupt,
-                           int events) -> RunStats {
+  const auto run_boot = [&](std::uint64_t seed, bool inject_corrupt,
+                            int events) -> RunStats {
     RunStats stats;
     Estimator est;
     std::mt19937_64 rng{seed};
@@ -663,12 +699,12 @@ TEST(
     const std::uint64_t boot =
         uniform(1, std::numeric_limits<std::uint64_t>::max() - 1);
     const double drift =
-        (static_cast<double>(uniform(0, 2000)) - 1000.0) * 1e-6;
+        (static_cast<double>(uniform(0, 2 * kMaxModelDriftPpm)) -
+         static_cast<double>(kMaxModelDriftPpm)) *
+        1e-6;
     const std::uint64_t g0 = uniform(0, 1) != 0
                                  ? uniform(0, 5'000'000)
                                  : uniform(0, 4'000'000'000'000ULL);
-    constexpr std::array<std::uint64_t, 4> kPeriods = {5'000, 5'000, 10'000,
-                                                       20'000};
     constexpr std::array<std::size_t, 4> kCaps = {64, 200, 1000, 4000};
     const std::uint64_t period =
         kPeriods[static_cast<std::size_t>(uniform(0, kPeriods.size() - 1))];
@@ -712,7 +748,8 @@ TEST(
     const auto stream = [&](std::uint64_t dur_us) {
       const std::uint64_t end = t + dur_us;
       for (; t < end; t += period) {
-        deliver({gclock(t), false}, t + uniform(50, 2'000));
+        deliver({gclock(t), false},
+                t + uniform(kMinDeliveryJitterUs, kMaxDeliveryJitterUs));
       }
     };
 
@@ -813,7 +850,8 @@ TEST(
         }
         lockout_active = true;
         lockout_from_us = t;
-        deliver({corrupt_s, true}, t + uniform(50, 2'000));
+        deliver({corrupt_s, true},
+                t + uniform(kMinDeliveryJitterUs, kMaxDeliveryJitterUs));
         t += period;
       }
 
@@ -850,13 +888,13 @@ TEST(
       shape_counts[i] += prop_b.corrupt_shapes[i];
     }
     EXPECT_EQ(prop_b.unrecovered, 0u) << "seed " << seed;
-    EXPECT_LE(prop_b.worst_lockout_us, 1'500'000u) << "seed " << seed;
+    EXPECT_LE(prop_b.worst_lockout_us, kMaxCorruptLockoutUs) << "seed " << seed;
   }
 
   EXPECT_GT(total_legit_a, 0u);
   EXPECT_LE(worst_refused_run, 1u);
   EXPECT_EQ(total_unrecovered, 0u);
-  EXPECT_LE(worst_lockout_us, 1'500'000u);
+  EXPECT_LE(worst_lockout_us, kMaxCorruptLockoutUs);
   for (std::size_t i = 0; i < shape_counts.size(); ++i) {
     EXPECT_GT(shape_counts[i], 0u) << "corrupt fault shape " << i;
   }

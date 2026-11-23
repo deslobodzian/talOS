@@ -68,7 +68,7 @@ Every decoded `kHardwareState` frame with a nonzero `boot_id` passes through
 `ClockOffsetEstimator::Observe(boot_id, sample_time_us, now_us)`
 ([`talOS/hardware/clock_offset.h`](../hardware/clock_offset.h)) before
 `HardwareNode::HandleGatewayFrame` updates identity, freshness, active merges,
-configuration pushes, or `/hw/state`:
+configuration pushes, or `/hw/state` (`REQ-RT-27`):
 
 - **Retired boot or non-increasing `sample_time_us`**: dropped whole and counted
   in `/hw/status` `clock_ignored_count`.
