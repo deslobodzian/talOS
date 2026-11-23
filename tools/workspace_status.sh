@@ -26,7 +26,8 @@ pwd_top=""
 if revision="$(git rev-parse HEAD 2>/dev/null)"; then
   echo "STABLE_GIT_COMMIT ${revision}"
   # Untracked files count: a new source file is part of the build.
-  if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  # Fail closed to dirty if `git status` itself fails.
+  if ! status_out="$(git status --porcelain 2>/dev/null)" || [ -n "$status_out" ]; then
     echo "STABLE_GIT_DIRTY 1"
   else
     echo "STABLE_GIT_DIRTY 0"
@@ -42,7 +43,7 @@ if raw_talos_top="$(git -C "$TALOS_DIR" rev-parse --show-toplevel 2>/dev/null)" 
   && [ "$talos_top" != "$pwd_top" ] \
   && talos_rev="$(git -C "$TALOS_DIR" rev-parse HEAD 2>/dev/null)"; then
   echo "STABLE_TALOS_GIT_COMMIT ${talos_rev}"
-  if [ -n "$(git -C "$TALOS_DIR" status --porcelain 2>/dev/null)" ]; then
+  if ! talos_status="$(git -C "$TALOS_DIR" status --porcelain 2>/dev/null)" || [ -n "$talos_status" ]; then
     echo "STABLE_TALOS_GIT_DIRTY 1"
   else
     echo "STABLE_TALOS_GIT_DIRTY 0"

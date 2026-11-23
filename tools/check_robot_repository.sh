@@ -62,9 +62,20 @@ robot_commit="$(git --no-optional-locks -C "$source_repo" rev-parse --short --ve
 # (not `repo_name`) and either quote may delimit it.
 module="$(git --no-optional-locks -C "$source_repo" show 'HEAD:MODULE.bazel' 2>/dev/null)" ||
   die "$source_repo is not a talOS-dependent repository: its commit $robot_commit has no MODULE.bazel"
-depends_on_talos="bazel_dep[[:space:]]*\\(([^)]*[,[:space:]])?name[[:space:]]*=[[:space:]]*[\"']talos[\"']"
-printf '%s\n' "$module" | sed 's/#.*//' | tr '\n' ' ' |
-  grep -Eq "$depends_on_talos" ||
+python3 -c '
+import ast, sys
+try:
+    tree = ast.parse(sys.stdin.read(), filename="MODULE.bazel")
+except SyntaxError:
+    sys.exit(1)
+for node in ast.walk(tree):
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "bazel_dep":
+        name_node = next((kw.value for kw in node.keywords if kw.arg == "name"),
+                         node.args[0] if node.args else None)
+        if isinstance(name_node, ast.Constant) and name_node.value == "talos":
+            sys.exit(0)
+sys.exit(1)
+' <<< "$module" ||
   die "$source_repo is not a talOS-dependent repository: the MODULE.bazel of its commit $robot_commit has no bazel_dep(name = \"talos\")"
 talos_commit="$(git -C "$talos" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 [ -n "$(git -C "$talos" status --porcelain 2>/dev/null)" ] && talos_commit="$talos_commit+changes"
