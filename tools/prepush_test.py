@@ -629,6 +629,68 @@ class PrepushTest(unittest.TestCase):
         self.assertEqual(status, 0, out)
         self.assertIn("prepush: scaffold-robot_repo skipped", out)
 
+    # REQ-DEV-29: prepush builds and tests @talos//talOS/configuration:config_fuzz_test
+    # inside both dependent repositories (examples/robot_repo and
+    # examples/wrist_repo) whenever MODULE.bazel or third_party/ changes, and
+    # fails the run if either dependent fails.
+    def test_dependents_run_config_fuzz_test_when_module_or_third_party_changes(
+            self):
+        self.commit("examples/robot_repo/MODULE.bazel", "robot_repo")
+        self.commit("examples/wrist_repo/MODULE.bazel", "wrist_repo")
+        put(os.path.join(self.repo, "tools", "check_robot_repo_scaffold.sh"),
+            "#!/bin/sh\nexit 0\n", 0o755)
+        self.git("add", "tools/check_robot_repo_scaffold.sh")
+        self.git("commit", "-qm", "scaffold check")
+        self.git("branch", "pushed")
+        self.git("branch", "--set-upstream-to=pushed")
+
+        def clear_log():
+            if os.path.exists(self.log):
+                os.remove(self.log)
+
+        def dependent_calls(calls, name):
+            suffix = os.sep + os.path.join("examples", name)
+            return [args.split() for cwd, _, args in calls
+                    if cwd.endswith(suffix)]
+
+        # A doc-only change skips dependent repositories.
+        self.commit("docs/note.md", "docs only")
+        clear_log()
+        status, out, calls = self.prepush()
+        self.assertEqual(status, 0, out)
+        self.assertIn("prepush: dependents not needed", out)
+        self.assertEqual(dependent_calls(calls, "robot_repo"), [])
+        self.assertEqual(dependent_calls(calls, "wrist_repo"), [])
+
+        # Touching MODULE.bazel or third_party/ runs config_fuzz_test inside
+        # both dependent repositories.
+        for path, msg in (("MODULE.bazel", "module change"),
+                          ("third_party/tomlplusplus_parser_ub.patch",
+                           "toml patch change")):
+            with self.subTest(path=path):
+                self.git("branch", "-f", "pushed", "HEAD")
+                self.commit(path, msg)
+                clear_log()
+                status, out, calls = self.prepush()
+                self.assertEqual(status, 0, out)
+                for dep in ("robot_repo", "wrist_repo"):
+                    self.assertIn(f"prepush: dependent-{dep} ok", out)
+                    dep_calls = dependent_calls(calls, dep)
+                    self.assertEqual(len(dep_calls), 1, calls)
+                    self.assertEqual(dep_calls[0][0], "test")
+                    self.assertIn("//...", dep_calls[0])
+                    self.assertIn(
+                        "@talos//talOS/configuration:config_fuzz_test",
+                        dep_calls[0])
+
+        # A failure in dependent test runs fails prepush naming both steps.
+        clear_log()
+        status, out, _ = self.prepush(STUB_FAIL="test")
+        self.assertEqual(status, 1, out)
+        self.assertIn("prepush: dependent-robot_repo FAILED", out)
+        self.assertIn("prepush: dependent-wrist_repo FAILED", out)
+        self.assert_cleaned_up()
+
     # REQ-DEV-25
     def test_full_is_refused_with_skip_gradle(self):
         # --full promises rio-in-the-loop, which runs through Gradle.
