@@ -43,10 +43,9 @@ def _clamp(value, low, high):
 
 
 def _micros(ns):
-    """static_cast<std::uint64_t>(ns / 1000) for an int64 count of ns:
-    division truncates toward zero, and a negative wraps."""
-    us = abs(ns) // 1000
-    return (us if ns >= 0 else -us) % 2**64
+    """Non-negative microsecond count from an int64 nanosecond duration:
+    clamps negative clock-mapping jitter to 0 instead of wrapping uint64."""
+    return 0 if ns <= 0 else ns // 1000
 
 
 class BenchMotor:

@@ -104,6 +104,8 @@ let manifestError = '';
 let nextManifestPoll = 0;
 let manifestBase: string|null = null;
 let lastManifestRaw: string|null = null;
+let manifestInFlight = false;
+let fetchAbort: AbortController|null = null;
 
 // Posted only when the graph changes or goes stale/fresh, not on every
 // telemetry tick: it is a few tens of kilobytes and structure changes at 4 Hz,
@@ -149,13 +151,14 @@ function postFrames() {
 // from the worker's own state rather than stored on the wire.
 function postPlayback(now: number) {
   const snapshot = coordinator.snapshot();
+  const elapsedNs = sampleArrival !== null && Number.isFinite(now - sampleArrival) ?
+      Math.max(0, Math.round((now - sampleArrival) * 1e6)) : null;
   const state: PlaybackState = {
     mode: coordinator.mode,
     cursor_ns: snapshot?.timestamp_ns ?? null,
     clock_ns: snapshot ? (coordinator.mode === 'LIVE_STREAMING' ?
-        (sampleArrival === null ? null :
-             (BigInt(snapshot.timestamp_ns) +
-              BigInt(Math.round((now - sampleArrival) * 1e6))).toString()) :
+        (elapsedNs === null ? null :
+             (BigInt(snapshot.timestamp_ns) + BigInt(elapsedNs)).toString()) :
         coordinator.cursor.toString()) : null,
     bounds: coordinator.timeline.bounds(),
     stats: {...history.jitter.stats},
@@ -181,12 +184,12 @@ function postPlayback(now: number) {
 // failure is equally quiet, because the connection status already says the
 // bridge is unreachable. A document that arrives and does not parse is the one
 // case worth a sentence on screen.
-async function fetchDeclared(url: string, gen: number) {
+async function fetchDeclared(url: string, gen: number, signal?: AbortSignal) {
   const target = declaredUrl(url);
   if (!target) return;
   let text: string;
   try {
-    const response = await fetch(target, {cache: 'no-store'});
+    const response = await fetch(target, {cache: 'no-store', signal});
     if (gen !== generation) return;
     if (response.status === 404) return;
     if (!response.ok) {
@@ -229,12 +232,13 @@ function ingestDeclared(text: string) {
 // is null and nothing is reported. A network failure is quiet, for the same
 // reason the declared graph's is. A malformed document keeps the last good
 // manifest and says why this one was refused.
-async function fetchManifest(url: string, gen: number) {
+async function fetchManifest(url: string, gen: number, signal?: AbortSignal) {
   const target = manifestUrl(url);
-  if (!target) return;
+  if (!target || manifestInFlight) return;
+  manifestInFlight = true;
   let text: string;
   try {
-    const response = await fetch(target, {cache: 'no-store'});
+    const response = await fetch(target, {cache: 'no-store', signal});
     if (gen !== generation) return;
     if (response.status === 404) {
       // "Not offered" is not a fault; it clears whatever the previous bridge
@@ -261,6 +265,8 @@ async function fetchManifest(url: string, gen: number) {
     text = await response.text();
   } catch {
     return;
+  } finally {
+    if (gen === generation) manifestInFlight = false;
   }
   if (gen !== generation) return;
   const previousError = manifestError;
@@ -339,6 +345,9 @@ function reset() {
 function close() {
   generation++;
   clearTimeout(retry);
+  fetchAbort?.abort();
+  fetchAbort = null;
+  manifestInFlight = false;
   if (socket) {
     socket.onopen = null;
     socket.onmessage = null;
@@ -385,8 +394,12 @@ function connect(url: string, gen: number) {
       // Asked for on every open, not once per session: the bridge may have been
       // started after Studio was, and the first attempt would have found
       // nothing to answer it.
-      void fetchDeclared(url, gen);
-      void fetchManifest(url, gen);
+      fetchAbort?.abort();
+      fetchAbort = typeof AbortController === 'function' ? new AbortController() : null;
+      manifestInFlight = false;
+      nextManifestPoll = performance.now() + 1000;
+      void fetchDeclared(url, gen, fetchAbort?.signal);
+      void fetchManifest(url, gen, fetchAbort?.signal);
     };
     socket.onmessage = e => {
       if (gen !== generation) return;
@@ -545,9 +558,11 @@ setInterval(() => {
   // live document, and the launcher replaces it atomically as nodes restart.
   if (manifestBase !== null && connection === 'live' && now >= nextManifestPoll) {
     nextManifestPoll = now + 1000;
-    void fetchManifest(manifestBase, generation);
+    void fetchManifest(manifestBase, generation, fetchAbort?.signal);
   }
-  coordinator.tick(BigInt(Math.max(0, Math.round((now - lastTick) * 1e6))));
+  const tickDt = Number.isFinite(now - lastTick) ?
+      Math.max(0, Math.round((now - lastTick) * 1e6)) : 0;
+  coordinator.tick(BigInt(tickDt));
   lastTick = now;
   // A graph goes stale with time or a dropped socket, not only with a new
   // document, so its freshness is re-judged every tick and posted on change.

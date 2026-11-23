@@ -317,6 +317,10 @@ class TalosMessagesMacroContractTest(unittest.TestCase):
             {"bad": "/hw/state/vel"},       # qualifier abbreviation
             {"bad": "/intake/pose"},        # invalid role
             {"BadKey": "/intake/state"},    # non-snake_case topic key
+            {"foo__bar": "/intake/state"},  # doubled underscore in topic key
+            {"foo_": "/intake/state"},      # trailing underscore in topic key
+            {"café": "/intake/state"},      # non-ASCII topic key
+            {"foo_1": "/intake/state", "foo1": "/intake/status"},  # C++ kFoo1 collision
         ]
         for topics in bad_cases:
             with self.subTest(topics=topics):

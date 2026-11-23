@@ -7,10 +7,16 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <random>
 #include <string>
 #include <vector>
 
 #include "talOS/vision/apriltag/cpu_apriltag_backend.h"
+
+extern "C" {
+#include <common/image_u8.h>
+#include <common/pjpeg.h>
+}
 
 namespace talos::vision::apriltag {
 namespace {
@@ -279,6 +285,82 @@ TEST(JpegLoader, RestartMarkerResetsAllComponentDcPredictors) {
   const std::vector<Detection> detections = backend.DetectImageFile(path);
   ASSERT_EQ(detections.size(), 1u);
   EXPECT_EQ(detections[0].id, 0);
+}
+
+// Seeded mutations of a minimal JPEG buffer through pjpeg_create_from_buffer
+// plus baseline conversions, and small/decimated image dimensions in Detect(),
+// must never read out of bounds or crash.
+TEST(JpegLoader, SeededBufferFuzzAndSmallImagesStayInBounds) {
+  const std::vector<uint8_t> seed = {
+      0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x43, 0x00, 64,   64,   64,   64,   64,
+      64,   64,   64,   64,   64,   64,   64,   64,   64,   64,   64,   64,
+      64,   64,   64,   64,   64,   64,   64,   64,   64,   64,   64,   64,
+      64,   64,   64,   64,   64,   64,   64,   64,   64,   64,   64,   64,
+      64,   64,   64,   64,   64,   64,   64,   64,   64,   64,   64,   64,
+      64,   64,   64,   64,   64,   64,   64,   64,   64,   64,   64,   0xFF,
+      0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x10, 0x01, 0x01, 0x11, 0x00,
+      0xFF, 0xC4, 0x00, 0x15, 0x00, 1,    1,    0,    0,    0,    0,    0,
+      0,    0,    0,    0,    0,    0,    0,    0,    0,    0x00, 0x05, 0xFF,
+      0xC4, 0x00, 0x14, 0x10, 1,    0,    0,    0,    0,    0,    0,    0,
+      0,    0,    0,    0,    0,    0,    0,    0,    0x00, 0xFF, 0xDA, 0x00,
+      0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0x28, 0x3F, 0x28, 0x3F, 0x28,
+      0x3F, 0x28, 0x3F, 0xFF, 0xD9};
+
+  std::mt19937 rng(0x6a706567U);
+  for (int iter = 0; iter < 512; ++iter) {
+    std::vector<uint8_t> mutated = seed;
+    const unsigned edits = 1 + (rng() % 6);
+    for (unsigned e = 0; e < edits; ++e) {
+      const std::size_t pos = rng() % (mutated.size() + 1);
+      switch (rng() % 3) {
+        case 0:
+          if (pos < mutated.size()) {
+            mutated[pos] ^= static_cast<uint8_t>(1U << (rng() % 8));
+          }
+          break;
+        case 1:
+          mutated.insert(mutated.begin() + static_cast<std::ptrdiff_t>(pos),
+                         static_cast<uint8_t>(rng()));
+          break;
+        case 2:
+          if (pos < mutated.size()) {
+            mutated.erase(mutated.begin() + static_cast<std::ptrdiff_t>(pos));
+          }
+          break;
+        default:
+          break;
+      }
+    }
+    const std::vector<uint8_t> exact(mutated.begin(), mutated.end());
+    int err = 0;
+    pjpeg_t* pj =
+        pjpeg_create_from_buffer(const_cast<uint8_t*>(exact.data()),
+                                 static_cast<int>(exact.size()), 0, &err);
+    if (pj != nullptr) {
+      if (pj->width <= 1024 && pj->height <= 1024) {
+        if (image_u8_t* u8 = pjpeg_to_u8_baseline(pj)) {
+          image_u8_destroy(u8);
+        }
+        if (pj->ncomponents == 3) {
+          if (image_u8x3_t* u8x3 = pjpeg_to_u8x3_baseline(pj)) {
+            image_u8x3_destroy(u8x3);
+          }
+        }
+      }
+      pjpeg_destroy(pj);
+    }
+  }
+
+  // Tiny / sub-tile images that previously triggered heap-buffer-overflow in
+  // apriltag_quad_thresh's threshold() when tw == 0 or th == 0.
+  const std::array<uint8_t, 64> small_buf{};
+  for (const float decimate : {1.0f, 1.5f, 2.0f}) {
+    CpuAprilTagBackend backend = MakeBackend(decimate);
+    EXPECT_TRUE(backend.Detect(small_buf.data(), 64, 1, 64).empty());
+    EXPECT_TRUE(backend.Detect(small_buf.data(), 1, 64, 1).empty());
+    EXPECT_TRUE(backend.Detect(small_buf.data(), 3, 3, 3).empty());
+    EXPECT_TRUE(backend.Detect(small_buf.data(), 6, 6, 6).empty());
+  }
 }
 
 }  // namespace

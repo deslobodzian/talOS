@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string_view>
@@ -111,11 +112,25 @@ void SnapshotDriverStation(DriverStationData& out) {
 
   HAL_MatchInfo info{};
   HAL_GetMatchInfo(&info);
-  out.fms.match_type = static_cast<MatchType>(info.matchType);
+  switch (info.matchType) {
+    case HAL_kMatchType_practice:
+      out.fms.match_type = MatchType::kPractice;
+      break;
+    case HAL_kMatchType_qualification:
+      out.fms.match_type = MatchType::kQualification;
+      break;
+    case HAL_kMatchType_elimination:
+      out.fms.match_type = MatchType::kElimination;
+      break;
+    default:
+      out.fms.match_type = MatchType::kNone;
+      break;
+  }
   out.fms.match_number = info.matchNumber;
   out.fms.replay_number = info.replayNumber;
   status = 0;
-  out.fms.match_time_s = static_cast<float>(HAL_GetMatchTime(&status));
+  const float match_time_s = static_cast<float>(HAL_GetMatchTime(&status));
+  out.fms.match_time_s = std::isfinite(match_time_s) ? match_time_s : 0.0f;
   CopyString(
       std::string_view{reinterpret_cast<const char*>(info.gameSpecificMessage),
                        std::min<std::size_t>(info.gameSpecificMessageSize,
@@ -136,10 +151,11 @@ void SnapshotDriverStation(DriverStationData& out) {
     j.axis_count = static_cast<uint8_t>(
         std::clamp<int>(axes[i].count, 0, static_cast<int>(kMaxAxes)));
     for (std::size_t a = 0; a < j.axis_count; ++a) {
-      j.axes[a] = axes[i].axes[a];
+      const float axis = axes[i].axes[a];
+      j.axes[a] = std::isfinite(axis) ? axis : 0.0f;
     }
     j.button_count = static_cast<uint8_t>(
-        std::min<int>(buttons[i].count, static_cast<int>(kMaxButtons)));
+        std::clamp<int>(buttons[i].count, 0, static_cast<int>(kMaxButtons)));
     j.buttons = buttons[i].buttons;
     j.pov_count = static_cast<uint8_t>(
         std::clamp<int>(povs[i].count, 0, static_cast<int>(kMaxPovs)));

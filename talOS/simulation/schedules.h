@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -27,8 +28,17 @@ inline std::vector<std::string> Split(const std::string& text, char delimiter) {
 }
 
 inline double Number(const std::string& text) {
+  if (text.empty() ||
+      std::isspace(static_cast<unsigned char>(text.front())) != 0) {
+    throw std::invalid_argument("schedule numbers must be finite");
+  }
   std::size_t used = 0;
-  const double value = std::stod(text, &used);
+  double value = 0.0;
+  try {
+    value = std::stod(text, &used);
+  } catch (const std::out_of_range&) {
+    throw std::invalid_argument("schedule numbers must be finite");
+  }
   if (used != text.size() || !std::isfinite(value)) {
     throw std::invalid_argument("schedule numbers must be finite");
   }
@@ -130,6 +140,10 @@ inline void ResolveFaults(std::vector<FaultEvent>& events,
     if (event.kind != FaultKind::kSensorDisconnect) {
       for (const auto& motor : config.motors) {
         if (motor.name == event.target) {
+          if (found) {
+            throw std::invalid_argument("ambiguous fault device: " +
+                                        event.target);
+          }
           event.id = motor.id;
           found = true;
         }
@@ -139,6 +153,10 @@ inline void ResolveFaults(std::vector<FaultEvent>& events,
         event.kind == FaultKind::kReset) {
       for (const auto& sensor : config.sensors) {
         if (sensor.name == event.target) {
+          if (found) {
+            throw std::invalid_argument("ambiguous fault device: " +
+                                        event.target);
+          }
           event.id = sensor.id;
           found = true;
         }
@@ -154,6 +172,9 @@ inline void ResolveFaults(std::vector<FaultEvent>& events,
 // intervals that ended before it joined as history: none of them acts, so a
 // past `reset` is not a spurious device reset. Call once, when it joins.
 inline void SkipPastFaults(std::vector<FaultEvent>& events, double elapsed_s) {
+  if (!std::isfinite(elapsed_s)) {
+    throw std::invalid_argument("schedule elapsed time must be finite");
+  }
   for (auto& event : events) {
     if (event.end_s <= elapsed_s) event.finished = true;
   }
@@ -176,6 +197,9 @@ inline int64_t ParseScheduleStart(std::string text) {
 
 inline bool ApplyFaults(std::vector<FaultEvent>& events, double elapsed_s,
                         talos::hardware::sim::PhysicsSimBackend& backend) {
+  if (!std::isfinite(elapsed_s)) {
+    throw std::invalid_argument("schedule elapsed time must be finite");
+  }
   bool blackout = false;
   for (auto& event : events) {
     if (event.finished || elapsed_s < event.start_s) continue;

@@ -286,9 +286,21 @@ when the Driver Station shows no mode, a new generation or a new gateway
 boot (so after a disable, however brief, even one no evaluation sampled);
 when the link recovers from a stale spell (sampled or not); when the
 producer's evaluations stop for `command_timeout_us`; and on `disarm()`. A
-`TargetLane` without an `OperatorArming` is never held: the graph lint cannot tell operator input
-from an autonomous producer, so using `OperatorArming` is the producer's
-job.
+non-bridge node that explicitly reads the Driver Station (constructs
+`talos::DriverStation` / `talos.DriverStation` or directly subscribes to
+`/hw/state/driver_station`) and publishes any target lane in that subsystem's
+`teleop` target policy must open that lane with a `talos::OperatorArming`
+(marking the endpoint `operator_arming`; REQ-SAFE-14). Both node startup
+(live runs, standalone binaries, `testing::Sim`, and `--allow-graph-errors`,
+including lazy `DriverStation` or lane opens in `update()`) and `LintGraph`
+refuse an unarmed `teleop`-policy lane on an explicit Driver Station reader,
+and the launcher's live endpoint check (`EndpointMismatch`) compares both
+`operator_arming` and `internal_driver_station`. Nodes that subscribe to
+`/hw/state/driver_station` only through internal `Target`/`TargetLane`/
+`OperatorArming` plumbing (such as coordinators like `Superstructure`, whose
+watcher carries `internal_driver_station`), and explicit Driver Station
+readers that publish only `autonomous` lanes, are unaffected; a `TargetLane`
+without an `OperatorArming` is never held.
 
 Messages reach a node when its loop drains its topics. Every node drains right
 before each of its own timers (`update()`, `every()`), so a timer sees what was

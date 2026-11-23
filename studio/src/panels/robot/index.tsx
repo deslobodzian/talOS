@@ -142,11 +142,11 @@ export const MODE_LABEL: Record<DriverStationMode, string> = {
 };
 
 const asBool = (value: number|undefined): boolean|null =>
-    value === undefined ? null : value !== 0;
+    value === undefined || !Number.isFinite(value) ? null : value !== 0;
 
-// `match_time_s` as m:ss, or '—' when the channel is absent.
+// `match_time_s` as m:ss, or '—' when the channel is absent, non-finite or negative.
 const matchTime = (value: number|null): string => {
-  if (value == null) return '—';
+  if (value == null || !Number.isFinite(value) || value < 0) return '—';
   const m = Math.floor(value / 60);
   const s = Math.floor(value % 60);
   return `${m}:${String(s).padStart(2, '0')}`;
@@ -216,7 +216,8 @@ function CameraTile({camera, channels}: {
   const healthy = healthyName === undefined ? null : asBool(channels[healthyName]);
   const period = periodName === undefined ? undefined : channels[periodName];
   const tags = tagsName === undefined ? undefined : channels[tagsName];
-  const fps = period !== undefined && period > 0 ? 1e6 / period : null;
+  const fps = period !== undefined && Number.isFinite(period) && period > 0 ?
+      1e6 / period : null;
 
   return <div className="camera-tile">
     <b className="tile-name">{camera.name}</b>

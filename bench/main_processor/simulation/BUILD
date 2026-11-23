@@ -13,6 +13,82 @@ SOAK_NODES = NODES + [
     "//bench/main_processor/simulation/testdata/nodes:python_motor",
 ]
 
+CPP_SIM_CONFIG_FILES = [
+    "//bench/main_processor/configuration:subsystems/motor.toml",
+    "//bench/main_processor/configuration:subsystems/swerve_module.toml",
+    "//bench/main_processor/configuration:subsystems/telemetry.toml",
+    "//bench/main_processor/configuration:subsystems/teleop.toml",
+]
+
+CPP_SIM_NODES = [
+    "//bench/main_processor/motor:node",
+    "//bench/main_processor/swerve_module:node",
+    "//talOS/telemetry:node",
+    "//talOS/teleop:node",
+]
+
+# Validates testdata/robot_cpp_sim.toml with launcher --describe-only under
+# plain, ASan, and TSan (every member is a C++ binary, no Python ctypes load).
+talos_graph_test(
+    name = "robot_cpp_sim_graph_test",
+    testonly = True,
+    config = "testdata/robot_cpp_sim.toml",
+    data = CPP_SIM_CONFIG_FILES,
+    nodes = CPP_SIM_NODES,
+    # Spawns five instrumented C++ nodes for --describe; macOS TSan adds ~100x
+    # fork/exec overhead on 3-vCPU hosted runners (TODO.md CI-13). Linux
+    # sanitizer lanes run this test.
+    tags = ["no_macos_sanitizer"],
+)
+
+# e2e (REQ-OPS-30, REQ-SAFE-31): pure-C++ full-graph simulation
+# (launcher + hardware_node + sim_gateway --physics + studio_bridge +
+# swerve_module + motor + teleop + telemetry) running disabled -> teleop
+# driving -> disabled cleanly under plain, ASan, and TSan (TODO.md CI-3).
+# Runs ~3.2 s of scripted session plus startup/shutdown; e2e lane.
+py_test(
+    name = "cpp_full_graph_sim_test",
+    size = "medium",
+    srcs = [
+        "cpp_full_graph_sim_test.py",
+        "support.py",
+        "//talOS/build:sim_check.py",
+    ],
+    data = [
+        "testdata/robot_cpp_sim.toml",
+        "//studio:web_dist",
+        "//studio/bridge:studio_bridge",
+        "//talOS/bridge:hardware_node",
+        "//talOS/build:registry_unlink",
+        "//talOS/launcher",
+        "//talOS/launcher:log_dump",
+        "//talOS/launcher:session_report",
+        "//talOS/simulation:sim_gateway",
+    ] + CPP_SIM_CONFIG_FILES + CPP_SIM_NODES,
+    env = {
+        "CONFIG": "$(rlocationpath testdata/robot_cpp_sim.toml)",
+        "LAUNCHER": "$(rlocationpath //talOS/launcher)",
+        "LOG_DUMP": "$(rlocationpath //talOS/launcher:log_dump)",
+        "REGISTRY_UNLINK": "$(rlocationpath //talOS/build:registry_unlink)",
+    },
+    imports = ["."],
+    legacy_create_init = False,
+    main = "cpp_full_graph_sim_test.py",
+    # Launches eight instrumented C++ processes; macOS TSan fork/exec overhead
+    # overruns the ready wait on 3-vCPU hosted runners (TODO.md CI-13). Both
+    # Linux sanitizer lanes (tools/sanitizer_lane.sh asan|tsan) run this test.
+    tags = [
+        "e2e",
+        "exclusive",
+        "no_macos_sanitizer",
+    ],
+    deps = [
+        "//talOS/build:udp_ports",
+        "//talOS/launcher:tlog_read",
+        "@rules_python//python/runfiles",
+    ],
+)
+
 # Validates testdata/robot_soak.toml with launcher --describe-only on every
 # build/test so graph or naming regressions fail before the manual soak lane.
 talos_graph_test(

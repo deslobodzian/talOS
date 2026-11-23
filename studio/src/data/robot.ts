@@ -112,7 +112,7 @@ export function canBuses(
 export function canBusReading(bus: CanBus): string {
   if (bus.state === null) return '—';
   if (bus.state === 'ok')
-    return bus.frac === null ? '—' : `${(bus.frac * 100).toFixed(0)}%`;
+    return bus.frac === null || !Number.isFinite(bus.frac) ? '—' : `${(bus.frac * 100).toFixed(0)}%`;
   if (bus.state === 'none') return 'not read';
   return bus.state;
 }
@@ -177,7 +177,7 @@ export function robotStatus(snapshot: Snapshot|null, system: SystemState): Robot
   };
   const flag = (name: string): boolean|null => {
     const v = ch[name];
-    return v === undefined ? null : v !== 0;
+    return v === undefined || !Number.isFinite(v) ? null : v !== 0;
   };
 
   const estimators = discoverEstimators(snapshotChannels(snapshot));

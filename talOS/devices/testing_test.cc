@@ -1263,5 +1263,59 @@ TEST(PublishTargetTest, StampsNewestDriverStationGenerationOrExplicitMode) {
   expect_envelope("auto", auto_gen, 0u, 0.0);
 }
 
+// REQ-SAFE-04: HardwareAccess::motor_set rejects invalid Mode values and
+// normalizes Mode::kNeutral to zero demand and slot 0 so neutral requests
+// satisfy Gateway::DrivesNothing.
+TEST(SimHardwareBounds, MotorSetNormalizesNeutralAndRejectsInvalidMode) {
+  struct NeutralProbe {
+    explicit NeutralProbe(Node& n) : link{n.extension<HardwareLink>()} {
+      AllowUntargetedOutputs(n);
+      motor_index = detail::HardwareAccess::add_device(
+          link, detail::DeviceKind::kMotor, "braked");
+    }
+    void update() {
+      if (send_invalid_mode) {
+        EXPECT_THROW(
+            detail::HardwareAccess::motor_set(
+                link, motor_index, static_cast<hardware::Mode>(99), 0, 0, 0),
+            std::invalid_argument);
+        send_invalid_mode = false;
+        return;
+      }
+      detail::HardwareAccess::motor_set(link, motor_index,
+                                        hardware::Mode::kNeutral, 5.0, 0.0, 2);
+    }
+    HardwareLink& link;
+    std::size_t motor_index = 0;
+    bool send_invalid_mode = true;
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& probe = sim.add<NeutralProbe>("mech");
+  SimHardware hw{sim};
+  hw.enable();
+  sim.step(15ms);
+  const auto req = hw.motor_request("mech", "braked");
+  EXPECT_EQ(req.mode, Mode::kNeutral);
+  EXPECT_DOUBLE_EQ(req.demand, 0.0);
+  EXPECT_EQ(req.slot, 0);
+  EXPECT_GE(detail::HardwareAccess::motor_clamped_count(probe.link,
+                                                        probe.motor_index),
+            1u);
+}
+
+// REQ-CONTRACT-23: SimHardware::set_gateway_clock and lose_states reject
+// signed integer overflow instead of triggering UB.
+TEST(SimHardwareBounds, SetGatewayClockAndLoseStatesRejectOverflow) {
+  auto sim = Sim::FromToml(kRobotToml);
+  SimHardware hw{sim};
+  sim.step(10ms);
+  EXPECT_THROW(hw.set_gateway_clock(Duration::min(), 1ns),
+               std::invalid_argument);
+  EXPECT_THROW(hw.set_gateway_clock(Duration::max(), 0ns),
+               std::invalid_argument);
+  hw.lose_states(std::numeric_limits<int>::max());
+  EXPECT_THROW(hw.lose_states(1), std::invalid_argument);
+}
+
 }  // namespace
 }  // namespace talos::testing

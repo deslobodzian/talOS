@@ -12,11 +12,13 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "talOS/events/log/format.h"
@@ -115,6 +117,22 @@ Retained Classify(const std::filesystem::directory_entry& entry,
   return abandoned ? Retained::kAbandoned : Retained::kNo;
 }
 
+uint64_t AddSatUint64(uint64_t a, uint64_t b) {
+  return b > std::numeric_limits<uint64_t>::max() - a
+             ? std::numeric_limits<uint64_t>::max()
+             : a + b;
+}
+
+int64_t AddSatInt64(int64_t a, int64_t b) {
+  if (b > 0 && a > std::numeric_limits<int64_t>::max() - b) {
+    return std::numeric_limits<int64_t>::max();
+  }
+  if (b < 0 && a < std::numeric_limits<int64_t>::min() - b) {
+    return std::numeric_limits<int64_t>::min();
+  }
+  return a + b;
+}
+
 // Bytes in the regular files under `dir`, symlinks not followed. Sets
 // `error` when any of the tree cannot be read.
 uintmax_t TreeBytes(const std::filesystem::path& dir, std::error_code& error) {
@@ -127,7 +145,7 @@ uintmax_t TreeBytes(const std::filesystem::path& dir, std::error_code& error) {
     if (type == fs::file_type::regular) {
       const uintmax_t size = file->file_size(error);
       if (error) break;
-      bytes += size;
+      bytes = AddSatUint64(bytes, size);
     }
     file.increment(error);
   }
@@ -141,8 +159,13 @@ uintmax_t TreeBytes(const std::filesystem::path& dir, std::error_code& error) {
 // other half for camera frames and metadata. A session whose frame
 // recording exceeds that half is not covered.
 uint64_t FreeFloor(const config::RobotConfig& config, std::size_t roster) {
-  return static_cast<uint64_t>(config.log_max_bytes) +
-         kChildOutputLogMaxBytes * (static_cast<uint64_t>(roster) + 1);
+  const uint64_t count = AddSatUint64(static_cast<uint64_t>(roster), 1);
+  const uint64_t output_reserve =
+      count > std::numeric_limits<uint64_t>::max() / kChildOutputLogMaxBytes
+          ? std::numeric_limits<uint64_t>::max()
+          : kChildOutputLogMaxBytes * count;
+  return AddSatUint64(static_cast<uint64_t>(config.log_max_bytes),
+                      output_reserve);
 }
 
 // Whether `error` says the filesystem has no room (ENOSPC, EDQUOT).
@@ -209,14 +232,36 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
     bool protected_match{false};
   };
   // A directory's modification time on the wall clock, for a session whose
-  // manifest records no start time.
-  const auto wall_ns =
-      [file_now = fs::file_time_type::clock::now(),
-       wall_now = std::chrono::system_clock::now()](fs::file_time_type time) {
-        return std::chrono::duration_cast<std::chrono::nanoseconds>(
-                   (time - file_now) + wall_now.time_since_epoch())
-            .count();
-      };
+  // manifest records no start time. Clamps out-of-range filesystem timestamps
+  // rather than overflowing int64 nanoseconds.
+  const auto wall_ns = [file_now = fs::file_time_type::clock::now(),
+                        wall_now = std::chrono::system_clock::now()](
+                           fs::file_time_type time) -> int64_t {
+    constexpr int64_t kNsPerSec = 1'000'000'000;
+    constexpr int64_t kMaxSec =
+        std::numeric_limits<int64_t>::max() / kNsPerSec - 3;
+    constexpr int64_t kMinSec =
+        std::numeric_limits<int64_t>::min() / kNsPerSec + 3;
+    const auto split = [](auto tp) {
+      const auto secs = std::chrono::time_point_cast<std::chrono::seconds>(tp);
+      const auto sub_ns =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(tp - secs)
+              .count();
+      return std::pair<int64_t, int64_t>{
+          static_cast<int64_t>(secs.time_since_epoch().count()),
+          static_cast<int64_t>(sub_ns)};
+    };
+    const auto [ts, tns] = split(time);
+    const auto [fs_s, fs_ns] = split(file_now);
+    const auto [ws, wns] = split(wall_now);
+    const int64_t neg_fs = fs_s == std::numeric_limits<int64_t>::min()
+                               ? std::numeric_limits<int64_t>::max()
+                               : -fs_s;
+    const int64_t total_s = AddSatInt64(AddSatInt64(ts, neg_fs), ws);
+    if (total_s >= kMaxSec) return std::numeric_limits<int64_t>::max();
+    if (total_s <= kMinSec) return std::numeric_limits<int64_t>::min();
+    return total_s * kNsPerSec + (tns - fs_ns + wns);
+  };
   // Whether the log root takes no advisory locks, decided once for this
   // retention (LogRootTakesNoLocks; set once the root is known to exist):
   // only then does a flock failing as FlockUnsupported let it remove a
@@ -419,7 +464,7 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
   std::size_t count = sessions.size() + 1;
   uintmax_t total = 0;  // The unprotected sessions' bytes.
   for (const auto& session : sessions) {
-    if (!session.protected_match) total += session.bytes;
+    if (!session.protected_match) total = AddSatUint64(total, session.bytes);
   }
   auto next = sessions.begin();
   for (; next != sessions.end() && !next->protected_match; ++next) {
@@ -429,7 +474,7 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
                               ? "unprotected older sessions exceed half of "
                                 "[robot] log_max_bytes"
                               : "more than [robot] log_keep_sessions");
-    total -= next->bytes;
+    total = total > next->bytes ? total - next->bytes : 0;
     --count;
   }
   // The disk's floor: what is left goes, protected last, only while the
@@ -448,7 +493,7 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
                                   current.parent_path().string() +
                                   ", less than " + std::to_string(free_floor) +
                                   " the new session may need")) {
-      *available += next->bytes;
+      *available = AddSatUint64(*available, next->bytes);
     }
   }
   if (*available < free_floor) {

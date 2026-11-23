@@ -77,7 +77,7 @@ void LoopWatchdog::DeliverReports() {
 
 void LoopWatchdog::Start(std::function<uint64_t()> clock,
                          int realtime_priority) {
-  if (thread_.joinable()) return;
+  if (thread_.joinable() || reporter_.joinable()) return;
   stop_.store(false, std::memory_order_relaxed);
   stop_reporter_.store(false, std::memory_order_relaxed);
   // From this thread, so it takes the caller's scheduling, not the
@@ -87,19 +87,27 @@ void LoopWatchdog::Start(std::function<uint64_t()> clock,
   // Owned here and outliving the wait; the thread only sets it.
   auto requested = std::make_shared<std::promise<void>>();
   std::future<void> done = requested->get_future();
-  thread_ =
-      std::thread([this, clock = std::move(clock), realtime_priority,
-                   requested] { Run(clock, realtime_priority, *requested); });
+  try {
+    thread_ =
+        std::thread([this, clock = std::move(clock), realtime_priority,
+                     requested] { Run(clock, realtime_priority, *requested); });
+  } catch (...) {
+    Stop();
+    throw;
+  }
   done.wait_for(kStartHandshakeTimeout);
 }
 
 void LoopWatchdog::Stop() {
-  if (!thread_.joinable()) return;
-  stop_.store(true, std::memory_order_relaxed);
-  thread_.join();
+  if (thread_.joinable()) {
+    stop_.store(true, std::memory_order_relaxed);
+    thread_.join();
+  }
   // After the watchdog thread, so its last report is delivered.
-  stop_reporter_.store(true, std::memory_order_relaxed);
-  reporter_.join();
+  if (reporter_.joinable()) {
+    stop_reporter_.store(true, std::memory_order_relaxed);
+    reporter_.join();
+  }
 }
 
 void LoopWatchdog::RunReporter() {

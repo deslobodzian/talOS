@@ -2407,5 +2407,108 @@ dio = 3
   EXPECT_TRUE(pilot.ds.teleop());
 }
 
+// REQ-SAFE-06: default-constructed device and DriverStation handles throw
+// std::logic_error instead of dereferencing a null
+// HardwareLink/DriverStationLink.
+TEST(Devices, DefaultConstructedHandlesThrowInsteadOfDereferencingNull) {
+  Motor motor{};
+  EXPECT_THROW(motor.set_voltage(1.0), std::logic_error);
+  EXPECT_THROW(motor.stop(), std::logic_error);
+  EXPECT_THROW((void)motor.position(), std::logic_error);
+  EXPECT_THROW((void)motor.connected(), std::logic_error);
+  EXPECT_THROW(motor.rezero(), std::logic_error);
+  EXPECT_THROW((void)motor.zeroed(), std::logic_error);
+  EXPECT_THROW((void)motor.clamped_count(), std::logic_error);
+
+  const CANcoder cc{};
+  EXPECT_THROW((void)cc.position(), std::logic_error);
+  EXPECT_THROW((void)cc.connected(), std::logic_error);
+
+  Gyro gyro{};
+  EXPECT_THROW((void)gyro.yaw(), std::logic_error);
+  EXPECT_THROW(gyro.rezero(), std::logic_error);
+
+  const DigitalInput di{};
+  EXPECT_THROW((void)di.get(), std::logic_error);
+  EXPECT_THROW((void)di.connected(), std::logic_error);
+
+  DigitalOutput dout{};
+  EXPECT_THROW(dout.set(true), std::logic_error);
+
+  const AnalogInput ai{};
+  EXPECT_THROW((void)ai.voltage(), std::logic_error);
+
+  const Encoder enc{};
+  EXPECT_THROW((void)enc.position(), std::logic_error);
+
+  PwmOutput pwm{};
+  EXPECT_THROW(pwm.set(0.0), std::logic_error);
+  EXPECT_THROW(pwm.stop(), std::logic_error);
+
+  const DriverStation ds{};
+  EXPECT_THROW((void)ds.connected(), std::logic_error);
+  EXPECT_THROW((void)ds.enabled(), std::logic_error);
+  EXPECT_THROW((void)ds.joystick(0), std::logic_error);
+  EXPECT_THROW((void)ds.data(), std::logic_error);
+}
+
+// REQ-CONTRACT-23, REQ-SAFE-05: HardwareLink::sample_time returns nullopt on
+// clock-mapping overflow rather than signed int64 overflow UB, and
+// RezeroAgeBound / ReadinessAgeBound reject invalid or overflowing status_hz.
+TEST(Devices, SampleTimeAndAgeBoundsGuardAgainstOverflow) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Watcher>("watcher");
+  auto& link = sim.node("watcher").extension<HardwareLink>();
+  const auto id = hardware::ConfigurationId(link.config().hardware);
+
+  // sample_time_us * 1000 overflows int64_t.
+  const std::uint64_t huge_us =
+      static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) /
+          1000 +
+      5000;
+  sim.publish(::bridge::topics::kStatus, ClockStatus(7, 0, true));
+  sim.publish(hardware::kStateTopic, StatePacket(id, huge_us, false));
+  sim.step(2ms);
+  EXPECT_EQ(link.sample_time(), std::nullopt);
+
+  // sample_time_us + clock_offset_us overflows int64_t.
+  sim.publish(::bridge::topics::kStatus,
+              ClockStatus(7, std::numeric_limits<std::int64_t>::max(), true));
+  sim.publish(hardware::kStateTopic, StatePacket(id, huge_us + 1, false));
+  sim.step(2ms);
+  EXPECT_EQ(link.sample_time(), std::nullopt);
+
+  // Invalid or overflowing status_hz in RezeroAgeBound / ReadinessAgeBound.
+  for (const double bad_hz :
+       {0.0, -50.0, std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity(), 1e-12}) {
+    hardware::Config cfg{};
+    cfg.status_hz = bad_hz;
+    EXPECT_THROW((void)RezeroAgeBound(cfg), std::invalid_argument) << bad_hz;
+    EXPECT_THROW((void)ReadinessAgeBound(cfg), std::invalid_argument) << bad_hz;
+  }
+}
+
+// REQ-SAFE-02: opening a node's first output device after start() fails
+// atomically without leaking a half-registered /hw/request/<node> publisher.
+TEST(Devices, LateOutputDeviceFailsAtomicallyWithoutLeakingRequestTopic) {
+  struct Empty {
+    explicit Empty(Node&) {}
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Empty>("mech");
+  Node& node = sim.node("mech");
+  EXPECT_THROW((void)Motor(node, "a"), std::logic_error);
+  // A second attempt must fail for the same constructor-only reason rather
+  // than "hardware request is already registered".
+  try {
+    Motor m{node, "a"};
+    FAIL() << "expected std::logic_error";
+  } catch (const std::logic_error& error) {
+    const std::string what{error.what()};
+    EXPECT_EQ(what.find("already registered"), std::string::npos) << what;
+  }
+}
+
 }  // namespace
 }  // namespace talos

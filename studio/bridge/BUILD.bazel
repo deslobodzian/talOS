@@ -347,3 +347,18 @@ py_test(
     ],
     main = "webroot_stamp_test.py",
 )
+
+cc_test(
+    name = "static_files_fuzz_test",
+    size = "small",
+    srcs = ["tests/static_files_fuzz_test.cc"],
+    deps = [
+        ":drive",
+        ":static_files",
+        "//talOS/telemetry:wire",
+        "@googletest//:gtest_main",
+        "@nlohmann_json//:json",
+        "@studio_usockets//:usockets",
+        "@studio_uws//:uws",
+    ],
+)

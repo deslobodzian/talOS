@@ -50,6 +50,49 @@ class CheckLinksTest(unittest.TestCase):
                 self.assertEqual(broken, 1, out)
                 self.assertIn(f"README.md:2: {target}:", out)
 
+    def test_inline_triple_backticks_fenced_anchors_and_title_parens(self):
+        # An inline triple-backtick code span at line start must not open an
+        # unclosed fenced code block that hides every later link.
+        doc = "```code```\n[broken](missing.md)\n"
+        broken, out = check({"README.md": doc})
+        self.assertEqual(broken, 1, out)
+        self.assertIn("README.md:2: missing.md:", out)
+
+        # A 3-backtick line inside a 4-backtick fence must not close it, and a
+        # closing fence with trailing text must not close a 3-backtick fence.
+        nested = (
+            "````markdown\n"
+            "```\n"
+            "[inside-fence](missing1.md)\n"
+            "````\n"
+            "[after-fence](missing2.md)\n"
+        )
+        broken, out = check({"README.md": nested})
+        self.assertEqual(broken, 1, out)
+        self.assertIn("missing2.md", out)
+        self.assertNotIn("missing1.md", out)
+
+        # An HTML <a id="..."> inside a fenced code block is not a real anchor,
+        # while a mixed-case real <a id="MixedCase"> outside code resolves.
+        guide = (
+            '```html\n<a id="fenced-only"></a>\n```\n'
+            '<a id="MixedCase"></a>\n'
+        )
+        broken, out = check({
+            "README.md": "[bad](GUIDE.md#fenced-only) [ok](GUIDE.md#MixedCase)\n",
+            "GUIDE.md": guide,
+        })
+        self.assertEqual(broken, 1, out)
+        self.assertIn("GUIDE.md#fenced-only", out)
+        self.assertNotIn("MixedCase", out)
+
+        # A broken link whose quoted title contains parentheses is still caught.
+        broken, out = check({
+            "README.md": '[x](missing.md "see (details)")\n',
+        })
+        self.assertEqual(broken, 1, out)
+        self.assertIn("missing.md", out)
+
 
 if __name__ == "__main__":
     unittest.main()

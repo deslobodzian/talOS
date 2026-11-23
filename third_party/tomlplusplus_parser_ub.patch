@@ -1,7 +1,43 @@
 diff -r a/include/toml++/impl/parser.inl b/include/toml++/impl/parser.inl
 --- a/include/toml++/impl/parser.inl	2026-11-07 19:30:46.630434725 -0500
 +++ b/include/toml++/impl/parser.inl	2026-11-07 19:30:46.642587358 -0500
-@@ -3151,6 +3151,13 @@
+@@ -1079,6 +1079,7 @@
+ 		bool recording = false, recording_whitespace = true;
+ 		std::string_view current_scope;
+ 		size_t nested_values = {};
++		size_t current_table_depth = {};
+ #if !TOML_EXCEPTIONS
+ 		mutable optional<parse_error> err;
+ #endif
+@@ -2443,6 +2444,13 @@
+ 			advance_and_return_if_error_or_eof({});
+ 
+ 			// "HH:MM:SS.FFFFFFFFF"
++			// talos patch: parse_time() assumes is_decimal_digit(*cp); reject
++			// anything else as a parse error instead of asserting (UB under NDEBUG).
++			if (!is_decimal_digit(*cp))
++				set_error_and_return_default("expected hour digit, saw '"sv,
++											 to_sv(*cp),
++											 "'"sv);
++
+ 			auto time = parse_time(true);
+ 			return_if_error({});
+ 
+@@ -3086,6 +3094,13 @@
+ 				if (is_eof() || *cp != U'.')
+ 					break;
+ 
++				// talos patch: bound dotted-key segment count so update_region_ends
++				// and recursive table destruction cannot overflow the stack.
++				if TOML_UNLIKELY(key_buffer.size() >= max_nested_values)
++					set_error_and_return_default("exceeded maximum nested key depth of "sv,
++												 max_nested_values,
++												 " (TOML_MAX_NESTED_VALUES)"sv);
++
+ 				// was a dotted key - go around again
+ 				advance_and_return_if_error_or_eof({});
+ 				consume_leading_whitespace();
+@@ -3151,6 +3166,13 @@
  				if (*cp == U']')
  					set_error_and_return_default("tables with blank bare keys are explicitly prohibited"sv);
  
@@ -15,6 +51,95 @@ diff -r a/include/toml++/impl/parser.inl b/include/toml++/impl/parser.inl
  				// get the actual key
  				start_recording();
  				parse_key();
+@@ -3357,6 +3379,14 @@
+ 			return_if_error({});
+ 			TOML_ASSERT(key_buffer.size() >= 1u);
+ 
++			// talos patch: bound combined table + dotted-key depth from root so
++			// recursive traversal and re-parsing stay within max_nested_values.
++			const size_t dotted_depth = key_buffer.size() - 1u;
++			if TOML_UNLIKELY(current_table_depth + nested_values + dotted_depth > max_nested_values)
++				set_error_and_return_default("exceeded maximum nested key depth of "sv,
++											 max_nested_values,
++											 " (TOML_MAX_NESTED_VALUES)"sv);
++
+ 			// skip past any whitespace that followed the key
+ 			consume_leading_whitespace();
+ 			set_error_and_return_if_eof({});
+@@ -3426,7 +3456,10 @@
+ 			auto last_key = make_key(key_buffer.size() - 1u);
+ 
+ 			// now we can actually parse the value
++			const size_t saved_table_depth = current_table_depth;
++			current_table_depth += dotted_depth;
+ 			node_ptr val = parse_value();
++			current_table_depth = saved_table_depth;
+ 			return_if_error({});
+ 
+ 			tbl->emplace_hint<node_ptr>(it, std::move(last_key), std::move(val));
+@@ -3463,7 +3496,10 @@
+ 				// [tables]
+ 				// [[table array]]
+ 				if (*cp == U'[')
++				{
+ 					current_table = parse_table_header();
++					current_table_depth = key_buffer.size();
++				}
+ 
+ 				// bare_keys
+ 				// dotted.keys
+@@ -3647,6 +3683,12 @@
+ 		TOML_ASSERT_ASSUME(*cp == U'{');
+ 		push_parse_scope("inline table"sv);
+ 
++		// talos patch: bound combined table + inline-table depth from root.
++		if TOML_UNLIKELY(current_table_depth + nested_values > max_nested_values)
++			set_error_and_return_default("exceeded maximum nested key depth of "sv,
++										 max_nested_values,
++										 " (TOML_MAX_NESTED_VALUES)"sv);
++
+ 		// skip opening '{'
+ 		advance_and_return_if_error_or_eof({});
+ 
+diff -r a/include/toml++/impl/toml_formatter.inl b/include/toml++/impl/toml_formatter.inl
+--- a/include/toml++/impl/toml_formatter.inl	2026-11-07 19:30:46.630434725 -0500
++++ b/include/toml++/impl/toml_formatter.inl	2026-11-07 19:30:46.642587358 -0500
+@@ -71,26 +71,32 @@
+ 				auto val = (*reinterpret_cast<const value<int64_t>*>(&node)).get();
+ 				if (!val)
+ 					return 1u;
+ 				size_t weight = {};
++				// talos patch: negate in uint64_t to avoid signed overflow UB on INT64_MIN.
++				auto abs_val = static_cast<uint64_t>(val);
+ 				if (val < 0)
+ 				{
+ 					weight += 1u;
+-					val *= -1;
++					abs_val = 0u - abs_val;
+ 				}
+-				return weight + static_cast<size_t>(log10(static_cast<double>(val))) + 1u;
++				return weight + static_cast<size_t>(log10(static_cast<double>(abs_val))) + 1u;
+ 			}
+ 
+ 			case node_type::floating_point:
+ 			{
+ 				auto val = (*reinterpret_cast<const value<double>*>(&node)).get();
+ 				if (val == 0.0)
+ 					return 3u;		// "0.0"
++				// talos patch: guard non-finite and |val| < 1.0 before casting log10(val) to size_t.
++				if (impl::fpclassify(val) != impl::fp_class::ok)
++					return 4u;		// "nan", "inf", "-inf"
+ 				size_t weight = 2u; // ".0"
+ 				if (val < 0.0)
+ 				{
+ 					weight += 1u;
+ 					val *= -1.0;
+ 				}
+-				return weight + static_cast<size_t>(log10(val)) + 1u;
++				const double digits = log10(val);
++				return weight + (digits > 0.0 ? static_cast<size_t>(digits) : 0u) + 1u;
+ 				break;
+ 			}
 diff -r a/include/toml++/impl/unicode_autogenerated.hpp b/include/toml++/impl/unicode_autogenerated.hpp
 --- a/include/toml++/impl/unicode_autogenerated.hpp	2026-11-07 19:35:40.071285759 -0500
 +++ b/include/toml++/impl/unicode_autogenerated.hpp	2026-11-07 19:35:40.083308998 -0500
@@ -32,7 +157,7 @@ diff -r a/include/toml++/impl/unicode_autogenerated.hpp b/include/toml++/impl/un
 diff -r a/toml.hpp b/toml.hpp
 --- a/toml.hpp	2026-11-07 19:30:46.629940719 -0500
 +++ b/toml.hpp	2026-11-07 19:35:40.082394328 -0500
-@@ -44,6 +44,12 @@
+@@ -44,5 +44,10 @@
  #ifndef TOMLPLUSPLUS_HPP
  #define TOMLPLUSPLUS_HPP
  
@@ -54,7 +179,43 @@ diff -r a/toml.hpp b/toml.hpp
  		}
  
  		TOML_UNREACHABLE;
-@@ -15595,6 +15603,13 @@
+@@ -13523,6 +13531,7 @@
+ 		bool recording = false, recording_whitespace = true;
+ 		std::string_view current_scope;
+ 		size_t nested_values = {};
++		size_t current_table_depth = {};
+ #if !TOML_EXCEPTIONS
+ 		mutable optional<parse_error> err;
+ #endif
+@@ -14887,6 +14896,13 @@
+ 			advance_and_return_if_error_or_eof({});
+ 
+ 			// "HH:MM:SS.FFFFFFFFF"
++			// talos patch: parse_time() assumes is_decimal_digit(*cp); reject
++			// anything else as a parse error instead of asserting (UB under NDEBUG).
++			if (!is_decimal_digit(*cp))
++				set_error_and_return_default("expected hour digit, saw '"sv,
++											 to_sv(*cp),
++											 "'"sv);
++
+ 			auto time = parse_time(true);
+ 			return_if_error({});
+ 
+@@ -15532,6 +15548,13 @@
+ 				if (is_eof() || *cp != U'.')
+ 					break;
+ 
++				// talos patch: bound dotted-key segment count so update_region_ends
++				// and recursive table destruction cannot overflow the stack.
++				if TOML_UNLIKELY(key_buffer.size() >= max_nested_values)
++					set_error_and_return_default("exceeded maximum nested key depth of "sv,
++												 max_nested_values,
++												 " (TOML_MAX_NESTED_VALUES)"sv);
++
+ 				// was a dotted key - go around again
+ 				advance_and_return_if_error_or_eof({});
+ 				consume_leading_whitespace();
+@@ -15595,6 +15618,13 @@
  				if (*cp == U']')
  					set_error_and_return_default("tables with blank bare keys are explicitly prohibited"sv);
  
@@ -68,3 +229,92 @@ diff -r a/toml.hpp b/toml.hpp
  				// get the actual key
  				start_recording();
  				parse_key();
+@@ -15793,6 +15823,14 @@
+ 			return_if_error({});
+ 			TOML_ASSERT(key_buffer.size() >= 1u);
+ 
++			// talos patch: bound combined table + dotted-key depth from root so
++			// recursive traversal and re-parsing stay within max_nested_values.
++			const size_t dotted_depth = key_buffer.size() - 1u;
++			if TOML_UNLIKELY(current_table_depth + nested_values + dotted_depth > max_nested_values)
++				set_error_and_return_default("exceeded maximum nested key depth of "sv,
++											 max_nested_values,
++											 " (TOML_MAX_NESTED_VALUES)"sv);
++
+ 			// skip past any whitespace that followed the key
+ 			consume_leading_whitespace();
+ 			set_error_and_return_if_eof({});
+@@ -15862,7 +15900,10 @@
+ 			auto last_key = make_key(key_buffer.size() - 1u);
+ 
+ 			// now we can actually parse the value
++			const size_t saved_table_depth = current_table_depth;
++			current_table_depth += dotted_depth;
+ 			node_ptr val = parse_value();
++			current_table_depth = saved_table_depth;
+ 			return_if_error({});
+ 
+ 			tbl->emplace_hint<node_ptr>(it, std::move(last_key), std::move(val));
+@@ -15899,7 +15940,10 @@
+ 				// [tables]
+ 				// [[table array]]
+ 				if (*cp == U'[')
++				{
+ 					current_table = parse_table_header();
++					current_table_depth = key_buffer.size();
++				}
+ 
+ 				// bare_keys
+ 				// dotted.keys
+@@ -16078,6 +16122,12 @@
+ 		TOML_ASSERT_ASSUME(*cp == U'{');
+ 		push_parse_scope("inline table"sv);
+ 
++		// talos patch: bound combined table + inline-table depth from root.
++		if TOML_UNLIKELY(current_table_depth + nested_values > max_nested_values)
++			set_error_and_return_default("exceeded maximum nested key depth of "sv,
++										 max_nested_values,
++										 " (TOML_MAX_NESTED_VALUES)"sv);
++
+ 		// skip opening '{'
+ 		advance_and_return_if_error_or_eof({});
+ 
+@@ -16952,29 +17002,35 @@
+ 			case node_type::integer:
+ 			{
+ 				auto val = (*reinterpret_cast<const value<int64_t>*>(&node)).get();
+ 				if (!val)
+ 					return 1u;
+ 				size_t weight = {};
++				// talos patch: negate in uint64_t to avoid signed overflow UB on INT64_MIN.
++				auto abs_val = static_cast<uint64_t>(val);
+ 				if (val < 0)
+ 				{
+ 					weight += 1u;
+-					val *= -1;
++					abs_val = 0u - abs_val;
+ 				}
+-				return weight + static_cast<size_t>(log10(static_cast<double>(val))) + 1u;
++				return weight + static_cast<size_t>(log10(static_cast<double>(abs_val))) + 1u;
+ 			}
+ 
+ 			case node_type::floating_point:
+ 			{
+ 				auto val = (*reinterpret_cast<const value<double>*>(&node)).get();
+ 				if (val == 0.0)
+ 					return 3u;		// "0.0"
++				// talos patch: guard non-finite and |val| < 1.0 before casting log10(val) to size_t.
++				if (impl::fpclassify(val) != impl::fp_class::ok)
++					return 4u;		// "nan", "inf", "-inf"
+ 				size_t weight = 2u; // ".0"
+ 				if (val < 0.0)
+ 				{
+ 					weight += 1u;
+ 					val *= -1.0;
+ 				}
+-				return weight + static_cast<size_t>(log10(val)) + 1u;
++				const double digits = log10(val);
++				return weight + (digits > 0.0 ? static_cast<size_t>(digits) : 0u) + 1u;
+ 				break;
+ 			}
+ 

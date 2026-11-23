@@ -531,6 +531,71 @@ class BundleBuilderTest(unittest.TestCase):
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn(problem, proc.stderr)
 
+    # REQ-OPS-48: runfile links, runfile relative paths, and config files
+    # using parent-directory segments must fail closed instead of reading or
+    # writing outside the bundle or config/.
+    def test_parent_traversal_in_runfiles_and_config_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            secret = os.path.join(tmp, "outside_secret.txt")
+            put(secret, "host-secret\n")
+            link = os.path.join(tmp, "src", "venv", "bin", "escape")
+            os.makedirs(os.path.dirname(link))
+            # 4 segments up out of _main/py/_node_bin.venv/bin, plus 3 up out
+            # of out/bin/py.runfiles to tmp/outside_secret.txt.
+            os.symlink("../../../../../../../outside_secret.txt", link)
+            py = dict(node(tmp, "py"), language="python", runfiles=[
+                {"src_path": link,
+                 "rf_rel": "_main/py/_node_bin.venv/bin/escape"}])
+            proc = self.assemble(
+                tmp, {"c/robot.toml": "[robot]\n"},
+                [node(tmp, "hardware_node", HARDWARE_NODE), py], ["//py:node"])
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertFalse(os.path.exists(os.path.join(
+                tmp, "out", "bin", "py.runfiles", "_main", "py",
+                "_node_bin.venv", "bin", "escape")))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src_file = os.path.join(tmp, "src", "escaped.py")
+            put(src_file, "x = 1\n")
+            py = dict(node(tmp, "py"), language="python", runfiles=[
+                {"src_path": src_file, "rf_rel": "../../escaped.py"}])
+            proc = self.assemble(
+                tmp, {"c/robot.toml": "[robot]\n"},
+                [node(tmp, "hardware_node", HARDWARE_NODE), py], ["//py:node"])
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "out", "escaped.py")))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = os.path.join(tmp, "src", "robot.toml")
+            ext = os.path.join(tmp, "ext", "defaults.toml")
+            put(cfg, "[robot]\n")
+            put(ext, "[subsystem]\n")
+            launcher = os.path.join(tmp, "src", "launcher")
+            put(launcher, "")
+            spec = os.path.join(tmp, "spec.json")
+            with open(spec, "w", encoding="utf-8") as f:
+                json.dump({
+                    "launcher_path": launcher,
+                    "config": {"src_path": cfg, "short_path": "robot.toml"},
+                    "config_files": [{"src_path": ext,
+                                      "short_path": "../ext/defaults.toml"}],
+                    "nodes": [node(tmp, "hardware_node", HARDWARE_NODE)],
+                    "default_hardware_node": HARDWARE_NODE,
+                    "studio": None,
+                }, f)
+            resolved = os.path.join(tmp, "resolved.json")
+            with open(resolved, "w", encoding="utf-8") as f:
+                json.dump({"nodes": [], "effective": {"robot": {}}}, f)
+            builder = runfiles.Create().Rlocation(
+                "_main/talOS/build/bundle_builder.py")
+            proc = subprocess.run(
+                [sys.executable, builder, "--spec", spec, "--resolved",
+                 resolved, "--out", os.path.join(tmp, "out")],
+                capture_output=True, text=True)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertFalse(
+                os.path.exists(os.path.join(tmp, "out", "ext", "defaults.toml")))
+
     # REQ-OPS-48
     def test_a_bundle_restored_from_a_cache_runs_its_python_nodes(self):
         # A bundle is a tree artifact, and Bazel may hand one back from its

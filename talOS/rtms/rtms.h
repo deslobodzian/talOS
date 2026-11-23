@@ -425,6 +425,7 @@ class RTMSQueue {
   RTMSHeader* header_{nullptr};
   SharedMemoryPtr ptr_;
   bool counted_{false};  // this queue holds one count of header_->lifetime
+  std::uint64_t owner_process_{0};  // process word that opened this attachment
   // The state word register_reader() claimed each reader slot with, 0 for a
   // slot this queue does not hold.
   std::array<std::uint64_t, MAX_READERS> registered_{};

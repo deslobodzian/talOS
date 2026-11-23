@@ -60,5 +60,25 @@ TEST(MetricsTest, QuantileFiltersNaNElementsAndRejectsNonFiniteQ) {
   EXPECT_TRUE(std::isnan(Quantile({1.0, 2.0, 3.0}, -inf)));
 }
 
+TEST(MetricsTest, SeededNonFiniteAndHostileInputsStaySafe) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  const std::vector<TagSighting> prev{{1, {nan, 100.0}, 40.0},
+                                      {2, {100.0, 100.0}, -5.0},
+                                      {3, {inf, -inf}, 20.0}};
+  const std::vector<TagSighting> curr{{4, {100.0, 100.0}, nan},
+                                      {5, {100.0, 100.0}, 10.0}};
+  EXPECT_GE(CountIdSwitches(prev, curr), 0);
+  EXPECT_EQ(LongestDropout({}), 0u);
+  EXPECT_EQ(LongestDropout({false, false}), 0u);
+
+  using V = Eigen::Matrix<double, 2, 1>;
+  const std::vector<std::optional<V>> track{
+      V(0.0, 0.0), V(nan, 1.0), V(inf, 2.0), std::nullopt, V(1.0, 1.0)};
+  const auto jitter = SecondDifferenceJitter<2>(track);
+  EXPECT_EQ(jitter.samples, 1u);
+  EXPECT_TRUE(std::isnan(jitter.rms_per_axis));
+}
+
 }  // namespace
 }  // namespace talos::vision::evaluation

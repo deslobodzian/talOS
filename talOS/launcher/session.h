@@ -288,6 +288,14 @@ struct SessionManifest {
   // its own on /hw/status (hardware_record.h RecordedProtocolVersion). Not
   // written when empty, as a manifest from before the field reads.
   std::optional<uint16_t> hardware_protocol_version{protocol::kProtocolVersion};
+  // The config's [robot] period_us, the gateway's tick, against which
+  // session_report judges the /hw/state cadence. Not written when empty, as
+  // a manifest from before the field reads.
+  std::optional<uint32_t> period_us;
+  // The config's [robot] command_timeout_us, the enabled /hw/state interval
+  // session_report counts as a gap. Not written when empty, as a manifest
+  // from before the field reads.
+  std::optional<uint32_t> command_timeout_us;
   int64_t start_wall_ns{0};
   int64_t end_wall_ns{0};
   // A stop request arrived before every member was started: the members

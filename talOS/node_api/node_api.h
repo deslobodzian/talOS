@@ -382,6 +382,10 @@ const char* talos_target_source_name(TalosNode* node, int64_t target,
 // Opens the lane /<subsystem>/target/<source>. Call while the factory runs.
 // `arming`: an index from talos_operator_arming_open on this node, whose
 // lane sends go out as releases while it is not armed; negative for none.
+// Required (non-negative) whenever this node explicitly reads the Driver
+// Station (talos_driver_station, talos_driver_station_read, or direct
+// /hw/state/driver_station subscription) and `source` is in `subsystem`'s
+// teleop target policy (REQ-SAFE-14); otherwise startup and LintGraph refuse.
 int64_t talos_target_lane_open(TalosNode* node, const char* subsystem,
                                const char* source, uint32_t message_bytes,
                                uint32_t alignment, const TalosSchema* schema,

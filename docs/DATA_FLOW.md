@@ -124,7 +124,7 @@ has no reflected radio channels; only the bench motor state adds these scalars.
 
 ## UDP frame and payload sizes
 
-One datagram contains exactly one protocol frame, version <!-- size: protocol.version -->**11**.
+One datagram contains exactly one protocol frame, version <!-- size: protocol.version -->**12**.
 The explicit little-endian header is <!-- size: frame.header_bytes -->**40 B**: magic u64 (8),
 version/header_size/type/flags u16 (8 total),
 sequence u64 (8), monotonic_time_us u64 (8), payload_size u32 (4), reserved u32
@@ -257,7 +257,8 @@ out of order, ignores duplicate chunks, waits until all indices are present,
 checks CRC32, deserializes and validates caps, then reconfigures. A new config ID
 replaces the assembly; inconsistent metadata or invalid assembled data is
 rejected. Completion/backend failure or malformed data produces the <!-- size: config_ack.payload_bytes -->73-byte ACK
-with status/reason (`config_wire.h`, `endpoint.h`).
+with status/reason (`config_wire.h`, `endpoint.h`); decoding requires that exact
+length (rejecting truncated or trailing-byte payloads).
 Hardware configuration assembly rejects serialized totals above <!-- size: config.max_serialized_bytes -->**10,227 B**
 (`kMaxSerializedConfigSize`) before allocation. Chunk data is limited to
 <!-- size: config.chunk_data_bytes -->**1,408 B**; chunk counts cannot exceed <!-- size: config.max_chunk_count -->10,227 or the serialized byte count.

@@ -93,7 +93,9 @@ bool ReadTimeline(const std::filesystem::path& directory,
       return Fail(error, csv.string() + ":" + std::to_string(number) +
                              ": pts_ns must increase strictly");
     }
-    if (!std::filesystem::is_regular_file(directory / file)) {
+    std::error_code file_ec;
+    if (!std::filesystem::is_regular_file(directory / file, file_ec) ||
+        file_ec) {
       return Fail(error, csv.string() + ":" + std::to_string(number) + ": " +
                              name + " is not a file");
     }
@@ -127,7 +129,9 @@ std::optional<ImageSequence> ImageSequence::Open(
     std::vector<std::filesystem::path> files;
     for (const auto& entry :
          std::filesystem::directory_iterator(directory, ec)) {
-      if (entry.is_regular_file() && IsImage(entry.path())) {
+      std::error_code entry_ec;
+      if (entry.is_regular_file(entry_ec) && !entry_ec &&
+          IsImage(entry.path())) {
         files.push_back(entry.path());
       }
     }

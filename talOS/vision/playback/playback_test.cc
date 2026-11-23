@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <opencv2/core.hpp>
@@ -303,6 +304,88 @@ TEST(RecordedCameraSourceTest, RealtimePlaybackThreadRunsAtBackgroundPriority) {
   }
   source.Stop();
   EXPECT_TRUE(is_background);
+}
+
+TEST(ImageSequenceTest, RejectsOverlongFilenamesAndSeededCsvMutationsSafely) {
+  const auto dir = NewDirectory("fuzz_timeline");
+  RenderFrame(dir, "a.png", 2.0);
+  std::string error;
+
+  // Filenames exceeding NAME_MAX must return nullopt rather than throwing.
+  const std::string overlong_name(300, 'a');
+  WriteTimeline(dir, "file,pts_ns\n" + overlong_name + ".png,1000\n");
+  EXPECT_FALSE(ImageSequence::Open(dir, 30.0, &error));
+  EXPECT_FALSE(error.empty());
+
+  // Symlink loops in the recording directory must not throw filesystem_error.
+  std::error_code ec;
+  std::filesystem::create_symlink("loop.png", dir / "loop.png", ec);
+  WriteTimeline(dir, "loop.png,1000\n");
+  EXPECT_FALSE(ImageSequence::Open(dir, 30.0, &error));
+  std::filesystem::remove(dir / "loop.png", ec);
+
+  // Deterministic seeded mutations of timestamps.csv must never throw or crash.
+  const std::string seed_csv =
+      "file,pts_ns\na.png,1000000000\na.png,1030000000\n";
+  uint32_t state = 0x706c6179U;
+  auto next = [&] {
+    state = state * 1664525U + 1013904223U;
+    return state;
+  };
+  for (int iter = 0; iter < 128; ++iter) {
+    std::string mutated = seed_csv;
+    const int edits = 1 + static_cast<int>(next() % 5);
+    for (int e = 0; e < edits; ++e) {
+      const std::size_t pos = next() % (mutated.size() + 1);
+      switch (next() % 3) {
+        case 0:
+          if (pos < mutated.size()) {
+            mutated[pos] = static_cast<char>(next() & 0xffU);
+          }
+          break;
+        case 1:
+          mutated.insert(pos, 1, static_cast<char>(next() & 0xffU));
+          break;
+        case 2:
+          if (pos < mutated.size()) mutated.erase(pos, 1);
+          break;
+        default:
+          break;
+      }
+    }
+    WriteTimeline(dir, mutated);
+    (void)ImageSequence::Open(dir, 30.0, &error);
+  }
+}
+
+TEST(RecordedCameraSourceTest, LargeTimestampsDoNotOverflowInt64) {
+  const auto dir = NewDirectory("large_pts");
+  RenderFrame(dir, "0.png", 1.5);
+  RenderFrame(dir, "1.png", 2.0);
+  WriteTimeline(dir, "0.png,0\n1.png,9223372036854775807\n");
+
+  CameraSourceConfig config;
+  config.device_path = dir.string();
+  config.width = kWidth;
+  config.height = kHeight;
+  RecordedCameraSource source(config, RecordedCameraSource::Pacing::kManual);
+  std::size_t delivered = 0;
+  source.SetFrameCallback([&](const Frame&) { ++delivered; });
+  ASSERT_TRUE(source.Start());
+  EXPECT_EQ(source.DeliverUntil(0), 1u);
+  EXPECT_EQ(source.DeliverUntil(std::numeric_limits<std::int64_t>::max() - 10),
+            0u);
+  EXPECT_EQ(source.DeliverUntil(std::numeric_limits<std::int64_t>::max()), 1u);
+  EXPECT_EQ(delivered, 2u);
+  source.Stop();
+
+  // Anchoring at near-INT64_MAX must also never overflow int64_t.
+  ASSERT_TRUE(source.Start());
+  EXPECT_EQ(source.DeliverUntil(std::numeric_limits<std::int64_t>::max() - 10),
+            1u);
+  EXPECT_EQ(source.DeliverUntil(std::numeric_limits<std::int64_t>::max()), 0u);
+  EXPECT_EQ(delivered, 3u);
+  source.Stop();
 }
 
 }  // namespace

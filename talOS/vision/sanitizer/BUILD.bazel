@@ -20,6 +20,7 @@ cc_test(
     data = ["//talOS/vision/testdata"],
     deps = [
         "//talOS/vision/apriltag:cpu_apriltag_backend",
+        "//third_party:apriltag",
         "@googletest//:gtest_main",
     ],
 )

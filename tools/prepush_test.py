@@ -844,6 +844,25 @@ class PrepushTest(unittest.TestCase):
         self.assertIn(other, self.worktree_paths())
         os.rename(other + ".away", other)
 
+    # REQ-DEV-25: checkout-unchanged must fail closed when `git status` fails
+    # with empty stdout rather than treating empty output as a clean tree.
+    def test_checkout_unchanged_fails_closed_when_git_status_errors(self):
+        real_git = shutil.which("git")
+        wrap_dir = os.path.join(self.tmp, "wrap_git")
+        put(os.path.join(wrap_dir, "git"),
+            "#!/bin/sh\n"
+            'if [ "$1" = status ] && [ "$2" = --porcelain ] && '
+            '[ "$3" = --untracked-files=all ]; then\n'
+            '  echo "fatal: broken index" >&2\n'
+            '  exit 128\n'
+            'fi\n'
+            f'exec {shlex.quote(real_git)} "$@"\n',
+            0o755)
+        status, out, _ = self.prepush(
+            PATH=wrap_dir + os.pathsep + self.env["PATH"])
+        self.assertEqual(status, 1, out)
+        self.assertIn("prepush: checkout-unchanged FAILED", out)
+
 
 if __name__ == "__main__":
     unittest.main(testLoader=sharded_test_loader.bazel_test_loader())

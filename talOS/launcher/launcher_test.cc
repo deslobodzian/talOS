@@ -33,6 +33,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -989,6 +990,8 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
 // in Studio (REQ-OPS-30). Once the bridge has spawned, the test moves the
 // supervision clock past the 3 s deadline, a whole settle interval after the
 // spawn: the deadline's pass finds the bridge up that long, so come up.
+// The manifest records the config's [robot] period_us and command_timeout_us,
+// which session_report judges the /hw/state cadence against (REQ-OPS-16).
 TEST(LauncherTest, StableBridgeJoinsDeployedSessionUntilDeadline) {
   const std::string tag = "bridge_stable";
   const std::string out_dir = TempPath(tag + "_out");
@@ -1003,7 +1006,15 @@ TEST(LauncherTest, StableBridgeJoinsDeployedSessionUntilDeadline) {
   options.heartbeat_startup_grace_ms = 60000;
   testing::SteppedClock clock;
   options.supervision_clock = clock.clock();
-  options.config_path = WriteFixtureToml();
+  // A [robot] period and timeout other than their defaults.
+  std::string toml{kFixtureToml};
+  const std::string_view robot_period = "period_us = 5000\nsim_gateway";
+  const std::size_t pos = toml.find(robot_period);
+  ASSERT_NE(pos, std::string::npos);
+  toml.replace(pos, robot_period.size(),
+               "period_us = 4000\ncommand_timeout_us = 120000\nsim_gateway");
+  options.config_path = TempPath(tag + "_toml") + ".toml";
+  std::ofstream{options.config_path} << toml;
   options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
       tag + "_hardware",
       DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
@@ -1052,7 +1063,10 @@ TEST(LauncherTest, StableBridgeJoinsDeployedSessionUntilDeadline) {
       << "session must end at the deadline";
   ASSERT_TRUE(std::filesystem::exists(session + "/manifest.json"));
   const std::string manifest = ReadFile(session + "/manifest.json");
-  EXPECT_NE(manifest.find("\"simulation\": false"), std::string::npos)
+  EXPECT_NE(manifest.find("\"simulation\": false,\n"
+                          "  \"period_us\": 4000,\n"
+                          "  \"command_timeout_us\": 120000,\n"),
+            std::string::npos)
       << manifest;
   const std::size_t bridge = manifest.find("\"name\": \"studio_bridge\"");
   ASSERT_NE(bridge, std::string::npos) << manifest;
@@ -1067,6 +1081,7 @@ TEST(LauncherTest, StableBridgeJoinsDeployedSessionUntilDeadline) {
       << manifest;
 
   std::filesystem::remove_all(out_dir);
+  std::filesystem::remove(options.config_path);
 }
 
 // REQ-OPS-30: the Studio bridge is an observer, so how it ends never sets the
@@ -1891,6 +1906,34 @@ TEST(LauncherGraphTest, AnOptOutTheProbeDidNotDescribeIsAnEndpointMismatch) {
   EXPECT_NE(hidden.find("/hw/request/alpha"), std::string::npos) << hidden;
   EXPECT_NE(hidden.find("untargeted_outputs"), std::string::npos) << hidden;
   EXPECT_EQ(EndpointMismatch({opted_out}, {opted_out}), "");
+}
+
+// REQ-SAFE-14, REQ-CONTRACT-11: EndpointMismatch catches a live node that
+// drops operator_arming on a target lane or drops internal_driver_station on
+// /hw/state/driver_station compared to its --describe probe.
+TEST(LauncherGraphTest,
+     HiddenUnarmedTeleopLaneOrDriverStationIsAnEndpointMismatch) {
+  auto armed = Sender("/alpha/target/teleop", 24);
+  armed.flags = introspect::naming::kSourceFlagOperatorArming;
+  auto unarmed = Sender("/alpha/target/teleop", 24);
+  const std::string dropped_arming = EndpointMismatch({armed}, {unarmed});
+  EXPECT_NE(dropped_arming.find("/alpha/target/teleop"), std::string::npos)
+      << dropped_arming;
+  EXPECT_NE(dropped_arming.find("operator_arming"), std::string::npos)
+      << dropped_arming;
+  EXPECT_EQ(EndpointMismatch({armed}, {armed}), "");
+
+  auto internal_ds = Watcher("/hw/state/driver_station", 1436);
+  internal_ds.flags = introspect::naming::kSourceFlagInternalDriverStation;
+  auto explicit_ds = Watcher("/hw/state/driver_station", 1436);
+  const std::string dropped_internal =
+      EndpointMismatch({internal_ds}, {explicit_ds});
+  EXPECT_NE(dropped_internal.find("/hw/state/driver_station"),
+            std::string::npos)
+      << dropped_internal;
+  EXPECT_NE(dropped_internal.find("internal_driver_station"), std::string::npos)
+      << dropped_internal;
+  EXPECT_EQ(EndpointMismatch({internal_ds}, {internal_ds}), "");
 }
 
 // SPEC-10 / REQ-SAFE-42, REQ-CONTRACT-11: the launcher passes

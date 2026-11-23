@@ -331,6 +331,81 @@ class SafetyParityTest(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "OperatorArming"):
             sim.add(BadArming, "roller")
 
+    # REQ-SAFE-14, REQ-CONTRACT-14: Python operator producers writing a
+    # teleop-policy target lane require OperatorArming, matching C++ semantics
+    # across init order, raw publish, and lazy DriverStation reads in update().
+    def test_operator_producer_teleop_lane_requires_operator_arming(self):
+        class DsBeforeLane:
+            def __init__(self, node):
+                self.ds = talos.DriverStation(node)
+                self.lane = talos.TargetLane(node, Goal, "roller", "teleop")
+
+        class LaneBeforeDs:
+            def __init__(self, node):
+                self.lane = talos.TargetLane(node, Goal, "roller", "teleop")
+                self.ds = talos.DriverStation(node)
+
+        class RawPublish:
+            def __init__(self, node):
+                self.ds = talos.DriverStation(node)
+                self.pub = node.publish(Goal, "/roller/target/teleop")
+
+        for cls in (DsBeforeLane, LaneBeforeDs, RawPublish):
+            with self.subTest(cls=cls.__name__):
+                sim = Sim.from_toml(ROBOT_TOML)
+                with self.assertRaisesRegex(
+                        talos.TalosError,
+                        r"/roller/target/teleop.*OperatorArming.*REQ-SAFE-14"):
+                    sim.add(cls, "driver")
+
+        # Lazy DriverStation construction in update() throws on every retry.
+        class LazyDs:
+            def __init__(self, node):
+                self.node = node
+                self.lane = talos.TargetLane(node, Goal, "roller", "teleop")
+                self.refused = 0
+                self.succeeded = 0
+
+            def update(self):
+                for _ in range(2):
+                    try:
+                        ds = talos.DriverStation(self.node)
+                        _ = ds.enabled
+                        self.succeeded += 1
+                    except talos.TalosError as err:
+                        if "OperatorArming" in str(err):
+                            self.refused += 1
+
+        sim_lazy = Sim.from_toml(ROBOT_TOML)
+        lazy = sim_lazy.add(LazyDs, "driver")
+        sim_lazy.step(0.02)
+        self.assertEqual(lazy.succeeded, 0)
+        self.assertGreaterEqual(lazy.refused, 2)
+
+        # Allowed: auto lane with DriverStation, coordinator without
+        # DriverStation, and armed teleop lane with DriverStation.
+        class AutoProducer:
+            def __init__(self, node):
+                self.ds = talos.DriverStation(node)
+                self.lane = talos.TargetLane(node, Goal, "roller", "auto")
+
+        class Coordinator:
+            def __init__(self, node):
+                self.target = talos.Target(node, Goal)
+                self.lane = talos.TargetLane(node, Goal, "roller", "teleop")
+
+        class ArmedOperator:
+            def __init__(self, node):
+                self.ds = talos.DriverStation(node)
+                self.arming = talos.OperatorArming(node)
+                self.lane = talos.TargetLane(
+                    node, Goal, "roller", "teleop", arming=self.arming)
+
+        sim_ok = Sim.from_toml(ROBOT_TOML)
+        sim_ok.add(AutoProducer, "autonomous")
+        sim_ok.add(Coordinator, "superstructure")
+        sim_ok.add(ArmedOperator, "driver")
+
     # REQ-CONTRACT-14: Node.publish_bytes rejects uint32 overflow instead of
     # silently wrapping max_bytes or slots.
     def test_publish_bytes_rejects_uint32_overflow(self):
@@ -422,6 +497,94 @@ class SafetyParityTest(unittest.TestCase):
             with self.subTest(intake_prop=prop):
                 with self.assertRaises(talos.TalosError):
                     getattr(intake, prop)
+
+    # REQ-CONTRACT-13, REQ-CONTRACT-14, REQ-SAFE-04: Python ctypes bindings
+    # reject out-of-range integer arguments instead of silently wrapping modulo
+    # 2**32 or 2**64 into valid C ABI values (e.g. slot=1<<32 -> slot=0,
+    # position_age_us=1<<32 -> 0 fresh, period/step wrap -> small positive).
+    def test_ctypes_integer_bounds_reject_silent_wraparound(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        hw = SimHardware(sim)
+        hw.enable(True)
+        wrap_s = (1 << 64) / 1e9 + 0.01
+
+        class SlotOverflow:
+            def __init__(self, node):
+                talos.allow_untargeted_outputs(node)
+                self.motor = talos.Motor(node, "wheel")
+                self.sm = talos.StateMachine(node, 0)
+                self.slot_exc = None
+
+            def update(self):
+                if self.slot_exc is None:
+                    try:
+                        self.motor.set_velocity(10.0, slot=(1 << 32))
+                    except (ValueError, OverflowError) as exc:
+                        self.slot_exc = exc
+
+        roller = sim.add(SlotOverflow, "roller")
+        sim.step(0.02)
+        self.assertIsNotNone(roller.slot_exc)
+        self.assertEqual(hw.motor_request("roller", "wheel").mode,
+                         talos.Mode.NEUTRAL)
+
+        with self.assertRaises((ValueError, OverflowError)):
+            roller.sm.go(1 << 63)
+        with self.assertRaises((ValueError, OverflowError)):
+            roller.sm.go(-(1 << 63) - 1)
+
+        class EveryOverflow:
+            def __init__(self, node):
+                node.every(wrap_s, lambda: None)
+
+        with self.assertRaises((ValueError, OverflowError)):
+            sim.add(EveryOverflow, "planner")
+
+        class StateOverflow:
+            def __init__(self, node):
+                talos.StateMachine(node, 1 << 63)
+
+        with self.assertRaises((ValueError, OverflowError)):
+            sim.add(StateOverflow, "planner")
+
+        with self.assertRaises((ValueError, OverflowError)):
+            sim.step(wrap_s)
+        with self.assertRaises((ValueError, OverflowError)):
+            sim.pause("roller", wrap_s)
+        with self.assertRaises((ValueError, OverflowError)):
+            hw.set_gateway_clock(offset=wrap_s, latency=0.0)
+        with self.assertRaises((ValueError, OverflowError)):
+            hw.set_motor("roller", "wheel", 0.0, 0.0, position_age_us=1 << 32)
+        with self.assertRaises((ValueError, OverflowError)):
+            hw.set_motor("roller", "wheel", 0.0, 0.0, velocity_age_us=-1)
+        with self.assertRaises((ValueError, OverflowError)):
+            hw.set_cancoder("arm", "arm_cc", 0.0, 0.0, position_age_us=1 << 32)
+        with self.assertRaises((ValueError, OverflowError)):
+            hw.lose_states(1 << 32)
+        with self.assertRaises((ValueError, OverflowError)):
+            hw.set_driver_station(station=1 << 32)
+        with self.assertRaises((ValueError, OverflowError)):
+            hw.set_driver_station(alliance=1 << 32)
+        with self.assertRaises((ValueError, OverflowError)):
+            hw.set_driver_station(joysticks=[Stick(povs=(1 << 32,))])
+        with self.assertRaises((ValueError, OverflowError)):
+            sim.publish_target(Goal, "roller", "teleop", mode_since_us=-1,
+                               height_rot=1.0, enabled=True, tick_count=1)
+        with self.assertRaises((ValueError, OverflowError)):
+            sim.publish_target(Goal, "roller", "teleop", mode_since_us=1 << 64,
+                               height_rot=1.0, enabled=True, tick_count=1)
+
+    # REQ-CONTRACT-14: destroying a Sim (as during cyclic GC finalization)
+    # destroys and invalidates attached SimHardware wrappers so subsequent calls
+    # raise TalosError instead of dereferencing freed Sim memory (UAF).
+    def test_sim_destroy_invalidates_attached_sim_hardware(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        hw = SimHardware(sim)
+        sim.__del__()
+        with self.assertRaises(talos.TalosError):
+            hw.enable(True)
+        with self.assertRaises(talos.TalosError):
+            hw.motor_request("roller", "wheel")
 
 
 if __name__ == "__main__":
