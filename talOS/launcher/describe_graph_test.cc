@@ -189,7 +189,7 @@ critical = false
   EXPECT_TRUE(LintCriticalNodes(specs, described).empty());
 }
 
-// VIS-1 (REQ-OPS-34, REQ-OPS-35, REQ-OPS-38, REQ-OPS-39, REQ-CONTRACT-33):
+// REQ-OPS-34, REQ-OPS-35, REQ-OPS-38, REQ-OPS-39, REQ-CONTRACT-33 (VIS-1):
 // LintTelemetryConfig promotes invalid [[subsystem.labels]] entries and
 // invalid [studio] dashboard layouts to hard phase-1 ERROR diagnostics even
 // when telemetry is non-critical or did not answer --describe.

@@ -896,7 +896,7 @@ TEST(PhoenixBackendSim, NeutralPreservesMomentumAndBrakeDecaysFasterThanCoast) {
 // (motor type, FOC variant, and gear-reflected inertia) and forwards the
 // simulated RoboRIO battery voltage to each device rather than assuming a
 // fixed 100 rps / 12 V lag.
-// REQ-DEV-05, REQ-DEV-06
+// REQ-DEV-06
 TEST(PhoenixBackendSim, WpilibPlantReflectsMotorTypeFocGearingAndSupply) {
   EnsureHal();
   EnabledDs ds;
@@ -1023,7 +1023,7 @@ TEST(PhoenixBackendSim, RemoteCancoderAppliesSensorToMechanismRatioOnce) {
 // Under desktop simulation, inferred swerve or differential chassis kinematics
 // integrate wheel motion into Pigeon2 yaw and yaw rate, while a non-chassis
 // configuration leaves manually injected SetRawYaw untouched.
-// REQ-DEV-05
+// REQ-DEV-06
 TEST(PhoenixBackendPigeon,
      ChassisKinematicsDrivesYawAndNonChassisPreservesManualYaw) {
   EnsureHal();
@@ -1131,7 +1131,7 @@ TEST(PhoenixBackendPigeon,
 // angle (wrap(steer_sign * raw + offset_rot)), so chassis kinematics must apply
 // both steer_sign and offset_rot to integrate Pigeon2 yaw CCW+ rather than
 // cancelling or reversing it.
-// REQ-DEV-05
+// REQ-DEV-06
 TEST(PhoenixBackendPigeon,
      SwerveRemoteCancoderWithMagnetOffsetAndInversionDrivesYawCcw) {
   EnsureHal();

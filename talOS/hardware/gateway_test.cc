@@ -4429,7 +4429,7 @@ TEST(ConfigWire, PersistenceValidatesCrcAndAssemblerResetsAfterCompletion) {
 // Allocation-free config codec helpers match their vector-returning
 // counterparts byte for byte, reject undersized output spans, and agree with
 // Validate()/ConfigurationId() on valid and invalid configs.
-// REQ-RT-01, REQ-RT-06, REQ-SAFE-24
+// REQ-CONTRACT-05, REQ-CONTRACT-06
 TEST(ConfigWire, AllocationFreeHelpersMatchWireBytesAndValidation) {
   const auto config = SwerveConfig(true);
   const auto expected_ser = SerializeConfig(config);
