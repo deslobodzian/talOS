@@ -19,6 +19,7 @@ writing there on pass (docs/TESTING.md §8.2, REQ-DEV-25).
 import json
 import os
 import select
+import shlex
 import signal
 import sys
 import tempfile
@@ -204,9 +205,13 @@ NOOP_SCRIPT = "import sys\nsys.exit(0)\n"
 
 
 def _write_executable(directory, name, body):
+    # Wrap via #!/bin/sh instead of #!{sys.executable} so long Bazel
+    # output-base paths do not exceed Linux's 255-byte shebang limit.
     path = os.path.join(directory, name)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(f"#!{sys.executable}\n{body}")
+        f.write(
+            "#!/bin/sh\n"
+            f'exec {shlex.quote(sys.executable)} -c {shlex.quote(body)} "$@"\n')
     os.chmod(path, 0o755)
     return path
 

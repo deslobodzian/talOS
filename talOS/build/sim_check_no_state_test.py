@@ -19,6 +19,7 @@ stand-in that makes the session directory, writes no manifest and exits 1.
 """
 
 import os
+import shlex
 import sys
 import tempfile
 import unittest
@@ -87,8 +88,14 @@ class SimCheckNoStateTest(unittest.TestCase):
 
     # REQ-DEV-30
     def test_launch_that_leaves_no_manifest_fails_with_its_output(self):
+        # Wrap via #!/bin/sh instead of #!{sys.executable} so long Bazel
+        # output-base paths do not exceed Linux's 255-byte shebang limit.
+        refusing = (
+            "#!/bin/sh\n"
+            f'exec {shlex.quote(sys.executable)} -c '
+            f'{shlex.quote(REFUSING_LAUNCH)} "$@"\n')
         problems, diagnostics = sim_check.check(
-            stand_in(f"#!{sys.executable}\n{REFUSING_LAUNCH}"), SETTLE_S, rlocation(os.environ["LOG_DUMP"]),
+            stand_in(refusing), SETTLE_S, rlocation(os.environ["LOG_DUMP"]),
             rlocation("_main/talOS/launcher/session_report.py"),
             rlocation(os.environ["REGISTRY_UNLINK"]),
             sim_check.ready_bound(SETTLE_S))
