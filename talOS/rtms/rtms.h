@@ -150,15 +150,24 @@ inline constexpr std::uint64_t kRtmsMagic =
     0x32534D54534F4C41ULL;  // "ALOSTMS2"
 inline constexpr std::uint64_t kRtmsVersion = 9;
 
-// RTMSHeader::lifetime: a session-owned flag, a closing flag, an exclusive
-// reclamation flag for an abandoned closing segment, and the count of queues
-// attached to a segment that is not session-owned.
-// kLifetimeReclaiming assumes single-bundle builds (same kRtmsVersion): all
-// peers sharing a standalone segment are built together and observe it.
+// RTMSHeader::lifetime, one of:
+//   - kLifetimeSessionOwned: a launcher session owns the segment;
+//   - kLifetimeClosing, with the process word (process_liveness.h) of its
+//     claimant in kLifetimeClaimantMask (0 for none): no queue is attached
+//     and the claimant is the one process that unlinks the segment. The last
+//     queue to close claims it in the step that marks it closing, and gives
+//     the claim up (no claimant) if its unlink fails; an opener claims it
+//     only from no claimant or a dead one, so among processes of one build a
+//     live claimant is never superseded;
+//   - otherwise the count of queues attached (kLifetimeCountMask).
+// Processes sharing a standalone segment must be the same build:
+// kRtmsVersion does not distinguish encodings of this word.
 inline constexpr std::uint64_t kLifetimeSessionOwned = 1ULL << 63;
 inline constexpr std::uint64_t kLifetimeClosing = 1ULL << 62;
-inline constexpr std::uint64_t kLifetimeReclaiming = 1ULL << 61;
+inline constexpr std::uint64_t kLifetimeClaimantMask = (1ULL << 62) - 1;
 inline constexpr std::uint64_t kLifetimeCountMask = (1ULL << 32) - 1;
+static_assert(kProcessPidBits + kProcessStartBits + kProcessNamespaceBits == 62,
+              "a closing segment's claimant word fits below kLifetimeClosing");
 
 // The segment records the writer's owner and each reader slot's claimant as
 // a process word (kProcessPidBits, process_liveness.h): pid, start time and
@@ -239,10 +248,19 @@ static_assert(MAX_READERS <= 64, "Writer::waiters has one bit per slot");
 // tests) the first queue to open a name creates the segment and the last
 // one to close it unlinks it; a segment whose last holder was killed stays
 // until a launcher session replaces it, someone unlinks it, or the machine
-// restarts, and is reused meanwhile. A last holder killed between
-// marking the segment closing and unlinking it never unlinks it: the next
-// queue to open the name waits out that unlink and then, when no live
-// process holds the segment, unlinks it itself.
+// restarts, and is reused meanwhile. The last holder marks the segment
+// closing and claims its unlink in one step (kLifetimeClaimantMask). Among
+// processes of one build, a queue that opens the name meanwhile waits for
+// that unlink while the claimant lives, however long it is descheduled
+// (failing after about a second in all, a bound for a stopped claimant), and
+// never unlinks it in the claimant's place. A claimant killed before
+// unlinking never does, and one whose unlink failed gives its claim up: a
+// later open of the name, when no live process holds the segment, claims
+// and unlinks it itself (an open() that claimed it and failed to unlink it
+// throws rather than claim again). A claimant that process_liveness.h counts
+// as running because it cannot check it (another pid namespace) is waited
+// for like a live one: if it is in fact dead or stuck, the open fails after
+// the wait.
 class RTMSQueue {
  public:
   RTMSQueue(std::string_view path, std::size_t message_size,
@@ -333,9 +351,14 @@ class RTMSQueue {
 
   // Test-only hook (null in production, never set by non-test callers;
   // mutated only via RegistrationPeer in ring_registration_test.cc): invoked
-  // by open() each time a loser yields while waiting for an existing
-  // kLifetimeReclaiming claim on `segment_id`.
+  // by open() on each wait for the live claimant of the closing segment
+  // `segment_id` to unlink it; `wait_count` counts this open()'s waits, on
+  // any segment, from 1.
   static void (*on_reclaim_wait_)(std::uint64_t segment_id, int wait_count);
+  // Test-only hook, like on_reclaim_wait_: invoked by the claimant's unlink
+  // of a closing segment (or the session owner's) once it has checked that
+  // the name still holds `segment_id`, just before it calls shm_unlink.
+  static void (*on_unlink_verified_)(std::uint64_t segment_id);
 
   // Whether reader slot `reader_id` still holds the word this queue claimed
   // it with. Another process that judged this one dead may have freed the
@@ -352,8 +375,8 @@ class RTMSQueue {
   }
 
   // Maps the segment (creating it when absent), initializes or validates the
-  // header, and joins its lifetime. Retries while a closing segment is being
-  // unlinked, and unlinks one its closer died before unlinking.
+  // header, and joins its lifetime. Retries while a closing segment's live
+  // claimant unlinks it, and claims and unlinks one whose claimant died.
   void open(const talos::schema::Identity& schema);
   // Leaves the segment's lifetime: the last queue of a segment that is not
   // session-owned, or the session owner, unlinks it.
