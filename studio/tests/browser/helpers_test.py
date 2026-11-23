@@ -81,6 +81,114 @@ class WatchSeesAFileCreatedBeforeItsDirectoryIsWatched(unittest.TestCase):
             self.assertEqual(watch.wait_for(check, paths, 10, "the write"), "listening\n")
             self.assertEqual(checked[0], "", "the check ran after the write: nothing proved")
 
+    def test_in_place_write_after_atomic_replace_wakes_the_wait(self):
+        """Replacing a watched file atomically (rename over it, as the launcher
+        updates manifest.json) swaps its inode; the watch must detect the
+        replacement and re-attach to the new inode so a subsequent in-place
+        write wakes wait_for rather than watching the unlinked inode until
+        timeout."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "manifest.json"
+            target.write_text("v0")
+            staged = Path(tmp) / "manifest.json.tmp"
+            step = [0]
+
+            def paths():
+                # Watch only the file itself (not its parent dir) so both
+                # atomic-replace detection and inode re-watch are exercised
+                # natively on inotify and kqueue alike.
+                return [target]
+
+            def check():
+                text = target.read_text()
+                if text == "v2":
+                    return text
+                if step[0] == 0:
+                    step[0] = 1
+                    staged.write_text("v1")
+                    os.replace(staged, target)
+                    return None
+                if step[0] == 1 and text == "v1":
+                    step[0] = 2
+                    with target.open("w") as handle:
+                        handle.write("v2")
+                        handle.flush()
+                return None
+
+            self.assertEqual(watch.wait_for(check, paths, 10, "post-replace write"), "v2")
+
+    def test_kqueue_add_raises_on_non_vanished_error_and_tracks_inode_replace(self):
+        """_Kqueue.add must fail fast on non-ENOENT/ENOTDIR open errors (never
+        silently leaving wait_for blind until its bound) and replace the old
+        watched fd when a file's inode changes."""
+        import errno as _errno
+        from unittest import mock
+
+        class FakeKqueue:
+            def __init__(self):
+                self.registered = []
+                self.drained = 0
+                self.pending_batches = 2
+                self.closed = False
+
+            def fileno(self):
+                return 99
+
+            def control(self, changelist, max_events, timeout):
+                if changelist is not None:
+                    self.registered.extend(changelist)
+                    return []
+                self.drained += 1
+                if self.pending_batches > 0:
+                    self.pending_batches -= 1
+                    return [object()]
+                return []
+
+            def close(self):
+                self.closed = True
+
+        fake_kq = FakeKqueue()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "manifest.json"
+            target.write_text("v0")
+            staged = Path(tmp) / "manifest.json.tmp"
+            with mock.patch.object(watch.select, "kqueue", create=True, return_value=fake_kq), \
+                    mock.patch.object(watch.select, "kevent", create=True,
+                                      side_effect=lambda fd, **kw: (fd, kw)), \
+                    mock.patch.object(watch.select, "KQ_FILTER_VNODE", -4, create=True), \
+                    mock.patch.object(watch.select, "KQ_EV_ADD", 1, create=True), \
+                    mock.patch.object(watch.select, "KQ_EV_CLEAR", 2, create=True), \
+                    mock.patch.object(watch.select, "KQ_NOTE_DELETE", 1, create=True), \
+                    mock.patch.object(watch.select, "KQ_NOTE_WRITE", 2, create=True), \
+                    mock.patch.object(watch.select, "KQ_NOTE_EXTEND", 4, create=True), \
+                    mock.patch.object(watch.select, "KQ_NOTE_RENAME", 8, create=True):
+                kq = watch._Kqueue()
+                try:
+                    self.assertTrue(kq.add(str(target)))
+                    self.assertFalse(kq.add(str(target)))
+                    # Atomic rename changes inode: add() must re-watch and close old fd.
+                    staged.write_text("v1")
+                    os.replace(staged, target)
+                    self.assertTrue(kq.add(str(target)))
+                    self.assertEqual(len(fake_kq.registered), 2)
+                    # Missing path returns False; EMFILE raises instead of going blind.
+                    self.assertFalse(kq.add(str(Path(tmp) / "missing.json")))
+                    other = Path(tmp) / "other.json"
+                    other.write_text("x")
+                    with mock.patch.object(
+                        watch.os, "open",
+                        side_effect=OSError(_errno.EMFILE, "Too many open files"),
+                    ):
+                        with self.assertRaises(OSError) as err:
+                            kq.add(str(other))
+                        self.assertEqual(err.exception.errno, _errno.EMFILE)
+                    # drain() loops until kqueue has no more pending batches.
+                    kq.drain()
+                    self.assertEqual(fake_kq.drained, 3)
+                finally:
+                    kq.close()
+                self.assertTrue(fake_kq.closed)
+
 
 if __name__ == "__main__":
     unittest.main()
