@@ -274,8 +274,8 @@ class Scanner {
         value += c;
         continue;
       }
-      const char escape = Peek();
-      ++at_;
+      if (at_ >= text_.size()) Fail("a string without its closing quote");
+      const char escape = text_[at_++];
       switch (escape) {
         case '"':
         case '\\':
