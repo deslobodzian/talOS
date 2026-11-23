@@ -26,7 +26,7 @@ on:
         - tsan     # tools/sanitizer_lane.sh tsan
         - soak     # the bench soak, once per seed 0..count-1
         - stress   # bazel test --runs_per_test=count //..., to find flakes
-        - rtprio   # //talOS/process tests under a realtime grant (TEST-8)
+        - rtprio   # //talOS/process tests under a realtime grant
       count:
         description: Seeds for soak, or runs of every test for stress
         type: string
@@ -199,7 +199,7 @@ jobs:
             # A realtime grant for this shell, and so for the Bazel server
             # started from it and the tests it runs: the limit is inherited.
             # Without it ProcessTest.BackgroundThreadLeavesAnInheritedRealtimePolicy
-            # skips (TODO.md TEST-8), so the lane fails unless that test ran.
+            # skips, so the lane fails unless that test ran.
             sudo prlimit --pid $$ --rtprio=99:99
             bazel shutdown
             bazel test --config=gcp --test_output=all --cache_test_results=no \

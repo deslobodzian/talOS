@@ -1,4 +1,5 @@
 import {poseError} from './core';
+import {bool, boundedString, fail, list, parsing, record} from './data/validate';
 
 // Frame archives are local, untrusted files; none of these objects enter the
 // telemetry worker or the bridge. Keep the timestamp lossless (JSON's integer
@@ -39,12 +40,6 @@ export type FrameMetadata = {
 export const MAX_FRAME_JSON_BYTES = 1 << 20;
 export const MAX_FRAME_FILES = 20000;
 const MAX_IMAGE_BYTES = 64 << 20;
-const fail = (message: string): never => { throw Error(message); };
-function object(value: unknown, name: string): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value))
-    fail(`${name} must be an object`);
-  return value as Record<string, unknown>;
-}
 function number(source: Record<string, unknown>, key: string): number {
   const value = source[key];
   if (typeof value !== 'number' || !Number.isFinite(value))
@@ -58,20 +53,16 @@ function integer(source: Record<string, unknown>, key: string, max = 0x7fffffff)
   return value;
 }
 function string(source: Record<string, unknown>, key: string): string {
-  const value = source[key];
-  if (typeof value !== 'string' || !value.length || value.length > 512)
+  const value = boundedString(source, key, 512);
+  if (!value.length)
     fail(`${key} must be a nonempty string of at most 512 characters`);
-  return value as string;
-}
-function boolean(source: Record<string, unknown>, key: string): boolean {
-  if (typeof source[key] !== 'boolean') fail(`${key} must be a boolean`);
-  return source[key] as boolean;
+  return value;
 }
 function numbers<K extends string>(source: Record<string, unknown>, keys: readonly K[]): Record<K, number> {
   return Object.fromEntries(keys.map(key => [key, number(source, key)])) as Record<K, number>;
 }
 function pose(value: unknown, name: string): FramePose {
-  return numbers(object(value, name), ['x_m', 'y_m', 'yaw_rad']);
+  return numbers(record(value, name), ['x_m', 'y_m', 'yaw_rad']);
 }
 
 // JSON.parse validates the syntax first. Tokenize only to recover the exact
@@ -94,9 +85,9 @@ function captureTimestamp(text: string): string {
 }
 
 export function parseFrameMetadata(text: string): FrameMetadata {
-  try {
+  return parsing('frame metadata', () => {
     if (text.length > MAX_FRAME_JSON_BYTES) fail('document too large');
-    const root = object(JSON.parse(text), 'document');
+    const root = record(JSON.parse(text), 'document');
     if (root.format_version !== 1) fail('unsupported format_version (expected 1)');
     if (typeof root.capture_ns !== 'number') fail('capture_ns must be a JSON integer');
     const capture_ns = captureTimestamp(text);
@@ -104,12 +95,10 @@ export function parseFrameMetadata(text: string): FrameMetadata {
     if (reason !== 'sampled' && reason !== 'rejected') fail('reason must be sampled or rejected');
     const width = integer(root, 'width', 32768), height = integer(root, 'height', 32768);
     if (!width || !height || width * height > 64 * 1024 * 1024) fail('image dimensions too large or zero');
-    const detector = object(root.detector, 'detector');
-    const observation = object(root.observation, 'observation');
-    if (!Array.isArray(root.detections) || root.detections.length > 1024)
-      fail('detections must be an array of at most 1024 entries');
-    const detections = (root.detections as unknown[]).map((value, i) => {
-      const entry = object(value, `detections[${i}]`);
+    const detector = record(root.detector, 'detector');
+    const observation = record(root.observation, 'observation');
+    const detections = list(root, 'detections', 1024).map((value, i) => {
+      const entry = record(value, `detections[${i}]`);
       if (!Array.isArray(entry.corners_px) || entry.corners_px.length !== 8 ||
           !entry.corners_px.every(v => typeof v === 'number' && Number.isFinite(v)))
         fail(`detections[${i}].corners_px must contain eight finite numbers`);
@@ -117,7 +106,7 @@ export function parseFrameMetadata(text: string): FrameMetadata {
       return {
         tag_id: integer(entry, 'tag_id'), hamming: integer(entry, 'hamming'),
         decision_margin: number(entry, 'decision_margin'),
-        corners_px: [...entry.corners_px as number[]], valid: boolean(entry, 'valid'),
+        corners_px: [...entry.corners_px as number[]], valid: bool(entry, 'valid'),
         reprojection_error_px: number(entry, 'reprojection_error_px'),
         ambiguity: number(entry, 'ambiguity'), reject_reason
       };
@@ -125,26 +114,24 @@ export function parseFrameMetadata(text: string): FrameMetadata {
     return {
       format_version: 1, camera: string(root, 'camera'), capture_ns,
       reason: reason as FrameReason, width, height,
-      intrinsics: numbers(object(root.intrinsics, 'intrinsics'), ['fx', 'fy', 'cx', 'cy', 'k1', 'k2', 'k3', 'p1', 'p2']),
-      mounting: numbers(object(root.mounting, 'mounting'), ['x_m', 'y_m', 'z_m', 'roll_rad', 'pitch_rad', 'yaw_rad']),
+      intrinsics: numbers(record(root.intrinsics, 'intrinsics'), ['fx', 'fy', 'cx', 'cy', 'k1', 'k2', 'k3', 'p1', 'p2']),
+      mounting: numbers(record(root.mounting, 'mounting'), ['x_m', 'y_m', 'z_m', 'roll_rad', 'pitch_rad', 'yaw_rad']),
       detector: {
         backend: string(detector, 'backend'), decimate: number(detector, 'decimate'),
         threads: integer(detector, 'threads'), sigma: number(detector, 'sigma'),
-        refine_edges: boolean(detector, 'refine_edges'),
+        refine_edges: bool(detector, 'refine_edges'),
         hamming_threshold: integer(detector, 'hamming_threshold'),
         min_decision_margin: number(detector, 'min_decision_margin')
       },
       detections,
       observation: {
-        ...pose(observation, 'observation'), valid: boolean(observation, 'valid'),
+        ...pose(observation, 'observation'), valid: bool(observation, 'valid'),
         ...numbers(observation, ['x_std_m', 'y_std_m', 'yaw_std_rad']),
         tag_count: integer(observation, 'tag_count')
       },
       truth: root.truth === null ? null : pose(root.truth, 'truth')
     };
-  } catch (error) {
-    throw Error(`Invalid frame metadata: ${error instanceof Error ? error.message : String(error)}`);
-  }
+  });
 }
 
 export type LocalFrameFile = {

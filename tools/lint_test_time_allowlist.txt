@@ -62,7 +62,7 @@ talOS/telemetry/dashboard_layout.cc io 1 construction-only: ParseDashboardLayout
 talOS/telemetry/node.h io 1 construction-only: ReportPages prints the channel/page budget to std::cerr once in Telemetry's constructor (and --describe-only), never in update()
 talOS/vision/pipeline_test.cc clock 2 integration: pipeline worker threads, condition wait with a deadline
 talOS/vision/pipeline_test.cc sleep 1 integration: pipeline worker threads, condition wait with a deadline
-talOS/vision/recording/recorder_test.cc clock 6 integration: recorder thread, condition wait with a deadline
+talOS/vision/recording/recorder_test.cc clock 4 integration: recorder thread, condition wait with a deadline
 talOS/vision/recording/recorder_test.cc sleep 2 integration: recorder thread, condition wait with a deadline
 tools/test_rio_in_the_loop.py clock 6 e2e: the RoboRIO program in the loop on its real clock; deadlines only bound a hang (TESTING.md §2)
 tools/test_rio_in_the_loop.py sleep 2 e2e: the RoboRIO program in the loop on its real clock; paces process bring-up (TESTING.md §2)

@@ -12,10 +12,16 @@ struct_hash reads .bfbs bytes with the reflection classes flatc generates
 from upstream reflection.fbs (`import reflection`) and computes the hash
 talOS/schema/schema_hash.h defines: the same value C++'s
 talos::schema::struct_hash and talos::Descriptor<M>::kHash give.
+find_struct resolves a named struct inside a .bfbs reflection schema and is
+shared with talos._messages.
 """
 
 from reflection.BaseType import BaseType
 from reflection.Schema import Schema
+
+
+class SchemaError(ValueError):
+    """A reflection .bfbs buffer is invalid or lacks the requested struct."""
 
 # reflection::EnumNameBaseType: flatc spells BaseType.None as None_.
 _BASE_NAMES = {value: name.rstrip("_") for name, value in vars(BaseType).items()
@@ -69,24 +75,35 @@ def _struct(schema, obj, out):
     out.append("}")
 
 
-def canonical_struct(bfbs, name):
-    """The canonical text of struct `name` in .bfbs bytes (schema_hash.h),
-    or None when the bytes are not a reflection.Schema or hold no struct of
-    that name."""
+def find_struct(bfbs, name):
+    """Returns `(reflection.Schema, reflection.Object)` for struct `name` in
+    .bfbs bytes, or raises SchemaError naming the reason when the bytes are not
+    a reflection.Schema, name a table, or hold no struct of that name."""
     data = bytes(bfbs)
     if not Schema.SchemaBufferHasIdentifier(data, 0):
-        return None
+        raise SchemaError("not a reflection schema")
     schema = Schema.GetRootAs(data, 0)
     wanted = name.encode("utf-8")
     for i in range(schema.ObjectsLength()):
         obj = schema.Objects(i)
         if obj.Name() == wanted:
             if not obj.IsStruct():
-                return None
-            out = []
-            _struct(schema, obj, out)
-            return "".join(out)
-    return None
+                raise SchemaError(f"{name} is a table, not a struct")
+            return schema, obj
+    raise SchemaError(f"has no struct {name}")
+
+
+def canonical_struct(bfbs, name):
+    """The canonical text of struct `name` in .bfbs bytes (schema_hash.h),
+    or None when the bytes are not a reflection.Schema or hold no struct of
+    that name."""
+    try:
+        schema, obj = find_struct(bfbs, name)
+    except SchemaError:
+        return None
+    out = []
+    _struct(schema, obj, out)
+    return "".join(out)
 
 
 def struct_hash(bfbs, name):

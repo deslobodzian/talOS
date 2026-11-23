@@ -5,7 +5,7 @@
 // and the exact spelling is recovered from the raw text because the launcher
 // writes them as JSON numbers, which JSON.parse would round past 2^53.
 
-import {bool, boundedString, fail, flag, list, parsing, record} from './validate';
+import {bool, boundedString, fail, flag, list, nonNegInt, parsing, record} from './validate';
 
 // One run of a node (launcher README "Session manifest"). Wall times are
 // nanoseconds as a double: rounded below a microsecond, which a display of
@@ -216,12 +216,8 @@ function u64Field(integers: ReadonlyMap<string, string>,
 }
 
 // A non-negative count that is 0 when absent.
-function countNumber(source: Record<string, unknown>, key: string): number {
-  const value = source[key] ?? 0;
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0)
-    fail(`${key} must be a non-negative integer`);
-  return value as number;
-}
+const countNumber = (source: Record<string, unknown>, key: string): number =>
+    nonNegInt(source[key] ?? 0, key);
 
 // A nested uint64 (per-node record_count), too small to need raw-text recovery.
 function countString(source: Record<string, unknown>, key: string): string {
@@ -260,12 +256,8 @@ function parseRun(value: unknown, where: string): ManifestRun {
 }
 
 // A count the launcher always writes once it writes any of them.
-function count(source: Record<string, unknown>, key: string): number {
-  const value = source[key];
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0)
-    fail(`${key} must be a non-negative integer`);
-  return value as number;
-}
+const count = (source: Record<string, unknown>, key: string): number =>
+    nonNegInt(source[key], key);
 
 // The launcher writes all five fields or none (talOS/launcher/session.cc).
 function parseDelivery(source: Record<string, unknown>,

@@ -78,6 +78,7 @@ class LogFileSink {
   // Syncs the active descriptor (`durable`: process::DurableSync for flush()
   // and destruction; otherwise periodic fsync), updates last_sync(), and
   // creates `<path>.capped` once head_dropped() or `capture_stopped` holds.
+  // A successful durable sync clears needs_durable_sync().
   void sync(bool durable, bool capture_stopped = false) noexcept;
 
   // Creates and durable-syncs `<path>.capped` once.
@@ -92,6 +93,8 @@ class LogFileSink {
   std::chrono::steady_clock::time_point last_sync() const noexcept {
     return last_sync_;
   }
+  bool is_open() const noexcept { return fd_ >= 0; }
+  bool needs_durable_sync() const noexcept { return needs_durable_sync_; }
 
   bool failed() const noexcept { return failed_.load(); }
   std::string error() const;
@@ -117,6 +120,15 @@ class LogFileSink {
   std::uint64_t dropped_through_{0};
   std::atomic<bool> head_dropped_{false};
   bool capped_marked_{false};
+  // True whenever the open descriptor may hold bytes (or an unpersisted cap
+  // marker) not yet covered by a successful durable sync. Not atomic: writer-
+  // thread updates in open_file(), write_bytes(), and rotate_to() are ordered
+  // before drain()'s sync(/*durable=*/true) by wait_written() (called from
+  // settle(), which observes file_ready and completed == submitted under
+  // LogWriter::State::mutex) and before LogWriter::State::~State() by
+  // stop_writer()'s thread join; periodic sync(/*durable=*/false) and drain()'s
+  // sync(/*durable=*/true) are serialized by LogWriter::State::mutex.
+  bool needs_durable_sync_{false};
   std::chrono::steady_clock::time_point last_sync_{
       std::chrono::steady_clock::now()};
   std::atomic<bool> failed_{false};
