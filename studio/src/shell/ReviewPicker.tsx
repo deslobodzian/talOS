@@ -16,6 +16,7 @@ import {
 } from '../data/review';
 import {useStudio} from '../data/studio';
 import {duration, wallDateTime} from '../ui/formatters';
+import {useEscape} from './Shortcuts';
 
 const SERVER_KEY = 'talos-studio-review-server';
 
@@ -67,16 +68,7 @@ export function ReviewPicker({onClose, fetchFn, server: fixed}: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        onClose();
-      }
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [onClose]);
+  useEscape(onClose);
 
   const open = async (id: string) => {
     setBusy(true);

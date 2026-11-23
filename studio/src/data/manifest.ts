@@ -5,6 +5,8 @@
 // and the exact spelling is recovered from the raw text because the launcher
 // writes them as JSON numbers, which JSON.parse would round past 2^53.
 
+import {bool, boundedString, fail, flag, list, parsing, record} from './validate';
+
 // One run of a node (launcher README "Session manifest"). Wall times are
 // nanoseconds as a double: rounded below a microsecond, which a display of
 // when a run started and ended never shows.
@@ -102,49 +104,11 @@ const MAX_LOG_PATHS = 64;
 const MAX_RUNS = 64;
 const MAX_SUBSYSTEMS = 256;
 
-const fail = (what: string): never => {
-  throw Error(what);
-};
-
-function parsing<T>(body: () => T): T {
-  try {
-    return body();
-  } catch (e) {
-    throw Error(`Invalid manifest: ${e instanceof Error ? e.message : String(e)}`);
-  }
-}
-
-function record(value: unknown, what: string): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value))
-    fail(`${what} must be an object`);
-  return value as Record<string, unknown>;
-}
-
-function str(source: Record<string, unknown>, key: string,
-             cap = MAX_STRING): string {
-  const value = source[key];
-  if (typeof value !== 'string' || value.length > cap)
-    fail(`${key} must be a string of at most ${cap} characters`);
-  return value as string;
-}
+const str = (source: Record<string, unknown>, key: string, cap = MAX_STRING) =>
+    boundedString(source, key, cap);
 
 const path = (source: Record<string, unknown>, key: string) =>
     str(source, key, MAX_PATH);
-
-function bool(source: Record<string, unknown>, key: string): boolean {
-  const value = source[key];
-  if (typeof value !== 'boolean') fail(`${key} must be a boolean`);
-  return value as boolean;
-}
-
-// Absent is read as false: an older launcher that did not yet write the field
-// still produces a readable document.
-function flag(source: Record<string, unknown>, key: string): boolean {
-  const value = source[key];
-  if (value === undefined) return false;
-  if (typeof value !== 'boolean') fail(`${key} must be a boolean`);
-  return value as boolean;
-}
 
 function integer(source: Record<string, unknown>, key: string): number {
   const value = source[key];
@@ -152,14 +116,6 @@ function integer(source: Record<string, unknown>, key: string): number {
       value < -2147483648 || value > 2147483647)
     fail(`${key} must be a 32-bit integer`);
   return value as number;
-}
-
-function list(source: Record<string, unknown>, key: string,
-              cap: number): unknown[] {
-  const value = source[key];
-  if (!Array.isArray(value) || value.length > cap)
-    fail(`${key} must be an array of at most ${cap} entries`);
-  return value as unknown[];
 }
 
 // JSON.parse validates the syntax first. Scan once to recover the exact decimal
@@ -362,7 +318,7 @@ function parseNode(value: unknown, where: string): ManifestNode {
 
 export function parseManifest(raw: string): SessionManifest {
   if (raw.length > MAX_MANIFEST_BYTES) fail('document too large');
-  return parsing(() => {
+  return parsing('manifest', () => {
     const source = record(JSON.parse(raw), 'manifest');
     const integers = topLevelIntegers(raw);
     return {
