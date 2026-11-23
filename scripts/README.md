@@ -38,7 +38,15 @@ workflow from the Actions tab.
 ## Using the cache
 
 `bazel build --config=gcp //...` (`.bazelrc`) on a VM in the `talos-ci`
-network. The address in `build:gcp` is `CACHE_IP` in `gcp-cicd.env.sh`;
+network. The workflow does this for a branch, and then runs one lane:
+
+```sh
+gh workflow run "Cloud Build" --ref my-branch -f lane=fast   # replay (default), fast, full, asan, tsan
+```
+
+`-f max_minutes=40` gives a lane that does not fit in the default 20 minutes
+(a sanitizer build with a cold cache) a longer-lived VM. When a lane fails,
+the run's artifact holds every test's log. The address in `build:gcp` is `CACHE_IP` in `gcp-cicd.env.sh`;
 change both together. It is not reachable from a laptop, whose builds keep
 using the local disk cache.
 
