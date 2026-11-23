@@ -318,8 +318,8 @@ TEST(LogFuzzTest, WindowedLogReaderSeekExtremeOffsetsDoNotOverflow) {
 
   WindowedLogReader reader{file.path()};
   for (const std::uint64_t bad :
-       {std::uint64_t{0}, std::uint64_t{1}, sizeof(FileHeader) - 1,
-        std::uint64_t{bytes.size()},
+       {std::uint64_t{0}, std::uint64_t{1},
+        std::uint64_t{sizeof(FileHeader) - 1}, std::uint64_t{bytes.size()},
         std::numeric_limits<std::uint64_t>::max() - 10,
         std::numeric_limits<std::uint64_t>::max()}) {
     EXPECT_THROW(reader.seek(bad), std::invalid_argument);
