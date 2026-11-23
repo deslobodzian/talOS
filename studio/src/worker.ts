@@ -377,6 +377,7 @@ function connect(url: string, gen: number) {
       if (gen !== generation) return;
       status = 'WebSocket connected';
       connection = 'live';
+      decoder.reset();
       // The bridge answers an open with its graph and then, when it has
       // them, the dictionary and a keyframe: the first update on a socket.
       firstUpdate = true;

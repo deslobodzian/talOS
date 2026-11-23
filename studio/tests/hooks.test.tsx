@@ -243,3 +243,75 @@ test('callbacks and scheduled credits from a failed worker cannot affect its rep
   assert.deepEqual(posts[1], [{type: 'ack'}]);
   client.fail(new WorkerRpcError('terminated', 'test cleanup'));
 });
+
+// REQ-OPS-23: an exception while processing a worker batch must still schedule
+// the ack so WorkerUpdateStream never deadlocks permanently.
+test('createWorkerStudio still acknowledges batches when a handler throws', t => {
+  t.mock.timers.enable({apis: ['setTimeout']});
+  const posted: object[] = [];
+  let port: WorkerPort = fakeWorker();
+  createWorkerStudio(
+      () => (port = {...fakeWorker(), postMessage: (m: object) => { posted.push(m); }}),
+      {now: () => 0, watch: () => {}});
+  // A frame with an unparseable timestamp_ns throws inside store.ingest.
+  assert.throws(() => port.onmessage?.call(port as Worker, {
+    data: {
+      type: 'updates',
+      messages: [{type: 'frames', reset: true, frames: [snap(1, 'not-a-bigint', {a: 1})]}],
+      dropped: 0, coalesced: 0
+    }
+  } as MessageEvent));
+  t.mock.timers.tick(0);
+  assert.deepEqual(posted, [{type: 'ack'}]);
+  port.onerror?.call(port as Worker, {message: 'cleanup', preventDefault() {}} as ErrorEvent);
+});
+
+// REQ-OPS-23: WorkerUpdateStream clears inFlight if send() throws.
+test('WorkerUpdateStream recovers if send throws during flush', () => {
+  let calls = 0;
+  const sent: object[] = [];
+  const stream = new WorkerUpdateStream(message => {
+    calls++;
+    if (calls === 1) throw new Error('clone failed');
+    sent.push(message);
+  });
+  stream.push({type: 'playback', state: 1});
+  assert.throws(() => stream.flush(), /clone failed/);
+  stream.push({type: 'playback', state: 2});
+  stream.flush();
+  assert.equal(sent.length, 1);
+});
+
+// REQ-OPS-23: when a tab is hidden, requestAnimationFrame is paused by the
+// browser, so ack must fall back to a timer instead of stalling forever.
+test('createWorkerStudio acknowledges via timer when document is hidden and rAF is paused', t => {
+  t.mock.timers.enable({apis: ['setTimeout']});
+  const rafQueue: FrameRequestCallback[] = [];
+  const origRaf = globalThis.requestAnimationFrame;
+  const origDoc = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  globalThis.requestAnimationFrame = ((cb: FrameRequestCallback) => {
+    rafQueue.push(cb);
+    return rafQueue.length;
+  }) as typeof requestAnimationFrame;
+  Object.defineProperty(globalThis, 'document', {
+    value: {hidden: true}, configurable: true, writable: true
+  });
+  let port: WorkerPort = fakeWorker();
+  try {
+    const posted: object[] = [];
+    createWorkerStudio(
+        () => (port = {...fakeWorker(), postMessage: (m: object) => { posted.push(m); }}),
+        {now: () => 0, watch: () => {}});
+    port.onmessage?.call(port as Worker, {
+      data: {type: 'updates', messages: [], dropped: 0, coalesced: 0}
+    } as MessageEvent);
+    // rAF never fires while hidden; timer tick must deliver the ack.
+    t.mock.timers.tick(0);
+    assert.deepEqual(posted, [{type: 'ack'}]);
+  } finally {
+    port.onerror?.call(port as Worker, {message: 'cleanup', preventDefault() {}} as ErrorEvent);
+    globalThis.requestAnimationFrame = origRaf;
+    if (origDoc) Object.defineProperty(globalThis, 'document', origDoc);
+    else delete (globalThis as Record<string, unknown>).document;
+  }
+});

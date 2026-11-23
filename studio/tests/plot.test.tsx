@@ -15,7 +15,7 @@ import {TelemetryStore} from '../src/data/store';
 import {createStaticStudio, type Studio, StudioProvider} from '../src/data/studio';
 import {demoPacket} from '../src/demo';
 import {assignYAxes, groupByUnit, type PlotChannel} from '../src/panels/plot/axes';
-import {plotColumn, plotData, plotPanel} from '../src/panels/plot';
+import {cursorTimestampNs, plotColumn, plotData, plotPanel} from '../src/panels/plot';
 
 const pc = (name: string, unit = '', labels: string[] = []): PlotChannel =>
     ({name, unit, labels});
@@ -221,3 +221,18 @@ test('plotColumn and plotData convert NaN/Infinity gaps to null and keep recorde
        assert.deepEqual(recA, [5, undefined, null]);
        assert.deepEqual(recB, [undefined, 9, 8]);
      });
+
+// REQ-OPS-23: plot double-click and cursor delta must not throw RangeError
+// when the cursor index has no finite x-axis sample.
+test('cursorTimestampNs returns null for missing or non-finite samples and exact ns otherwise', () => {
+  const origin = 1_000_000_000n;
+  assert.equal(cursorTimestampNs([0, 1.25], 1, origin), 2_250_000_000n);
+  assert.equal(cursorTimestampNs([], 0, origin), null);
+  assert.equal(cursorTimestampNs([0], 5, origin), null);
+  assert.equal(cursorTimestampNs([Number.NaN, Infinity, -Infinity, 1e308], 0, origin), null);
+  assert.equal(cursorTimestampNs([Number.NaN, Infinity, -Infinity, 1e308], 1, origin), null);
+  assert.equal(cursorTimestampNs([Number.NaN, Infinity, -Infinity, 1e308], 2, origin), null);
+  assert.equal(cursorTimestampNs([Number.NaN, Infinity, -Infinity, 1e308], 3, origin), null);
+  assert.equal(cursorTimestampNs([0], null, origin), null);
+  assert.equal(cursorTimestampNs([0], 0, null), null);
+});

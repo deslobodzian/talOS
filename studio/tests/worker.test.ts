@@ -366,3 +366,42 @@ test('a new launcher session replaces the history', () => {
   advance(40);
   assert.deepEqual(frames.map(f => f.stream_id), ['12']);
 });
+
+// REQ-OPS-23: reconnecting resets TelemetryDecoder so stale delta state from
+// the prior socket never leaks onto the new connection before a fresh
+// dictionary and keyframe arrive.
+test('a reconnect resets the decoder so stale delta state never leaks', () => {
+  const socket = connect();
+  const specs = [
+    {name: 'a', unit: 'm', kind: ChannelKind.Double},
+    {name: 'b', unit: 'm', kind: ChannelKind.Double}
+  ];
+  const dictId = dictionaryId(specs);
+  const chassis = {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0};
+  const header = (seq: bigint, ts: bigint) => ({
+    streamId: 55n, sequenceId: seq, timestampNs: ts, dictionaryId: dictId,
+    channelCount: specs.length
+  });
+  binary(socket, concatPages([
+    ...encodeDictionaryPages(header(1n, 1_000_000_000n), specs),
+    ...encodeValuePages(header(1n, 1_000_000_000n), chassis, true,
+                        [[0, rawFromDouble(10)], [1, rawFromDouble(20)]])
+  ]));
+  advance(40);
+  assert.equal(frames.at(-1)!.channels.a, 10);
+  const invalidBefore = playback!.stats.invalid;
+
+  const retry = captureTimeout(() => socket.onclose!());
+  retry();
+  const again = sockets.at(-1)!;
+  again.onopen!();
+
+  // A delta update without a new dictionary/keyframe on the new socket must be
+  // rejected rather than decoded against the previous connection's cached state.
+  binary(again, concatPages(encodeValuePages(
+      header(2n, 2_000_000_000n), chassis, false, [[1, rawFromDouble(99)]])));
+  advance(40);
+  assert.equal(frames.at(-1)!.sequence_id, '1',
+               'delta before reconnect dictionary/keyframe must not be accepted');
+  assert.equal(playback!.stats.invalid, invalidBefore + 1);
+});

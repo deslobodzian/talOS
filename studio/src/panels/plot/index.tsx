@@ -213,6 +213,20 @@ export function plotData(
   return [times, ...values];
 }
 
+// Convert a plot cursor's x-axis sample (seconds since `origin`) to an exact
+// nanosecond timestamp, or null when the cursor has no finite sample.
+export function cursorTimestampNs(
+    times: ArrayLike<number | null | undefined> | undefined,
+    index: number | null | undefined,
+    origin: bigint | null): bigint | null {
+  if (index == null || origin === null || !times) return null;
+  const sample = times[index];
+  if (typeof sample !== 'number' || !Number.isFinite(sample)) return null;
+  const ns = Math.round(sample * 1e9);
+  if (!Number.isFinite(ns)) return null;
+  return origin + BigInt(ns);
+}
+
 function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
   const dictionary = useDictionary();
   const playback = usePlayback();
@@ -354,13 +368,9 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
           ],
           hooks: {
             setCursor: [u => {
-              const index = u.cursor.idx;
-              if (index == null || anchor.current == null) return;
-              const sample = u.data[0][index];
-              if (sample != null && originRef.current != null)
-                setDelta(Number(BigInt(
-                    originRef.current + BigInt(Math.round(sample * 1e9))) -
-                    anchor.current) / 1e9);
+              if (anchor.current == null) return;
+              const t = cursorTimestampNs(u.data[0], u.cursor.idx, originRef.current);
+              if (t !== null) setDelta(Number(t - anchor.current) / 1e9);
             }],
             draw: [u => {
               drawEnvelope(u, seriesRef.current, orderedRef.current.ordered,
@@ -373,10 +383,8 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
     chart.current = plot;
 
     const click = () => {
-      const index = plot.cursor.idx;
-      if (index != null && originRef.current != null) {
-        const t = originRef.current +
-            BigInt(Math.round(plot.data[0][index] * 1e9));
+      const t = cursorTimestampNs(plot.data[0], plot.cursor.idx, originRef.current);
+      if (t !== null) {
         anchor.current = t;
         latest.current.seek(t.toString());
       }
