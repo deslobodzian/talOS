@@ -246,20 +246,35 @@ configuration fingerprint. `sim_gateway --physics` binds them from its own
 parse of `--config` (`PhysicsSimBackend::SetHomeSwitches`; the backend table
 below gives the switch's behaviour).
 
-An optional top-level `[simulation]` table configures physics chassis geometry
-and end-of-travel hard stops:
-`wheel_radius_m` (positive finite double, default `0.0508` m),
-`[[simulation.swerve_modules]]` entries (`drive`, `steer`, `x_m`, `y_m`, where
-`drive` and `steer` name distinct configured motors, no motor appears twice,
-and `(x_m, y_m)` is finite and nonzero), and `[[simulation.hard_stops]]`
-entries (`motor` naming a configured motor with no duplicates, optional finite
-`min_rot` and/or `max_rot` with at least one set and `min_rot < max_rot` when
-both are set, in mechanism rotations of the motor's hardware frame). Like
-`motor_type` and `sim_motor`, `[simulation]` stays off the wire and out of
+An optional top-level `[simulation]` table configures physics chassis geometry,
+end-of-travel hard stops, battery sag, chassis dynamics, and per-mechanism
+inertia/friction:
+- `wheel_radius_m` (positive finite double, default `0.0508` m),
+- `[[simulation.swerve_modules]]` entries (`drive`, `steer`, `x_m`, `y_m`, where
+  `drive` and `steer` name distinct configured motors, no motor appears twice,
+  and `(x_m, y_m)` is finite and nonzero),
+- `[[simulation.hard_stops]]` entries (`motor` naming a configured motor with no
+  duplicates, optional finite `min_rot` and/or `max_rot` with at least one set
+  and `min_rot < max_rot` when both are set, in mechanism rotations of the
+  motor's hardware frame),
+- `[simulation.battery]` (`nominal_voltage_v` finite in `(0, 16]`, default
+  `12.8`; `internal_resistance_ohm` finite `>= 0`, default `0.0`;
+  `base_current_a` finite `>= 0`, default `0.0`; `brownout_voltage_v` finite in
+  `[0, nominal_voltage_v)`, default `6.75`),
+- `[simulation.chassis]` (`mass_kg` required positive finite; optional positive
+  finite `moment_of_inertia_kg_m2` and `traction_coefficient`), and
+- `[[simulation.mechanisms]]` entries (`motor` naming a configured master motor
+  with no duplicates; `inertia_kg_m2` required positive finite at the mechanism
+  shaft; optional `load`, `"roller"` (default) or `"flywheel"`; optional
+  non-negative finite `viscous_damping_nm_per_radps` and `static_friction_nm`).
+
+Like `motor_type` and `sim_motor`, `[simulation]` stays off the wire and out of
 `ConfigurationId`; `sim_gateway --physics` passes `wheel_radius_m` in
-`PhysicsOptions`, binds any `swerve_modules` with
-`PhysicsSimBackend::SetSwerveModules`, and binds any `hard_stops` with
-`PhysicsSimBackend::SetHardStops`.
+`PhysicsOptions` and binds `swerve_modules` (`SetSwerveModules`), `hard_stops`
+(`SetHardStops`), `battery` (`SetBatteryModel`), `chassis`
+(`SetChassisDynamics`), and `mechanisms` (resolved to each master motor's CAN
+id via `SetMechanisms`) on `PhysicsSimBackend` before `Reconfigure` so all of
+them survive any later pushed config.
 
 Each `[subsystems.<sub>.motors.<motor>.slot0]` (also `slot1`, `slot2`) accepts
 `gravity_type = "ElevatorStatic"` (default; alias `"Elevator"`) or
@@ -1158,31 +1173,40 @@ Both implement `Backend`, both share the gateway safe-state policy
 explicit `sample_time_us` clock, so Gateway ticks with explicit timestamps are
 exactly reproducible.
 Both publish valid, no-brownout, zero-CAN-load health resting at a charged
-battery's 12.8 V (`kSimRestingSupplyV`, `sim_backend.h`), so a healthy
-simulated robot passes the pre-match battery check;
+battery's 12.8 V (`kSimRestingSupplyV`, `sim_backend.h`) by default, so a
+healthy simulated robot passes the pre-match battery check;
 `SetPowerHealth(volts, brownout)` injects low-power telemetry. Physics also uses
 the reported voltage as its motor supply: a duty-cycle demand applies that
-fraction of it (0.5 is 6.4 V at rest), while voltage, closed-loop and
-torque-current modes are clamped to `max_voltage` (12 V when unset) and the motor models keep their 12 V
-free-speed and stall ratings. Health is observable while disabled
-or without a live command. Both keep each PWM output's last request
-(`GetPwm`, off when there is none) and read an output that sends no pulse as
-0, as the RoboRIO's `PWM::GetSpeed()` does after `SetDisabled`.
+fraction of it (0.5 is 6.4 V at 12.8 V rest), while voltage, closed-loop and
+torque-current modes are clamped to `max_voltage` (12 V when unset) and the
+motor models keep their 12 V free-speed and stall ratings. With
+`SetBatteryModel` (`[simulation.battery]`), `PhysicsSimBackend` models
+internal-resistance voltage sag (`V_batt = V_oc − R_int × max(0, base_current_a
++ Σ supply_current_a_i(V_batt))`, solved via 28-step bisection on `[0, V_oc]`
+so it stays monotone and oscillation-free even under heavy stall load where
+`R_eq < R_int`) and automatic brownout below `brownout_voltage_v`;
+`SetSupplyVoltage` / `SetPowerHealth` override the bus until
+`ClearSupplyVoltageOverride()` resumes the battery model. Health is observable
+while disabled or without a live command. Both keep each PWM output's last
+request (`GetPwm`, off when there is none) and read an output that sends no
+pulse as 0, as the RoboRIO's `PWM::GetSpeed()` does after `SetDisabled`.
 
 | | Ideal (`SimBackend`) | Physics-backed (`sim::PhysicsSimBackend`) |
 |---|---|---|
 | Use for | Fast logic tests: wiring, sequencing, timeouts | PID/gearing/direction/limit believability |
 | Velocity demand | Applies instantly, even with zero gains | P+FF loop produces volts; zero gains stall |
 | Position demand | Teleports (no position-jump reset check) | P-loop ramps through voltage; MotionMagic uses trapezoid profiles |
-| Neutral | Velocity snaps to 0 | Unpowered decay: brake stops fast, coast rolls on |
+| Neutral | Velocity snaps to 0 | Unpowered decay: brake stops fast (shorted-winding electromagnetic braking under a `MechanismSpec`), coast rolls on (no-load + viscous/static friction decay under a `MechanismSpec`) |
 | Gearing/inversion | Ignored | Rotor/gearing division, inversion flips direction; a follower drives in its master's direction (reversed if opposed), ignoring its own `inverted`; a remote-CANcoder motor reports and closes its loops on the CANcoder in the CANcoder's direction |
+| Mechanism inertia | Ignored | Opt-in `SetMechanisms` (`sim::MechanismSpec`, bound from `[[simulation.mechanisms]]` by master CAN id; survives `Configure`): 10-substep exact exponential rigid-body ODE reflecting `inertia_kg_m2 / gear_ratio²`, viscous damping, and Coulomb static friction onto the root master shaft, summing active follower torques and re-evaluating current limits each sub-step; motors without a spec keep the legacy first-order lag |
+| Chassis dynamics | Ignored | Opt-in `SetChassisDynamics` (`sim::ChassisDynamics`, bound from `[simulation.chassis]`; survives `Configure`): coupled 2D rigid-body swerve dynamics with chassis mass, rotational inertia (defaulting to `mass_kg × mean(x_i² + y_i²)`), per-wheel friction-circle clamping (`mu × m × g / N`), lateral scrub resistance, excess-torque wheel spin-up (physical odometry slip), and exact SE(2) pose stepping; unset keeps kinematic least-squares chassis integration |
 | Soft limits | Ignored | Clamped, axis stopped at the limit |
 | Hard stops | Ignored | `SetHardStops` (`sim::HardStop`): physical end-of-travel bounds `[min_rot, max_rot]` per named motor (mechanism rotations in its hardware frame), enforced even when `soft_limits = false` (rezero-frame mechanisms); clamps position and zeroes velocity when driven into a stop so back-EMF drops to 0 and stator current rises to the stall/limited current while allowing motion away from the stop; bound by name, survives a pushed config. `sim_gateway --physics` binds `[[simulation.hard_stops]]` |
 | CANcoder position | Its linked motor's sensor-shaft reading (`mechanism × sensor_to_mechanism_ratio`, with motor initial offset `offset_rot / sensor_to_mechanism_ratio`), position wrapped to [-0.5, 0.5) rotations as the RoboRIO reports it | The linked sensor shaft (`rotor / rotor_to_sensor_ratio = mechanism × sensor_to_mechanism_ratio`), position wrapped the same way; the remote-CANcoder motor divides `offset_rot` by `sensor_to_mechanism_ratio` to match Phoenix 6 |
 | Pigeon yaw | Zero raw yaw, then mounting offset/inversion | True chassis yaw relative to boot, plus optional drift; explicit gyro overrides remain available |
-| Supply voltage | Ignored | Scales free speed (`SetSupplyVoltage`) |
+| Supply voltage | Ignored | Scales free speed; `SetBatteryModel` (`[simulation.battery]`, survives `Configure`) models internal-resistance sag and automatic brownout via 28-step bisection, overridden by `SetSupplyVoltage` / `SetPowerHealth` until `ClearSupplyVoltageOverride()` resumes the battery model |
 | Torque current | Not modelled: velocity and voltage read 0, as for duty cycle | The volts that pass the demand through the winding at the rotor's speed, I R + back-EMF in the motor's direction (`TorqueCurrentVolts`, using the same `R` and `k_e` as `StatorCurrent`), the current clamped to `max_torque_current_a` and `stator_limit_a`, the volts to `max_voltage` and the supply; powered at 0 A, modelled as zero stator current (slowly coasting only under the motor's no-load drag rather than braking; hardware unmeasured: [Supported Hardware Requests](#supported-hardware-requests)). FOC is not modelled |
-| Stator and supply current | Stator zero; supply placeholder `|voltage| / 12 × supply_limit_a` | Winding model with free current: `R = 12 V / stall_current`, `k_e = (12 V − free_current × R) / free_speed`, `back_emf = k_e × rotor_rps` (`MotorModelFor`: Kraken X60 6000 rpm, 366 A stall, 2.0 A free, default; Kraken X44 7530 rpm, 275 A stall, 2.0 A free; Falcon 500 6380 rpm, 257 A stall, 1.5 A free). Stator current is `|applied_volts − back_emf| / R` (equals `free_current` at 12 V free speed and `stall_current` at 12 V stall), 0 while unpowered. `stator_limit_a` and `supply_limit_a` clamp effective winding voltage before rotor integration and are reflected in `applied_volts_` and reported currents. Supply current follows signed power conservation `(rotor_volts × signed_stator_current) / supply_v` (positive battery draw clamped to `supply_limit_a`, negative regenerative braking kept signed, 0 when unpowered or `supply_v <= 0`). A motor held at a hard stop or soft limit is stalled. The type is the motor's `motor_type` key (above) |
+| Stator and supply current | Stator zero; supply placeholder `|voltage| / 12 × supply_limit_a` | Winding model with free current and stall torque: `R = 12 V / stall_current`, `k_e = (12 V − free_current × R) / free_speed`, `k_t = stall_torque / stall_current`, `back_emf = k_e × rotor_rps` (`MotorModelFor`: Kraken X60 6000 rpm, 366 A stall, 2.0 A free, 7.09 N·m stall, default; Kraken X44 7530 rpm, 275 A stall, 2.0 A free, 4.05 N·m stall; Falcon 500 6380 rpm, 257 A stall, 1.5 A free, 4.69 N·m stall). Stator current is `|applied_volts − back_emf| / R` (equals `free_current` at 12 V free speed and `stall_current` at 12 V stall), 0 while unpowered. `stator_limit_a` and `supply_limit_a` clamp effective winding voltage before rotor integration and are reflected in `applied_volts_` and reported currents. Supply current follows signed power conservation `(rotor_volts × signed_stator_current) / supply_v` (positive battery draw clamped to `supply_limit_a`, negative regenerative braking kept signed, 0 when unpowered or `supply_v <= 0`). A motor held at a hard stop or soft limit is stalled. The type is the motor's `motor_type` key (above) |
 | Home switch | None: a digital input reads what `SetDigitalInput` set, false if unset | `SetHomeSwitches` (`sim::HomeSwitch`): a named digital input reads closed exactly while a named motor's reported position is at or beyond a point (below or above it), with no hysteresis, and reads `closed_reads` while closed (default false: normally open); bound by name, it survives a pushed config. `sim_gateway` binds each input's `sim_motor` keys (above); an input without them reads false at every position |
 | Faults | Device resets, digital/analog/encoder setters | Plus frozen feedback (valid) and per-device disconnect (invalid), each read as `PhoenixBackend` reads a device whose frames stopped: ages growing from its last sample, limit bits cleared once that sample is 50 ms old and temperature 0 once it is 500 ms old (`kFaultFieldMaxAgeUs`, `kTemperatureMaxAgeUs`, `feedback.h`); controller restart |
 | Device restore | The chain `BeginRestoreAfterReset` reapplies (its motors, their followers, motors on a listed remote CANcoder: `RestoredWith`, `feedback.h`) reads invalid until `PollRestore` completes it, as `PhoenixBackend::Read` reports it (the gateway masks it in those States either way); completes at the next poll, unless `SetRestoreFails` fails restores: the chain then stays invalid until one succeeds | The same |
@@ -1214,21 +1238,25 @@ untouched.
 | Path | How to run | Motor / chassis model | Driver Station & gamepad | Truth (`/sim/state`) & faults | Use for |
 |---|---|---|---|---|---|
 | Ideal (`SimBackend`) | `sim_gateway` (default, no `--physics`), or `SimHardware` in unit tests | Instant velocity/position; zero gains still move; zero Pigeon2 raw yaw | Scripted `--mode-schedule` / `--joystick-schedule` | None (resets & I/O setters in C++ tests only) | Fast logic, wiring, sequencing, mode/timeout unit tests |
-| Lightweight physics (`sim_gateway --physics`) | `./sim.sh --sim-gateway` (or `sim_gateway --physics`) | `sim::PhysicsSimBackend`: winding/current-limit model, gearing, hard stops, home switches, swerve ground pose & Pigeon2 yaw | Scripted `--mode-schedule` / `--joystick-schedule` (no USB gamepad) | Publishes `/sim/state` for cameras; odometry error (`--wheel-radius-error`, `--wheel-slip-gain`, `--gyro-drift-radps`) & `--fault-schedule` | Headless CI/soak runs, vision/odometry error tests, fault injection, PID/limit/homing verification |
+| Lightweight physics (`sim_gateway --physics`) | `./sim.sh --sim-gateway` (or `sim_gateway --physics`) | `sim::PhysicsSimBackend`: winding/current-limit model, gearing, opt-in rigid-body mechanism inertia, battery sag/brownout, hard stops, home switches, kinematic or dynamic mass/traction swerve ground pose & Pigeon2 yaw | Scripted `--mode-schedule` / `--joystick-schedule` (no USB gamepad) | Publishes `/sim/state` for cameras; odometry error (`--wheel-radius-error`, `--wheel-slip-gain`, `--gyro-drift-radps`) & `--fault-schedule` | Headless CI/soak runs, vision/odometry error tests, fault injection, PID/limit/homing/battery-sag verification |
 | WPILib desktop sim (`PhoenixBackend`) | `./sim.sh` (or `./gradlew simulateNative` in `controller_processor/rio`) | Real Phoenix 6 simulator + WPILib `LinearSystemId::DCMotorSystem` plant (`KrakenX60`/`KrakenX60FOC` over UDP since `motor_type` is off-wire; `KrakenX44`/`Falcon500` when populated in-process) + inferred swerve/differential Pigeon2 yaw | WPILib Sim GUI with live USB gamepad (or `--headless` scripted schedules) | None (cameras emit invalid observations) | Interactive driving with a USB gamepad, testing real Phoenix 6 closed-loop/FOC/status-signal behaviour, RoboRIO-in-the-loop verification |
 
 ### Ground truth and odometry error
 
 `PhysicsSimBackend::truth()` exposes true planar field pose (meters/radians)
-and field-frame velocity (m/s, rad/s). Each step converts every registered
-swerve wheel's surface velocity and steer azimuth into ground velocity, solves
-the rigid-body least-squares chassis motion, and integrates the field pose.
-Conventional `front`/`back` (`rear`), `left`/`right` drive/steer names infer
-module coordinates at ±0.30 m when no explicit modules are set;
-`SetSwerveModules` binds explicit drive/steer pairs by motor name (surviving
-every later `Configure` and replacing name inference), and
-`SetSwerveModuleGeometry` overrides or registers modules by logical id. No gyro
-is required to compute truth.
+and field-frame velocity (m/s, rad/s). By default, each step converts every
+registered swerve wheel's surface velocity and steer azimuth into ground
+velocity, solves the rigid-body least-squares chassis motion, and integrates
+the field pose; when `SetChassisDynamics` (`[simulation.chassis]`) configures
+a positive chassis mass, each step instead integrates coupled 2D rigid-body
+mass, rotational inertia, per-wheel friction-circle traction clamping, lateral
+scrub resistance, and slipping drive wheel spin-up. Conventional
+`front`/`back` (`rear`), `left`/`right` drive/steer names infer module
+coordinates at ±0.30 m when no explicit modules are set; `SetSwerveModules`
+binds explicit drive/steer pairs by motor name (surviving every later
+`Configure` and replacing name inference), and `SetSwerveModuleGeometry`
+overrides or registers modules by logical id. No gyro is required to compute
+truth.
 
 `sim::PhysicsOptions` selects the start pose, nominal wheel radius
 (`wheel_radius_m`, default `0.0508` m), and three deterministic errors
