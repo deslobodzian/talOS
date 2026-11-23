@@ -71,7 +71,10 @@ class PhaseTimer {
  public:
   PhaseTimer(talos::rio::RioLog& log, talos::rio::TickPhase phase)
       : log_{log}, phase_{phase}, start_ns_{NowNs()} {}
-  ~PhaseTimer() { log_.AddPhase(phase_, NowNs() - start_ns_); }
+  ~PhaseTimer() {
+    const uint64_t end_ns = NowNs();
+    log_.AddPhase(phase_, end_ns > start_ns_ ? end_ns - start_ns_ : 0);
+  }
   PhaseTimer(const PhaseTimer&) = delete;
   PhaseTimer& operator=(const PhaseTimer&) = delete;
 
@@ -80,6 +83,31 @@ class PhaseTimer {
   talos::rio::TickPhase phase_;
   uint64_t start_ns_;
 };
+
+// Defense-in-depth at the backend boundary: a driving motor request must carry
+// finite demand/feedforward, a valid closed-loop gain slot (0..2), and satisfy
+// TorqueCurrentAllowed for kTorqueCurrent. Any disallowed request neutralizes
+// that motor (and its followers) instead of reaching Phoenix SetControl.
+bool MotorRequestAllowed(const hw::MotorConfig& config,
+                         const hw::MotorRequest& r) {
+  if (r.mode == hw::Mode::kNeutral) return true;
+  if (!std::isfinite(r.demand) || !std::isfinite(r.feedforward_v)) {
+    return false;
+  }
+  switch (r.mode) {
+    case hw::Mode::kDutyCycle:
+    case hw::Mode::kVoltage:
+      return true;
+    case hw::Mode::kVelocity:
+    case hw::Mode::kPosition:
+    case hw::Mode::kMotionMagic:
+      return r.slot <= 2;
+    case hw::Mode::kTorqueCurrent:
+      return hw::TorqueCurrentAllowed(config, r);
+    default:
+      return false;
+  }
+}
 uint32_t Age(const ph::BaseStatusSignal& signal) {
   const double age = signal.GetTimestamp().GetLatency().value() * 1e6;
   if (!std::isfinite(age) || age >= std::numeric_limits<uint32_t>::max())
@@ -1343,6 +1371,27 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
     sim_neutral_[i] = true;
     apply_failed_.push_back(config.id);
   };
+  const auto device_blocked = [&](uint16_t id) {
+    return std::find(unavailable_.begin(), unavailable_.end(), id) !=
+               unavailable_.end() ||
+           std::find(foc_unlicensed_.begin(), foc_unlicensed_.end(), id) !=
+               foc_unlicensed_.end() ||
+           std::find(apply_failed_.begin(), apply_failed_.end(), id) !=
+               apply_failed_.end();
+  };
+  const auto remote_sensor_valid = [&](const hw::MotorConfig& cfg,
+                                       uint64_t bound) {
+    if (cfg.feedback != hw::Feedback::kRemoteCANcoder) return true;
+    for (std::size_t j = 0; j < config_.sensors.size(); ++j) {
+      if (config_.sensors[j].id == cfg.feedback_sensor_id &&
+          sensors_[j].encoder) {
+        return ValidMotionFeedback(
+            sensors_[j].encoder->GetAbsolutePosition(false),
+            sensors_[j].encoder->GetVelocity(false), bound);
+      }
+    }
+    return false;
+  };
   for (std::size_t i = 0; i < commands.size(); ++i) {
     const auto& r = commands[i];
     auto& m = *motors_[i];
@@ -1371,23 +1420,16 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
       auto& position = motors_[master_index]->GetPosition(false);
       auto& velocity = motors_[master_index]->GetVelocity(false);
       const uint64_t bound = config_.command_timeout_us;
-      bool feedback_valid = ValidMotionFeedback(m.GetPosition(false),
-                                                m.GetVelocity(false), bound);
-      if (config.feedback == hw::Feedback::kRemoteCANcoder) {
-        bool sensor_valid = false;
-        for (std::size_t j = 0; j < config_.sensors.size(); ++j) {
-          if (config_.sensors[j].id == config.feedback_sensor_id &&
-              sensors_[j].encoder) {
-            sensor_valid = ValidMotionFeedback(
-                sensors_[j].encoder->GetAbsolutePosition(false),
-                sensors_[j].encoder->GetVelocity(false), bound);
-            break;
-          }
-        }
-        feedback_valid &= sensor_valid;
-      }
-      const bool neutral = r.mode == hw::Mode::kNeutral ||
-                           commands[master_index].mode == hw::Mode::kNeutral ||
+      const bool feedback_valid =
+          ValidMotionFeedback(m.GetPosition(false), m.GetVelocity(false),
+                              bound) &&
+          remote_sensor_valid(config, bound) &&
+          remote_sensor_valid(*master, bound);
+      const bool master_allowed =
+          !device_blocked(master->id) &&
+          commands[master_index].mode != hw::Mode::kNeutral &&
+          MotorRequestAllowed(*master, commands[master_index]);
+      const bool neutral = r.mode == hw::Mode::kNeutral || !master_allowed ||
                            !ValidMotionFeedback(position, velocity, bound) ||
                            !feedback_valid;
       sim_neutral_[i] = neutral;
@@ -1399,6 +1441,13 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
             ph::controls::Follower{master->can_id, config.oppose_master}
                 .WithUpdateFreqHz(0_Hz));
       }
+      note_send(i, result);
+      continue;
+    }
+    if (r.mode != hw::Mode::kNeutral && r.mode <= hw::kLastMode &&
+        !MotorRequestAllowed(config, r)) {
+      sim_neutral_[i] = true;
+      result = m.SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
       note_send(i, result);
       continue;
     }
@@ -1483,7 +1532,8 @@ bool PhoenixBackend::ApplyOutputs(
   for (std::size_t i = 0; i < pwm_outputs.size() && i < pwm_outputs_.size();
        ++i) {
     const auto& request = pwm_outputs[i];
-    if (request.mode == hw::PwmMode::kPulse) {
+    if (request.mode == hw::PwmMode::kPulse && std::isfinite(request.output) &&
+        request.output >= -1.0 && request.output <= 1.0) {
       pwm_outputs_[i]->SetSpeed(request.output);
     } else {
       pwm_outputs_[i]->SetDisabled();
@@ -1516,13 +1566,18 @@ void PhoenixBackend::Neutral() {
   }
   const uint64_t control_end_ns = NowNs();
   log_->AddPhase(talos::rio::TickPhase::kControl,
-                 control_end_ns - control_start_ns);
+                 control_end_ns > control_start_ns
+                     ? control_end_ns - control_start_ns
+                     : 0);
   for (auto& pwm : pwm_outputs_) pwm->SetDisabled();
   // Support matrix: DIO outputs de-energize on every safe-state transition.
   for (auto& dio : digital_outputs_) dio->Set(false);
   // Sim: neutral keeps rotor momentum; UpdateSimulation decays it per brake.
   if (is_simulation_) sim_neutral_.fill(true);
-  log_->AddPhase(talos::rio::TickPhase::kOther, NowNs() - control_end_ns);
+  const uint64_t other_end_ns = NowNs();
+  log_->AddPhase(
+      talos::rio::TickPhase::kOther,
+      other_end_ns > control_end_ns ? other_end_ns - control_end_ns : 0);
 }
 
 bool PhoenixBackend::WatchdogNeutral() {

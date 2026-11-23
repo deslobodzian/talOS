@@ -15,9 +15,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -576,6 +578,64 @@ TEST(DriverStationReader, WpilibCallsRefreshPeriodicallyAndOnNewData) {
 
     reader.Stop();
   }
+}
+
+// An e-stopped control word must always map to ProgramMode::kDisabled even if
+// kEnabled is also set, matching Robot.cpp's gateway enable gate (RULES.md 1).
+// REQ-SAFE-10
+TEST(DriverStationReader, ProgramModeOfTreatsEStoppedAsDisabled) {
+  using talos::rio::ProgramModeOf;
+  EXPECT_EQ(
+      ProgramModeOf(ds::kDsAttached | ds::kEnabled | ds::kEStop | ds::kTeleop),
+      ProgramMode::kDisabled);
+  EXPECT_EQ(ProgramModeOf(ds::kDsAttached | ds::kEnabled | ds::kEStop |
+                          ds::kAutonomous),
+            ProgramMode::kDisabled);
+  EXPECT_EQ(
+      ProgramModeOf(ds::kDsAttached | ds::kEnabled | ds::kEStop | ds::kTest),
+      ProgramMode::kDisabled);
+  EXPECT_EQ(ProgramModeOf(ds::kDsAttached | ds::kEnabled | ds::kTeleop),
+            ProgramMode::kTeleop);
+  EXPECT_EQ(ProgramModeOf(ds::kDsAttached | ds::kEnabled | ds::kAutonomous),
+            ProgramMode::kAutonomous);
+  EXPECT_EQ(ProgramModeOf(ds::kDsAttached | ds::kEnabled | ds::kTest),
+            ProgramMode::kTest);
+}
+
+// SnapshotDriverStation sanitizes non-finite HAL axes/match_time and invalid
+// match types into safe finite defaults.
+// REQ-SAFE-10
+TEST(DriverStationReader, SnapshotDriverStationSanitizesNonFiniteHalFields) {
+  HAL_Initialize(500, 0);
+  struct ResetSim {
+    ~ResetSim() {
+      frc::sim::DriverStationSim::SetMatchTime(-1.0);
+      frc::sim::DriverStationSim::SetMatchType(
+          frc::DriverStation::MatchType::kNone);
+      frc::sim::DriverStationSim::SetJoystickAxisCount(0, 0);
+      frc::sim::DriverStationSim::NotifyNewData();
+    }
+  } reset_sim;
+
+  frc::sim::DriverStationSim::SetMatchTime(
+      std::numeric_limits<double>::quiet_NaN());
+  frc::sim::DriverStationSim::SetJoystickAxisCount(0, 2);
+  frc::sim::DriverStationSim::SetJoystickAxis(
+      0, 0, std::numeric_limits<double>::quiet_NaN());
+  frc::sim::DriverStationSim::SetJoystickAxis(
+      0, 1, std::numeric_limits<double>::infinity());
+  frc::sim::DriverStationSim::NotifyNewData();
+
+  ds::DriverStationData snapshot{};
+  ds::SnapshotDriverStation(snapshot);
+  EXPECT_TRUE(std::isfinite(snapshot.fms.match_time_s));
+  EXPECT_FLOAT_EQ(snapshot.fms.match_time_s, 0.0f);
+  ASSERT_TRUE(snapshot.joysticks[0].connected);
+  ASSERT_EQ(snapshot.joysticks[0].axis_count, 2u);
+  EXPECT_TRUE(std::isfinite(snapshot.joysticks[0].axes[0]));
+  EXPECT_FLOAT_EQ(snapshot.joysticks[0].axes[0], 0.0f);
+  EXPECT_TRUE(std::isfinite(snapshot.joysticks[0].axes[1]));
+  EXPECT_FLOAT_EQ(snapshot.joysticks[0].axes[1], 0.0f);
 }
 
 }  // namespace

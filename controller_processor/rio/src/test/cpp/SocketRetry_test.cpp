@@ -479,4 +479,29 @@ TEST(SocketRetry, ASocketThatCannotSendIsReplacedOnItsPorts) {
 }
 #endif
 
+// Backward clock steps must not underflow now_us - last_attempt_us_ (bypassing
+// the 100 ms reopen cadence) or now_us - spell_last_failure_us_ (ending a
+// failing send spell prematurely).
+// REQ-RT-22
+TEST(SocketRetry, BackwardClockDoesNotBypassRetryOrSpellQuietPeriod) {
+  SocketRetry retry;
+  int attempts = 0;
+  const auto fail_open = [&] {
+    ++attempts;
+    return false;
+  };
+  ASSERT_EQ(retry.Poll(10'000'000, fail_open), SocketRetry::Event::kFailed);
+  ASSERT_EQ(attempts, 1);
+  EXPECT_EQ(retry.Poll(5'000'000, fail_open), SocketRetry::Event::kNone);
+  EXPECT_EQ(attempts, 1);
+
+  ASSERT_EQ(
+      retry.Poll(10'000'000 + SocketRetry::kPeriodUs, [] { return true; }),
+      SocketRetry::Event::kOpened);
+  ASSERT_EQ(retry.SendFailed(20'000'000, ECONNREFUSED),
+            SocketRetry::SendEvent::kFailing);
+  EXPECT_EQ(retry.SendSucceeded(19'000'000), SocketRetry::SendEvent::kNone)
+      << "backward clock step prematurely ended failing send spell";
+}
+
 }  // namespace

@@ -903,4 +903,35 @@ TEST(ConfigStore, ConfigTransferReconfigurePersistAndRioLogSinkZeroHeapAlloc) {
   std::fclose(log_stream);
   EXPECT_EQ(logged, "[12.345] [rio] hello\n[12.346] " + long_line);
 }
+
+// A corrupt persisted config file larger than kMaxPersistedConfigSize must be
+// rejected without reading unbounded bytes into heap memory.
+// REQ-CONTRACT-06
+TEST(ConfigStore, LoadConfigFileRejectsOversizedFileWithoutUnboundedRead) {
+  const auto path = (std::filesystem::temp_directory_path() /
+                     "talos_config_store_oversized_test.bin")
+                        .string();
+  {
+    std::ofstream out{path, std::ios::binary | std::ios::trunc};
+    const std::string chunk(4096, 'A');
+    const std::size_t total = hw::kMaxPersistedConfigSize + 256 * 1024;
+    for (std::size_t written = 0; written < total; written += chunk.size()) {
+      out.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+    }
+    ASSERT_TRUE(static_cast<bool>(out));
+  }
+  loop_allocations = 0;
+  on_loop_thread = true;
+  counting = true;
+  const auto loaded = talos::rio::LoadConfigFile(path);
+  counting = false;
+  on_loop_thread = false;
+  std::filesystem::remove(path);
+  EXPECT_EQ(loaded, std::nullopt);
+  // Bounded stack buffer read (or single bounded buffer): zero huge vector
+  // growth from std::istreambuf_iterator reading past kMaxPersistedConfigSize.
+  EXPECT_LE(loop_allocations.load(), 2)
+      << "LoadConfigFile grew heap buffer across oversized file ("
+      << loop_allocations.load() << " allocations)";
+}
 }  // namespace

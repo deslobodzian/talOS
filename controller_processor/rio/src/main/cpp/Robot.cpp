@@ -390,7 +390,9 @@ void Robot::StartCompetition() {
     const uint64_t tick_start_us = tick_start_ns / 1000;
     log_->BeginTick(tick_start_ns);
     const uint64_t tick_interval_us =
-        previous_tick_start_us ? tick_start_us - *previous_tick_start_us : 0;
+        previous_tick_start_us && tick_start_us > *previous_tick_start_us
+            ? tick_start_us - *previous_tick_start_us
+            : 0;
     previous_tick_start_us = tick_start_us;
     if (gateway_->configured()) {
       period_us = gateway_->config().period_us;
@@ -450,7 +452,10 @@ void Robot::StartCompetition() {
           "hardware gateway socket open after %u failed attempts, %.3f s "
           "after the first",
           static_cast<unsigned>(socket_retry.failures()),
-          static_cast<double>(now_us - socket_retry.first_failure_us()) / 1e6);
+          static_cast<double>(now_us > socket_retry.first_failure_us()
+                                  ? now_us - socket_retry.first_failure_us()
+                                  : 0) /
+              1e6);
       Report(*log_, kSocketOpenMessage, text);
     } else if (socket_event == talos::rio::SocketRetry::Event::kReplaced) {
       char text[128];
@@ -459,7 +464,10 @@ void Robot::StartCompetition() {
           "hardware gateway socket replaced after %u failed attempts, %.3f s "
           "after it was lost",
           static_cast<unsigned>(socket_retry.failures()),
-          static_cast<double>(now_us - socket_retry.lost_us()) / 1e6);
+          static_cast<double>(now_us > socket_retry.lost_us()
+                                  ? now_us - socket_retry.lost_us()
+                                  : 0) /
+              1e6);
       Report(*log_, kSocketReplacedMessage, text);
     }
     // A send that finds the socket unable to send again loses it
@@ -483,6 +491,7 @@ void Robot::StartCompetition() {
               endpoint_->udp_stats().send_would_block);
           return;
         case SendEvent::kLost:
+          endpoint_->Close();
           std::snprintf(text, sizeof(text),
                         "hardware gateway socket cannot send (errno %d); "
                         "replacing it, nothing is sent until then",
@@ -510,8 +519,11 @@ void Robot::StartCompetition() {
               "hardware gateway socket sending again: %u sends failed over "
               "%.3f s (errno %d%s)",
               static_cast<unsigned>(socket_retry.spell_failures()),
-              static_cast<double>(socket_retry.spell_last_failure_us() -
-                                  socket_retry.spell_start_us()) /
+              static_cast<double>(socket_retry.spell_last_failure_us() >
+                                          socket_retry.spell_start_us()
+                                      ? socket_retry.spell_last_failure_us() -
+                                            socket_retry.spell_start_us()
+                                      : 0) /
                   1e6,
               socket_retry.spell_error(), last);
           Report(*log_, kSocketSendMessage, text);
@@ -582,13 +594,16 @@ void Robot::StartCompetition() {
           sent(ds_status);
           const uint64_t ds_sent_ns = NowNs();
           log_->ClosePhase(TickPhase::kLink, ds_sent_ns);
-          // The sent snapshot's refresh age at its send (REQ-RT-25); none
-          // for the neutral snapshot, which no refresh made.
-          if (ds_status == talos::protocol::UdpStatus::kOk &&
-              driver_station.refreshed_us() != 0) {
+          if (ds_status != talos::protocol::UdpStatus::kOk) {
+            ds_sampler.RevertSample();
+          } else if (driver_station.refreshed_us() != 0) {
+            // The sent snapshot's refresh age at its send (REQ-RT-25); none
+            // for the neutral snapshot, which no refresh made.
             log_->RecordDriverStationAge(ds_sent_ns / 1000 -
                                          driver_station.refreshed_us());
           }
+        } else {
+          ds_sampler.RevertSample();
         }
       }
     } else {
@@ -642,7 +657,9 @@ void Robot::StartCompetition() {
     // Start-to-start interval and wake-to-sleep work against the period,
     // which the logger thread reports once a second as late ticks and
     // overruns.
-    log_->RecordTick(tick_interval_us, end_us - tick_start_us, period_us);
+    log_->RecordTick(tick_interval_us,
+                     end_us > tick_start_us ? end_us - tick_start_us : 0,
+                     period_us);
     // On time, the loop keeps its phase; past the deadline it drops the
     // missed ticks instead of catching up in a burst, yields the CPU for
     // kOverrunSleepUs and counts the next period from there, so the phase

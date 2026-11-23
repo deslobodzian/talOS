@@ -2841,3 +2841,116 @@ TEST_F(PhoenixBackendFoc,
   EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut");
   EXPECT_EQ(AppliedControl(backend, 1), "NeutralOut");
 }
+
+// Defense-in-depth at the backend boundary: non-finite motor demands or
+// feedforwards and out-of-range closed-loop slots (slot > 2) neutralize that
+// motor instead of reaching Phoenix SetControl, and non-finite or out-of-range
+// PWM pulse outputs disable the PWM channel instead of calling SetSpeed.
+// REQ-SAFE-03, REQ-SAFE-04
+TEST_F(PhoenixBackendFoc, ApplyNeutralizesNonFiniteInvalidSlotAndBadPwm) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  config.motors.push_back(TestMotor(10, "m1", 1));
+  hw::PwmConfig pwm;
+  pwm.id = 30;
+  pwm.name = "servo";
+  pwm.channel = 0;
+  config.pwm_outputs.push_back(pwm);
+
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+
+  // First drive motor and PWM so each bad request must actively neutralize it.
+  const std::array<hw::MotorRequest, 1> valid_cmd{
+      Request(10, hw::Mode::kVoltage, 4.0)};
+  ASSERT_TRUE(ApplySent(backend, valid_cmd));
+  ASSERT_EQ(AppliedControl(backend, 0), "VoltageOut");
+
+  const std::array<hw::MotorRequest, 6> bad_motor_requests{
+      hw::MotorRequest{10, hw::Mode::kDutyCycle, 0, nan, 0.0},
+      hw::MotorRequest{10, hw::Mode::kVoltage, 0, inf, 0.0},
+      hw::MotorRequest{10, hw::Mode::kVelocity, 0, 5.0, nan},
+      hw::MotorRequest{10, hw::Mode::kPosition, /*slot=*/3, 1.0, 0.0},
+      hw::MotorRequest{10, hw::Mode::kMotionMagic, 0, -inf, 0.0},
+      hw::MotorRequest{10, hw::Mode::kMotionMagic, /*slot=*/4, 1.0, 0.0},
+  };
+  for (std::size_t k = 0; k < bad_motor_requests.size(); ++k) {
+    ASSERT_TRUE(ApplySent(backend, valid_cmd)) << "setup " << k;
+    ASSERT_EQ(AppliedControl(backend, 0), "VoltageOut") << "setup " << k;
+    const std::array<hw::MotorRequest, 1> bad{bad_motor_requests[k]};
+    ASSERT_TRUE(ApplySent(backend, bad)) << "case " << k;
+    EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut") << "case " << k;
+  }
+
+  // Bad PWM pulses must disable the PWM channel (0 us pulse) rather than
+  // calling SetSpeed with NaN/Inf/out-of-range.
+  const frc::sim::PWMSim pwm_sim{0};
+  for (const double bad_output : {nan, inf, -inf, 1.5, -1.5}) {
+    ASSERT_TRUE(backend.ApplyOutputs(
+        {}, std::array{hw::PwmRequest{30, hw::PwmMode::kPulse, 0.25}}));
+    ASSERT_GT(pwm_sim.GetPulseMicrosecond(), 0);
+    ASSERT_TRUE(backend.ApplyOutputs(
+        {}, std::array{hw::PwmRequest{30, hw::PwmMode::kPulse, bad_output}}));
+    EXPECT_EQ(pwm_sim.GetPulseMicrosecond(), 0)
+        << "bad PWM pulse " << bad_output << " was not disabled";
+  }
+}
+
+// Even when a follower precedes its master in config.motors, Apply() must
+// neutralize the follower whenever the master's request is disallowed (e.g.
+// non-finite demand or disallowed TorqueCurrent) so the follower never runs
+// Follower{master} while the master is neutralized.
+// REQ-SAFE-03, REQ-SAFE-04
+TEST_F(PhoenixBackendFoc,
+       FollowerNeutralizesWhenMasterRequestIsDisallowedAtBackend) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  auto follower = TestMotor(20, "follower", 2);
+  follower.master_id = 10;
+  auto master = TestMotor(10, "master", 1);
+  // Follower intentionally precedes master in manifest order.
+  config.motors = {follower, master};
+
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  // Baseline: valid master demand drives both master and follower.
+  const std::array<hw::MotorRequest, 2> good_cmds{
+      Request(20, hw::Mode::kVoltage, 0.0),
+      Request(10, hw::Mode::kVoltage, 4.0)};
+  hw::State state;
+  PumpReads(backend, state, good_cmds, 15);
+  ASSERT_TRUE(ApplySent(backend, good_cmds));
+  ASSERT_EQ(AppliedControl(backend, 0), "Follower");
+  ASSERT_EQ(AppliedControl(backend, 1), "VoltageOut");
+
+  // Disallowed master demand (NaN voltage): BOTH master and follower must go
+  // NeutralOut.
+  const std::array<hw::MotorRequest, 2> nan_master{
+      Request(20, hw::Mode::kVoltage, 0.0),
+      Request(10, hw::Mode::kVoltage,
+              std::numeric_limits<double>::quiet_NaN())};
+  ASSERT_TRUE(ApplySent(backend, nan_master));
+  EXPECT_EQ(AppliedControl(backend, 1), "NeutralOut");
+  EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut")
+      << "follower stayed active when master demand was non-finite";
+
+  // Disallowed TorqueCurrent on non-FOC master: BOTH master and follower must
+  // go NeutralOut.
+  ASSERT_TRUE(ApplySent(backend, good_cmds));
+  ASSERT_EQ(AppliedControl(backend, 0), "Follower");
+  const std::array<hw::MotorRequest, 2> bad_torque_master{
+      Request(20, hw::Mode::kTorqueCurrent, 0.0),
+      Request(10, hw::Mode::kTorqueCurrent, 10.0)};
+  ASSERT_TRUE(ApplySent(backend, bad_torque_master));
+  EXPECT_EQ(AppliedControl(backend, 1), "NeutralOut");
+  EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut")
+      << "follower stayed active when master TorqueCurrent was disallowed";
+}
