@@ -363,6 +363,7 @@ TEST(Devices, StaleStateBoundaryIsTheCommandTimeout) {
   EXPECT_TRUE(went_neutral);
 }
 
+// REQ-SAFE-04
 TEST(Devices, MotorDemandsClampPerDeviceAndCountAdjustedCalls) {
   std::string toml{kRobotToml};
   toml.insert(toml.find("[subsystems.mech.digital_outputs"),
@@ -430,6 +431,7 @@ TEST(Devices, ClampedCountRisesOncePerAdjustedCall) {
   EXPECT_EQ(twice.motor.clamped_count(), before + 2);
 }
 
+// REQ-SAFE-04
 TEST(Devices, MotorVoltageDutyPositionAndFeedforwardUseConfiguredLimits) {
   struct Limited {
     explicit Limited(Node& node) : motor{node, "a"} {
@@ -1102,6 +1104,7 @@ can_id = 6
   EXPECT_EQ(hw.motor_request("mech", "unrelated").mode, Mode::kPosition);
 }
 
+// REQ-SAFE-04
 TEST(Devices, NonFiniteDemandIsNeutral) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");
@@ -1113,6 +1116,78 @@ TEST(Devices, NonFiniteDemandIsNeutral) {
     mech.a_velocity = demand;
     sim.step(10ms);
     EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kNeutral);
+  }
+}
+
+// REQ-SAFE-04: non-finite feedforward (NaN, +Inf, -Inf) neutralizes only the
+// affected motor and increments its clamped_count() once per call, while a
+// sibling motor on the same node keeps driving untouched.
+TEST(Devices, NonFiniteFeedforwardNeutralizesOnlyAffectedMotor) {
+  struct DualMotor {
+    explicit DualMotor(Node& n) : a{n, "a"}, b{n, "b"} {
+      AllowUntargetedOutputs(n);
+    }
+    void update() {
+      switch (mode) {
+        case Mode::kVelocity:
+          a.set_velocity(10.0, ff, 1);
+          break;
+        case Mode::kPosition:
+          a.set_position(1.0, ff, 1);
+          break;
+        case Mode::kMotionMagic:
+          a.set_motion_magic(1.0, ff, 1);
+          break;
+        default:
+          a.stop();
+          break;
+      }
+      b.set_voltage(4.0);
+    }
+    Motor a, b;
+    Mode mode = Mode::kVelocity;
+    double ff = 0.5;
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<DualMotor>("mech");
+  SimHardware hw{sim};
+  hw.enable();
+  sim.step(10ms);
+  mech.a.rezero();
+  ASSERT_TRUE(mech.a.zeroed());
+
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  for (const Mode mode :
+       {Mode::kVelocity, Mode::kPosition, Mode::kMotionMagic}) {
+    mech.mode = mode;
+    mech.ff = 0.5;
+    sim.step(5ms);
+    ASSERT_EQ(hw.motor_request("mech", "a").mode, mode);
+    ASSERT_EQ(hw.motor_request("mech", "b").mode, Mode::kVoltage);
+
+    for (const double ff :
+         {std::numeric_limits<double>::quiet_NaN(), kInf, -kInf}) {
+      SCOPED_TRACE(ff);
+      const std::uint64_t a_before = mech.a.clamped_count();
+      const std::uint64_t b_before = mech.b.clamped_count();
+      mech.ff = ff;
+      sim.step(5ms);  // one tick
+      const auto a_req = hw.motor_request("mech", "a");
+      EXPECT_EQ(a_req.mode, Mode::kNeutral);
+      EXPECT_EQ(a_req.demand, 0.0);
+      EXPECT_EQ(a_req.feedforward_v, 0.0);
+      EXPECT_EQ(a_req.slot, 0);
+      EXPECT_EQ(mech.a.clamped_count(), a_before + 1);
+      const auto b_req = hw.motor_request("mech", "b");
+      EXPECT_EQ(b_req.mode, Mode::kVoltage);
+      EXPECT_DOUBLE_EQ(b_req.demand, 4.0);
+      EXPECT_EQ(mech.b.clamped_count(), b_before);
+    }
+
+    mech.ff = 0.5;
+    sim.step(5ms);
+    EXPECT_EQ(hw.motor_request("mech", "a").mode, mode);
+    EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").feedforward_v, 0.5);
   }
 }
 
