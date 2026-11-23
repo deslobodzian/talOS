@@ -774,6 +774,44 @@ def _strip_cpp_comments(text):
         no_strings.append(ch_ns)
         line_map.append(lineno)
 
+    def quoted_literal(start, quote, kind):
+        """Emits the `quote`-delimited literal at `start`, delimiters kept and
+        interior blanked in `no_strings`, and returns the index after it. It
+        ends at its closing quote or an unescaped newline. Refuses `??/`
+        inside it: phase-1 `??/` -> `\\` can escape the closing quote or
+        splice lines under trigraph-enabling flags and desync the lexer."""
+        emit(quote, quote, spliced_lines[start])
+        i = start + 1
+        while i < n:
+            c = src[i]
+            if c == "\\":
+                emit(c, " ", spliced_lines[i])
+                i += 1
+                if i < n and src[i] != "\n":
+                    emit(src[i], " ", spliced_lines[i])
+                    i += 1
+                continue
+            if c == quote:
+                emit(quote, quote, spliced_lines[i])
+                i += 1
+                break
+            if c == "\n":
+                emit("\n", "\n", spliced_lines[i])
+                i += 1
+                break
+            emit(c, " ", spliced_lines[i])
+            i += 1
+        pos = src.find("??/", start, i)
+        while pos != -1:
+            errors.append((
+                spliced_lines[pos],
+                "trigraph",
+                f"uses C++ trigraph `??/` in {kind} "
+                "(can escape quotes or splice lines under -trigraphs)",
+            ))
+            pos = src.find("??/", pos + 3, i)
+        return i
+
     i = 0
     while i < n:
         ch = src[i]
@@ -880,75 +918,13 @@ def _strip_cpp_comments(text):
                 break
             continue
         # Normal string literal: preserve in `with_strings` (for #include),
-        # blank interior in `no_strings`. Refuse `??/` inside literals because
-        # phase-1 `??/` -> `\` can escape the closing quote or splice lines
-        # under trigraph-enabling flags and desync the lexer.
+        # blank interior in `no_strings`. Character literal likewise
+        # (pp-number digit separators were already consumed).
         if ch == '"':
-            lit_start = i
-            emit('"', '"', spliced_lines[i])
-            i += 1
-            while i < n:
-                c = src[i]
-                if c == "\\":
-                    emit(c, " ", spliced_lines[i])
-                    i += 1
-                    if i < n and src[i] != "\n":
-                        emit(src[i], " ", spliced_lines[i])
-                        i += 1
-                    continue
-                if c == '"':
-                    emit('"', '"', spliced_lines[i])
-                    i += 1
-                    break
-                if c == "\n":
-                    emit("\n", "\n", spliced_lines[i])
-                    i += 1
-                    break
-                emit(c, " ", spliced_lines[i])
-                i += 1
-            pos = src.find("??/", lit_start, i)
-            while pos != -1:
-                errors.append((
-                    spliced_lines[pos],
-                    "trigraph",
-                    "uses C++ trigraph `??/` in string literal "
-                    "(can escape quotes or splice lines under -trigraphs)",
-                ))
-                pos = src.find("??/", pos + 3, i)
+            i = quoted_literal(i, '"', "string literal")
             continue
-        # Character literal (pp-number digit separators were already consumed).
         if ch == "'":
-            lit_start = i
-            emit("'", "'", spliced_lines[i])
-            i += 1
-            while i < n:
-                c = src[i]
-                if c == "\\":
-                    emit(c, " ", spliced_lines[i])
-                    i += 1
-                    if i < n and src[i] != "\n":
-                        emit(src[i], " ", spliced_lines[i])
-                        i += 1
-                    continue
-                if c == "'":
-                    emit("'", "'", spliced_lines[i])
-                    i += 1
-                    break
-                if c == "\n":
-                    emit("\n", "\n", spliced_lines[i])
-                    i += 1
-                    break
-                emit(c, " ", spliced_lines[i])
-                i += 1
-            pos = src.find("??/", lit_start, i)
-            while pos != -1:
-                errors.append((
-                    spliced_lines[pos],
-                    "trigraph",
-                    "uses C++ trigraph `??/` in character literal "
-                    "(can escape quotes or splice lines under -trigraphs)",
-                ))
-                pos = src.find("??/", pos + 3, i)
+            i = quoted_literal(i, "'", "character literal")
             continue
         emit(ch, ch, spliced_lines[i])
         i += 1
