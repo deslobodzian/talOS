@@ -8,8 +8,9 @@
 //
 // Appends its pid to <runs_file> once its stop handlers and registry row are
 // ready. <mode> is:
-// - `once`: run 1 advances until <hang_file> exists, then freezes (stops
-//   updating its row) until SIGKILL; later runs keep advancing until stop.
+// - `once`: run 1 advances until <hang_file> exists, then creates
+//   <hang_file>.hung once and freezes (stops updating its row) until SIGKILL;
+//   later runs keep advancing until stop.
 // - `always`: every run advances twice, records its pid, then freezes until
 //   SIGKILL.
 
@@ -104,9 +105,17 @@ int main(int argc, char** argv) {
     std::ofstream out{runs_file, std::ios::app};
     out << ::getpid() << '\n';
   }
+  bool hung_acked = false;
   while (stop == 0) {
     const bool hung = run_number == 1 && std::filesystem::exists(hang_file);
-    if (!hung) sample(dispatch++);
+    if (hung) {
+      if (!hung_acked) {
+        std::ofstream{hang_file + ".hung"}.close();
+        hung_acked = true;
+      }
+    } else {
+      sample(dispatch++);
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds{10});
   }
   return 0;
