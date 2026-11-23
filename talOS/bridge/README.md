@@ -41,9 +41,9 @@ reasons:
    owner's `ExpiresAtUs()`, and (7) `CommandDueUs()` (immediate on merge change,
    else command heartbeat), with `kRetryUs` backoff on failed sends and `Pass()`
    bounding waits by liveness, introspection, and `max_wait_us_`. On clean loop
-   exit, `Run()` calls `SendShutdownNeutral()` before `CloseWaits()` so an
-   active gateway immediately receives a neutral command stamped with the latest
-   observed identity and sample time.
+   exit, `Run()` calls `SendShutdownNeutral()` before `CloseWaits()` so a
+   gateway with a fresh ready State matching `config_id_` immediately receives
+   a neutral command stamped with the latest observed identity and sample time.
 3. **`kBridge` CPU-budget throttling.** Because `hardware_node` runs in the
    highest realtime tier (`LoopTier::kBridge`, above control nodes on Linux),
    a UDP or request flood would starve control loops if the poller stayed

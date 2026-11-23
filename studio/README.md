@@ -267,22 +267,33 @@ reads OK, it asserts from the live DOM:
   the subsystems and checks lists fit without scrolling (that rows whose
   names differ only past the cell's width read differently is
   `tests/drive.test.ts`'s, on the 2026 layout: the bench has no such rows);
-- at 1366x500, where the subsystems list scrolls: every visible row is whole
-  and the heading's `N above` / `+N below` equals the rows the boxes show,
-  after a scroll by script too; scrolled to the bottom and to the middle, the
-  list keeps its `scrollTop` when SIGKILLing `swerve_module` (the launcher
-  restarts it) changes that row; the list's heading and words are whole;
+- at 1366x500 (subsystems scroll) and 1366x300 (alerts scroll): every visible
+  row is whole and the heading's `N above` / `+N below` equals the rows the
+  boxes show, after a scroll by script too; scrolled to the bottom and to the
+  middle, the subsystems list keeps its `scrollTop` when SIGKILLing
+  `swerve_module` (the launcher restarts it) changes that row; the list's
+  heading and words are whole, and at 1280x720 the subsystems session label
+  yields (ellipsizes) while the heading and out-of-view count stay whole;
 - with the `telemetry` node SIGSTOPped, every widget but subsystems reads
-  STALE within REQ-OPS-36's 500 ms of the producer's last tick at the latest
+  STALE (dimmed, struck-through, last value kept) past `STALE_MS` (300 ms) and
+  within REQ-OPS-36's 500 ms of the producer's last tick at the latest
   (the page's `performance.now()` read just before the stop, plus one 10 ms
-  producer period) and the status line reads TELEMETRY; after SIGCONT the
-  page is current again.
+  producer period) and the status line reads TELEMETRY; a wall-clock jump past
+  `STALE_MS` triggers sleep detection (every widget including subsystems
+  stale) until a new tick arrives; returning from a hidden tab repaints
+  synchronously inside `visibilitychange`; after SIGCONT the page is current
+  again;
+- live HTTP checks on `/drive`, `/`, hashed assets, `/drive/layout.json`, and
+  `/drive/summary.json` confirm the served status codes, bodies, and
+  `Cache-Control` headers.
 
 Every wait is on an event (a file change, a DOM mutation, an animation
-frame), bounded only against a hang. The launcher refuses port 0, so the
-test reserves the bridge's and the gateway link's ports and releases them
-before the launch; a member that then cannot bind one fails the run at
-once, naming the port and the member's log line. Any exit of the test,
+frame), bounded only against a hang. Studio uses `--studio-http-port 0` (its
+OS-assigned port is read from `manifest.json`), while the launcher refuses
+port 0 for the gateway link (`--remote-port`, `--local-port`), so the test
+reserves those two ports and releases them before the launch; a member that
+then cannot bind an explicit port fails the run at once, naming the port and
+the member's log line. Any exit of the test,
 SIGTERM from Bazel's timeout included, stops the session and the browser,
 which run in sessions of their own. A failed check saves a screenshot and
 the failing elements' CSS path, outerHTML and geometry (`<label>.png`,

@@ -148,13 +148,18 @@ design and keeps the drain's time
 Subscriptions without a per-message callback skip directly to the newest
 available value once per drain, counting skipped messages as dropped. Callback
 subscriptions retain sequence delivery with `max_messages_per_tick` (64 by
-default) bounding each drain. A drain that stops at that cap is followed at
-once by another, never by a wait: a prompt watcher's failed arm drains again
+default) bounding each drain. Before dispatching a due timer, both
+`RealtimeEventLoop` and `SimulatedEventLoop` repeat bounded sequence drains up
+to `(slots - 1) / max_messages_per_tick + 2` passes (one full ring plus one
+confirming pass; 17 passes at the default 1024 slots and 64-message cap) so a
+queued burst catches up before the timer runs while a continuously flooded
+topic stays bounded. Between timers, a drain that stops at that cap is followed
+at once by another, never by a wait: a prompt watcher's failed arm drains again
 under `ON_PUBLISH`, and under `BEFORE_TIMERS` and `ON_PUBLISH` a sequence
 watcher that is not prompt makes the loop drain again before it waits
-(`POLL`'s next tick drains it anyway). Each drain stays capped and due timers
-run between them, so a burst costs one drain per 64 messages per watcher, and
-a watcher fed faster than 64 per drain never falls behind by a batch per
+(`POLL`'s next tick drains it anyway). Each such drain stays capped and due
+timers run between them, so a burst costs one drain per 64 messages per watcher,
+and a watcher fed faster than 64 per drain never falls behind by a batch per
 timer (`RealtimeEventLoop.ADrainCappedOnAQuietWatcherDrainsAgainAtOnce`).
 `SimulatedEventLoop` makes the loop due again at that instant
 (`next_deadline()`); such drains count toward `kMaxWokenDrainsPerInstant`.

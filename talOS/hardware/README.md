@@ -517,13 +517,16 @@ only in its readers' logs (receipts), and none when no node reads it;
 
 The bridge's exit lines (stdout, so the session's
 `<output_dir>/<session_id>/hardware_node.log`, [node
-output](../launcher/README.md#node-output)) carry counters `/hw/status` does
-not: `passes`, the wake reasons, `wait_fallbacks`, `send_failures`,
-`socket_reopens`, and `throttled`, the passes that spent the loop's CPU
+output](../launcher/README.md#node-output)) carry wake and CPU-budget counters
+`/hw/status` does not: `passes`, the wake reasons (`udp`, `request`,
+`deadline`), `wait_fallbacks` (reported as `wake_fallbacks` in the registry
+and manifest), and `throttled`, the passes that spent the loop's CPU
 budget (8 passes or 64 received datagrams in a 1 ms window,
 `HardwareNode::kCpuWindowUs`) and so slept through input until the window
-ended. A nonzero `throttled` means a gateway or a node flooded the bridge;
-normal traffic stays far below the budget.
+ended, alongside the five UDP/socket loss counters (`send_failures`,
+`socket_reopens`, `sequence_gaps`, `decode_failures`, `send_would_block`) that
+`/hw/status` also publishes. A nonzero `throttled` means a gateway or a node
+flooded the bridge; normal traffic stays far below the budget.
 
 Nodes read the gateway's poll timestamp in their own clock through
 `HardwareLink::sample_time()` (C `talos_hardware_sample_time`, Python
@@ -1084,7 +1087,7 @@ Build without deploying:
 ```sh
 cd controller_processor/rio
 ./gradlew buildRio -Pcompanion=<ipv4>
-./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, LoopConsole, SocketRetry, LoopSchedule, CanBusHealth, DriverStationReader; and rioBuildStampTest
+./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, LoopConsole, SocketRetry, LoopSchedule, CanBusHealth, DriverStationReader, DriverStationSampler, RobotSafety; and rioBuildStampTest
 ```
 
 WPILib desktop simulation (`./gradlew simulateNative`) runs the same gateway
