@@ -103,10 +103,18 @@ class PrepushTest(unittest.TestCase):
             GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t",
             GIT_AUTHOR_EMAIL="t@example.com", GIT_COMMITTER_NAME="t",
             GIT_COMMITTER_EMAIL="t@example.com")
-        for args in (["init", "-q", "--template="], ["add", "."],
+        # Disable git auto-gc / background maintenance in the template repo
+        # (and every copy) so git never creates/removes .git/objects/
+        # maintenance.lock asynchronously while setUp copies the tree.
+        for args in (["init", "-q", "--template="],
+                     ["config", "gc.auto", "0"],
+                     ["config", "maintenance.auto", "false"],
+                     ["add", "."],
                      ["commit", "-qm", "one"]):
-            subprocess.run(["git", *args], cwd=cls._template_repo, env=git_env,
-                           capture_output=True, text=True, check=True)
+            subprocess.run(
+                ["git", "-c", "gc.auto=0", "-c", "maintenance.auto=false", *args],
+                cwd=cls._template_repo, env=git_env,
+                capture_output=True, text=True, check=True)
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
