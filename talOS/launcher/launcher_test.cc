@@ -460,6 +460,7 @@ std::string NodeDescribeThenSleep(
          std::to_string(sleep_s) + "\n";
 }
 
+// REQ-OPS-09
 TEST(LauncherTest, RestartSharesByteBudgetAndManifestEnospcDoesNotStopIt) {
   const auto root = TempPath("budget_restart");
   const auto attempts = root + "/attempts";

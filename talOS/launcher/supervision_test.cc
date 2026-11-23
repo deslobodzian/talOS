@@ -2727,6 +2727,7 @@ TEST(Supervision, GuardianKeepsNoLockHeldAtSpawn) {
 
 // The real supervision loop, not a watchdog thread, must deliver READY before
 // its first WATCHDOG. A hung loop consequently cannot keep the unit healthy.
+// REQ-OPS-07
 TEST(Supervision, SendsReadyThenWatchdogDatagrams) {
   const std::string path = "/tmp/tn_" + std::to_string(::getpid());
   ::unlink(path.c_str());
@@ -2919,6 +2920,7 @@ TEST(Supervision, NotifierSupportsAbstractSocketNames) {
 // launcher's loop, which feeds the service watchdog, must not wait on it.
 // With the lock held all session, every member starts and the session still
 // stops when asked (SIGTERM, once every member has set its stop trap).
+// REQ-OPS-07
 TEST(Supervision, HeldRegistryLockDoesNotStallSupervision) {
   auto options = BaseOptions("held_lock");
   options.duration_s = kHangSeconds;

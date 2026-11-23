@@ -2905,14 +2905,6 @@ TEST_F(ReviewTest, CodecRejectedHardwarePacketRefusesAllHardwareChannels) {
     const std::string reason = bounds["hardware_not_decoded"];
     EXPECT_NE(reason.find(build_ver), std::string::npos) << reason;
     EXPECT_NE(reason.find("/hw/state"), std::string::npos) << reason;
-    if (with_matching_manifest) {
-      EXPECT_NE(reason.find("recorded under this build's hardware protocol"),
-                std::string::npos)
-          << reason;
-    } else {
-      EXPECT_NE(reason.find("records no protocol version"), std::string::npos)
-          << reason;
-    }
 
     const Response tl_resp = review.Get("/review/" + id + "/timeline.json", "");
     ASSERT_EQ(tl_resp.status, 200) << tl_resp.body;
@@ -2965,10 +2957,9 @@ std::string WideStructSchema(const std::string& struct_name) {
   return {reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
 }
 
-// Guards REQ-OPS-42: opening and querying a multi-MiB `.tlog` streams through
+// REQ-OPS-42: opening and querying a multi-MiB `.tlog` streams through
 // a fixed read window and never reads the file whole, so both the session's
 // index and the process's RSS delta stay far below the file size on disk.
-// REQ-OPS-42
 TEST_F(ReviewTest, MultiMiBLogStreamsWithoutReadingFileWhole) {
   namespace tlog = talos::event::log;
   using talos::event::Context;

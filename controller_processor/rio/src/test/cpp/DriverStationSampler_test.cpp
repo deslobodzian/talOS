@@ -113,7 +113,7 @@ TEST(DriverStationSampler, ASameModeCompanionLinkDropKeepsTheGeneration) {
 // In one mode a packet goes out every kSamplePeriodUs (every fourth 5 ms
 // tick), never between; a mode change goes out on its own tick, and the
 // cadence restarts from it.
-// REQ-SAFE-10
+// REQ-SAFE-10, REQ-RT-13
 TEST(DriverStationSampler, SendsOnAModeChangeAndEverySamplePeriod) {
   static_assert(ds::kSamplePeriodUs == 4 * kPeriodUs);
   constexpr uint32_t kDisabled = ds::kDsAttached | ds::kTeleop;

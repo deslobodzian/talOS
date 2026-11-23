@@ -2093,6 +2093,7 @@ TEST(HardwareNodeTest, TheLivenessSampleRidesEveryPass) {
 // registry samples, arming the request wakes and the next deadline. Tick()
 // and Pass() run on this thread, which is the only one AllocationProbe
 // counts.
+// REQ-RT-06
 TEST(HardwareNodeTest, SteadyStateTickDoesNotAllocate) {
   if (const auto why = talos::testing::AllocationProbe::Unsupported();
       !why.empty()) {

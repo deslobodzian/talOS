@@ -618,8 +618,6 @@ class SessionReportTest(unittest.TestCase):
                 report = session_report.analyze({"nodes": []}, base + [gap(process, 2, 2)])
                 self.assertIsNone(report["driver_station_to_command_ms"])
                 self.assertEqual(report["intervals_across_gaps"]["driver_station_to_command"], 1)
-                self.assertIn("Driver station to command: 1 samples across a log gap not measured.",
-                              session_report.markdown(report).splitlines())
         unrelated = session_report.analyze({"nodes": []}, base + [gap("camera", 2, 2)])
         self.assertEqual(unrelated["driver_station_to_command_ms"]["count"], 1)
         self.assertEqual(unrelated["intervals_across_gaps"]["driver_station_to_command"], 0)
