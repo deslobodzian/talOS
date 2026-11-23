@@ -104,8 +104,11 @@ export class TelemetryStore {
 
   private readonly eventEngine: EventEngine;
   // Fed every frame in order, so its latch spans more than the retained
-  // history; replaced with the history (a reset).
+  // history; replaced with the history (a reset). When the worker owns the
+  // tracker ahead of WorkerUpdateStream, `externalAlertLatch` holds its
+  // authoritative latch so frames dropped on UI stall never lose activations.
   private readonly alertTracker = new AlertTracker();
+  private externalAlertLatch: AlertLatch|null = null;
   private bands: ModeBand[] = [];
   private bandMode: DriverStationMode|null = null;
 
@@ -285,7 +288,14 @@ export class TelemetryStore {
   // Every alert raised since the current match began, as of the newest frame
   // (data/alerts.ts), whatever the cursor.
   alertLatch(): AlertLatch {
-    return this.alertTracker.latch();
+    return this.externalAlertLatch ?? this.alertTracker.latch();
+  }
+
+  // Installs the worker's authoritative alert latch (computed before
+  // WorkerUpdateStream can drop frames during a UI stall; REQ-OPS-37).
+  setAlertLatch(latch: AlertLatch) {
+    this.externalAlertLatch = latch;
+    this.scheduleNotify();
   }
 
   // --- internals ------------------------------------------------------------
@@ -434,7 +444,7 @@ export class TelemetryStore {
     }
 
     this.eventEngine.pushFrame(frame);
-    this.alertTracker.push(frame);
+    if (this.externalAlertLatch === null) this.alertTracker.push(frame);
     this.updateBands(frame, this.streamStarts[slot] === 1);
   }
 
@@ -473,6 +483,7 @@ export class TelemetryStore {
     this.bandMode = null;
     this.eventEngine.clear();
     this.alertTracker.reset();
+    this.externalAlertLatch = null;
   }
 
   private trimHistory() {

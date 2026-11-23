@@ -3,6 +3,7 @@ import {handleRpc} from '../agent/rpc';
 
 import {concatPages} from './encode';
 import {checkExportFormat, Coordinator, type Dictionary, dictionaryKey, exportPages, TelemetryDecoder, Timeline, type Snapshot} from './core';
+import {AlertTracker} from './data/alerts';
 import {graphStale} from './data/freshness';
 import {MAX_MANIFEST_BYTES, manifestUrl, parseManifest, type SessionManifest} from './data/manifest';
 import {type Connection, type PlaybackState} from './data/types';
@@ -28,6 +29,13 @@ let firstUpdate = false;
 // launcher session, import) so the next post carries `reset: true`.
 let pendingFrames: Snapshot[] = [];
 let needsReset = false;
+// Maintained in the worker ahead of WorkerUpdateStream so frames dropped
+// during a main-thread stall never lose an alert activation or match boundary
+// (REQ-OPS-37).
+const alertTracker = new AlertTracker();
+function postAlerts() {
+  updates.push({type: 'alerts', latch: alertTracker.latch()});
+}
 const historyHooks: HistoryHooks = {
   // An arrival of 0 is Timeline's "no known arrival", so the Agent tab's
   // get_latest reports the join keyframe's age as null too.
@@ -35,11 +43,15 @@ const historyHooks: HistoryHooks = {
   appended(f, arrivalMs) {
     pendingFrames.push(f);
     sampleArrival = arrivalMs === 0 ? null : performance.now();
+    if (alertTracker.push(f)) postAlerts();
   },
   replaced(kept) {
     coordinator = new Coordinator(history.timeline);
     pendingFrames = kept.slice();
     needsReset = true;
+    alertTracker.reset();
+    for (const f of kept) alertTracker.push(f);
+    postAlerts();
     // The render cache's events and manifest baseline go with its history.
     // Posted now, the manifest follows the reset frames: a batch carries its
     // frames before its other messages (WorkerUpdateStream.flush).
@@ -321,6 +333,7 @@ function reset() {
   decoder = new TelemetryDecoder();
   needsReset = true;
   pendingFrames = [];
+  alertTracker.reset();
   unknownAge.clear();
   sampleArrival = null;
   // Whatever is being connected to next is a different system, so the old
@@ -339,6 +352,7 @@ function reset() {
   manifestBase = null;
   nextManifestPoll = 0;
   lastManifestRaw = null;
+  postAlerts();
   postSystem();
   postManifest();
 }
@@ -531,6 +545,8 @@ ctx.onmessage = ({data}) => {
         connection = 'replay';
         pendingFrames = imported.frames.slice();
         needsReset = true;
+        for (const f of imported.frames) alertTracker.push(f);
+        postAlerts();
         break;
       }
     }
