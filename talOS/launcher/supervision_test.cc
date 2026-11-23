@@ -3731,11 +3731,32 @@ TEST(Supervision, UndescribedNodeAllowedExplicitlyStillMustRegister) {
       "alpha", false);
   options.binary_overrides["//example/beta:node"] =
       WriteStub("undescribed_beta", "exit 0\n");
+  const uint64_t session = options.session_id;
+  const std::string live =
+      options.output_dir + "/" + std::to_string(session) + "/manifest.json";
   testing::SupervisionPasses passes;
   bool stepped = false;
   std::jthread driver{[&](const std::stop_token& stop) {
     const testing::SteppedClock::ReleaseOnExit release{clock};
-    if (!WaitFor(stop, [&] { return !ReadLines(runs).empty(); })) return;
+    // Wait until alpha run 0 is up and its peers' run 0s have exited cleanly
+    // and been reaped, so advancing to start + kMinHeartbeatTimeout cannot
+    // SIGKILL a still-exiting peer under heartbeat_startup_grace_ms = 0.
+    if (!WaitFor(stop, [&] {
+          SupervisionWakeup::Wake();
+          if (ReadLines(runs).empty()) return false;
+          const std::string manifest = ReadFile(live);
+          for (const char* name : {"hardware_node", "beta"}) {
+            const auto member_runs = ManifestRuns(manifest, name);
+            if (member_runs.empty() ||
+                member_runs.back().find("\"reason\": \"running\"") !=
+                    std::string::npos) {
+              return false;
+            }
+          }
+          return true;
+        })) {
+      return;
+    }
     const uint64_t next = passes.Started() + 2;
     if (!WaitFor(stop, [&] {
           SupervisionWakeup::Wake();
@@ -3743,11 +3764,34 @@ TEST(Supervision, UndescribedNodeAllowedExplicitlyStillMustRegister) {
         })) {
       return;
     }
+    // Step run 0 past kMinHeartbeatTimeout so unregistered alpha is killed as
+    // heartbeat_missing and restarted cleanly; while the clock stays frozen at
+    // start + kMinHeartbeatTimeout, run 1 of alpha and its peers exit cleanly
+    // without hitting any heartbeat timeout or starting a second restart.
     clock.HoldAt(start + kMinHeartbeatTimeout);
-    if (!WaitFor(stop, [&] { return ReadLines(runs).size() >= 2; })) return;
+    if (!WaitFor(stop, [&] {
+          SupervisionWakeup::Wake();
+          const std::string manifest = ReadFile(live);
+          for (const char* name : {"hardware_node", "alpha", "beta"}) {
+            const auto member_runs = ManifestRuns(manifest, name);
+            if (member_runs.size() < 2 ||
+                member_runs.back().find("\"reason\": \"running\"") !=
+                    std::string::npos) {
+              return false;
+            }
+          }
+          return true;
+        })) {
+      return;
+    }
     stepped = true;
-    // Past the 50 ms clean-exit backoff so RosterContinues ends the session.
-    clock.HoldAt(start + kMinHeartbeatTimeout + 100ms);
+    // Past every clean-exit backoff (100 ms for restart 2) so RosterContinues
+    // cancels every pending restart and ends the session at once.
+    clock.HoldAt(start + kMinHeartbeatTimeout + 200ms);
+    WaitFor(stop, [&] {
+      SupervisionWakeup::Wake();
+      return false;
+    });
   }};
   EXPECT_EQ(RunSession(options), 0);
   driver.request_stop();
