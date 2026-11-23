@@ -190,4 +190,58 @@ TEST(DriverStationSampler,
       RunTick(sampler, kAutoEnabled, retry_us + ds::kSamplePeriodUs).sent);
 }
 
+// An A -> B -> A transition within kSamplePeriodUs where B was never delivered
+// (either RevertSample() after a send failure, or a closed socket during B)
+// advances ModeTracker to a new generation (gen3 > gen1) even though ModeKey
+// returned to A. Sample() must still send gen3 immediately so the main
+// processor's OperatorArming and Target lanes see the new generation at once.
+// REQ-SAFE-10, REQ-SAFE-14, REQ-RT-13
+TEST(
+    DriverStationSampler,
+    BounceBackToSameModeWithinSamplePeriodAfterRevertOrClosedSocketSendsNewGen) {
+  constexpr uint32_t kTeleopEnabled =
+      ds::kDsAttached | ds::kEnabled | ds::kTeleop;
+  constexpr uint32_t kTeleopDisabled = ds::kDsAttached | ds::kTeleop;
+
+  // Case 1: B send failed and was reverted via RevertSample().
+  {
+    DriverStationSampler sampler;
+    const Tick t0 = RunTick(sampler, kTeleopEnabled, kStartUs);
+    ASSERT_TRUE(t0.sent);
+    const uint64_t gen1 = t0.packet.mode_since_us;
+
+    const Tick t1 = RunTick(sampler, kTeleopDisabled, kStartUs + kPeriodUs);
+    ASSERT_TRUE(t1.sent);
+    ASSERT_GT(t1.packet.mode_since_us, gen1);
+    sampler.RevertSample();
+
+    const uint64_t t2_us = kStartUs + 2 * kPeriodUs;
+    const Tick t2 = RunTick(sampler, kTeleopEnabled, t2_us);
+    ASSERT_TRUE(t2.sent)
+        << "new generation suppressed after RevertSample() on A->B->A";
+    EXPECT_EQ(t2.packet.mode_since_us, t2_us);
+    EXPECT_GT(t2.packet.mode_since_us, t1.packet.mode_since_us);
+  }
+
+  // Case 2: socket was closed during B and reopened on return to A.
+  {
+    DriverStationSampler sampler;
+    const Tick t0 = RunTick(sampler, kTeleopEnabled, kStartUs);
+    ASSERT_TRUE(t0.sent);
+    const uint64_t gen1 = t0.packet.mode_since_us;
+
+    const Tick t1 = RunTick(sampler, kTeleopDisabled, kStartUs + kPeriodUs,
+                            /*socket_open=*/false);
+    ASSERT_FALSE(t1.sent);
+
+    const uint64_t t2_us = kStartUs + 2 * kPeriodUs;
+    const Tick t2 =
+        RunTick(sampler, kTeleopEnabled, t2_us, /*socket_open=*/true);
+    ASSERT_TRUE(t2.sent)
+        << "new generation suppressed after closed socket on A->B->A";
+    EXPECT_EQ(t2.packet.mode_since_us, t2_us);
+    EXPECT_GT(t2.packet.mode_since_us, gen1);
+  }
+}
+
 }  // namespace
