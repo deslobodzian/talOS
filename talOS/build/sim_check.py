@@ -64,7 +64,9 @@ its guardian (talOS/launcher, REQ-SAFE-30), so the check then waits, on
 the kernel's exit notifications, for every process left in the launch's
 session, kills any still there after EXIT_WAIT_S, and fails naming them.
 A process that left the session (a grandchild calling setsid) is not seen.
-A failure prints the launch's output.
+A failure prints the launch's output and, when `TEST_UNDECLARED_OUTPUTS_DIR`
+is set, preserves `launch.log` and the session directory there on a
+best-effort basis (never on a passing run).
 
 Shared memory. The launch runs in the test's namespace (TEST_TMPDIR, which
 ShmObjectName maps every name into), so it never touches a robot's. The
@@ -83,6 +85,7 @@ import json
 import os
 import random
 import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -630,6 +633,82 @@ def ready_bound(settle_s):
     return bound
 
 
+def _copy_file_best_effort(src, dst):
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copyfile(src, dst)
+    except OSError:
+        pass
+
+
+def _copy_tree_best_effort(src, dst):
+    if not os.path.isdir(src):
+        return
+    try:
+        os.makedirs(dst, exist_ok=True)
+    except OSError:
+        return
+    for root, dirs, files in os.walk(src):
+        rel = os.path.relpath(root, src)
+        target_root = dst if rel == "." else os.path.join(dst, rel)
+        for name in dirs:
+            try:
+                os.makedirs(os.path.join(target_root, name), exist_ok=True)
+            except OSError:
+                pass
+        for name in files:
+            src_path = os.path.join(root, name)
+            dst_path = os.path.join(target_root, name)
+            if os.path.islink(src_path) and not os.path.exists(src_path):
+                continue
+            _copy_file_best_effort(src_path, dst_path)
+
+
+def _unique_artifact_dir(outputs_dir, subdir):
+    os.makedirs(outputs_dir, exist_ok=True)
+    for index in range(1, 1000):
+        name = subdir if index == 1 else f"{subdir}_{index}"
+        candidate = os.path.join(outputs_dir, name)
+        try:
+            os.makedirs(candidate, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            continue
+    return tempfile.mkdtemp(prefix=f"{subdir}_", dir=outputs_dir)
+
+
+def preserve_failure_artifacts(launch_log, sessions_dir, outputs_dir=None,
+                               subdir="sim_check_failure"):
+    """Best-effort copy of `launch_log` and `sessions_dir` into `outputs_dir`
+    (default: `TEST_UNDECLARED_OUTPUTS_DIR`) under a fresh `subdir`. Returns
+    the destination directory, or None when no outputs directory is configured,
+    nothing exists to copy, or copying fails. Never raises so copy errors
+    cannot mask the underlying test failure."""
+    dest_root = (outputs_dir if outputs_dir is not None
+                 else os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR"))
+    if not dest_root:
+        return None
+    has_log = bool(launch_log) and os.path.isfile(launch_log)
+    has_sessions = False
+    if sessions_dir and os.path.isdir(sessions_dir):
+        try:
+            has_sessions = bool(os.listdir(sessions_dir))
+        except OSError:
+            has_sessions = False
+    if not has_log and not has_sessions:
+        return None
+    try:
+        dest = _unique_artifact_dir(dest_root, subdir)
+    except OSError:
+        return None
+    if has_log:
+        _copy_file_best_effort(
+            launch_log, os.path.join(dest, os.path.basename(launch_log)))
+    if has_sessions:
+        _copy_tree_best_effort(sessions_dir, os.path.join(dest, "sessions"))
+    return dest
+
+
 def check(sim, settle_s, log_dump, session_report, registry_unlink,
           ready_s, state_s=None, studio=False):
     """Runs `sim`, waits up to `ready_s` for it to be ready (with `state_s`,
@@ -657,48 +736,67 @@ def check(sim, settle_s, log_dump, session_report, registry_unlink,
         if studio:
             args += ["--start-studio-bridge", "--studio-http-port", "0"]
         problems = []
+        diagnostics = ""
+        failed = True
+        raised = False
         try:
-            with open(output_path, "wb") as output, \
-                    Launch(args, output) as launch:
-                unready = wait_ready(launch, out, ready_s, state_s,
-                                     studio=studio)
-                if unready:
-                    problems.append(unready)
-                elif launch.process.poll() is None:
-                    try:
-                        launch.process.wait(timeout=settle_s)
-                    except subprocess.TimeoutExpired:
-                        pass
-                ended = launch.process.poll()
-                in_order, killed = launch.finish()
+            try:
+                with open(output_path, "wb") as output, \
+                        Launch(args, output) as launch:
+                    unready = wait_ready(launch, out, ready_s, state_s,
+                                         studio=studio)
+                    if unready:
+                        problems.append(unready)
+                    elif launch.process.poll() is None:
+                        try:
+                            launch.process.wait(timeout=settle_s)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    ended = launch.process.poll()
+                    in_order, killed = launch.finish()
+            finally:
+                subprocess.run([registry_unlink], check=False)
+            with open(output_path, encoding="utf-8", errors="replace") as f:
+                diagnostics = (f"{' '.join(args)}\nports {gateway_port}, "
+                               f"{bridge_port} (released before the launch; "
+                               "another process may have taken one)\n"
+                               f"launch output:\n{f.read()}")
+            status = launch.process.returncode
+            if ended is not None:
+                problems.append(f"the launch ended on its own (exit {ended}) "
+                                "before the check stopped it")
+            elif not in_order:
+                problems.append(f"the launch did not stop within {STOP_WAIT_S} s "
+                                "of SIGINT and was killed")
+            elif status != 0:
+                problems.append(f"the launch exited {status}")
+            if killed:
+                problems.append("processes of the launch outlived it and were "
+                                f"killed: {killed}")
+            if in_order:
+                sessions = [os.path.join(out, d) for d in os.listdir(out)
+                            if os.path.isdir(os.path.join(out, d))]
+                if len(sessions) != 1:
+                    problems.append(f"expected one session directory, found "
+                                    f"{sessions}")
+                else:
+                    problems += judge(sessions[0], log_dump, report,
+                                      studio=studio)
+            failed = bool(problems)
+        except BaseException:
+            raised = True
+            raise
         finally:
-            subprocess.run([registry_unlink], check=False)
-        with open(output_path, encoding="utf-8", errors="replace") as f:
-            diagnostics = (f"{' '.join(args)}\nports {gateway_port}, "
-                           f"{bridge_port} (released before the launch; "
-                           "another process may have taken one)\n"
-                           f"launch output:\n{f.read()}")
-        status = launch.process.returncode
-        if ended is not None:
-            problems.append(f"the launch ended on its own (exit {ended}) "
-                            "before the check stopped it")
-        elif not in_order:
-            problems.append(f"the launch did not stop within {STOP_WAIT_S} s "
-                            "of SIGINT and was killed")
-        elif status != 0:
-            problems.append(f"the launch exited {status}")
-        if killed:
-            problems.append("processes of the launch outlived it and were "
-                            f"killed: {killed}")
-        if in_order:
-            sessions = [os.path.join(out, d) for d in os.listdir(out)
-                        if os.path.isdir(os.path.join(out, d))]
-            if len(sessions) != 1:
-                problems.append(f"expected one session directory, found "
-                                f"{sessions}")
-            else:
-                problems += judge(sessions[0], log_dump, report,
-                                  studio=studio)
+            if failed:
+                kept = preserve_failure_artifacts(output_path, out)
+                if kept:
+                    note = f"failure artifacts preserved: {kept}"
+                    if raised:
+                        print(f"sim_check: {note}", file=sys.stderr)
+                    elif diagnostics:
+                        diagnostics = f"{diagnostics}\n{note}"
+                    else:
+                        diagnostics = note
     return problems, diagnostics
 
 

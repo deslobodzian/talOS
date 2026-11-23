@@ -26,6 +26,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -83,6 +84,83 @@ def remove(tree):
     shutil.rmtree(tree)
 
 
+def _copy_tree_best_effort(src, dst):
+    if not os.path.isdir(src):
+        return
+    try:
+        os.makedirs(dst, exist_ok=True)
+    except OSError:
+        return
+    for root, dirs, files in os.walk(src):
+        rel = os.path.relpath(root, src)
+        target_root = dst if rel == "." else os.path.join(dst, rel)
+        for name in dirs:
+            try:
+                os.makedirs(os.path.join(target_root, name), exist_ok=True)
+            except OSError:
+                pass
+        for name in files:
+            src_path = os.path.join(root, name)
+            dst_path = os.path.join(target_root, name)
+            if os.path.islink(src_path) and not os.path.exists(src_path):
+                continue
+            try:
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                shutil.copyfile(src_path, dst_path)
+            except OSError:
+                pass
+
+
+def preserve_failure_artifacts(logs_dir, install_output="",
+                               describe_output="",
+                               subdir="bundle_install_failure"):
+    """Best-effort copy of command output and session logs into
+    `TEST_UNDECLARED_OUTPUTS_DIR` on failure (docs/TESTING.md §8.2). Never
+    raises so copy errors cannot mask the test failure."""
+    outputs_dir = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
+    if not outputs_dir:
+        return None
+    has_logs = False
+    if logs_dir and os.path.isdir(logs_dir):
+        try:
+            has_logs = bool(os.listdir(logs_dir))
+        except OSError:
+            has_logs = False
+    if not has_logs and not install_output and not describe_output:
+        return None
+    try:
+        os.makedirs(outputs_dir, exist_ok=True)
+        dest = None
+        for index in range(1, 1000):
+            name = subdir if index == 1 else f"{subdir}_{index}"
+            candidate = os.path.join(outputs_dir, name)
+            try:
+                os.makedirs(candidate, exist_ok=False)
+                dest = candidate
+                break
+            except FileExistsError:
+                continue
+        if dest is None:
+            dest = tempfile.mkdtemp(prefix=f"{subdir}_", dir=outputs_dir)
+    except OSError:
+        return None
+    sections = []
+    if install_output:
+        sections.append(f"=== deploy.sh install ===\n{install_output}")
+    if describe_output:
+        sections.append(f"=== run.sh --describe-only ===\n{describe_output}")
+    if sections:
+        try:
+            with open(os.path.join(dest, "launch.log"), "w",
+                      encoding="utf-8", errors="replace") as f:
+                f.write("\n".join(sections))
+        except OSError:
+            pass
+    if has_logs:
+        _copy_tree_best_effort(logs_dir, os.path.join(dest, "sessions"))
+    return dest
+
+
 class BundleInstallTest(unittest.TestCase):
     def test_installed_bundle_describes_without_the_build(self):
         bundle = location("_main/robot_bundle")
@@ -93,71 +171,84 @@ class BundleInstallTest(unittest.TestCase):
         # deploy.sh installs read-only, so cleanup cannot remove it all;
         # Bazel clears TEST_TMPDIR.
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            # The bundle as Bazel wrote it (bazel-bin/robot_bundle), not the
-            # sandbox's tree of links into that directory: this is the
-            # directory a person installs from.
-            built = os.path.dirname(os.path.realpath(
-                os.path.join(bundle, "bundle_manifest.toml")))
-            staging = os.path.join(tmp, "staging", "robot_bundle")
-            shutil.copytree(built, staging, symlinks=True)
-            prefix = os.path.join(tmp, "prefix")
-            install = subprocess.run(
-                ["bash", deploy, "install", staging, "--prefix", prefix],
-                capture_output=True, text=True, env=env, cwd=tmp,
-                timeout=STEP_TIMEOUT_S)
-            installed = install.stdout + install.stderr
-            self.assertEqual(install.returncode, 0, installed)
-            self.assertNotIn("warning: warm-up", installed)
-            remove(os.path.dirname(staging))
-
-            where = os.path.realpath(os.path.join(prefix, "current"))
-            for parent, dirs, files in os.walk(where):
-                for name in dirs + files:
-                    path = os.path.join(parent, name)
-                    if os.path.islink(path):
-                        target = os.path.realpath(path)
-                        self.assertTrue(
-                            target == where
-                            or target.startswith(where + os.sep),
-                            f"{path} links to {os.readlink(path)}, outside "
-                            "the install")
-                    elif name in files:
-                        with open(path, "rb") as f:
-                            data = f.read()
-                        for avoided in avoid:
-                            self.assertNotIn(
-                                avoided.encode(), data,
-                                f"{path} names {avoided}, which the robot "
-                                "does not have")
-
             logs = os.path.join(tmp, "logs")
-            proc = subprocess.run(
-                [os.path.join(prefix, "current", "run.sh"), "--describe-only"],
-                capture_output=True, text=True, cwd=tmp,
-                env=dict(env, TALOS_LOG_DIR=logs), timeout=STEP_TIMEOUT_S)
-            out = proc.stdout + proc.stderr
-            self.assertEqual(proc.returncode, 0, out)
-            (session,) = os.listdir(logs)
-            with open(os.path.join(logs, session, "graph.json"),
-                      encoding="utf-8") as f:
-                graph = json.load(f)
-            with open(os.path.join(where, "bundle_manifest.toml"), "rb") as f:
-                manifest = tomllib.load(f)
-            names = sorted(node["name"] for node in graph["nodes"])
-            # The config's nodes and the hardware bridge, as the bundle
-            # holds them, and its Studio bridge once its talos_bundle names
-            # one (README.md, "Studio").
-            studio = ["studio_bridge"] if "studio" in manifest else []
-            self.assertEqual(len(names),
-                             len(manifest_nodes()) + 1 + len(studio), out)
-            self.assertEqual(names, sorted(
-                [node["name"] for node in manifest["nodes"]] + studio), out)
-            for node in graph["nodes"]:
-                self.assertTrue(
-                    node.get("described"),
-                    f"{node.get('name')}: {node.get('describe_error')}\n{out}")
-            self.assertEqual(graph["config_sha256"],
-                             manifest["config_sha256"], out)
+            installed = ""
+            out = ""
+            try:
+                # The bundle as Bazel wrote it (bazel-bin/robot_bundle), not
+                # the sandbox's tree of links into that directory: this is the
+                # directory a person installs from.
+                built = os.path.dirname(os.path.realpath(
+                    os.path.join(bundle, "bundle_manifest.toml")))
+                staging = os.path.join(tmp, "staging", "robot_bundle")
+                shutil.copytree(built, staging, symlinks=True)
+                prefix = os.path.join(tmp, "prefix")
+                install = subprocess.run(
+                    ["bash", deploy, "install", staging, "--prefix", prefix],
+                    capture_output=True, text=True, env=env, cwd=tmp,
+                    timeout=STEP_TIMEOUT_S)
+                installed = install.stdout + install.stderr
+                self.assertEqual(install.returncode, 0, installed)
+                self.assertNotIn("warning: warm-up", installed)
+                remove(os.path.dirname(staging))
+
+                where = os.path.realpath(os.path.join(prefix, "current"))
+                for parent, dirs, files in os.walk(where):
+                    for name in dirs + files:
+                        path = os.path.join(parent, name)
+                        if os.path.islink(path):
+                            target = os.path.realpath(path)
+                            self.assertTrue(
+                                target == where
+                                or target.startswith(where + os.sep),
+                                f"{path} links to {os.readlink(path)}, "
+                                "outside the install")
+                        elif name in files:
+                            with open(path, "rb") as f:
+                                data = f.read()
+                            for avoided in avoid:
+                                self.assertNotIn(
+                                    avoided.encode(), data,
+                                    f"{path} names {avoided}, which the robot "
+                                    "does not have")
+
+                proc = subprocess.run(
+                    [os.path.join(prefix, "current", "run.sh"),
+                     "--describe-only"],
+                    capture_output=True, text=True, cwd=tmp,
+                    env=dict(env, TALOS_LOG_DIR=logs), timeout=STEP_TIMEOUT_S)
+                out = proc.stdout + proc.stderr
+                self.assertEqual(proc.returncode, 0, out)
+                (session,) = os.listdir(logs)
+                with open(os.path.join(logs, session, "graph.json"),
+                          encoding="utf-8") as f:
+                    graph = json.load(f)
+                with open(os.path.join(where, "bundle_manifest.toml"),
+                          "rb") as f:
+                    manifest = tomllib.load(f)
+                names = sorted(node["name"] for node in graph["nodes"])
+                # The config's nodes and the hardware bridge, as the bundle
+                # holds them, and its Studio bridge once its talos_bundle names
+                # one (README.md, "Studio").
+                studio = ["studio_bridge"] if "studio" in manifest else []
+                self.assertEqual(len(names),
+                                 len(manifest_nodes()) + 1 + len(studio), out)
+                self.assertEqual(names, sorted(
+                    [node["name"] for node in manifest["nodes"]] + studio),
+                    out)
+                for node in graph["nodes"]:
+                    self.assertTrue(
+                        node.get("described"),
+                        f"{node.get('name')}: "
+                        f"{node.get('describe_error')}\n{out}")
+                self.assertEqual(graph["config_sha256"],
+                                 manifest["config_sha256"], out)
+            except BaseException:
+                kept = preserve_failure_artifacts(logs, installed, out)
+                if kept:
+                    print(f"bundle_install_test: failure artifacts preserved: "
+                          f"{kept}", file=sys.stderr)
+                raise
 
 
 if __name__ == "__main__":
