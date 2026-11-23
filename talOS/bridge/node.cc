@@ -873,13 +873,17 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
     state_decode_failure_logged_ = false;
 
     ++states_received_;
-    // Ordering first, before anything is touched: the clock mapping takes
-    // a State only when it is newer than the last one of its gateway boot
-    // or opens a boot never seen. A duplicate, a reordered frame (with
-    // whatever older epoch or enable edge it carries) or a datagram delayed
-    // from a retired boot is dropped whole, counted in
-    // clock_ignored_count: it must not roll back the identity, refresh
-    // freshness, invalidate healthy requests or trigger a config push.
+    // Ordering and forward-jump gate first, before anything is touched: the
+    // clock mapping takes a State only when it opens a boot never seen or is
+    // strictly newer than the last accepted one of its gateway boot without an
+    // unconfirmed jump past elapsed bridge time + ClockOffsetEstimator's jitter
+    // and drift bound (two consecutive physically-consistent jump frames
+    // re-sync the anchor to recover from unseen-boot stall/tail-drop). A
+    // duplicate, a reordered frame (with whatever older epoch or enable edge it
+    // carries), an isolated or inconsistent corrupt far-future timestamp, or a
+    // datagram delayed from a retired boot is dropped whole, counted in
+    // clock_ignored_count: it must not advance or roll back the identity,
+    // refresh freshness, invalidate healthy requests or trigger a config push.
     if (!clock_.Observe(state.boot_id, state.sample_time_us, now_us)) {
       return;
     }

@@ -373,5 +373,252 @@ TEST(ClockOffset, ExtremeTimestampsDoNotOverflowSignedArithmetic) {
   EXPECT_EQ(clock.bounded_offset_us(), 1511);
 }
 
+// Guards RT-29: a corrupt or spoofed far-future sample_time_us within a boot
+// (including UINT64_MAX) must be ignored rather than advancing
+// last_sample_time_us_ and permanently locking out subsequent valid States or
+// poisoning the one-way offset estimate.
+// REQ-RT-20
+TEST(ClockOffset, FarFutureSampleJumpIsIgnoredWithoutLockingOutLaterSamples) {
+  Estimator clock;
+  for (std::uint64_t i = 0; i < Estimator::kConvergedSamples; ++i) {
+    ASSERT_TRUE(clock.Observe(11, 1'000 + 5'000 * i, 1'000'000 + 5'000 * i));
+  }
+  const std::uint64_t last_sample =
+      1'000 + 5'000 * (Estimator::kConvergedSamples - 1);
+  const std::uint64_t last_receipt =
+      1'000'000 + 5'000 * (Estimator::kConvergedSamples - 1);
+  const std::int64_t offset_before = clock.offset_us();
+  const std::size_t window_before = clock.window_count();
+
+  // Far-future jumps (+1 hour, UINT64_MAX, and 1 us past the 1 s margin at
+  // zero elapsed bridge time), duplicate UINT64_MAX, and inconsistent jump
+  // pairs (+1 h then +5 h, or a frozen corrupt pair separated by >1 s) are all
+  // ignored without disturbing state.
+  EXPECT_FALSE(
+      clock.Observe(11, last_sample + 3'600'000'000ULL, last_receipt + 5'000));
+  EXPECT_FALSE(clock.Observe(11, last_sample + 18'000'000'000ULL,
+                             last_receipt + 10'000));
+  EXPECT_FALSE(clock.Observe(11, std::numeric_limits<std::uint64_t>::max(),
+                             last_receipt + 15'000));
+  EXPECT_FALSE(clock.Observe(11, std::numeric_limits<std::uint64_t>::max(),
+                             last_receipt + 20'000));
+  EXPECT_FALSE(clock.Observe(11, last_sample + 1'000'001ULL, last_receipt));
+  // A frozen corrupt timestamp pair separated by >1 s of bridge time fails the
+  // symmetric physical-rate check and must not re-sync.
+  EXPECT_FALSE(
+      clock.Observe(11, last_sample + 7'200'000'000ULL, last_receipt + 5'000));
+  EXPECT_FALSE(clock.Observe(11, last_sample + 7'200'000'001ULL,
+                             last_receipt + 2'005'000));
+  EXPECT_EQ(clock.ignored_count(), 7u);
+  EXPECT_EQ(clock.window_count(), window_before);
+  EXPECT_EQ(clock.offset_us(), offset_before);
+  EXPECT_EQ(clock.spread_us(), 0u);
+
+  // Subsequent normal samples clear any pending jump candidate and continue to
+  // be accepted cleanly; a later corrupt frame matching the old candidate's
+  // trajectory is therefore still ignored.
+  EXPECT_TRUE(clock.Observe(11, last_sample + 5'000, last_receipt + 5'000));
+  EXPECT_FALSE(clock.Observe(11, last_sample + 7'200'005'001ULL,
+                             last_receipt + 2'010'000));
+  EXPECT_TRUE(clock.Observe(11, last_sample + 10'000, last_receipt + 10'000));
+  EXPECT_EQ(clock.ignored_count(), 8u);
+  EXPECT_EQ(clock.window_count(), window_before + 2);
+  EXPECT_EQ(clock.offset_us(), offset_before);
+}
+
+// Guards RT-29 against delayed buffered frames after a long (>500 s) outage:
+// a packet delayed past the 1 s jump margin must never pull the prompt anchor
+// backward and lock out the live frame immediately behind it, while sustained
+// bridge-fast oscillator drift refreshes the anchor over normal streaming so
+// the drift allowance never grows unboundedly.
+// REQ-RT-20
+TEST(ClockOffset, DelayedFrameAfterLongOutageDoesNotLockOutLiveSamples) {
+  // 1. 1000 s outage + 1.5 s delayed buffered packet + live frame 5 ms later.
+  // Because 1000 s / 500 (2 s) > 1.5 s, a naive anchor-retreat check would
+  // pull the anchor back to the delayed packet and reject live frames for
+  // ~250 s. Instead, the live frame is accepted on frame 1 (zero frames lost).
+  {
+    Estimator clock;
+    ASSERT_TRUE(clock.Observe(1, 1'000'000, 1'000'000));
+    ASSERT_TRUE(clock.Observe(1, 1'000'000 + 999'500'000ULL,
+                              1'000'000 + 1'001'000'000ULL));
+    EXPECT_TRUE(clock.Observe(1, 1'000'000 + 1'001'005'000ULL,
+                              1'000'000 + 1'001'005'000ULL));
+    EXPECT_EQ(clock.ignored_count(), 0u);
+    // Anchor advanced to the live frame, so 1 us past the 1 s margin is
+    // rejected immediately.
+    EXPECT_FALSE(clock.Observe(1, 1'000'000 + 1'002'005'001ULL,
+                               1'000'000 + 1'001'005'000ULL));
+    EXPECT_EQ(clock.ignored_count(), 1u);
+  }
+
+  // 2. One hour of steady 200 Hz streaming with bridge 1000 ppm fast (every
+  // frame slower than the first by increasing drift): every valid frame is
+  // accepted, and the anchor refreshes periodically so a corrupt +1.5 s jump
+  // after an hour is still rejected rather than accepted inside a huge drift
+  // cone.
+  {
+    Estimator clock;
+    constexpr std::uint64_t kSteps = 720'000;  // 1 hour at 5 ms
+    for (std::uint64_t i = 0; i <= kSteps; ++i) {
+      ASSERT_TRUE(
+          clock.Observe(2, 1'000'000 + 5'000 * i, 10'000'000 + 5'005 * i));
+    }
+    const std::uint64_t last_sample = 1'000'000 + 5'000 * kSteps;
+    const std::uint64_t last_receipt = 10'000'000 + 5'005 * kSteps;
+    EXPECT_FALSE(
+        clock.Observe(2, last_sample + 1'500'000, last_receipt + 5'005));
+    EXPECT_TRUE(clock.Observe(2, last_sample + 5'000, last_receipt + 5'005));
+    EXPECT_EQ(clock.ignored_count(), 1u);
+  }
+}
+
+// Guards RT-29 against SIGSTOP / startup stall + SO_RCVBUF tail-drop on an
+// unseen boot (e.g. a mid-boot bridge restart): draining stale buffered frames
+// leaves the initial anchor behind live time, so the first live frame is held
+// as a jump candidate and the second live frame (5 ms later, consistent at
+// physical clock rate) immediately re-syncs the anchor and resumes acceptance.
+// REQ-RT-20
+TEST(ClockOffset, UnseenBootStallTailDropRecoversOnTwoConsistentLiveFrames) {
+  {
+    Estimator clock;
+    // Unseen boot: bridge stalled 3 s while SO_RCVBUF buffered 10.000 s ..
+    // 11.000 s and tail-dropped 11.005 s .. 12.995 s.
+    ASSERT_TRUE(clock.Observe(9, 10'000'000, 13'000'000));
+    for (std::uint64_t i = 1; i <= Estimator::kWindowSamples; ++i) {
+      ASSERT_TRUE(clock.Observe(9, 10'000'000 + 5'000 * i, 13'001'000));
+    }
+    ASSERT_TRUE(clock.converged());
+    const std::int64_t stale_offset = clock.offset_us();
+    ASSERT_EQ(stale_offset, 2'001'000);
+
+    // Live frame 1 (2.005 s ahead of the stale anchor): held as jump candidate
+    // without disturbing the window or offset.
+    EXPECT_FALSE(clock.Observe(9, 13'005'000, 13'005'000));
+    EXPECT_EQ(clock.ignored_count(), 1u);
+    EXPECT_EQ(clock.offset_us(), stale_offset);
+
+    // A reordered stale duplicate does not disturb the pending candidate.
+    EXPECT_FALSE(clock.Observe(9, 10'995'000, 13'006'000));
+    EXPECT_EQ(clock.ignored_count(), 2u);
+
+    // Live frame 2 (5 ms later, consistent with live frame 1 at physical clock
+    // rate): re-syncs the anchor and is accepted immediately, snapping
+    // offset_us_ to 0 while stale delays age out of spread_us_.
+    EXPECT_TRUE(clock.Observe(9, 13'010'000, 13'010'000));
+    EXPECT_EQ(clock.ignored_count(), 2u);
+    EXPECT_TRUE(clock.converged());
+    EXPECT_EQ(clock.offset_us(), 0);
+    EXPECT_GT(clock.spread_us(), 2'000'000u);
+
+    // After a full window of live frames, stale buffered delays age out cleanly
+    // and a single corrupt jump is still rejected without locking out live
+    // time.
+    for (std::uint64_t i = 1; i <= Estimator::kWindowSamples; ++i) {
+      ASSERT_TRUE(
+          clock.Observe(9, 13'010'000 + 5'000 * i, 13'010'000 + 5'000 * i));
+    }
+    EXPECT_EQ(clock.offset_us(), 0);
+    EXPECT_EQ(clock.spread_us(), 0u);
+    const std::uint64_t live = 13'010'000 + 5'000 * Estimator::kWindowSamples;
+    EXPECT_FALSE(clock.Observe(9, live + 1'000'001, live));
+    EXPECT_TRUE(clock.Observe(9, live + 5'000, live + 5'000));
+    EXPECT_EQ(clock.ignored_count(), 3u);
+  }
+
+  // A backward bridge receipt must not confirm a pending jump candidate.
+  {
+    Estimator clock;
+    ASSERT_TRUE(clock.Observe(10, 10'000'000, 13'000'000));
+    ASSERT_TRUE(clock.Observe(10, 11'000'000, 13'001'000));
+    EXPECT_FALSE(clock.Observe(10, 13'005'000, 13'005'000));
+    EXPECT_FALSE(clock.Observe(10, 13'010'000, 13'004'000));
+    EXPECT_TRUE(clock.Observe(10, 13'015'000, 13'015'000));
+    EXPECT_EQ(clock.ignored_count(), 2u);
+  }
+}
+
+// Guards RT-29 boundary cases: exact 1 s jitter margin, burst catch-up after
+// delayed buffered frames (including UDP tail-drop after a multi-second pause),
+// long outages with up to 1000 ppm relative oscillator drift in either
+// direction, backward bridge clock without underflow, and arbitrary starting
+// sample_time_us on a new boot.
+// REQ-RT-20
+TEST(ClockOffset, JumpGuardAcceptsOutagesJitterAndNewBootWhileEnforcingBound) {
+  // 1. Exact boundary at receipt_delta == 0 and burst jitter catch-up.
+  {
+    Estimator clock;
+    // Frame 0 delayed by 400 ms; Frame 1 arrives promptly in the same Tick.
+    ASSERT_TRUE(clock.Observe(1, 1'000'000, 2'400'000));
+    EXPECT_TRUE(clock.Observe(1, 1'400'000, 2'400'000));
+    // Exact 1 s margin above the prompt anchor is accepted; 1 us past is not.
+    EXPECT_FALSE(clock.Observe(1, 2'400'001, 2'400'000));
+    EXPECT_TRUE(clock.Observe(1, 2'400'000, 2'400'000));
+    EXPECT_EQ(clock.ignored_count(), 1u);
+  }
+
+  // 2. Multi-second pause with 200 buffered stale frames followed by a live
+  // frame (UDP tail-drop): delayed frames must not pull the anchor back and
+  // lock out the live frame behind them.
+  {
+    Estimator clock;
+    ASSERT_TRUE(clock.Observe(2, 1'000'000, 1'000'000));
+    // 200 delayed frames drained at t = 3.5 s carrying s = 1.005 s .. 2.000 s.
+    for (std::uint64_t i = 1; i <= Estimator::kWindowSamples; ++i) {
+      ASSERT_TRUE(clock.Observe(2, 1'000'000 + 5'000 * i, 3'500'000));
+    }
+    // Live frame arrives at t = 3.505 s with s = 3.505 s (+1.505 s ahead of
+    // the last buffered frame, but matching the pre-pause anchor).
+    EXPECT_TRUE(clock.Observe(2, 3'505'000, 3'505'000));
+    // Once back at live time, 1 us past the 1 s margin is still rejected.
+    EXPECT_FALSE(clock.Observe(2, 3'505'000 + 1'000'001, 3'505'000));
+    EXPECT_EQ(clock.ignored_count(), 1u);
+  }
+
+  // 3. Long link outages (10 s and 1 hour) with 1000 ppm relative oscillator
+  // drift in either direction, plus exact bound check at 10 s (drift = 20 ms).
+  {
+    Estimator clock;
+    ASSERT_TRUE(clock.Observe(3, 1'000'000, 10'000'000));
+    // 10 s outage: max allowed = 10 s + 20 ms (2000 ppm) + 1 s = 11.020 s.
+    EXPECT_FALSE(clock.Observe(3, 1'000'000 + 11'020'001, 20'000'000));
+    // Gateway 1000 ppm fast across 10 s (+10 ms): accepted.
+    EXPECT_TRUE(clock.Observe(3, 1'000'000 + 10'010'000, 20'000'000));
+    // 1-hour outage with gateway 1000 ppm fast (+3.6 s): accepted.
+    EXPECT_TRUE(clock.Observe(3, 11'010'000 + 3'603'600'000ULL,
+                              20'000'000 + 3'600'000'000ULL));
+    // 1-hour outage with bridge 1000 ppm fast (-3.6 s): accepted without
+    // retreating the anchor on one frame (a far-future jump outside the 1-hour
+    // drift cone is still rejected immediately, and once 1 s of live frames
+    // refreshes the anchor a +1.5 s jump is rejected again).
+    const std::uint64_t s2 = 11'010'000 + 3'603'600'000ULL + 3'596'400'000ULL;
+    const std::uint64_t r2 = 20'000'000 + 7'200'000'000ULL;
+    EXPECT_TRUE(clock.Observe(3, s2, r2));
+    EXPECT_FALSE(clock.Observe(3, s2 + 15'000'000, r2 + 5'000));
+    constexpr std::uint64_t kRefreshSteps = 201;
+    for (std::uint64_t i = 1; i <= kRefreshSteps; ++i) {
+      ASSERT_TRUE(clock.Observe(3, s2 + 5'000 * i, r2 + 5'005 * i));
+    }
+    const std::uint64_t s3 = s2 + 5'000 * kRefreshSteps;
+    const std::uint64_t r3 = r2 + 5'005 * kRefreshSteps;
+    EXPECT_FALSE(clock.Observe(3, s3 + 1'500'000, r3 + 5'005));
+    EXPECT_EQ(clock.ignored_count(), 3u);
+  }
+
+  // 4. Backward bridge receipt_us must not underflow into a huge allowance,
+  // and a new boot resets the baseline for arbitrary starting sample_time_us.
+  {
+    Estimator clock;
+    ASSERT_TRUE(clock.Observe(4, 5'000, 10'000'000));
+    EXPECT_FALSE(clock.Observe(4, 5'000 + 1'000'001, 1'000'000));
+    EXPECT_TRUE(clock.Observe(4, 10'000, 1'000'000));
+    // New boot may jump far higher or far lower than the previous boot.
+    EXPECT_TRUE(clock.Observe(5, 900'000'000'000ULL, 10'005'000));
+    EXPECT_TRUE(clock.Observe(6, 0, 10'010'000));
+    EXPECT_FALSE(clock.Observe(6, 1'000'001, 10'010'000));
+    EXPECT_TRUE(clock.Observe(6, 5'000, 10'015'000));
+  }
+}
+
 }  // namespace
 }  // namespace talos::hardware
