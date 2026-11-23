@@ -34,9 +34,14 @@ class DriverStationSampler {
               uint64_t boot_id, bool socket_open,
               driver_station::DriverStationData& packet) {
     const uint32_t mode = driver_station::ModeKey(view.fms.flags);
-    const bool sample_due =
-        now_us - last_sample_us_ >= driver_station::kSamplePeriodUs;
+    const bool sample_due = !has_sent_ || (now_us >= last_sample_us_ &&
+                                           now_us - last_sample_us_ >=
+                                               driver_station::kSamplePeriodUs);
     if (!socket_open || (mode == last_mode_ && !sample_due)) return false;
+    prev_has_sent_ = has_sent_;
+    prev_sample_us_ = last_sample_us_;
+    prev_mode_ = last_mode_;
+    has_sent_ = true;
     last_sample_us_ = now_us;
     last_mode_ = mode;
     // The tick's view, so the packet is one refresh's and agrees with the
@@ -50,11 +55,24 @@ class DriverStationSampler {
     return true;
   }
 
+  // Undoes the cadence/mode bookkeeping of the immediately preceding Sample()
+  // when encoding or sending that packet failed, so the next tick with an open
+  // socket retries immediately (preserving the ModeTracker generation).
+  void RevertSample() {
+    has_sent_ = prev_has_sent_;
+    last_sample_us_ = prev_sample_us_;
+    last_mode_ = prev_mode_;
+  }
+
  private:
   driver_station::ModeTracker mode_;
+  bool has_sent_{false};
   uint64_t last_sample_us_{0};
   // The mode (ModeKey) of the last packet sent.
   uint32_t last_mode_{0};
+  bool prev_has_sent_{false};
+  uint64_t prev_sample_us_{0};
+  uint32_t prev_mode_{0};
 };
 
 }  // namespace talos::rio

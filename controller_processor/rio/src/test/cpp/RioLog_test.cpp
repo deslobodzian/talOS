@@ -592,4 +592,38 @@ TEST(RioLog, LoopTimingConcurrentOverrunAlwaysMatchesItsOwnPhases) {
   EXPECT_EQ(sum_overruns, kExpectedOverruns);
 }
 
+// A backward clock reading in ClosePhase() or Drain() must not underflow
+// unsigned elapsed times into multi-century phase durations or prematurely
+// expire a fault-coalescing window.
+// REQ-OPS-29
+TEST(RioLog, ClosePhaseAndCoalesceGuardBackwardClock) {
+  using talos::rio::TickPhase;
+  std::vector<std::string> lines;
+  RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
+  log.Drain(10'000'000);
+
+  log.BeginTick(10'000'000);
+  // Clock steps backward before ClosePhase: must clamp elapsed to 0, never
+  // wrap to ~2^64 ns.
+  log.ClosePhase(TickPhase::kLink, 9'000'000);
+  log.RecordTick(5'000, 1'000, 5'000);
+  log.Flush(10'000'000);
+  const auto phases =
+      std::find_if(lines.begin(), lines.end(), [](const std::string& line) {
+        return line.find("[rio] tick phases:") != std::string::npos;
+      });
+  ASSERT_NE(phases, lines.end());
+  EXPECT_NE(phases->find("link 0.0/0.0 us"), std::string::npos) << *phases;
+
+  // Backward Drain() timestamp must not expire an open coalescing window.
+  lines.clear();
+  ASSERT_TRUE(log.Post(FaultChange(1, 1u << 8, 0)));
+  log.Drain(20'000'000);
+  ASSERT_EQ(lines.size(), 1u);
+  ASSERT_TRUE(log.Post(FaultChange(1, 0, 1u << 8)));
+  log.Drain(19'000'000);
+  EXPECT_EQ(lines.size(), 1u)
+      << "backward clock step prematurely emitted coalesced fault line";
+}
+
 }  // namespace

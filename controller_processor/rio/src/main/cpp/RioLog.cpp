@@ -316,7 +316,7 @@ void RioLog::BeginTick(uint64_t now_ns) {
 }
 
 void RioLog::ClosePhase(TickPhase phase, uint64_t now_ns) {
-  const uint64_t elapsed = now_ns - boundary_ns_;
+  const uint64_t elapsed = now_ns > boundary_ns_ ? now_ns - boundary_ns_ : 0;
   const uint64_t nested = tick_total_ns_ - boundary_total_ns_;
   // The backend's phases lie inside the interval on the same clock, so
   // `nested` never exceeds it; the guard keeps a clock fault from wrapping.
@@ -502,7 +502,8 @@ void RioLog::Handle(const LogEvent& event, uint64_t now_us) {
       (*windows_)[kind][std::min<std::size_t>(event.index, kKeysPerKind - 1)];
   const uint32_t toggled =
       event.kind == LogKind::kMotorFault ? event.value ^ event.previous : 0;
-  const bool expired = now_us - window.start_us >= kWindowUs;
+  const bool expired =
+      now_us >= window.start_us && now_us - window.start_us >= kWindowUs;
   if (window.open && (!expired || window.suppressed > 0)) {
     ++window.suppressed;
     window.toggled |= toggled;
@@ -538,7 +539,10 @@ void RioLog::WriteDue(uint64_t now_us, bool force) {
   for (auto& kind : *windows_) {
     for (auto& window : kind) {
       if (!window.open) continue;
-      if (!force && now_us - window.start_us < kWindowUs) continue;
+      if (!force &&
+          (now_us < window.start_us || now_us - window.start_us < kWindowUs)) {
+        continue;
+      }
       if (window.suppressed == 0) {
         window.open = false;
         continue;

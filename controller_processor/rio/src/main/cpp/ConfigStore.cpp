@@ -1,8 +1,9 @@
 #include "ConfigStore.h"
 
+#include <array>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
+#include <span>
 #include <system_error>
 #include <utility>
 
@@ -53,9 +54,21 @@ bool SyncDirectory(const char* directory) {
 std::optional<hardware::Config> LoadConfigFile(const std::string& path) {
   std::ifstream file{path, std::ios::binary};
   if (!file) return std::nullopt;
-  const std::vector<uint8_t> bytes{std::istreambuf_iterator<char>{file}, {}};
+  // Bound the read so a corrupt or oversized file on disk cannot exhaust
+  // RoboRIO memory at boot; LoadPersistedConfig rejects any payload larger
+  // than kMaxPersistedConfigSize.
+  std::array<uint8_t, hardware::kMaxPersistedConfigSize + 1> bytes{};
+  file.read(reinterpret_cast<char*>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+  if (file.bad()) return std::nullopt;
+  const auto count = static_cast<std::size_t>(file.gcount());
+  if (count == 0 || count > hardware::kMaxPersistedConfigSize) {
+    return std::nullopt;
+  }
   hardware::Config config;
-  if (!hardware::LoadPersistedConfig(bytes, config)) return std::nullopt;
+  if (!hardware::LoadPersistedConfig(std::span{bytes.data(), count}, config)) {
+    return std::nullopt;
+  }
   return config;
 }
 

@@ -133,4 +133,61 @@ TEST(DriverStationSampler, SendsOnAModeChangeAndEverySamplePeriod) {
   EXPECT_EQ(sent, expected);
 }
 
+// On the first tick with a small monotonic clock (< kSamplePeriodUs) and zero
+// flags, a packet still goes out immediately; a subsequent backward clock step
+// must not underflow now_us - last_sample_us_ into a spurious send.
+// REQ-SAFE-10, REQ-RT-13
+TEST(DriverStationSampler,
+     InitialZeroModeNearZeroClockSendsAndBackwardClockDoesNotUnderflow) {
+  DriverStationSampler sampler;
+  const Tick first = RunTick(sampler, /*flags=*/0, /*now_us=*/5'000);
+  EXPECT_TRUE(first.sent)
+      << "first tick with flags=0 and now_us < kSamplePeriodUs did not send";
+
+  const Tick backward = RunTick(sampler, /*flags=*/0, /*now_us=*/1'000);
+  EXPECT_FALSE(backward.sent)
+      << "backward clock step underflowed into a spurious send";
+}
+
+// If encoding or sending a mode-change packet fails, RevertSample() rolls back
+// the cadence/mode state so the next open-socket tick retries immediately
+// without waiting kSamplePeriodUs, while preserving the exact mode_since_us
+// generation recorded on the transition tick.
+// REQ-SAFE-10, REQ-RT-13, REQ-RT-22
+TEST(DriverStationSampler,
+     RevertSampleRetriesModeChangeImmediatelyWhileKeepingGeneration) {
+  constexpr uint32_t kTeleopEnabled =
+      ds::kDsAttached | ds::kEnabled | ds::kTeleop;
+  constexpr uint32_t kAutoEnabled =
+      ds::kDsAttached | ds::kEnabled | ds::kAutonomous;
+  DriverStationSampler sampler;
+
+  const Tick initial = RunTick(sampler, kTeleopEnabled, kStartUs);
+  ASSERT_TRUE(initial.sent);
+
+  // Enabled mode switch (teleop -> auto) 5 ms later; simulate UDP send failure.
+  const uint64_t switch_us = kStartUs + kPeriodUs;
+  const Tick failed = RunTick(sampler, kAutoEnabled, switch_us);
+  ASSERT_TRUE(failed.sent);
+  ASSERT_EQ(failed.packet.mode_since_us, switch_us);
+  sampler.RevertSample();
+  // Idempotent on repeated calls without an intervening Sample().
+  sampler.RevertSample();
+
+  // Next tick (still 10 ms < kSamplePeriodUs from initial): must retry at once
+  // with the original transition's mode_since_us generation.
+  const uint64_t retry_us = switch_us + kPeriodUs;
+  const Tick retried = RunTick(sampler, kAutoEnabled, retry_us);
+  ASSERT_TRUE(retried.sent)
+      << "mode change was delayed up to kSamplePeriodUs after failed send";
+  EXPECT_EQ(retried.packet.mode_since_us, switch_us);
+  EXPECT_EQ(retried.packet.sample_time_us, retry_us);
+  EXPECT_EQ(retried.packet.boot_id, kBootId);
+
+  // Once sent, normal kSamplePeriodUs cadence resumes from the successful send.
+  EXPECT_FALSE(RunTick(sampler, kAutoEnabled, retry_us + kPeriodUs).sent);
+  EXPECT_TRUE(
+      RunTick(sampler, kAutoEnabled, retry_us + ds::kSamplePeriodUs).sent);
+}
+
 }  // namespace
