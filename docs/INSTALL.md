@@ -168,13 +168,14 @@ Third-party patches in `third_party/` that sanitizer runs depend on:
   only its `--config=tsan` runs report that flag's race. (talOS fetches
   toml++ as its own patched archive instead, so its parser patch reaches
   every repository that depends on talOS.)
-- `third_party/apriltag_pjpeg_bounds.patch`: bounds and overflow fixes in AprilTag's JPEG
-  decoder (`pjpeg.c`), used only by the offline `DetectImageFile` API; live
-  capture passes raw GREY/YUYV buffers to `Detect`.
-  `//talOS/vision/sanitizer:jpeg_loader_test` runs only 64 deterministic
-  corrupt-scan variants of one fixture photograph under ASan/UBSan (memory
-  safety only); intact photographs are decoded in
-  `//talOS/vision/apriltag:cpu_apriltag_backend_test`.
+- `third_party/apriltag_pjpeg_bounds.patch`: bounds, overflow, malformed-header/file,
+  and restart-marker (`RST`) DC-predictor fixes in AprilTag's JPEG decoder (`pjpeg.c`),
+  used only by the offline `DetectImageFile` API; live capture passes raw GREY/YUYV
+  buffers to `Detect`. `//talOS/vision/sanitizer:jpeg_loader_test` runs 64 deterministic
+  corrupt-scan variants of one fixture photograph (memory safety under ASan/UBSan),
+  regression cases for empty/missing-scan inputs, marker lengths < 2, truncated DHT
+  segments, and directory paths, plus a multi-component `RST` decode check; intact
+  photographs are decoded in `//talOS/vision/apriltag:cpu_apriltag_backend_test`.
 
 ## Building without a network
 
