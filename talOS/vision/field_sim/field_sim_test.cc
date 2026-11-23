@@ -500,5 +500,22 @@ TEST(FieldLayoutLoader, SeededFuzzMutationsNeverCrashOrLeakNonFinite) {
   }
 }
 
+TEST(JsonParser, AsIntReturnsFallbackOnOutOfRangeOrNonFiniteNumber) {
+  for (const char* json : {R"({"x": 1e30})", R"({"x": -1e30})",
+                           R"({"x": 2147483648})", R"({"x": -2147483649})"}) {
+    SCOPED_TRACE(json);
+    JsonValue root;
+    std::string err;
+    ASSERT_TRUE(ParseJson(json, &root, &err)) << err;
+    const JsonValue* x = root.Find("x");
+    ASSERT_NE(x, nullptr);
+    EXPECT_EQ(x->AsInt(-7), -7);
+  }
+  JsonValue nan_val;
+  nan_val.type = JsonValue::Type::kNumber;
+  nan_val.number = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(nan_val.AsInt(-7), -7);
+}
+
 }  // namespace
 }  // namespace talos::vision::field_sim
