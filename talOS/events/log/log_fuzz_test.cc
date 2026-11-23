@@ -1,10 +1,13 @@
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <random>
 #include <span>
@@ -422,7 +425,8 @@ TEST(LogFuzzTest, SessionManifestSeededMutations) {
     for (std::size_t len = 0; len <= seed.size(); len += 7) {
       try {
         (void)session_manifest::Parse(std::string_view{seed}.substr(0, len));
-      } catch (const session_manifest::ManifestError&) {
+      } catch (const session_manifest::ManifestError& error) {
+        (void)error;
       }
     }
     for (int iter = 0; iter < 512; ++iter) {
@@ -433,7 +437,9 @@ TEST(LogFuzzTest, SessionManifestSeededMutations) {
         switch (rng() % 4) {
           case 0:
             if (pos < mutated.size()) {
-              mutated[pos] ^= static_cast<char>(1u << (rng() % 8));
+              mutated[pos] =
+                  static_cast<char>(static_cast<unsigned char>(mutated[pos]) ^
+                                    (1u << (rng() % 8)));
             }
             break;
           case 1:
@@ -451,10 +457,75 @@ TEST(LogFuzzTest, SessionManifestSeededMutations) {
       }
       try {
         (void)session_manifest::Parse(mutated);
-      } catch (const session_manifest::ManifestError&) {
+      } catch (const session_manifest::ManifestError& error) {
+        (void)error;
       }
     }
   }
+}
+
+// REQ-OPS-14, REQ-OPS-42: session_manifest::ReadText must bound how much of
+// manifest.json it loads (4 MiB, matching Studio's kMaxManifestBytes) and fail
+// closed on oversized or non-regular files while keeping empty and valid
+// manifests readable.
+TEST(LogFuzzTest, SessionManifestReadTextEnforcesSizeBoundAndRegularFiles) {
+  namespace fs = std::filesystem;
+  constexpr std::size_t kExpectedMaxManifestBytes = std::size_t{4} << 20;
+  static_assert(session_manifest::kMaxManifestBytes ==
+                kExpectedMaxManifestBytes);
+  const fs::path base = fs::path{::testing::TempDir()} /
+                        ("talos_manifest_bound_" + std::to_string(::getpid()));
+  std::error_code ec;
+  fs::remove_all(base, ec);
+  ASSERT_TRUE(fs::create_directories(base, ec)) << ec.message();
+
+  // Missing manifest.json -> nullopt.
+  EXPECT_FALSE(session_manifest::ReadText(base).has_value());
+
+  // Empty 0-byte manifest.json -> returns "" (so callers parse and fail
+  // closed).
+  {
+    std::ofstream empty{base / session_manifest::kFileName, std::ios::binary};
+    ASSERT_TRUE(empty.good());
+    empty.close();
+    const auto text = session_manifest::ReadText(base);
+    ASSERT_TRUE(text.has_value());
+    EXPECT_TRUE(text->empty());
+  }
+
+  // Exact upper bound (4 MiB) -> accepted in full.
+  {
+    const std::string payload(kExpectedMaxManifestBytes, ' ');
+    std::ofstream out{base / session_manifest::kFileName, std::ios::binary};
+    out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    ASSERT_TRUE(out.good());
+    out.close();
+    const auto text = session_manifest::ReadText(base);
+    ASSERT_TRUE(text.has_value());
+    EXPECT_EQ(text->size(), kExpectedMaxManifestBytes);
+  }
+
+  // Oversized (4 MiB + 1 byte) -> rejected (nullopt).
+  {
+    std::ofstream out{base / session_manifest::kFileName,
+                      std::ios::binary | std::ios::app};
+    out.put('x');
+    ASSERT_TRUE(out.good());
+    out.close();
+    EXPECT_FALSE(session_manifest::ReadText(base).has_value());
+  }
+
+  // Directory named manifest.json -> rejected (nullopt), not empty string.
+  fs::remove(base / session_manifest::kFileName, ec);
+  ASSERT_TRUE(fs::create_directory(base / session_manifest::kFileName, ec));
+  EXPECT_FALSE(session_manifest::ReadText(base).has_value());
+
+  // FIFO named manifest.json -> rejected (nullopt) without blocking.
+  fs::remove(base / session_manifest::kFileName, ec);
+  ASSERT_EQ(::mkfifo((base / session_manifest::kFileName).c_str(), 0600), 0);
+  EXPECT_FALSE(session_manifest::ReadText(base).has_value());
+
+  fs::remove_all(base, ec);
 }
 
 }  // namespace

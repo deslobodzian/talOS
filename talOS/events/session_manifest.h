@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -22,6 +23,10 @@
 namespace talos::event::session_manifest {
 
 inline constexpr std::string_view kFileName = "manifest.json";
+
+// Maximum manifest.json size ReadText will load (4 MiB, matching Studio's
+// kMaxManifestBytes in studio/review/review.h).
+inline constexpr std::size_t kMaxManifestBytes = std::size_t{4} << 20;
 
 // The members this reader reads, as the launcher writes them.
 inline constexpr std::string_view kSessionId = "session_id";
@@ -79,7 +84,8 @@ class ManifestError : public std::runtime_error {
 // that is not an object reads as no members. Throws ManifestError.
 Fields Parse(std::string_view text);
 
-// The text of `<directory>/manifest.json`; nullopt when it cannot be opened.
+// The text of `<directory>/manifest.json`; nullopt when it cannot be opened,
+// is not a regular file, or exceeds kMaxManifestBytes.
 std::optional<std::string> ReadText(const std::filesystem::path& directory);
 
 }  // namespace talos::event::session_manifest
