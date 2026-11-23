@@ -45,6 +45,8 @@ cc_library(
     hdrs = ["testing.h"],
     implementation_deps = [
         ":teleop",
+        "//talOS/events:events_core",
+        "//talOS/node",
         "//talOS/node:testing",
     ],
     visibility = ["//visibility:public"],

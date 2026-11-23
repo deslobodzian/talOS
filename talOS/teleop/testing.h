@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace talos::testing {
 class Sim;
@@ -11,5 +13,13 @@ namespace talos::teleop {
 // Adds the declarative teleop node to `sim` without exposing the internal
 // talOS/teleop/node.h (and talOS/node/access.h) header to node tests.
 void AddTeleop(talos::testing::Sim& sim, const std::string& name = "teleop");
+
+// Adds the declarative teleop node wrapped to record each update() callback's
+// entry-to-exit monotonic wall duration (nanoseconds) into `samples_ns` while
+// `recording` is true (REQ-RT-07; docs/METHODOLOGY.md §10). Both references
+// must outlive `sim`.
+void AddTimedTeleop(talos::testing::Sim& sim,
+                    std::vector<std::int64_t>& samples_ns,
+                    const bool& recording, const std::string& name = "teleop");
 
 }  // namespace talos::teleop

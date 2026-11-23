@@ -146,6 +146,22 @@ cc_library(
     ],
 )
 
+# Test helper for robot/bench Sim tests to add the telemetry node without
+# exposing talOS/telemetry/node.h or talOS/node/access.h.
+cc_library(
+    name = "testing",
+    testonly = True,
+    srcs = ["testing.cc"],
+    hdrs = ["testing.h"],
+    implementation_deps = [
+        ":telemetry",
+        "//talOS/events:events_core",
+        "//talOS/node",
+        "//talOS/node:testing",
+    ],
+    visibility = ["//visibility:public"],
+)
+
 talos_cc_node(
     name = "node",
     srcs = ["node.cc"],

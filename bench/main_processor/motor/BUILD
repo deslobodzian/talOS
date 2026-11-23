@@ -14,6 +14,7 @@ cc_library(
     hdrs = ["motor.h"],
     include_prefix = "motor",
     strip_include_prefix = ".",
+    visibility = ["//bench/main_processor:__pkg__"],
     deps = [
         ":messages",
         "//talOS/bridge:messages",
