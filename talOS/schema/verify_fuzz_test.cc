@@ -121,8 +121,8 @@ std::string CraftHostileSchema(std::mt19937_64& rng) {
                                    : static_cast<std::int8_t>(rng() % 20);
       fbb.AddElement<std::int8_t>(reflection::Type::VT_BASE_TYPE, base, 0);
       fbb.AddElement<std::int8_t>(reflection::Type::VT_ELEMENT, elem, 0);
-      // Avoid 2-field self-cycle in DecodeToText/struct_hash while exercising
-      // all other indices (0..3, -1, 99).
+      // Exercise all object/enum indices (0..3, -1, 4), including self-cycles
+      // and mutual cycles.
       const std::int32_t idx = static_cast<std::int32_t>(rng() % 6) - 1;
       fbb.AddElement<std::int32_t>(reflection::Type::VT_INDEX, idx, -1);
       fbb.AddElement<std::uint16_t>(reflection::Type::VT_FIXED_LENGTH,
@@ -203,18 +203,24 @@ void ExerciseSchemaAndPayload(std::string_view bfbs,
                   FieldValue{1.25}, FieldValue{std::string{"OFF"}}}) {
               try {
                 EncodeField(buf.data(), rf, v, "fuzz");
-              } catch (const std::invalid_argument&) {
+              } catch (const std::invalid_argument& e) {
+                // Expected rejection of malformed/mismatched fuzz inputs.
+                EXPECT_NE(e.what(), nullptr);
               }
             }
           }
-        } catch (const std::invalid_argument&) {
+        } catch (const std::invalid_argument& e) {
+          // Expected rejection of malformed/hostile fuzz schemas.
+          EXPECT_NE(e.what(), nullptr);
         }
       }
       // Also exercise malformed field paths.
       for (const char* bad : {"", "/", "a/", "/a", "a//b", "missing/x"}) {
         try {
           (void)ResolveField(*schema, *obj, bad, "fuzz");
-        } catch (const std::invalid_argument&) {
+        } catch (const std::invalid_argument& e) {
+          // Expected rejection of malformed field paths.
+          EXPECT_NE(e.what(), nullptr);
         }
       }
     }
@@ -247,11 +253,12 @@ TEST(SchemaVerifyFuzz, SeededMutatedBfbsAndHostileSchemasDoNotCrash) {
     }
   }
 
-  // 1,000 semantically hostile FlatBuffer schemas for field_path + verify.
+  // 1,000 semantically hostile FlatBuffer schemas across VerifySchema,
+  // DecodeToText, struct_hash, and field_path.
   for (int iter = 0; iter < 1000; ++iter) {
     const std::string crafted = CraftHostileSchema(rng);
     const std::array<std::byte, 64> payload{};
-    ExerciseSchemaAndPayload(crafted, payload, rng, false);
+    ExerciseSchemaAndPayload(crafted, payload, rng, true);
   }
 }
 
