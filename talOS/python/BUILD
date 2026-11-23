@@ -145,15 +145,13 @@ py_test(
     ],
 )
 
+_TALOS_PY_SRCS = glob(["talos/**/*.py"])
+
 py_test(
     name = "api_parity_test",
     size = "small",
     srcs = ["api_parity_test.py"],
-    data = [
-        "talos/__init__.py",
-        "talos/_abi.py",
-        "talos/devices.py",
-        "talos/mechanisms.py",
+    data = _TALOS_PY_SRCS + [
         "//talOS/node_api:node_api.h",
     ],
     env = {
@@ -162,6 +160,7 @@ py_test(
         "TALOS_ABI_INIT": "$(rlocationpath talos/__init__.py)",
         "TALOS_ABI_MECHANISMS": "$(rlocationpath talos/mechanisms.py)",
         "TALOS_ABI_PYTHON": "$(rlocationpath talos/_abi.py)",
+        "TALOS_PY_SRCS": ":".join(["$(rlocationpath %s)" % s for s in _TALOS_PY_SRCS]),
     },
     # A generated empty talos/__init__.py here would collide with the tracked
     # one in every other test's runfiles (see tools/check_runfiles_collisions.py).
