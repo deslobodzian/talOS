@@ -135,6 +135,14 @@ jobs:
         set -euo pipefail
         tar xzf src.tar.gz
         cd talos
+        # The archive has no .git, and a test can need a git checkout:
+        # controller_processor/rio's gradlew refuses a caller's revision
+        # stamp only inside one, which its test checks. One commit holding
+        # exactly the archived files, made before anything else is written.
+        git init -q
+        git add -Af
+        git -c user.name=cloud-build -c user.email=cloud-build@invalid \
+          commit -q -m "the archived commit"
         # The toolchain the repository's own setup installs (bazelisk as
         # `bazel`, g++, python3, Node and pnpm); no RoboRIO or lint tools.
         tools/setup.sh --yes --no-rio --no-lint
