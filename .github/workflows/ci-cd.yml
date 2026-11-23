@@ -1,7 +1,8 @@
 name: Cloud Build
 
-# Builds //... and runs the replay tests on a 16-core Spot VM in Google
-# Cloud, against the bazel-remote cache VM (scripts/, .bazelrc build:gcp).
+# Runs one lane of the suite on a 16-core Spot VM in Google Cloud, against
+# the bazel-remote cache VM (scripts/, .bazelrc build:gcp):
+#   gh workflow run "Cloud Build" --ref <branch> -f lane=fast
 #
 # Started by hand only. It is a trusted writer of the shared cache, so it
 # must never run code from a fork: do not add a pull_request trigger.
@@ -11,13 +12,29 @@ name: Cloud Build
 
 on:
   workflow_dispatch:
+    inputs:
+      lane:
+        description: What to run after bazel build //...
+        type: choice
+        default: replay
+        options:
+        - replay   # the replay tests, found by query
+        - fast     # bazel test --config=fast //...
+        - full     # bazel test //...
+        - asan     # tools/sanitizer_lane.sh asan
+        - tsan     # tools/sanitizer_lane.sh tsan
+      max_minutes:
+        description: Minutes after which Google deletes the VM
+        type: choice
+        default: "20"
+        options: ["20", "40"]
 
 permissions:
   contents: read
   id-token: write   # the OIDC token Workload Identity Federation exchanges
 
 concurrency:
-  group: cloud-build-${{ github.ref }}
+  group: cloud-build-${{ github.ref }}-${{ inputs.lane }}
   cancel-in-progress: true
 
 env:
@@ -27,13 +44,16 @@ env:
   BUILD_SA: ci-build-vm@${{ vars.GCP_PROJECT_ID }}.iam.gserviceaccount.com
   # One VM per run attempt, so a re-run never meets the last attempt's VM.
   VM: talos-ci-${{ github.run_id }}-${{ github.run_attempt }}
+  LANE: ${{ inputs.lane }}
+  MAX_MINUTES: ${{ inputs.max_minutes }}
 
 jobs:
   spot-build:
-    name: Build and replay tests (Spot VM)
+    name: ${{ inputs.lane }} lane (Spot VM)
     runs-on: ubuntu-latest
-    # The VM deletes itself at 20 minutes; the rest is creation and cleanup.
-    timeout-minutes: 30
+    # The VM deletes itself at max_minutes (40 at most); the rest is
+    # creation and cleanup.
+    timeout-minutes: 50
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
@@ -60,7 +80,7 @@ jobs:
           --machine-type=n2d-standard-16 \
           --provisioning-model=SPOT \
           --instance-termination-action=DELETE \
-          --max-run-duration=20m \
+          --max-run-duration="${MAX_MINUTES}m" \
           --image-family=ubuntu-2404-lts-amd64 --image-project=ubuntu-os-cloud \
           --boot-disk-size=100GB --boot-disk-type=pd-balanced \
           --network-interface="subnet=$SUBNET,no-address" \
@@ -86,19 +106,40 @@ jobs:
         gcloud compute scp "$RUNNER_TEMP/src.tar.gz" "$VM":src.tar.gz \
           --project="$PROJECT_ID" --zone="$ZONE" --tunnel-through-iap
 
-    - name: Build and run the replay tests
-      # A preemption or the 20-minute limit ends the SSH session, which
+    - name: Build and run the lane
+      # A preemption or the run-duration limit ends the SSH session, which
       # fails this step; the VM is already gone then.
       run: |
         gcloud compute ssh "$VM" --project="$PROJECT_ID" --zone="$ZONE" \
-          --tunnel-through-iap --command='bash -s' <<'REMOTE'
+          --tunnel-through-iap --command="LANE=$LANE bash -s" <<'REMOTE'
         set -euo pipefail
         tar xzf src.tar.gz
         cd talos
         # The toolchain the repository's own setup installs (bazelisk as
         # `bazel`, g++, python3, Node and pnpm); no RoboRIO or lint tools.
         tools/setup.sh --yes --no-rio --no-lint
+        # Two kernel settings as GitHub's Ubuntu runners have them. Ubuntu
+        # 24.04's 32 bits of mmap randomization put mappings where
+        # ThreadSanitizer cannot track them ("unexpected memory mapping"),
+        # and its AppArmor default refuses the unprivileged user namespace
+        # //talOS/protocol:udp_address_change_test needs.
+        sudo sysctl -w vm.mmap_rnd_bits=28 \
+          kernel.apparmor_restrict_unprivileged_userns=0
+        # A short output base. The OS Login account's name is 24 characters,
+        # and under ~/.cache/bazel the hermetic Python's path passes the
+        # kernel's 255-character limit on a script's "#!" line, which a test
+        # that writes such a script (//talOS/build:sim_check_no_state_test)
+        # then fails on with "Exec format error".
+        sudo install -d -o "$(id -u)" -g "$(id -g)" /b
+        echo 'startup --output_user_root=/b' >> ~/.bazelrc
         bazel build --config=gcp //...
+        case "$LANE" in
+          fast) exec bazel test --config=gcp --config=fast --test_output=errors //... ;;
+          full) exec bazel test --config=gcp --test_output=errors //... ;;
+          asan|tsan) exec tools/sanitizer_lane.sh "$LANE" --config=gcp ;;
+          replay) ;;
+          *) echo "unknown lane: $LANE" >&2; exit 2 ;;
+        esac
         # Every test target whose name says replay, so a new one is picked
         # up without editing this file. --keep_going: some external
         # packages do not load on every host (docs/DEVELOPMENT.md §5).
@@ -120,6 +161,31 @@ jobs:
         # shellcheck disable=SC2086
         bazel test --config=gcp --test_output=errors $replay
         REMOTE
+
+    - name: Fetch the test logs
+      # Nothing to fetch when the VM is already gone (preempted or timed
+      # out): the step then says so and passes.
+      if: failure()
+      run: |
+        if gcloud compute ssh "$VM" --project="$PROJECT_ID" --zone="$ZONE" \
+             --tunnel-through-iap --command='cd talos &&
+               find -L bazel-testlogs -name test.log > ~/testlogs.txt &&
+               [ -s ~/testlogs.txt ] &&
+               tar czf ~/testlogs.tar.gz -T ~/testlogs.txt' &&
+           gcloud compute scp "$VM":testlogs.tar.gz "$RUNNER_TEMP/testlogs.tar.gz" \
+             --project="$PROJECT_ID" --zone="$ZONE" --tunnel-through-iap; then
+          echo "have_logs=1" >> "$GITHUB_ENV"
+        else
+          echo "no test logs fetched (the VM may already be gone)"
+        fi
+
+    - name: Upload the test logs
+      if: failure() && env.have_logs == '1'
+      uses: actions/upload-artifact@v4
+      with:
+        name: cloud-build-testlogs-${{ inputs.lane }}
+        path: ${{ runner.temp }}/testlogs.tar.gz
+        retention-days: 7
 
     - name: Delete the Spot VM
       if: always()
