@@ -195,6 +195,9 @@ TEST(Target,
   EXPECT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kNeutral);
 }
 
+// REQ-SAFE-08: Target::get() judges freshness from the writer's publication
+// timestamp, so a paused consumer resuming after command_timeout_us rejects a
+// queued target on its first drain rather than treating drain time as fresh
 // REQ-SAFE-31: the first request after a gap, as after a restart, is neutral
 // on a lane that expired before the consumer drained it
 TEST(Target, PausedConsumerNeverActuatesOnExpiredQueuedTargetAfterResume) {
