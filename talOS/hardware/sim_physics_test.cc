@@ -2478,5 +2478,626 @@ TEST(SimBelievability,
   }
 }
 
+namespace {
+
+constexpr double kTestTau = 6.28318530717958647692;
+
+Config FourCornerSwerveConfig(double gear_ratio = 6.75,
+                              double stator_limit_a = 80.0,
+                              double supply_limit_a = 400.0) {
+  Config config;
+  config.commissioned = true;
+  config.command_timeout_us = 100000;
+  const std::array<const char*, 4> names{"front_left", "front_right",
+                                         "back_left", "back_right"};
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    auto drive = TestMotor(static_cast<uint16_t>(2 * i + 1), "drive",
+                           static_cast<int>(2 * i + 1));
+    drive.name = std::string(names[i]) + "_drive";
+    drive.sensor_to_mechanism_ratio = gear_ratio;
+    drive.stator_limit_a = stator_limit_a;
+    drive.supply_limit_a = supply_limit_a;
+    drive.max_voltage = 12.0;
+
+    auto steer = TestMotor(static_cast<uint16_t>(2 * i + 2), "steer",
+                           static_cast<int>(2 * i + 2));
+    steer.name = std::string(names[i]) + "_steer";
+    steer.continuous_wrap = true;
+    steer.slots[0].p = 20.0;
+    steer.slots[0].d = 0.2;
+    steer.stator_limit_a = 80.0;
+    steer.supply_limit_a = 80.0;
+
+    config.motors.push_back(drive);
+    config.motors.push_back(steer);
+  }
+  config.sensors.push_back({20, "imu", SensorKind::kPigeon2, 30, "rio"});
+  return config;
+}
+
+}  // namespace
+
+// REQ-DEV-10: Rigid-body mechanism ODE obeys analytical current-limited
+// flywheel spin-up (delta_omega ~= (G * k_t * I_lim / J_mech) * dt), scales
+// monotonically in inertia J and gear ratio G, honors static friction stiction,
+// and survives Configure().
+TEST(SimMechanismOde, FlywheelSpinUpInertiaGearingAndStaticFriction) {
+  constexpr double kGear = 2.0;
+  constexpr double kInertia = 0.02;
+  constexpr double kStatorLimit = 40.0;
+  constexpr double kDt = 0.05;  // 10 x 5 ms
+  const sim::MotorModel x60 = sim::MotorModelFor(MotorType::kKrakenX60);
+  const double expected_delta_rps =
+      (kGear * x60.torque_constant_nm_per_a() * kStatorLimit / kInertia) * kDt /
+      kTestTau;
+
+  Config cfg = SingleMotorConfig();
+  cfg.motors[0].sensor_to_mechanism_ratio = kGear;
+  cfg.motors[0].stator_limit_a = kStatorLimit;
+  cfg.motors[0].supply_limit_a = 400.0;
+
+  // SetMechanisms before Configure() must survive Configure().
+  PhysicsSimBackend backend;
+  backend.SetMechanisms({{.motor_can_id = 1,
+                          .inertia_kg_m2 = kInertia,
+                          .load = sim::LoadKind::kFlywheel}});
+  ASSERT_TRUE(backend.Configure(cfg));
+  std::array<MotorRequest, 1> cmd{{{1, Mode::kVoltage, 0, 12.0, 0.0}}};
+  ASSERT_TRUE(backend.Apply(cmd));
+  State s{};
+  uint64_t now_us = 0;
+  StepBackend(backend, s, now_us, 5000, 1);   // dt = 0
+  StepBackend(backend, s, now_us, 5000, 10);  // 50 ms
+  EXPECT_NEAR(s.motors[0].velocity_rps, expected_delta_rps,
+              0.02 * expected_delta_rps);
+  EXPECT_NEAR(s.motors[0].stator_current_a, kStatorLimit, 0.5);
+
+  // Monotonicity in J: larger inertia yields strictly slower spin-up, scaling
+  // inversely with J while current-limited.
+  double prev_vel = std::numeric_limits<double>::infinity();
+  std::array<double, 3> vels_by_j{};
+  const std::array<double, 3> inertias{0.005, 0.02, 0.08};
+  for (std::size_t idx = 0; idx < inertias.size(); ++idx) {
+    PhysicsSimBackend b;
+    b.SetMechanisms({{.motor_can_id = 1,
+                      .inertia_kg_m2 = inertias[idx],
+                      .load = sim::LoadKind::kFlywheel}});
+    ASSERT_TRUE(b.Configure(cfg));
+    ASSERT_TRUE(b.Apply(cmd));
+    State st{};
+    uint64_t t = 0;
+    StepBackend(b, st, t, 5000, 1);
+    StepBackend(b, st, t, 5000, 10);
+    vels_by_j[idx] = st.motors[0].velocity_rps;
+    EXPECT_LT(vels_by_j[idx], prev_vel);
+    prev_vel = vels_by_j[idx];
+  }
+  EXPECT_NEAR(vels_by_j[0] / vels_by_j[1], 4.0, 0.05);
+  EXPECT_NEAR(vels_by_j[1] / vels_by_j[2], 4.0, 0.05);
+
+  // Monotonicity in G: higher gear ratio multiplies mechanism torque
+  // (G * k_t * I_lim) so current-limited initial acceleration increases with G.
+  double prev_gear_vel = 0.0;
+  for (const double gear : {1.0, 2.0, 4.0}) {
+    Config gcfg = cfg;
+    gcfg.motors[0].sensor_to_mechanism_ratio = gear;
+    PhysicsSimBackend b;
+    b.SetMechanisms({{.motor_can_id = 1,
+                      .inertia_kg_m2 = 0.05,
+                      .load = sim::LoadKind::kFlywheel}});
+    ASSERT_TRUE(b.Configure(gcfg));
+    ASSERT_TRUE(b.Apply(cmd));
+    State st{};
+    uint64_t t = 0;
+    StepBackend(b, st, t, 5000, 1);
+    StepBackend(b, st, t, 5000, 5);  // 25 ms, still current-limited
+    EXPECT_GT(st.motors[0].velocity_rps, prev_gear_vel);
+    prev_gear_vel = st.motors[0].velocity_rps;
+  }
+
+  // Static friction holds the shaft at 0 below breakaway torque and lets it
+  // spin above breakaway torque.
+  {
+    PhysicsSimBackend b;
+    b.SetMechanisms({{.motor_can_id = 1,
+                      .inertia_kg_m2 = 0.01,
+                      .load = sim::LoadKind::kRoller,
+                      .viscous_damping_nm_per_radps = 0.0,
+                      .static_friction_nm = 2.0}});
+    ASSERT_TRUE(
+        b.Configure(cfg));  // G = 2 -> 1.0 N*m rotor breakaway (~51.6 A)
+    // Stator limit 40 A gives G * k_t * 40 = 1.55 N*m < 2.0 N*m static
+    // friction.
+    ASSERT_TRUE(b.Apply(cmd));
+    State st{};
+    uint64_t t = 0;
+    StepBackend(b, st, t, 5000, 20);
+    EXPECT_DOUBLE_EQ(st.motors[0].velocity_rps, 0.0);
+    EXPECT_DOUBLE_EQ(st.motors[0].position_rot, 0.0);
+
+    // Raise stator limit to 80 A -> 3.10 N*m > 2.0 N*m: breaks away cleanly.
+    Config strong = cfg;
+    strong.motors[0].stator_limit_a = 80.0;
+    ASSERT_TRUE(b.Configure(strong));
+    ASSERT_TRUE(b.Apply(cmd));
+    StepBackend(b, st, t, 5000, 1);
+    StepBackend(b, st, t, 5000, 20);
+    EXPECT_GT(st.motors[0].velocity_rps, 1.0);
+  }
+}
+
+// REQ-DEV-10: Active followers (aligned or opposed, in any config order) sum
+// torque onto the root master's shared rigid-body shaft, doubling acceleration
+// for two identical current-limited motors.
+TEST(SimMechanismOde, MasterAndFollowerDoubleAccelerationOnSharedShaft) {
+  auto make_single = []() {
+    Config c = SingleMotorConfig();
+    c.motors[0].sensor_to_mechanism_ratio = 2.0;
+    c.motors[0].stator_limit_a = 40.0;
+    c.motors[0].supply_limit_a = 400.0;
+    return c;
+  };
+
+  PhysicsSimBackend single_backend;
+  single_backend.SetMechanisms({{.motor_can_id = 1,
+                                 .inertia_kg_m2 = 0.05,
+                                 .load = sim::LoadKind::kFlywheel}});
+  ASSERT_TRUE(single_backend.Configure(make_single()));
+  std::array<MotorRequest, 1> single_cmd{{{1, Mode::kVoltage, 0, 12.0, 0.0}}};
+  ASSERT_TRUE(single_backend.Apply(single_cmd));
+  State single_state{};
+  uint64_t t0 = 0;
+  StepBackend(single_backend, single_state, t0, 5000, 1);
+  StepBackend(single_backend, single_state, t0, 5000, 10);
+  const double single_vel = single_state.motors[0].velocity_rps;
+  ASSERT_GT(single_vel, 0.2);
+
+  for (const bool oppose : {false, true}) {
+    for (const bool follower_first : {false, true}) {
+      SCOPED_TRACE(testing::Message() << "oppose=" << oppose
+                                      << " follower_first=" << follower_first);
+      Config dual = make_single();
+      auto follower = TestMotor(2, "follower", 2);
+      follower.master_id = 1;
+      follower.oppose_master = oppose;
+      follower.sensor_to_mechanism_ratio = 2.0;
+      follower.stator_limit_a = 40.0;
+      follower.supply_limit_a = 400.0;
+      dual.motors.push_back(follower);
+      if (follower_first) std::swap(dual.motors[0], dual.motors[1]);
+      const std::size_t master_idx = follower_first ? 1 : 0;
+      const std::size_t slave_idx = 1 - master_idx;
+
+      PhysicsSimBackend dual_backend;
+      dual_backend.SetMechanisms({{.motor_can_id = 1,
+                                   .inertia_kg_m2 = 0.05,
+                                   .load = sim::LoadKind::kFlywheel}});
+      ASSERT_TRUE(dual_backend.Configure(dual));
+      std::array<MotorRequest, 2> cmd{};
+      cmd[master_idx] = {1, Mode::kVoltage, 0, 12.0, 0.0};
+      cmd[slave_idx] = Duty(2, 0.0);  // Non-neutral activates follower.
+      ASSERT_TRUE(dual_backend.Apply(cmd));
+      State st{};
+      uint64_t t = 0;
+      StepBackend(dual_backend, st, t, 5000, 1);
+      StepBackend(dual_backend, st, t, 5000, 10);
+
+      EXPECT_NEAR(st.motors[master_idx].velocity_rps, 2.0 * single_vel,
+                  0.03 * single_vel);
+      EXPECT_NEAR(st.motors[slave_idx].velocity_rps,
+                  st.motors[master_idx].velocity_rps * (oppose ? -1.0 : 1.0),
+                  1e-9);
+    }
+  }
+}
+
+// REQ-DEV-10: In the rigid-body ODE, brake neutral applies shorted-winding
+// back-EMF braking (V = 0), stopping far faster than coast neutral (I = 0,
+// decaying only via viscous damping and static friction).
+TEST(SimMechanismOde, BrakeNeutralStopsFasterThanCoastNeutral) {
+  auto run_neutral = [](bool brake, double viscous) {
+    Config cfg = SingleMotorConfig();
+    cfg.motors[0].brake = brake;
+    cfg.motors[0].stator_limit_a = 400.0;
+    cfg.motors[0].supply_limit_a = 400.0;
+    PhysicsSimBackend backend;
+    backend.SetMechanisms({{.motor_can_id = 1,
+                            .inertia_kg_m2 = 0.005,
+                            .load = sim::LoadKind::kFlywheel,
+                            .viscous_damping_nm_per_radps = viscous}});
+    EXPECT_TRUE(backend.Configure(cfg));
+    std::array<MotorRequest, 1> cmd{{{1, Mode::kVoltage, 0, 12.0, 0.0}}};
+    EXPECT_TRUE(backend.Apply(cmd));
+    State s{};
+    uint64_t t = 0;
+    StepBackend(backend, s, t, 5000, 1);
+    StepBackend(backend, s, t, 5000, 120);  // 0.6 s spin-up
+    const double peak = s.motors[0].velocity_rps;
+    backend.Neutral();
+    StepBackend(backend, s, t, 5000, 100);  // 0.5 s unpowered decay
+    return std::pair{peak, s.motors[0].velocity_rps};
+  };
+
+  const auto [brake_peak, brake_after] = run_neutral(true, 0.0);
+  const auto [coast_peak, coast_after] = run_neutral(false, 0.0);
+  const auto [damped_peak, damped_after] = run_neutral(false, 0.005);
+
+  ASSERT_GT(brake_peak, 60.0);
+  ASSERT_NEAR(brake_peak, coast_peak, 1e-9);
+  EXPECT_LT(brake_after, 0.4 * brake_peak);
+  EXPECT_GT(coast_after, 0.95 * coast_peak);
+  EXPECT_LT(damped_after, coast_after);
+  EXPECT_GT(damped_after, brake_after);
+}
+
+// REQ-DEV-10: No-load motor viscous damping preserves exact CTRE 12 V free
+// speed and free current across Kraken X60, Kraken X44, and Falcon 500.
+TEST(SimMechanismOde, TwelveVoltFreeSpeedAndFreeCurrentMatchDatasheet) {
+  struct Case {
+    MotorType type;
+    double free_rps;
+    double free_a;
+  };
+  for (const Case& c : {Case{MotorType::kKrakenX60, 6000.0 / 60.0, 2.0},
+                        Case{MotorType::kKrakenX44, 7530.0 / 60.0, 2.0},
+                        Case{MotorType::kFalcon500, 6380.0 / 60.0, 1.5}}) {
+    SCOPED_TRACE(static_cast<int>(c.type));
+    Config cfg = SingleMotorConfig();
+    cfg.motors[0].motor_type.value = c.type;
+    cfg.motors[0].stator_limit_a = 1000.0;
+    cfg.motors[0].supply_limit_a = 1000.0;
+    PhysicsSimBackend backend;
+    backend.SetMechanisms({{.motor_can_id = 1,
+                            .inertia_kg_m2 = 0.001,
+                            .load = sim::LoadKind::kRoller}});
+    ASSERT_TRUE(backend.Configure(cfg));
+    std::array<MotorRequest, 1> cmd{{{1, Mode::kVoltage, 0, 12.0, 0.0}}};
+    ASSERT_TRUE(backend.Apply(cmd));
+    State s{};
+    uint64_t t = 0;
+    StepBackend(backend, s, t, 5000, 1);
+    StepBackend(backend, s, t, 5000, 500);  // 2.5 s -> > 12 time constants
+    EXPECT_NEAR(s.motors[0].velocity_rps, c.free_rps, 0.001 * c.free_rps);
+    EXPECT_NEAR(s.motors[0].stator_current_a, c.free_a, 0.02 * c.free_a);
+  }
+}
+
+// REQ-DEV-10: Property test — rigid-body ODE stays unconditionally stable
+// (finite, bounded by free speed, non-oscillatory) down to tiny inertia J.
+TEST(SimMechanismOde, SmallInertiaRemainsNumericallyStable) {
+  for (const double j : {1e-7, 1e-6, 1e-5, 1e-4, 1e-3}) {
+    for (const double gear : {1.0, 5.0}) {
+      for (const uint64_t dt_us :
+           {uint64_t{1000}, uint64_t{5000}, uint64_t{20000}}) {
+        SCOPED_TRACE(testing::Message()
+                     << "j=" << j << " gear=" << gear << " dt_us=" << dt_us);
+        Config cfg = SingleMotorConfig();
+        cfg.motors[0].sensor_to_mechanism_ratio = gear;
+        cfg.motors[0].stator_limit_a = 80.0;
+        cfg.motors[0].supply_limit_a = 40.0;
+        PhysicsSimBackend backend;
+        backend.SetMechanisms({{.motor_can_id = 1,
+                                .inertia_kg_m2 = j,
+                                .load = sim::LoadKind::kRoller}});
+        ASSERT_TRUE(backend.Configure(cfg));
+        std::array<MotorRequest, 1> cmd{{{1, Mode::kVoltage, 0, 12.0, 0.0}}};
+        ASSERT_TRUE(backend.Apply(cmd));
+        State s{};
+        uint64_t t = 0;
+        StepBackend(backend, s, t, dt_us, 1);
+        const double free_mech_rps = 100.0 / gear;
+        double prev_vel = 0.0;
+        for (int step = 0; step < 30; ++step) {
+          StepBackend(backend, s, t, dt_us, 1);
+          ASSERT_TRUE(std::isfinite(s.motors[0].velocity_rps));
+          ASSERT_TRUE(std::isfinite(s.motors[0].position_rot));
+          EXPECT_GE(s.motors[0].velocity_rps, prev_vel - 1e-6);
+          EXPECT_LE(s.motors[0].velocity_rps, free_mech_rps * 1.005);
+          prev_vel = s.motors[0].velocity_rps;
+        }
+        // Brake neutral from speed must also decay monotonically to >= 0.
+        backend.Neutral();
+        for (int step = 0; step < 20; ++step) {
+          StepBackend(backend, s, t, dt_us, 1);
+          ASSERT_TRUE(std::isfinite(s.motors[0].velocity_rps));
+          EXPECT_LE(s.motors[0].velocity_rps, prev_vel + 1e-6);
+          EXPECT_GE(s.motors[0].velocity_rps, -1e-9);
+          prev_vel = s.motors[0].velocity_rps;
+        }
+      }
+    }
+  }
+}
+
+// REQ-DEV-10: Battery sag solves V_batt = V_oc - R_int * (I_base + sum I_sup)
+// deterministically, converges with zero oscillation even when R_eq < R_int,
+// trips and recovers auto-brownout, and respects SetSupplyVoltage /
+// ClearSupplyVoltageOverride and R_int = 0 backward compatibility.
+TEST(SimBatteryModel, SagMultiMotorStallBrownoutOverrideAndBackwardCompat) {
+  // 1. Single stalled motor + base current satisfies V_oc - I_total * R_int.
+  {
+    Config cfg = SingleMotorConfig();
+    cfg.motors[0].stator_limit_a = 80.0;
+    cfg.motors[0].supply_limit_a = 80.0;
+    PhysicsSimBackend backend;
+    const sim::BatteryModel batt{.nominal_voltage_v = 12.6,
+                                 .internal_resistance_ohm = 0.025,
+                                 .base_current_a = 4.0,
+                                 .brownout_voltage_v = 6.75};
+    backend.SetBatteryModel(batt);
+    ASSERT_TRUE(backend.Configure(cfg));
+
+    // Unloaded resting voltage reflects base_current_a.
+    State s{};
+    uint64_t t = 0;
+    StepBackend(backend, s, t, 5000, 1);
+    EXPECT_NEAR(s.health.battery_v, 12.6 - 0.025 * 4.0, 1e-6);
+    EXPECT_FALSE(s.health.brownout);
+
+    // Under stall (dt = 0 after fresh Configure -> rotor at rest), bus voltage
+    // satisfies V_batt = V_oc - R_int * (base + supply_current_a).
+    ASSERT_TRUE(backend.Configure(cfg));
+    std::array<MotorRequest, 1> cmd{{{1, Mode::kVoltage, 0, 12.0, 0.0}}};
+    ASSERT_TRUE(backend.Apply(cmd));
+    StepBackend(backend, s, t, 5000, 1);
+    const double expected_v =
+        batt.nominal_voltage_v -
+        batt.internal_resistance_ohm *
+            (batt.base_current_a + s.motors[0].supply_current_a);
+    EXPECT_LT(s.health.battery_v, 12.5);
+    EXPECT_NEAR(s.health.battery_v, expected_v, 1e-5);
+    EXPECT_FALSE(s.health.brownout);
+  }
+
+  // 2. Multi-motor stall where R_eq < R_int: 4 Kraken X60s stalled against
+  // hard stops (R_eq = 12 / (4 * 366) = 0.00820 ohm < R_int = 0.020 ohm).
+  // Exact analytical solution: V = V_oc * R_eq / (R_eq + R_int), zero
+  // oscillation across ticks, auto-brownout trips and recovers on Neutral().
+  {
+    Config cfg;
+    cfg.commissioned = true;
+    cfg.command_timeout_us = 100000;
+    std::vector<sim::HardStop> stops;
+    for (int i = 0; i < 4; ++i) {
+      auto m = TestMotor(static_cast<uint16_t>(i + 1),
+                         ("m" + std::to_string(i)).c_str(), i + 1);
+      m.stator_limit_a = 1000.0;
+      m.supply_limit_a = 1000.0;
+      cfg.motors.push_back(m);
+      stops.push_back(
+          {.motor = m.name.str(), .min_rot = -0.01, .max_rot = 0.0});
+    }
+    PhysicsSimBackend backend;
+    backend.SetHardStops(stops);
+    backend.SetBatteryModel({.nominal_voltage_v = 12.8,
+                             .internal_resistance_ohm = 0.02,
+                             .base_current_a = 0.0,
+                             .brownout_voltage_v = 6.75});
+    ASSERT_TRUE(backend.Configure(cfg));
+
+    const double r_eq = (12.0 / 366.0) / 4.0;
+    const double expected_stall_v = 12.8 * r_eq / (r_eq + 0.02);
+    ASSERT_LT(r_eq, 0.02);
+    ASSERT_LT(expected_stall_v, 6.75);
+
+    std::array<MotorRequest, 4> cmd{};
+    for (std::size_t i = 0; i < 4; ++i) {
+      cmd[i] = {static_cast<uint16_t>(i + 1), Mode::kVoltage, 0, 12.0, 0.0};
+    }
+    ASSERT_TRUE(backend.Apply(cmd));
+    State s{};
+    uint64_t t = 0;
+    StepBackend(backend, s, t, 5000, 1);  // dt = 0
+    for (int step = 0; step < 15; ++step) {
+      StepBackend(backend, s, t, 5000, 1);
+      EXPECT_NEAR(s.health.battery_v, expected_stall_v, 1e-4)
+          << "step " << step;
+      EXPECT_TRUE(s.health.brownout) << "step " << step;
+    }
+
+    // Explicit SetSupplyVoltage overrides BatteryModel and clears
+    // auto-brownout.
+    backend.SetSupplyVoltage(11.5);
+    StepBackend(backend, s, t, 5000, 1);
+    EXPECT_DOUBLE_EQ(s.health.battery_v, 11.5);
+    EXPECT_FALSE(s.health.brownout);
+
+    // ClearSupplyVoltageOverride resumes BatteryModel -> sags and browns out.
+    backend.ClearSupplyVoltageOverride();
+    StepBackend(backend, s, t, 5000, 1);
+    EXPECT_NEAR(s.health.battery_v, expected_stall_v, 1e-4);
+    EXPECT_TRUE(s.health.brownout);
+
+    // Neutral removes load -> battery recovers and brownout clears.
+    backend.Neutral();
+    StepBackend(backend, s, t, 5000, 1);
+    EXPECT_DOUBLE_EQ(s.health.battery_v, 12.8);
+    EXPECT_FALSE(s.health.brownout);
+  }
+
+  // 3. Backward compatibility: R_int = 0 with nominal = 12.8 is bit-for-bit
+  // identical to never calling SetBatteryModel.
+  {
+    Config cfg = SingleMotorConfig();
+    PhysicsSimBackend unset_backend;
+    PhysicsSimBackend default_batt_backend;
+    default_batt_backend.SetBatteryModel(sim::BatteryModel{});
+    ASSERT_TRUE(unset_backend.Configure(cfg));
+    ASSERT_TRUE(default_batt_backend.Configure(cfg));
+    std::array<MotorRequest, 1> cmd{{{1, Mode::kVoltage, 0, 8.0, 0.0}}};
+    ASSERT_TRUE(unset_backend.Apply(cmd));
+    ASSERT_TRUE(default_batt_backend.Apply(cmd));
+    State sa{}, sb{};
+    uint64_t ta = 0, tb = 0;
+    StepBackend(unset_backend, sa, ta, 5000, 50);
+    StepBackend(default_batt_backend, sb, tb, 5000, 50);
+    EXPECT_DOUBLE_EQ(sa.health.battery_v, sb.health.battery_v);
+    EXPECT_EQ(sa.health.brownout, sb.health.brownout);
+    EXPECT_DOUBLE_EQ(sa.motors[0].position_rot, sb.motors[0].position_rot);
+    EXPECT_DOUBLE_EQ(sa.motors[0].velocity_rps, sb.motors[0].velocity_rps);
+    EXPECT_DOUBLE_EQ(sa.motors[0].voltage, sb.motors[0].voltage);
+    EXPECT_DOUBLE_EQ(sa.motors[0].stator_current_a,
+                     sb.motors[0].stator_current_a);
+    EXPECT_DOUBLE_EQ(sa.motors[0].supply_current_a,
+                     sb.motors[0].supply_current_a);
+  }
+}
+
+// REQ-DEV-10: Coupled 2D chassis dynamics limits acceleration by mass, scales
+// angular acceleration by moment_of_inertia_kg_m2 (with mass * mean(r^2)
+// default), produces physical wheel slip (encoder_speed > ground_speed) under
+// traction_coefficient, and stays bit-for-bit compatible when omitted.
+TEST(SimChassisDynamics, MassMoiTractionSlipAndBackwardCompat) {
+  constexpr double kGear = 6.75;
+  constexpr double kWheelRadius = sim::PhysicsOptions::kDefaultWheelRadiusM;
+  constexpr double kStatorLimit = 60.0;
+  const sim::MotorModel x60 = sim::MotorModelFor(MotorType::kKrakenX60);
+
+  // 1. Mass acceleration limit & non-slipping wheel coupling (infinite
+  // traction).
+  {
+    const Config cfg = FourCornerSwerveConfig(kGear, kStatorLimit, 400.0);
+    auto run_mass = [&](double mass_kg) {
+      PhysicsSimBackend b;
+      b.SetChassisDynamics({.mass_kg = mass_kg});  // Survives Configure().
+      EXPECT_TRUE(b.Configure(cfg));
+      std::array<MotorRequest, kMaxMotors> cmd{};
+      for (std::size_t i = 0; i < 4; ++i) {
+        cmd[2 * i] = {static_cast<uint16_t>(2 * i + 1), Mode::kVoltage, 0, 12.0,
+                      0.0};
+      }
+      EXPECT_TRUE(b.Apply(cmd));
+      State s{};
+      uint64_t t = 0;
+      StepBackend(b, s, t, 5000, 1);   // dt = 0
+      StepBackend(b, s, t, 5000, 10);  // 50 ms
+      const double enc_speed =
+          s.motors[0].velocity_rps * kTestTau * kWheelRadius;
+      return std::pair{b.truth().vx_mps, enc_speed};
+    };
+
+    const auto [vx_40, enc_40] = run_mass(40.0);
+    const auto [vx_80, enc_80] = run_mass(80.0);
+    const double wheel_force =
+        kGear * x60.torque_constant_nm_per_a() * kStatorLimit / kWheelRadius;
+    const double expected_vx_40 = (4.0 * wheel_force / 40.0) * 0.05;
+    EXPECT_NEAR(vx_40, expected_vx_40, 0.03 * expected_vx_40);
+    EXPECT_NEAR(vx_80, 0.5 * vx_40, 0.02 * vx_40);
+    // Infinite traction: no slip, wheel encoder speed equals ground speed.
+    EXPECT_NEAR(enc_40, vx_40, 1e-6);
+    EXPECT_NEAR(enc_80, vx_80, 1e-6);
+  }
+
+  // 2. Rotational MOI scaling and default mass * mean(x_i^2 + y_i^2).
+  {
+    const Config cfg = FourCornerSwerveConfig(kGear, kStatorLimit, 400.0);
+    const std::array<double, 4> spin_angles{0.375, 0.125, -0.375, -0.125};
+    auto run_spin = [&](double moi) {
+      PhysicsSimBackend b;
+      b.SetChassisDynamics({.mass_kg = 50.0, .moment_of_inertia_kg_m2 = moi});
+      EXPECT_TRUE(b.Configure(cfg));
+      std::array<MotorRequest, kMaxMotors> cmd{};
+      for (std::size_t i = 0; i < 4; ++i) {
+        cmd[2 * i + 1] = {static_cast<uint16_t>(2 * i + 2), Mode::kPosition, 0,
+                          spin_angles[i], 0.0};
+      }
+      EXPECT_TRUE(b.Apply(cmd));
+      State s{};
+      uint64_t t = 0;
+      StepBackend(b, s, t, 5000, 100);  // Steer modules into spin tangent.
+      for (std::size_t i = 0; i < 4; ++i) {
+        cmd[2 * i] = {static_cast<uint16_t>(2 * i + 1), Mode::kVoltage, 0, 12.0,
+                      0.0};
+      }
+      EXPECT_TRUE(b.Apply(cmd));
+      StepBackend(b, s, t, 5000, 10);  // 50 ms spin acceleration
+      EXPECT_NEAR(s.sensors[0].position_rot, b.truth().yaw_rad / kTestTau,
+                  1e-9);
+      return b.truth().omega_radps;
+    };
+
+    // Default MOI for (±0.3, ±0.3): 50 * (0.09 + 0.09) = 9.0 kg*m^2.
+    const double omega_default = run_spin(0.0);
+    const double omega_explicit_9 = run_spin(9.0);
+    const double omega_18 = run_spin(18.0);
+    EXPECT_DOUBLE_EQ(omega_default, omega_explicit_9);
+    EXPECT_GT(omega_default, 0.5);
+    EXPECT_NEAR(omega_18, 0.5 * omega_default, 0.03 * omega_default);
+  }
+
+  // 3. Finite traction_coefficient caps ground acceleration to mu * g and
+  // spins slipping wheels up on excess torque (encoder_speed > ground_speed).
+  {
+    const Config cfg = FourCornerSwerveConfig(kGear, 80.0, 400.0);
+    constexpr double kMu = 0.4;
+    constexpr double kG = 9.80665;
+    PhysicsSimBackend backend;
+    backend.SetChassisDynamics({.mass_kg = 50.0, .traction_coefficient = kMu});
+    ASSERT_TRUE(backend.Configure(cfg));
+    std::array<MotorRequest, kMaxMotors> cmd{};
+    for (std::size_t i = 0; i < 4; ++i) {
+      cmd[2 * i] = {static_cast<uint16_t>(2 * i + 1), Mode::kVoltage, 0, 12.0,
+                    0.0};
+    }
+    ASSERT_TRUE(backend.Apply(cmd));
+    State s{};
+    uint64_t t = 0;
+    StepBackend(backend, s, t, 5000, 1);   // dt = 0
+    StepBackend(backend, s, t, 5000, 10);  // 50 ms
+    const double ground_vx = backend.truth().vx_mps;
+    const double encoder_vx =
+        s.motors[0].velocity_rps * kTestTau * kWheelRadius;
+    EXPECT_NEAR(ground_vx, kMu * kG * 0.05, 0.01);
+    EXPECT_GT(encoder_vx, ground_vx * 2.0);
+
+    // Lateral scrub: steer wheels 90 deg while moving in +x and neutral drive;
+    // lateral friction decelerates +x smoothly without instability.
+    for (std::size_t i = 0; i < 4; ++i) {
+      cmd[2 * i] = {static_cast<uint16_t>(2 * i + 1), Mode::kNeutral, 0, 0.0,
+                    0.0};
+      cmd[2 * i + 1] = {static_cast<uint16_t>(2 * i + 2), Mode::kPosition, 0,
+                        0.25, 0.0};
+    }
+    ASSERT_TRUE(backend.Apply(cmd));
+    StepBackend(backend, s, t, 5000, 60);
+    EXPECT_TRUE(std::isfinite(backend.truth().vx_mps));
+    EXPECT_LT(std::abs(backend.truth().vx_mps), ground_vx);
+  }
+
+  // 4. Backward compatibility: omitted or mass_kg <= 0 stays bit-for-bit
+  // identical to legacy kinematics.
+  {
+    const Config cfg = FourCornerSwerveConfig(kGear, 80.0, 400.0);
+    PhysicsSimBackend unset_backend;
+    PhysicsSimBackend zero_mass_backend;
+    zero_mass_backend.SetChassisDynamics(sim::ChassisDynamics{.mass_kg = 0.0});
+    ASSERT_TRUE(unset_backend.Configure(cfg));
+    ASSERT_TRUE(zero_mass_backend.Configure(cfg));
+    std::array<MotorRequest, kMaxMotors> cmd{};
+    for (std::size_t i = 0; i < 4; ++i) {
+      cmd[2 * i] = {static_cast<uint16_t>(2 * i + 1), Mode::kVoltage, 0, 6.0,
+                    0.0};
+      cmd[2 * i + 1] = {static_cast<uint16_t>(2 * i + 2), Mode::kPosition, 0,
+                        0.1, 0.0};
+    }
+    ASSERT_TRUE(unset_backend.Apply(cmd));
+    ASSERT_TRUE(zero_mass_backend.Apply(cmd));
+    State sa{}, sb{};
+    uint64_t ta = 0, tb = 0;
+    StepBackend(unset_backend, sa, ta, 5000, 40);
+    StepBackend(zero_mass_backend, sb, tb, 5000, 40);
+    EXPECT_DOUBLE_EQ(unset_backend.truth().x_m, zero_mass_backend.truth().x_m);
+    EXPECT_DOUBLE_EQ(unset_backend.truth().y_m, zero_mass_backend.truth().y_m);
+    EXPECT_DOUBLE_EQ(unset_backend.truth().yaw_rad,
+                     zero_mass_backend.truth().yaw_rad);
+    EXPECT_DOUBLE_EQ(unset_backend.truth().vx_mps,
+                     zero_mass_backend.truth().vx_mps);
+    EXPECT_DOUBLE_EQ(unset_backend.truth().vy_mps,
+                     zero_mass_backend.truth().vy_mps);
+    EXPECT_DOUBLE_EQ(unset_backend.truth().omega_radps,
+                     zero_mass_backend.truth().omega_radps);
+  }
+}
+
 }  // namespace
 }  // namespace talos::hardware
