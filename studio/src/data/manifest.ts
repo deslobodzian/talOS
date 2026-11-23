@@ -92,7 +92,8 @@ export type SessionManifest = {
   nodes: ManifestNode[];
 };
 
-export const MAX_MANIFEST_BYTES = 1 << 20;
+// Matches studio/review/review.h kMaxManifestBytes (4 MiB).
+export const MAX_MANIFEST_BYTES = 4 << 20;
 
 const MAX_NODES = 256;
 const MAX_STRING = 512;
@@ -161,24 +162,87 @@ function list(source: Record<string, unknown>, key: string,
   return value as unknown[];
 }
 
-// The exact decimal spelling of a top-level integer field, recovered from the
-// raw text before JSON.parse rounds it (the launcher writes uint64 as raw
-// numbers). Null when the field is absent or not a plain integer token.
-// Only the text before "nodes" is searched: the launcher writes every
-// top-level field first, and a node's runs repeat start_wall_ns/end_wall_ns.
-function rawInteger(raw: string, key: string): string|null {
-  const nodes = raw.indexOf('"nodes"');
-  const head = nodes < 0 ? raw : raw.slice(0, nodes);
-  const match = new RegExp(`"${key}"\\s*:\\s*(-?\\d+)`).exec(head);
-  return match ? match[1] : null;
+// JSON.parse validates the syntax first. Scan once to recover the exact decimal
+// spelling of top-level integer tokens before JSON.parse rounds past 2^53 (last
+// key wins, matching JSON.parse). Strings are indivisible and nested objects /
+// arrays are skipped so field names inside string values (e.g. config_path) or
+// node run histories never match.
+function topLevelIntegers(raw: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const n = raw.length;
+  let i = 0;
+  const skipWs = () => {
+    while (i < n && (raw[i] === ' ' || raw[i] === '\t' || raw[i] === '\n' || raw[i] === '\r')) i++;
+  };
+  const readString = (): string => {
+    const start = i++;  // opening '"'
+    while (i < n) {
+      const ch = raw[i++];
+      if (ch === '\\') { i++; continue; }
+      if (ch === '"') return raw.slice(start, i);
+    }
+    return raw.slice(start);
+  };
+  const skipValue = () => {
+    skipWs();
+    if (i >= n) return;
+    const ch = raw[i];
+    if (ch === '"') {
+      readString();
+    } else if (ch === '{' || ch === '[') {
+      let depth = 0;
+      while (i < n) {
+        const c = raw[i];
+        if (c === '"') { readString(); continue; }
+        i++;
+        if (c === '{' || c === '[') depth++;
+        else if (c === '}' || c === ']') {
+          depth--;
+          if (depth === 0) return;
+        }
+      }
+    } else {
+      while (i < n && raw[i] !== ',' && raw[i] !== '}' && raw[i] !== ']' &&
+             raw[i] !== ' ' && raw[i] !== '\t' && raw[i] !== '\n' && raw[i] !== '\r') i++;
+    }
+  };
+  skipWs();
+  if (raw[i] !== '{') return out;
+  i++;
+  while (i < n) {
+    skipWs();
+    if (raw[i] === '}') break;
+    if (raw[i] === ',') { i++; continue; }
+    if (raw[i] !== '"') break;
+    const key = JSON.parse(readString()) as string;
+    skipWs();
+    if (raw[i] !== ':') break;
+    i++;
+    skipWs();
+    const valStart = i;
+    if (raw[i] === '-' || (raw[i] >= '0' && raw[i] <= '9')) {
+      skipValue();
+      const token = raw.slice(valStart, i);
+      if (/^-?(?:0|[1-9]\d*)$/.test(token)) out.set(key, token);
+      else out.delete(key);
+    } else {
+      out.delete(key);
+      skipValue();
+    }
+  }
+  return out;
 }
 
 // A uint64/int64 field kept as a string. Prefers the exact raw spelling, and
 // falls back to a string or number field for documents that already carry it
 // as a string.
-function u64Field(raw: string, source: Record<string, unknown>, key: string): string {
-  const exact = rawInteger(raw, key);
-  if (exact !== null) return exact;
+function u64Field(integers: ReadonlyMap<string, string>,
+                  source: Record<string, unknown>, key: string): string {
+  const exact = integers.get(key);
+  if (exact !== undefined) {
+    if (/^-?\d{1,20}$/.test(exact)) return exact;
+    fail(`${key} must be a decimal integer`);
+  }
   const value = source[key];
   if (typeof value === 'string' && /^-?\d{1,20}$/.test(value)) return value;
   if (typeof value === 'number' && Number.isInteger(value)) return String(value);
@@ -300,8 +364,9 @@ export function parseManifest(raw: string): SessionManifest {
   if (raw.length > MAX_MANIFEST_BYTES) fail('document too large');
   return parsing(() => {
     const source = record(JSON.parse(raw), 'manifest');
+    const integers = topLevelIntegers(raw);
     return {
-      session_id: u64Field(raw, source, 'session_id'),
+      session_id: u64Field(integers, source, 'session_id'),
       config_path: path(source, 'config_path'),
       config_sha256: path(source, 'config_sha256'),
       ...('git_revision' in source ?
@@ -309,8 +374,8 @@ export function parseManifest(raw: string): SessionManifest {
                git_dirty: flag(source, 'git_dirty')} : {}),
       output_dir: path(source, 'output_dir'),
       simulation: bool(source, 'simulation'),
-      start_wall_ns: u64Field(raw, source, 'start_wall_ns'),
-      end_wall_ns: u64Field(raw, source, 'end_wall_ns'),
+      start_wall_ns: u64Field(integers, source, 'start_wall_ns'),
+      end_wall_ns: u64Field(integers, source, 'end_wall_ns'),
       ...('session_lock_lost' in source ?
               {session_lock_lost: bool(source, 'session_lock_lost')} : {}),
       ...('directory_lock_lost' in source ?

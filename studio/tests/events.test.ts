@@ -405,3 +405,20 @@ test('timeout mask set bits warn naming the subsystem bit; clears are info', () 
       .filter(e => e.severity === 'warn');
   assert.equal(warnings.length, 2);
 });
+
+// REQ-OPS-23: non-finite mask readings (NaN/Infinity) must not throw RangeError
+// inside BigInt(Math.trunc(...)) and break frame ingestion.
+test('fault and timeout mask detectors ignore non-finite readings without throwing', () => {
+  for (const [id, channel] of [
+    ['link-fault-mask', 'hw/status/motor_fault_mask'],
+    ['link-timeout-mask', 'hw/status/timed_out_mask']
+  ] as const) {
+    const detector = FRAME_DETECTORS.find(d => d.id === id)!;
+    for (const bad of [Number.NaN, Infinity, -Infinity]) {
+      assert.deepEqual(detector.detect(frame(1, 1n, {[channel]: 0}),
+                                       frame(2, 2n, {[channel]: bad})), []);
+      assert.deepEqual(detector.detect(frame(1, 1n, {[channel]: bad}),
+                                       frame(2, 2n, {[channel]: 1})), []);
+    }
+  }
+});

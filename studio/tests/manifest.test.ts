@@ -3,7 +3,7 @@ import {test} from 'node:test';
 
 import type {Snapshot} from '../src/core';
 import {EventEngine} from '../src/data/events';
-import {parseManifest, type SessionManifest} from '../src/data/manifest';
+import {MAX_MANIFEST_BYTES, parseManifest, type SessionManifest} from '../src/data/manifest';
 
 type ManifestNode = SessionManifest['nodes'][number];
 
@@ -223,4 +223,43 @@ test('manifest detector is silent on first observation', () => {
   engine.pushFrame(snap(1n));
   engine.pushManifest(manifest([node({restart_count: 5, recorder_failed: true})]));
   assert.equal(engine.events.filter(e => e.id.startsWith('manifest-node:')).length, 0);
+});
+
+// REQ-OPS-42: Studio's manifest size ceiling matches review.h kMaxManifestBytes (4 MiB).
+test('parseManifest accepts manifests up to 4 MiB and rejects larger ones', () => {
+  assert.equal(MAX_MANIFEST_BYTES, 4 << 20);
+  const pad = ' '.repeat(2 << 20);
+  const big = `{${pad}"session_id":1,"config_path":"/robot.toml","config_sha256":"abc",` +
+      `"output_dir":"/tmp","simulation":false,"start_wall_ns":1,"end_wall_ns":2,"nodes":[]}`;
+  assert.ok(big.length > (1 << 20) && big.length < MAX_MANIFEST_BYTES);
+  assert.equal(parseManifest(big).session_id, '1');
+  const tooBig = `{${' '.repeat(MAX_MANIFEST_BYTES)}"session_id":1}`;
+  assert.throws(() => parseManifest(tooBig), /document too large/);
+});
+
+// REQ-OPS-23: raw top-level integer recovery must be JSON-string-aware so
+// "nodes" or field names inside string values (e.g. config_path) or key order
+// after "nodes" never corrupt uint64 parsing.
+test('parseManifest ignores field names inside strings and handles keys after nodes', () => {
+  const raw = `{
+    "session_id": 1735689600000000123,
+    "config_path": "/tmp/\\"nodes\\"/\\"start_wall_ns\\": 999/robot.toml",
+    "config_sha256": "abc",
+    "output_dir": "/tmp/\\"end_wall_ns\\": 888",
+    "simulation": false,
+    "nodes": [
+      {"name":"n","target":"t","binary_path":"b","log_path":"l","log_paths":["l"],
+       "pid":1,"exit_code":0,"restart_count":0,"record_count":0,
+       "runs":[{"pid":1,"start_wall_ns":111,"end_wall_ns":222,"exit_code":0,"exit_signal":0,"reason":"exit"}]}
+    ],
+    "start_wall_ns": 1735689600000000456,
+    "end_wall_ns": 1735689600000000789
+  }`;
+  const m = parseManifest(raw);
+  assert.equal(m.session_id, '1735689600000000123');
+  assert.equal(m.start_wall_ns, '1735689600000000456');
+  assert.equal(m.end_wall_ns, '1735689600000000789');
+  // Non-integer float for a u64 field must be rejected, not truncated to its integer prefix.
+  assert.throws(() => parseManifest(raw.replace('1735689600000000456', '1.5')),
+                /decimal integer/);
 });

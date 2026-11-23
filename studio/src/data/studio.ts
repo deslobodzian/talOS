@@ -60,6 +60,35 @@ const defaultScheduler = (cb: () => void): void => {
   else setTimeout(cb, 0);
 };
 
+// Schedule worker batch acknowledgements: pace to display frames while visible,
+// and fall back to a timer when the tab is hidden (browsers pause rAF in
+// background tabs, which would stall ack and trip the silence watchdog).
+const scheduleAck = (cb: () => void): void => {
+  if (typeof requestAnimationFrame !== 'function' ||
+      (typeof document !== 'undefined' && document.hidden)) {
+    setTimeout(cb, 0);
+    return;
+  }
+  let done = false;
+  const run = () => {
+    if (done) return;
+    done = true;
+    if (typeof document !== 'undefined' &&
+        typeof document.removeEventListener === 'function') {
+      document.removeEventListener('visibilitychange', onVisibility);
+    }
+    cb();
+  };
+  const onVisibility = () => {
+    if (typeof document !== 'undefined' && document.hidden) setTimeout(run, 0);
+  };
+  if (typeof document !== 'undefined' &&
+      typeof document.addEventListener === 'function') {
+    document.addEventListener('visibilitychange', onVisibility);
+  }
+  requestAnimationFrame(run);
+};
+
 function boundsOf(frames: readonly Snapshot[]): Bounds|null {
   if (!frames.length) return null;
   return {start: frames[0].timestamp_ns, end: frames[frames.length - 1].timestamp_ns};
@@ -208,12 +237,15 @@ export function createWorkerStudio(
   const receive = (data: WorkerMessage) => {
     if (data.type === 'updates') {
       lastUpdate = now();
-      for (const message of data.messages) receive(message);
-      studio.playback = {...studio.playback, updates: {
-        dropped: data.dropped, coalesced: data.coalesced
-      }};
-      studio.notify();
-      defaultScheduler(client.acknowledger());
+      try {
+        for (const message of data.messages) receive(message);
+        studio.playback = {...studio.playback, updates: {
+          dropped: data.dropped, coalesced: data.coalesced
+        }};
+        studio.notify();
+      } finally {
+        scheduleAck(client.acknowledger());
+      }
       return;
     }
     if (data.type === 'frames') {

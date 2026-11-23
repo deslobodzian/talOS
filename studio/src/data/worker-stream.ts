@@ -42,6 +42,11 @@ export class WorkerUpdateStream {
       this.reset = false;
     }
     this.inFlight = true;
-    this.send({type: 'updates', messages, dropped: this.dropped, coalesced: this.coalesced});
+    try {
+      this.send({type: 'updates', messages, dropped: this.dropped, coalesced: this.coalesced});
+    } catch (error) {
+      this.inFlight = false;
+      throw error;
+    }
   }
 }
