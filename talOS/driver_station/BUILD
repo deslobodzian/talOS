@@ -13,8 +13,9 @@ cc_library(
 )
 
 # The bounded little-endian payload cursors this codec and the hardware
-# Command and State codecs (//talOS/hardware:codecs) derive theirs from.
-# Header only, so the RoboRIO program's GradleRIO build compiles it too.
+# Command, State and configuration codecs (//talOS/hardware:codecs) derive
+# theirs from. Header only, so the RoboRIO program's GradleRIO build compiles
+# it too.
 cc_library(
     name = "little_endian",
     hdrs = ["little_endian.h"],
