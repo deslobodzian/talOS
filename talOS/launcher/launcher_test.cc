@@ -17,6 +17,7 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -27,8 +28,10 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -6404,6 +6407,70 @@ TEST(LauncherTest, WriteFileAtomicallySyncsTempBeforeRenameAndDirAfterRename) {
   }
 
   std::filesystem::remove_all(dir);
+}
+
+// REQ-OPS-08, REQ-OPS-33, REQ-OPS-11: when an exception escapes RunSession()
+// while ManifestWriter's background thread is active, ManifestWriter must stop
+// and join before SessionDirectoryLock is released and before LauncherOutput is
+// torn down (preventing UAF/race on std::cerr and unlocked directory writes).
+TEST(LauncherTest, ManifestWriterStopsBeforeTeardownOnException) {
+  GraphFixture fixture{
+      "manifest_unwind",
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")}),
+      DescribingStub("beta", "//example/beta:node", {Watcher("/alpha/state")})};
+  const std::string session_dir = fixture.out_dir;
+  const std::thread::id main_thread = std::this_thread::get_id();
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool worker_in_sync = false;
+  bool worker_synced = false;
+  bool lock_lost_while_writing = false;
+
+  fixture.options.sync_file = [&](int) {
+    if (std::this_thread::get_id() == main_thread) return 0;
+    {
+      const std::lock_guard lock{mutex};
+      worker_in_sync = true;
+      worker_synced = true;
+    }
+    cv.notify_all();
+    // Hold briefly while the main thread throws and unwinds: if ~Launcher()
+    // releases session_directory_ before joining manifest_writer_, Held() flips
+    // to false here.
+    std::unique_lock lock{mutex};
+    for (int i = 0; i < 30; ++i) {
+      if (!SessionDirectoryLock::Held(session_dir, false)) {
+        lock_lost_while_writing = true;
+        break;
+      }
+      cv.wait_for(lock, std::chrono::milliseconds{5});
+    }
+    // Fail the sync so ManifestWriter::Persist logs to std::cerr while
+    // LauncherOutput must still be alive.
+    errno = EIO;
+    return -1;
+  };
+
+  bool threw_once = false;
+  fixture.options.member_spawned = [&](const std::string&) {
+    if (threw_once) return;
+    threw_once = true;
+    std::unique_lock lock{mutex};
+    cv.wait_for(lock, kHang, [&] { return worker_in_sync; });
+    throw std::runtime_error("injected unwind");
+  };
+
+  EXPECT_THROW(static_cast<void>(Launcher{fixture.options}.Run()),
+               std::runtime_error);
+  EXPECT_TRUE(worker_synced);
+  EXPECT_FALSE(lock_lost_while_writing)
+      << "SessionDirectoryLock was released while ManifestWriter was still "
+         "running";
+  EXPECT_FALSE(SessionDirectoryLock::Held(session_dir, false));
+  const std::string talos_log =
+      ReadFile(session_dir + "/" + std::string{kLauncherOutputFile});
+  EXPECT_NE(talos_log.find("cannot persist"), std::string::npos) << talos_log;
 }
 
 }  // namespace

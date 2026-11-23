@@ -1295,5 +1295,127 @@ TEST(ClosedOutput, EchoHoldsExact64KiBAndForwardsAt64KiBPlusOne) {
   EXPECT_EQ(log_seen, header + held_exact + "z");
 }
 
+// REQ-OPS-33
+// Launching with closed standard descriptors (`<&- >&-` or `>&- 2>&-`) must not
+// let LauncherOutput's wake pipe occupy fd 0/1/2 and be hijacked as stdout or
+// stderr (causing a self-feeding busy-loop or spurious EBADF errors in
+// talos.log).
+TEST(ClosedOutput, ClosedStandardDescriptorsNeverHijackWakePipe) {
+  struct Row {
+    const char* name;
+    bool close_stdin;
+    bool close_stdout;
+    bool close_stderr;
+  };
+  for (const Row row : {Row{"closed_stdin_stdout", true, true, false},
+                        Row{"closed_stdout_stderr", false, true, true}}) {
+    SCOPED_TRACE(row.name);
+    const std::string log_path = TempPath(std::string{row.name} + "_talos.log");
+    ::remove(log_path.c_str());
+
+    int err_pipe[2]{-1, -1};
+    int report_pipe[2]{-1, -1};
+    if (!row.close_stderr) {
+      ASSERT_EQ(::pipe(err_pipe), 0);
+    }
+    ASSERT_EQ(::pipe(report_pipe), 0);
+
+    std::fflush(nullptr);
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+      ::close(report_pipe[0]);
+      if (!row.close_stderr) {
+        ::close(err_pipe[0]);
+        if (::dup2(err_pipe[1], STDERR_FILENO) < 0) ::_exit(100);
+        ::close(err_pipe[1]);
+      }
+      // Keep report_pipe[1] well above 0/1/2 so closing standard descriptors
+      // never collides with it.
+      const int report_fd = ::fcntl(report_pipe[1], F_DUPFD_CLOEXEC, 10);
+      ::close(report_pipe[1]);
+      if (report_fd < 0) ::_exit(101);
+
+      if (row.close_stdin) {
+        ::close(STDIN_FILENO);
+      } else {
+        const int null_rd = ::open("/dev/null", O_RDONLY);
+        if (null_rd < 0 || ::dup2(null_rd, STDIN_FILENO) < 0) ::_exit(102);
+        if (null_rd > STDERR_FILENO) ::close(null_rd);
+      }
+      if (row.close_stdout) ::close(STDOUT_FILENO);
+      if (row.close_stderr) ::close(STDERR_FILENO);
+
+      {
+        LauncherOutput launcher;
+        launcher.Record(log_path);
+
+        const auto fd_is_closed = [](int fd) {
+          errno = 0;
+          return ::fcntl(fd, F_GETFD) < 0 && errno == EBADF;
+        };
+        std::string report;
+        if (row.close_stdin && !fd_is_closed(STDIN_FILENO))
+          report += "stdin_hijacked ";
+        if (row.close_stdout && !fd_is_closed(STDOUT_FILENO))
+          report += "stdout_hijacked ";
+        if (row.close_stderr && !fd_is_closed(STDERR_FILENO))
+          report += "stderr_hijacked ";
+        if (report.empty()) report = "ok";
+        [[maybe_unused]] const ssize_t ignored =
+            ::write(report_fd, report.data(), report.size());
+
+        // Write more than a pipe buffer to stdout (via std::cout and Echo) and
+        // a marker to stderr. If stdout hijacked wake[1], this feeds the wake
+        // pipe itself; if stdout hijacked wake[0], write() fails with EBADF.
+        const std::string payload(4096, 's');
+        for (int i = 0; i < 64; ++i) {
+          ConsoleLine(std::cout)
+              << "[launcher] out_" << i << " " << payload << "\n";
+          launcher.Echo("[node] echo_" + std::to_string(i) + "\n");
+        }
+        ConsoleLine(std::cerr) << "[launcher] stderr_marker\n";
+        launcher.Stop(std::chrono::milliseconds{1000});
+      }
+      ::close(report_fd);
+      ::_exit(0);
+    }
+
+    ::close(report_pipe[1]);
+    if (!row.close_stderr) ::close(err_pipe[1]);
+
+    std::string report;
+    std::string err_seen;
+    std::jthread err_drainer{[&] {
+      if (!row.close_stderr) AwaitEnd(err_pipe[0], err_seen);
+    }};
+    const bool report_ended = AwaitEnd(report_pipe[0], report);
+    err_drainer.join();
+    ::close(report_pipe[0]);
+    if (!row.close_stderr) ::close(err_pipe[0]);
+    const int status = Reap(child);
+
+    const std::string log = ReadFile(log_path);
+    ::remove(log_path.c_str());
+
+    ASSERT_TRUE(report_ended);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        << ExitReason(status);
+    EXPECT_EQ(report, "ok") << "closed fd hijacked by wake pipe: " << report;
+    EXPECT_EQ(log.find("Bad file descriptor"), std::string::npos) << log;
+    EXPECT_EQ(log.find("no longer writes to it"), std::string::npos) << log;
+    EXPECT_EQ(log.find("were not written"), std::string::npos) << log;
+    EXPECT_NE(log.find("[launcher] out_0 "), std::string::npos) << log;
+    EXPECT_NE(log.find("[launcher] out_63 "), std::string::npos) << log;
+    EXPECT_NE(log.find("[launcher] stderr_marker\n"), std::string::npos) << log;
+    if (!row.close_stderr) {
+      EXPECT_NE(err_seen.find("[launcher] stderr_marker\n"), std::string::npos)
+          << err_seen;
+      EXPECT_EQ(err_seen.find("[launcher] out_0 "), std::string::npos)
+          << err_seen;
+    }
+  }
+}
+
 }  // namespace
 }  // namespace talos::launcher

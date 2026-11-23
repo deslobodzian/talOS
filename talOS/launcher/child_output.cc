@@ -93,12 +93,29 @@ uint64_t WriteLog(LogFile& file, const std::string& path, std::string bytes) {
 }
 
 // A pipe for waking a thread out of poll(): close-on-exec, both ends
-// nonblocking, so a full one already holds a wakeup.
+// nonblocking, so a full one already holds a wakeup. Relocates any end
+// assigned below 3 so closed standard descriptors are never occupied by an
+// internal pipe.
 void WakePipe(int (&fds)[2], const char* what) {
   {
     const std::lock_guard lock{SpawnMutex()};
     if (!CloseOnExecPipe(fds))
       throw std::system_error(errno, std::generic_category(), what);
+    for (int& fd : fds) {
+      if (fd < 3) {
+        const int moved = ::fcntl(fd, F_DUPFD_CLOEXEC, 3);
+        if (moved < 0) {
+          const int code = errno;
+          ::close(fds[0]);
+          ::close(fds[1]);
+          fds[0] = -1;
+          fds[1] = -1;
+          throw std::system_error(code, std::generic_category(), what);
+        }
+        ::close(fd);
+        fd = moved;
+      }
+    }
   }
   for (const int fd : fds)
     ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) | O_NONBLOCK);
@@ -249,7 +266,8 @@ std::streamsize LauncherOutput::Sink::xsputn(const char* data,
 LauncherOutput::LauncherOutput()
     : state_{std::make_shared<State>()}, out_{*state_, 1}, err_{*state_, 2} {
   State& state = *state_;
-  WakePipe(state.wake, "launcher output wake pipe");
+  // Probe and duplicate standard descriptors before opening the wake pipe so
+  // closed fd 0/1/2 can never be hijacked as stdout or stderr.
   struct stat seen[2]{};
   for (std::size_t i = 0; i < 2; ++i) {
     State::Descriptor& descriptor = state.descriptors[i];
@@ -278,6 +296,7 @@ LauncherOutput::LauncherOutput()
     state.descriptors[1].fd = -1;
     state.descriptors[1].closed = true;
   }
+  WakePipe(state.wake, "launcher output wake pipe");
   try {
     const SignalsBlocked blocked;
     descriptor_writer_ =

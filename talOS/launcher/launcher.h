@@ -479,21 +479,25 @@ class Launcher {
   // Log root directory (--output-dir before /<session_id> is appended).
   std::string log_root_;
   SessionManifest session_manifest_;
-  std::unique_ptr<ManifestWriter> manifest_writer_;  // PersistManifest
   // Set by Run from --max-restarts or the config, and the window.
   RestartLimits restart_limits_{};
-  // The launcher's stdout and stderr while Run runs; empty otherwise.
-  std::optional<LauncherOutput> launcher_output_;
-  // Drains every member's output for the session (Run), echoing through
-  // launcher_output_; empty before it.
-  std::optional<ChildOutput> output_;
   // Held by Run for the session, refreshed by Supervise; null without one.
   const SessionLock* session_lock_{nullptr};
   // The new session directory's lock (CreateSessionDirectory), held until
   // Run returns, so no launch's retention, in any shared-memory namespace,
   // removes the directory while this launch writes it; refreshed by
-  // Supervise with the session lock.
+  // Supervise with the session lock. Declared before the output and manifest
+  // writers so exception unwinding destroys them while the directory stays
+  // locked.
   std::optional<SessionDirectoryLock> session_directory_;
+  // The launcher's stdout and stderr while Run runs; empty otherwise.
+  std::optional<LauncherOutput> launcher_output_;
+  // Drains every member's output for the session (Run), echoing through
+  // launcher_output_; empty before it.
+  std::optional<ChildOutput> output_;
+  // Declared after session_directory_ and launcher_output_ so its background
+  // thread stops and joins before either is destroyed on exception unwind.
+  std::unique_ptr<ManifestWriter> manifest_writer_;  // PersistManifest
   // A critical member's first run's live endpoints differed from its probe
   // and --allow-graph-errors was not given (CheckEndpoints): Supervise stops
   // the session and Run returns 1.

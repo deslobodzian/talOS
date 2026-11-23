@@ -5,11 +5,13 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <string_view>
 
@@ -24,10 +26,14 @@ class ServiceNotifier {
     // WATCHDOG=1 on it goes unused.
     const char* watchdog = std::getenv("WATCHDOG_USEC");
     if (watchdog != nullptr) {
-      char* end = nullptr;
-      const unsigned long long usec = std::strtoull(watchdog, &end, 10);
-      if (end != watchdog && *end == '\0' && usec > 0)
+      const std::string_view text{watchdog};
+      uint64_t usec = 0;
+      const auto* const end = text.data() + text.size();
+      const auto [ptr, ec] = std::from_chars(text.data(), end, usec);
+      if (!text.empty() && ec == std::errc{} && ptr == end && usec >= 2 &&
+          usec <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
         watchdog_ = std::chrono::microseconds{static_cast<int64_t>(usec)};
+      }
     }
     const char* path = std::getenv("NOTIFY_SOCKET");
     if (path == nullptr || path[0] == '\0') return;
@@ -62,7 +68,9 @@ class ServiceNotifier {
   // watchdog or a socket.
   std::optional<std::chrono::microseconds> watchdog_interval() const {
     if (fd_ < 0 || !watchdog_) return std::nullopt;
-    return *watchdog_ / 2;
+    const auto half = *watchdog_ / 2;
+    if (half < std::chrono::microseconds{1}) return std::nullopt;
+    return half;
   }
 
   void Send(std::string_view message) const {
