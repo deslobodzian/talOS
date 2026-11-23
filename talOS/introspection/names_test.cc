@@ -1841,8 +1841,9 @@ TEST(AlertPrefixedFields, DeepObjectChainAndSeededMutationsDoNotCrash) {
       bfbs.resize(1 + (next_u64() % bfbs.size()));
     } else if (op == 1 && !bfbs.empty()) {
       for (int k = 0; k < 3; ++k) {
-        bfbs[next_u64() % bfbs.size()] ^=
-            static_cast<char>(1u << (next_u64() % 8));
+        char& byte = bfbs[next_u64() % bfbs.size()];
+        byte = static_cast<char>(static_cast<unsigned char>(byte) ^
+                                 (1u << (next_u64() % 8)));
       }
     } else {
       bfbs.resize(next_u64() % 96);

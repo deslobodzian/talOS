@@ -331,7 +331,9 @@ TEST(TelemetryChannels, EnumLabelsNullSafeAndSeededMutationFuzz) {
       bfbs.resize(1 + (rng() % bfbs.size()));
     } else if (mode == 1 && !bfbs.empty()) {
       for (std::size_t k = 0; k < 3; ++k) {
-        bfbs[rng() % bfbs.size()] ^= static_cast<char>(1u << (rng() % 8));
+        char& byte = bfbs[rng() % bfbs.size()];
+        byte = static_cast<char>(static_cast<unsigned char>(byte) ^
+                                 (1u << (rng() % 8)));
       }
     } else if (mode == 2) {
       bfbs.resize(rng() % 128);
@@ -351,7 +353,10 @@ TEST(TelemetryChannels, EnumLabelsNullSafeAndSeededMutationFuzz) {
         for (const auto& ch : channels) {
           (void)ReadChannel(ch, payload, raw);
         }
-      } catch (const std::invalid_argument&) {
+      } catch (const std::invalid_argument& e) {
+        // Malformed fuzzed .bfbs schemas are expected to throw
+        // invalid_argument.
+        (void)e;
       }
       try {
         const auto channels =
@@ -360,7 +365,10 @@ TEST(TelemetryChannels, EnumLabelsNullSafeAndSeededMutationFuzz) {
         for (const auto& ch : channels) {
           (void)ReadChannel(ch, payload, raw);
         }
-      } catch (const std::invalid_argument&) {
+      } catch (const std::invalid_argument& e) {
+        // Malformed fuzzed .bfbs schemas are expected to throw
+        // invalid_argument.
+        (void)e;
       }
     }
     std::array<std::uint64_t, kDriverStationChannelCount> ds{};

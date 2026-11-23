@@ -205,7 +205,7 @@ void RequireRegularFile(const std::string& context, const std::string& path) {
     if (ec) {
       message += " (" + ec.message() + ")";
     }
-    throw std::invalid_argument(std::move(message));
+    throw std::invalid_argument(message);
   }
 }
 

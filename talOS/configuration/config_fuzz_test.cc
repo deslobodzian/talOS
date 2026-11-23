@@ -223,7 +223,8 @@ std::string MutateStructureAware(std::string input, std::mt19937_64& rng) {
         if (!input.empty()) {
           const std::size_t pos = rng() % input.size();
           if (rng() % 2 == 0) {
-            input[pos] ^= static_cast<char>(1u << (rng() % 8));
+            input[pos] = static_cast<char>(
+                static_cast<unsigned char>(input[pos]) ^ (1u << (rng() % 8)));
           } else {
             const std::size_t len =
                 1 + (rng() % std::min<std::size_t>(16, input.size() - pos));
@@ -241,7 +242,7 @@ std::string MutateStructureAware(std::string input, std::mt19937_64& rng) {
         input.insert(nl, "\n" + std::string(k) + " = " + std::string(v) + "\n");
         break;
       }
-      case 5: {
+      default: {
         if (input.size() > 1) input.resize(rng() % input.size());
         break;
       }
