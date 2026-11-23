@@ -227,5 +227,20 @@ TEST(CalibrationTest, UndistortGuardsInfiniteRadialAndFinalIterationOverflow) {
   EXPECT_DOUBLE_EQ(p_overflow.y(), 0.0);
 }
 
+TEST(CalibrationTest, UndistortPointFallsBackWhenPixelScalingOverflows) {
+  CameraIntrinsics intr;
+  intr.fx = 1e-250;
+  intr.fy = 1e-250;
+  intr.cx = 1e200;
+  intr.cy = 1e200;
+  ASSERT_TRUE(intr.IsValid());
+
+  const Eigen::Vector2d uv(1e10, -1e10);
+  const Eigen::Vector2d undistorted = intr.UndistortPoint(uv);
+  EXPECT_TRUE(undistorted.allFinite());
+  EXPECT_DOUBLE_EQ(undistorted.x(), uv.x());
+  EXPECT_DOUBLE_EQ(undistorted.y(), uv.y());
+}
+
 }  // namespace
 }  // namespace talos::vision

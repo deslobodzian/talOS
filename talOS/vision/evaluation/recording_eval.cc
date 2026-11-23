@@ -142,6 +142,9 @@ Options Parse(int argc, char** argv) {
       if (v.size() > 6) k.p1 = v[6];
       if (v.size() > 7) k.p2 = v[7];
       if (v.size() > 8) k.k3 = v[8];
+      if (!k.IsValid()) {
+        Die("--intrinsics: fx, fy, cx, cy must be positive");
+      }
       o.intrinsics = k;
     } else if (flag == "--photonvision-calibration") {
       field_sim::JsonValue json;
@@ -154,22 +157,36 @@ Options Parse(int argc, char** argv) {
       if (!kd || kd->arr.size() != 9 || !dd || dd->arr.size() < 5) {
         Die("--photonvision-calibration: no cameraIntrinsics/distCoeffs data");
       }
+      for (const auto& elem : kd->arr) {
+        if (elem.type != field_sim::JsonValue::Type::kNumber ||
+            !std::isfinite(elem.number)) {
+          Die("--photonvision-calibration: non-numeric cameraIntrinsics");
+        }
+      }
+      for (const auto& elem : dd->arr) {
+        if (elem.type != field_sim::JsonValue::Type::kNumber ||
+            !std::isfinite(elem.number)) {
+          Die("--photonvision-calibration: non-numeric distCoeffs");
+        }
+      }
       CameraIntrinsics c;
-      c.fx = kd->arr[0].AsDouble(0);
-      c.cx = kd->arr[2].AsDouble(0);
-      c.fy = kd->arr[4].AsDouble(0);
-      c.cy = kd->arr[5].AsDouble(0);
+      c.fx = kd->arr[0].number;
+      c.cx = kd->arr[2].number;
+      c.fy = kd->arr[4].number;
+      c.cy = kd->arr[5].number;
       if (dd->arr.size() == 5) {
-        c.k1 = dd->arr[0].AsDouble(0);
-        c.k2 = dd->arr[1].AsDouble(0);
-        c.p1 = dd->arr[2].AsDouble(0);
-        c.p2 = dd->arr[3].AsDouble(0);
-        c.k3 = dd->arr[4].AsDouble(0);
+        c.k1 = dd->arr[0].number;
+        c.k2 = dd->arr[1].number;
+        c.p1 = dd->arr[2].number;
+        c.p2 = dd->arr[3].number;
+        c.k3 = dd->arr[4].number;
       } else {
         // The rational model (k4..k6) is beyond the pipeline's
         // Brown-Conrady: rectify with OpenCV instead.
-        for (const auto& v : dd->arr)
-          o.opencv_distortion.push_back(v.AsDouble(0));
+        for (const auto& v : dd->arr) o.opencv_distortion.push_back(v.number);
+      }
+      if (!c.IsValid()) {
+        Die("--photonvision-calibration: invalid cameraIntrinsics");
       }
       o.intrinsics = c;
     } else if (flag == "--opencv-distortion") {
@@ -184,10 +201,17 @@ Options Parse(int argc, char** argv) {
       o.equidistant = {v[0], v[1], v[2], v[3]};
     } else if (flag == "--tag-size-m") {
       o.tag_size_m = Numbers(value(), 1, 1, "--tag-size-m")[0];
+      if (!(o.tag_size_m > 0.0)) Die("--tag-size-m must be positive");
     } else if (flag == "--layout") {
       o.layout_json = value();
     } else if (flag == "--aprilgrid") {
       const auto v = Numbers(value(), 4, 4, "--aprilgrid");
+      if (std::floor(v[0]) != v[0] || std::floor(v[1]) != v[1] || v[0] < 1.0 ||
+          v[0] > 1000.0 || v[1] < 1.0 || v[1] > 1000.0 || !(v[2] > 0.0) ||
+          v[3] < 0.0) {
+        Die("--aprilgrid expects integer rows/cols in [1, 1000], size > 0, "
+            "spacing >= 0");
+      }
       o.aprilgrid = {v[0], v[1], v[2], v[3]};
     } else if (flag == "--detect-only") {
       // Unknown tag placement: every tag36h11 id counts as known (one row of
@@ -196,7 +220,11 @@ Options Parse(int argc, char** argv) {
       o.aprilgrid = {1, 587, o.tag_size_m, 0.3};
       o.detect_only = true;
     } else if (flag == "--grid-variant") {
-      o.grid_variant = static_cast<int>(Numbers(value(), 1, 1, flag.data())[0]);
+      const double v = Numbers(value(), 1, 1, "--grid-variant")[0];
+      if (std::floor(v) != v || v < 0.0 || v > 7.0) {
+        Die("--grid-variant expects an integer in [0, 7]");
+      }
+      o.grid_variant = static_cast<int>(v);
     } else if (flag == "--mount") {
       const auto v = Numbers(value(), 6, 6, "--mount");
       std::copy(v.begin(), v.end(), o.mount.begin());
@@ -208,20 +236,31 @@ Options Parse(int argc, char** argv) {
     } else if (flag == "--decimate") {
       o.decimate = static_cast<float>(Numbers(value(), 1, 1, "--decimate")[0]);
     } else if (flag == "--threads") {
-      o.threads = static_cast<int>(Numbers(value(), 1, 1, "--threads")[0]);
+      const double v = Numbers(value(), 1, 1, "--threads")[0];
+      if (std::floor(v) != v || v < 1.0 || v > 16.0) {
+        Die("--threads expects an integer in [1, 16]");
+      }
+      o.threads = static_cast<int>(v);
     } else if (flag == "--sigma") {
       o.sigma = static_cast<float>(Numbers(value(), 1, 1, "--sigma")[0]);
     } else if (flag == "--refine-edges") {
       o.refine_edges = value() != "off";
     } else if (flag == "--hamming") {
-      o.hamming = static_cast<int>(Numbers(value(), 1, 1, "--hamming")[0]);
+      const double v = Numbers(value(), 1, 1, "--hamming")[0];
+      if (std::floor(v) != v || v < 0.0 || v > 2.0) {
+        Die("--hamming expects an integer in [0, 2]");
+      }
+      o.hamming = static_cast<int>(v);
     } else if (flag == "--min-margin") {
       o.min_margin = Numbers(value(), 1, 1, "--min-margin")[0];
     } else if (flag == "--pixel-std-px") {
       o.pixel_std_px = Numbers(value(), 1, 1, "--pixel-std-px")[0];
     } else if (flag == "--max-frames") {
-      o.max_frames =
-          static_cast<std::size_t>(Numbers(value(), 1, 1, "--max-frames")[0]);
+      const double v = Numbers(value(), 1, 1, "--max-frames")[0];
+      if (std::floor(v) != v || v < 0.0 || v > 1e9) {
+        Die("--max-frames expects a non-negative integer <= 1e9");
+      }
+      o.max_frames = static_cast<std::size_t>(v);
     } else if (flag == "--mocap") {
       o.mocap_csv = value();
     } else if (flag == "--t-cam-imu") {
@@ -230,6 +269,9 @@ Options Parse(int argc, char** argv) {
       r << v[0], v[1], v[2], v[4], v[5], v[6], v[8], v[9], v[10];
       o.T_cam_imu = SE3<double>(SO3<double>::FromMatrixNormalized(r),
                                 Eigen::Vector3d(v[3], v[7], v[11]));
+      if (!o.T_cam_imu->matrix().allFinite()) {
+        Die("--t-cam-imu: non-finite transform");
+      }
     } else if (flag == "--out") {
       o.out_dir = value();
     } else if (flag == "--label") {
