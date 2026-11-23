@@ -1115,5 +1115,202 @@ TEST(Endpoint, SurfacesPermanentReceiveErrorsWhileIgnoringTransientErrors) {
   EXPECT_EQ(endpoint.last_receive_error(), 0);
   EXPECT_FALSE(endpoint.receive_needs_reopen());
 }
+
+// A transfer whose serialized payload and CRC are valid but whose
+// ConfigChunkHeader::config_id does not match TryConfigurationId(parsed) must
+// be rejected before Gateway::BeginReconfigure is called, keeping the active
+// configuration untouched and stamping the rejected hdr.config_id on the ACK.
+// REQ-SAFE-21, REQ-CONTRACT-05
+TEST(Endpoint, MismatchedHeaderConfigIdRefusalPreservesActiveConfig) {
+  FakeBackend backend;
+  Gateway gateway{backend, 3016};
+  Endpoint endpoint{gateway};
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+
+  const auto active = SwerveConfig(true);
+  const auto accepted = PushConfig(endpoint, gateway, companion, active, false);
+  ASSERT_TRUE(accepted.has_value());
+  ASSERT_EQ(accepted->status, ConfigAckStatus::kOk);
+  ASSERT_EQ(accepted->config_id, ConfigurationId(active));
+  const int configures_before = backend.configure_calls;
+
+  auto other = active;
+  other.motors[0].slots[0].p = 7.5;
+  const uint64_t other_id = ConfigurationId(other);
+  ASSERT_NE(other_id, ConfigurationId(active));
+  const uint64_t wrong_id = other_id ^ 0x55AAULL;
+  ASSERT_NE(wrong_id, 0u);
+  ASSERT_NE(wrong_id, other_id);
+
+  auto chunks = CreateConfigChunks(other, 200);
+  ASSERT_GT(chunks.size(), 1u);
+  for (auto& ch : chunks) {
+    ConfigChunkHeader hdr = DecodeConfigChunkHeader(ch.data());
+    hdr.config_id = wrong_id;
+    EncodeConfigChunkHeader(hdr, ch.data());
+  }
+  for (const auto& ch : chunks) {
+    ASSERT_EQ(
+        companion.SendFrame(protocol::FrameType::kHardwareConfig,
+                            protocol::kFlagNone, 3000, ch.data(), ch.size()),
+        protocol::UdpStatus::kOk);
+  }
+
+  std::optional<ConfigAckPayload> ack;
+  uint64_t now_us = 4000;
+  ASSERT_TRUE(Eventually([&] {
+    endpoint.Tick(now_us, false);
+    now_us += 1000;
+    protocol::DecodedFrame frame;
+    while (!ack && companion.TryReceive(&frame) == protocol::UdpStatus::kOk) {
+      if (frame.header.type != protocol::FrameType::kHardwareConfigAck)
+        continue;
+      ack.emplace();
+      EXPECT_TRUE(DecodeConfigAck({frame.payload, frame.payload_size}, *ack));
+    }
+    return ack.has_value();
+  }));
+  EXPECT_EQ(ack->status, ConfigAckStatus::kMalformed);
+  EXPECT_EQ(ack->config_id, wrong_id);
+  EXPECT_NE(ack->reason[0], '\0');
+
+  // The gateway never replaced its active config or touched the backend.
+  EXPECT_EQ(backend.configure_calls, configures_before);
+  EXPECT_EQ(gateway.config(), active);
+  const auto state = TickForState(endpoint, companion, now_us, true);
+  ASSERT_TRUE(state.has_value());
+  EXPECT_EQ(state->config_id, ConfigurationId(active));
+  EXPECT_TRUE(state->flags & kConfigured);
+  EXPECT_TRUE(gateway.Accept(Request(gateway), 1, now_us));
+}
+
+// Every config refusal ACK (CRC mismatch, malformed payload, inconsistent
+// chunk metadata, ceiling exceeded, mismatched hdr.config_id) carries the
+// rejected transfer's nonzero hdr.config_id so HardwareNode matches it instead
+// of dropping ACKs with config_id == 0 and retrying at 50 ms forever.
+// REQ-CONTRACT-04, REQ-OPS-20
+TEST(Endpoint, RefusalAcksCarryTransferConfigId) {
+  FakeBackend backend;
+  Gateway gateway{backend, 3017};
+  Endpoint endpoint{gateway};
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+
+  uint64_t now_us = 1000;
+  const auto send_and_await_ack =
+      [&](const std::vector<std::vector<uint8_t>>& chunks) {
+        for (const auto& ch : chunks) {
+          EXPECT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig,
+                                        protocol::kFlagNone, now_us, ch.data(),
+                                        ch.size()),
+                    protocol::UdpStatus::kOk);
+        }
+        std::optional<ConfigAckPayload> ack;
+        EXPECT_TRUE(Eventually([&] {
+          endpoint.Tick(now_us, false);
+          now_us += 1000;
+          protocol::DecodedFrame frame;
+          while (!ack &&
+                 companion.TryReceive(&frame) == protocol::UdpStatus::kOk) {
+            if (frame.header.type != protocol::FrameType::kHardwareConfigAck)
+              continue;
+            ack.emplace();
+            EXPECT_TRUE(
+                DecodeConfigAck({frame.payload, frame.payload_size}, *ack));
+          }
+          return ack.has_value();
+        }));
+        return ack;
+      };
+
+  const auto base = SwerveConfig(true);
+  const uint64_t base_id = ConfigurationId(base);
+
+  // 1. kInvalidCrc
+  {
+    SCOPED_TRACE("kInvalidCrc");
+    auto chunks = CreateConfigChunks(base, 200);
+    chunks.front().back() ^= 0xFF;
+    const auto ack = send_and_await_ack(chunks);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->status, ConfigAckStatus::kInvalidCrc);
+    EXPECT_EQ(ack->config_id, base_id);
+  }
+
+  // 2. kMalformed (undeserializable bytes with valid CRC)
+  {
+    SCOPED_TRACE("kMalformed_deserialize");
+    constexpr uint64_t kMalformedId = 0x1122334455667788ULL;
+    const std::array<uint8_t, 8> garbage{9, 8, 7, 6, 5, 4, 3, 2};
+    std::vector<uint8_t> chunk(sizeof(ConfigChunkHeader) + garbage.size());
+    ConfigChunkHeader hdr{};
+    hdr.config_id = kMalformedId;
+    hdr.total_crc32 = ComputeCrc32(garbage);
+    hdr.total_bytes = static_cast<uint32_t>(garbage.size());
+    hdr.chunk_index = 0;
+    hdr.chunk_count = 1;
+    hdr.chunk_bytes = static_cast<uint32_t>(garbage.size());
+    EncodeConfigChunkHeader(hdr, chunk.data());
+    std::memcpy(chunk.data() + sizeof(ConfigChunkHeader), garbage.data(),
+                garbage.size());
+    const auto ack = send_and_await_ack({chunk});
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->status, ConfigAckStatus::kMalformed);
+    EXPECT_EQ(ack->config_id, kMalformedId);
+  }
+
+  // 3. kMalformed (inconsistent chunk metadata mid-transfer)
+  {
+    SCOPED_TRACE("kMalformed_inconsistent_metadata");
+    auto chunks = CreateConfigChunks(base, 200);
+    ASSERT_GT(chunks.size(), 2u);
+    auto bad_second = chunks[1];
+    ConfigChunkHeader hdr = DecodeConfigChunkHeader(bad_second.data());
+    ++hdr.total_bytes;
+    EncodeConfigChunkHeader(hdr, bad_second.data());
+    const auto ack = send_and_await_ack({chunks[0], bad_second});
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->status, ConfigAckStatus::kMalformed);
+    EXPECT_EQ(ack->config_id, base_id);
+  }
+
+  // 4. kCeilingExceeded
+  {
+    SCOPED_TRACE("kCeilingExceeded");
+    auto ceiling = base;
+    ceiling.motors[0].stator_limit_a = 150.0;
+    const uint64_t ceiling_id = ConfigurationId(ceiling);
+    const auto ack = send_and_await_ack(CreateConfigChunks(ceiling, 200));
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->status, ConfigAckStatus::kCeilingExceeded);
+    EXPECT_EQ(ack->config_id, ceiling_id);
+  }
+
+  // 5. kMalformed (mismatched hdr.config_id)
+  {
+    SCOPED_TRACE("kMalformed_id_mismatch");
+    constexpr uint64_t kWrongId = 0xDEADBEEF12345678ULL;
+    auto chunks = CreateConfigChunks(base, 200);
+    for (auto& ch : chunks) {
+      ConfigChunkHeader hdr = DecodeConfigChunkHeader(ch.data());
+      hdr.config_id = kWrongId;
+      EncodeConfigChunkHeader(hdr, ch.data());
+    }
+    const auto ack = send_and_await_ack(chunks);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->status, ConfigAckStatus::kMalformed);
+    EXPECT_EQ(ack->config_id, kWrongId);
+  }
+
+  // 6. Recovery: a valid push still succeeds cleanly afterward.
+  {
+    SCOPED_TRACE("recovery");
+    const auto ack = send_and_await_ack(CreateConfigChunks(base, 200));
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->status, ConfigAckStatus::kOk);
+    EXPECT_EQ(ack->config_id, base_id);
+  }
+}
 }  // namespace
 }  // namespace talos::hardware

@@ -4663,5 +4663,188 @@ TEST(ConfigWire, AllocationFreeHelpersMatchWireBytesAndValidation) {
   EXPECT_THROW(Validate(bad_name), std::invalid_argument);
 }
 
+// ConfigAssembler verifies that the deserialized Config is valid and its
+// TryConfigurationId matches hdr.config_id before returning kComplete, and
+// preserves hdr.config_id across every refusal reset so Endpoint::Tick stamps
+// the transfer's id onto refusal ACKs (while clearing assembly state).
+// REQ-SAFE-21, REQ-CONTRACT-04, REQ-CONTRACT-05, REQ-OPS-20
+TEST(ConfigWire, RefusalsPreserveHeaderConfigIdAndRejectIdMismatch) {
+  const auto valid = SwerveConfig(true);
+  const uint64_t valid_id = ConfigurationId(valid);
+  ASSERT_NE(valid_id, 0u);
+
+  const auto make_single_chunk =
+      [](uint64_t config_id, std::span<const uint8_t> body, uint32_t crc) {
+        std::vector<uint8_t> chunk(sizeof(ConfigChunkHeader) + body.size());
+        ConfigChunkHeader hdr{};
+        hdr.config_id = config_id;
+        hdr.total_crc32 = crc;
+        hdr.total_bytes = static_cast<uint32_t>(body.size());
+        hdr.chunk_index = 0;
+        hdr.chunk_count = 1;
+        hdr.chunk_bytes = static_cast<uint32_t>(body.size());
+        EncodeConfigChunkHeader(hdr, chunk.data());
+        std::memcpy(chunk.data() + sizeof(ConfigChunkHeader), body.data(),
+                    body.size());
+        return chunk;
+      };
+
+  // 1. Valid payload and valid CRC, but mismatched hdr.config_id must be
+  // rejected as kMalformedConfig while preserving the rejected hdr.config_id.
+  {
+    const uint64_t wrong_id = valid_id ^ 0x55AAULL;
+    auto chunks = CreateConfigChunks(valid, 200);
+    ASSERT_GT(chunks.size(), 1u);
+    for (auto& ch : chunks) {
+      ConfigChunkHeader hdr = DecodeConfigChunkHeader(ch.data());
+      hdr.config_id = wrong_id;
+      EncodeConfigChunkHeader(hdr, ch.data());
+    }
+    ConfigAssembler assembler;
+    std::string error;
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+      EXPECT_EQ(assembler.AddChunk(chunks[i], error),
+                i + 1 == chunks.size()
+                    ? ConfigAssembler::Status::kMalformedConfig
+                    : ConfigAssembler::Status::kIncomplete);
+    }
+    EXPECT_EQ(assembler.config_id(), wrong_id);
+    EXPECT_FALSE(error.empty());
+    // Assembly state was cleared, so a valid transfer completes cleanly next.
+    const auto good_chunks = CreateConfigChunks(valid, 200);
+    for (std::size_t i = 0; i < good_chunks.size(); ++i) {
+      EXPECT_EQ(assembler.AddChunk(good_chunks[i], error),
+                i + 1 == good_chunks.size()
+                    ? ConfigAssembler::Status::kComplete
+                    : ConfigAssembler::Status::kIncomplete);
+    }
+    EXPECT_EQ(assembler.config_id(), valid_id);
+  }
+
+  // 2. Deserializable but invalid config (TryConfigurationId == 0) is rejected
+  // even when hdr.config_id == 0 (0 must never match 0).
+  {
+    Config invalid;
+    MotorConfig motor;
+    motor.id = 1;
+    motor.name = "bad_motor";
+    motor.can_id = 1;
+    motor.bus = "rio";
+    motor.max_voltage = -1.0;
+    invalid.motors.push_back(motor);
+    ASSERT_EQ(TryConfigurationId(invalid), 0u);
+    const auto body = SerializeConfig(invalid);
+    ASSERT_LE(body.size(), kMaxConfigChunkData);
+    const uint32_t crc = ComputeCrc32(body);
+    const auto zero_id_chunk = make_single_chunk(0, body, crc);
+    ConfigAssembler assembler;
+    std::string error;
+    EXPECT_EQ(assembler.AddChunk(zero_id_chunk, error),
+              ConfigAssembler::Status::kMalformedConfig);
+    EXPECT_EQ(assembler.config_id(), 0u);
+
+    constexpr uint64_t kNonZeroId = 0x123456789ABCDEF0ULL;
+    const auto nonzero_id_chunk = make_single_chunk(kNonZeroId, body, crc);
+    EXPECT_EQ(assembler.AddChunk(nonzero_id_chunk, error),
+              ConfigAssembler::Status::kMalformedConfig);
+    EXPECT_EQ(assembler.config_id(), kNonZeroId);
+  }
+
+  // 3. CRC mismatch preserves hdr.config_id.
+  {
+    auto chunks = CreateConfigChunks(valid, 200);
+    chunks.front().back() ^= 0xFF;
+    ConfigAssembler assembler;
+    std::string error;
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+      EXPECT_EQ(assembler.AddChunk(chunks[i], error),
+                i + 1 == chunks.size() ? ConfigAssembler::Status::kCrcMismatch
+                                       : ConfigAssembler::Status::kIncomplete);
+    }
+    EXPECT_EQ(assembler.config_id(), valid_id);
+  }
+
+  // 4. Undeserializable payload with valid CRC preserves hdr.config_id.
+  {
+    constexpr uint64_t kMalformedId = 0xCAFEBABE11223344ULL;
+    const std::array<uint8_t, 8> garbage{1, 2, 3, 4, 5, 6, 7, 8};
+    const auto chunk =
+        make_single_chunk(kMalformedId, garbage, ComputeCrc32(garbage));
+    ConfigAssembler assembler;
+    std::string error;
+    EXPECT_EQ(assembler.AddChunk(chunk, error),
+              ConfigAssembler::Status::kMalformedConfig);
+    EXPECT_EQ(assembler.config_id(), kMalformedId);
+  }
+
+  // 5. Ceiling violation preserves hdr.config_id.
+  {
+    auto ceiling = valid;
+    ceiling.motors[0].stator_limit_a = 150.0;
+    const uint64_t ceiling_id = ConfigurationId(ceiling);
+    ASSERT_NE(ceiling_id, 0u);
+    const auto chunks = CreateConfigChunks(ceiling, 200);
+    ConfigAssembler assembler;
+    std::string error;
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+      EXPECT_EQ(assembler.AddChunk(chunks[i], error),
+                i + 1 == chunks.size()
+                    ? ConfigAssembler::Status::kCeilingExceeded
+                    : ConfigAssembler::Status::kIncomplete);
+    }
+    EXPECT_EQ(assembler.config_id(), ceiling_id);
+  }
+
+  // 6. Mid-transfer inconsistent chunk metadata preserves hdr.config_id and
+  // resets assembly state so a subsequent transfer succeeds.
+  {
+    const auto chunks = CreateConfigChunks(valid, 200);
+    ASSERT_GT(chunks.size(), 2u);
+    ConfigAssembler assembler;
+    std::string error;
+    ASSERT_EQ(assembler.AddChunk(chunks[0], error),
+              ConfigAssembler::Status::kIncomplete);
+    auto bad_meta = chunks[1];
+    ConfigChunkHeader hdr = DecodeConfigChunkHeader(bad_meta.data());
+    ++hdr.total_bytes;
+    EncodeConfigChunkHeader(hdr, bad_meta.data());
+    EXPECT_EQ(assembler.AddChunk(bad_meta, error),
+              ConfigAssembler::Status::kInvalidChunk);
+    EXPECT_EQ(assembler.config_id(), valid_id);
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+      EXPECT_EQ(assembler.AddChunk(chunks[i], error),
+                i + 1 == chunks.size() ? ConfigAssembler::Status::kComplete
+                                       : ConfigAssembler::Status::kIncomplete);
+    }
+    EXPECT_EQ(assembler.config_id(), valid_id);
+  }
+
+  // 7. A chunk shorter than ConfigChunkHeader reports config_id == 0 (never
+  // leaking a prior transfer's id) without disturbing an in-progress assembly,
+  // and explicit Reset() clears config_id to 0.
+  {
+    const auto chunks = CreateConfigChunks(valid, 200);
+    ASSERT_GT(chunks.size(), 1u);
+    ConfigAssembler assembler;
+    std::string error;
+    ASSERT_EQ(assembler.AddChunk(chunks[0], error),
+              ConfigAssembler::Status::kIncomplete);
+    EXPECT_EQ(assembler.config_id(), valid_id);
+    const std::array<uint8_t, 4> tiny{1, 2, 3, 4};
+    EXPECT_EQ(assembler.AddChunk(tiny, error),
+              ConfigAssembler::Status::kInvalidChunk);
+    EXPECT_EQ(assembler.config_id(), 0u);
+    // Remaining chunks of the in-progress transfer still complete it.
+    for (std::size_t i = 1; i < chunks.size(); ++i) {
+      EXPECT_EQ(assembler.AddChunk(chunks[i], error),
+                i + 1 == chunks.size() ? ConfigAssembler::Status::kComplete
+                                       : ConfigAssembler::Status::kIncomplete);
+    }
+    EXPECT_EQ(assembler.config_id(), valid_id);
+    assembler.Reset();
+    EXPECT_EQ(assembler.config_id(), 0u);
+  }
+}
+
 }  // namespace
 }  // namespace talos::hardware

@@ -590,11 +590,13 @@ class ConfigAssembler {
     };
     if (!error_reason.empty()) error_reason[0] = '\0';
     if (payload.size() < sizeof(ConfigChunkHeader)) {
+      last_config_id_ = 0;
       set_reason("chunk payload smaller than header");
       return Status::kInvalidChunk;
     }
 
     const ConfigChunkHeader hdr = DecodeConfigChunkHeader(payload.data());
+    last_config_id_ = hdr.config_id;
 
     if (hdr.chunk_bytes == 0 || hdr.chunk_bytes > kMaxConfigChunkData ||
         payload.size() != sizeof(ConfigChunkHeader) + hdr.chunk_bytes) {
@@ -646,7 +648,7 @@ class ConfigAssembler {
       if (hdr.total_bytes != total_bytes_ || hdr.total_crc32 != total_crc32_ ||
           hdr.chunk_count != chunk_count_ || stride != chunk_stride_) {
         set_reason("inconsistent chunk metadata");
-        Reset();
+        ResetAssembly();
         return Status::kInvalidChunk;
       }
     }
@@ -672,27 +674,33 @@ class ConfigAssembler {
                       "assembled CRC mismatch (expected %u, got %u)",
                       total_crc32_, actual_crc);
       }
-      Reset();
+      ResetAssembly();
       return Status::kCrcMismatch;
     }
 
     Config parsed;
     if (!DeserializeConfig(assembled, parsed)) {
       set_reason("failed to deserialize config bytes");
-      Reset();
+      ResetAssembly();
+      return Status::kMalformedConfig;
+    }
+
+    const uint64_t actual_id = TryConfigurationId(parsed);
+    if (actual_id == 0 || actual_id != active_config_id_) {
+      set_reason(actual_id == 0 ? "config failed validation"
+                                : "config id mismatch");
+      ResetAssembly();
       return Status::kMalformedConfig;
     }
 
     // Check ceilings!
     if (!CheckCeilingsInto(parsed, error_reason)) {
-      Reset();
+      ResetAssembly();
       return Status::kCeilingExceeded;
     }
 
     config_ = parsed;
-    const auto completed_id = active_config_id_;
-    Reset();
-    active_config_id_ = completed_id;
+    ResetAssembly();
     return Status::kComplete;
   }
 
@@ -711,9 +719,19 @@ class ConfigAssembler {
   }
 
   const Config& config() const { return config_; }
-  uint64_t config_id() const { return active_config_id_; }
+  // The header config_id of the most recently processed chunk (0 before any
+  // chunk, after Reset(), or after a chunk shorter than ConfigChunkHeader).
+  // Preserved across completion and refusal resets so Endpoint::Tick stamps
+  // the rejected transfer's config_id onto refusal ACKs (REQ-CONTRACT-04).
+  uint64_t config_id() const { return last_config_id_; }
 
   void Reset() noexcept {
+    ResetAssembly();
+    last_config_id_ = 0;
+  }
+
+ private:
+  void ResetAssembly() noexcept {
     active_config_id_ = 0;
     total_crc32_ = 0;
     total_bytes_ = 0;
@@ -723,8 +741,8 @@ class ConfigAssembler {
     received_chunks_.reset();
   }
 
- private:
   uint64_t active_config_id_{0};
+  uint64_t last_config_id_{0};
   uint32_t total_crc32_{0};
   uint32_t total_bytes_{0};
   uint16_t chunk_count_{0};
