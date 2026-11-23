@@ -206,7 +206,8 @@ TEST(LauncherAdversarial, HugeWatchdogUsecDoesNotOverflowNanoseconds) {
     ASSERT_TRUE(interval.has_value());
     EXPECT_EQ(*interval, std::chrono::microseconds{
                              std::numeric_limits<int64_t>::max() / 2});
-    const auto now = std::chrono::steady_clock::now();
+    const std::chrono::steady_clock::time_point now{
+        std::chrono::seconds{1'000'000}};
     const auto wake = ServiceNotifier::NextDeadline(now, *interval);
     EXPECT_EQ(wake, std::chrono::steady_clock::time_point::max());
     EXPECT_GT(wake, now);
