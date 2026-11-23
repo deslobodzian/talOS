@@ -12,6 +12,7 @@
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <string_view>
 #include <system_error>
 
@@ -78,7 +79,7 @@ ProcessStart InspectProcess(pid_t pid) {
 
 // macOS has no pid namespaces.
 OwnIdentity InspectSelf() {
-  const auto pid = static_cast<std::uint64_t>(::getpid());
+  const auto pid = static_cast<std::uint64_t>(::getpid()) & kProcessPidMask;
   const std::uint64_t start =
       InspectProcess(static_cast<pid_t>(pid)).start & kProcessStartMask;
   return {.word = (start << kProcessPidBits) | pid,
@@ -88,19 +89,30 @@ OwnIdentity InspectSelf() {
 // A /proc/<pid>/stat file holds the state in field 3, the thread count in
 // field 20 and the start, in clock ticks since boot, in field 22. The command
 // name (field 2) may hold spaces and parentheses, so fields are counted from
-// its closing ')'. A file that cannot be read or parsed reports a running
-// process of unknown start.
-ProcessStart ReadStat(const char* path) {
-  const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
-  if (fd == -1) return {.running = true};
+// its closing ')'. Returns nullopt when the file cannot be opened or read so
+// InspectProcess can distinguish an exited process from hidepid; an unparseable
+// file reports a running process of unknown start.
+std::optional<ProcessStart> ReadStat(const char* path) {
+  int fd = -1;
+  do {
+    fd = ::open(path, O_RDONLY | O_CLOEXEC);
+  } while (fd == -1 && errno == EINTR);
+  if (fd == -1) return std::nullopt;
   std::array<char, 1024> buffer{};
-  const ssize_t length = ::read(fd, buffer.data(), buffer.size());
+  std::size_t used = 0;
+  while (used < buffer.size()) {
+    const ssize_t length =
+        ::read(fd, buffer.data() + used, buffer.size() - used);
+    if (length < 0 && errno == EINTR) continue;
+    if (length <= 0) break;
+    used += static_cast<std::size_t>(length);
+  }
   ::close(fd);
-  if (length <= 0) return {.running = true};
-  const std::string_view line{buffer.data(), static_cast<std::size_t>(length)};
+  if (used == 0) return std::nullopt;
+  const std::string_view line{buffer.data(), used};
   const std::size_t name_end = line.rfind(')');
   if (name_end == std::string_view::npos || name_end + 2 >= line.size()) {
-    return {.running = true};
+    return ProcessStart{.running = true};
   }
   const char state = line[name_end + 2];
   std::size_t at = name_end + 2;
@@ -119,13 +131,15 @@ ProcessStart ReadStat(const char* path) {
   };
   std::uint64_t threads = 0;
   std::uint64_t start = 0;
-  if (!field(20, threads) || !field(22, start)) return {.running = true};
+  if (!field(20, threads) || !field(22, start)) {
+    return ProcessStart{.running = true};
+  }
   // A leader that exited while its other threads run (pthread_exit from
   // main) shows as a zombie but its threads still map the segment.
   if ((state == 'Z' && threads <= 1) || state == 'X' || state == 'x') {
-    return {};
+    return ProcessStart{};
   }
-  return {.running = true, .start = start};
+  return ProcessStart{.running = true, .start = start};
 }
 
 // kill() first, so another user's process hidden from /proc (hidepid) still
@@ -135,7 +149,15 @@ ProcessStart InspectProcess(pid_t pid) {
   std::array<char, 32> path{};
   std::snprintf(path.data(), path.size(), "/proc/%d/stat",
                 static_cast<int>(pid));
-  return ReadStat(path.data());
+  if (const std::optional<ProcessStart> parsed = ReadStat(path.data());
+      parsed.has_value()) {
+    return *parsed;
+  }
+  // /proc/<pid>/stat disappeared or could not be read: re-check kill() so a
+  // process that exited between kill() and open() is reported dead while a live
+  // hidepid process still counts as running.
+  if (::kill(pid, 0) != 0 && errno == ESRCH) return {};
+  return {.running = true};
 }
 
 // Whether the mounted /proc shows this process's own pid namespace. NSpid in
@@ -146,7 +168,10 @@ ProcessStart InspectProcess(pid_t pid) {
 // read another process's start for every pid it checks; comparing
 // /proc/self with getpid() misses it when the two pids happen to be equal.
 bool ProcIsOwnNamespace() {
-  const int fd = ::open("/proc/self/status", O_RDONLY | O_CLOEXEC);
+  int fd = -1;
+  do {
+    fd = ::open("/proc/self/status", O_RDONLY | O_CLOEXEC);
+  } while (fd == -1 && errno == EINTR);
   if (fd == -1) return false;
   std::array<char, 8192> buffer{};
   std::size_t used = 0;
@@ -182,8 +207,9 @@ bool ProcIsOwnNamespace() {
 // namespace the mounted /proc shows. The checking code is its own
 // namespace's only while that /proc is its own namespace's.
 OwnIdentity InspectSelf() {
-  const auto pid = static_cast<std::uint64_t>(::getpid());
-  const std::uint64_t start = ReadStat("/proc/self/stat").start;
+  const auto pid = static_cast<std::uint64_t>(::getpid()) & kProcessPidMask;
+  const std::uint64_t start =
+      ReadStat("/proc/self/stat").value_or(ProcessStart{}).start;
   struct stat entry {};
   const std::uint64_t space =
       ::stat("/proc/self/ns/pid", &entry) == 0

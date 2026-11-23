@@ -69,6 +69,68 @@ class SubjectConfigTest(unittest.TestCase):
             self.narrow(text)
         self.assertFalse(os.path.exists(self.dir / "subject.toml"))
 
+    def test_refuses_mismatched_toml_header_brackets(self):
+        for bad_header in ("[[robot]\nname = \"bench\"\n",
+                           "[subsystems]]\nname = \"swerve_module\"\n"):
+            with self.subTest(bad_header=bad_header), \
+                    self.assertRaises(RuntimeError):
+                self.narrow(bad_header)
+
+
+class RotationsAndSilenceJudgmentTest(unittest.TestCase):
+    # REQ-DEV-06
+    def test_rotations_of_handles_signed_scientific_and_rejects_non_finite(self):
+        self.assertAlmostEqual(
+            rio.rotations_of("sim_gateway: first_wheel_rotations=1e-05 x=0"),
+            1e-5,
+        )
+        self.assertAlmostEqual(
+            rio.rotations_of("sim_gateway: first_wheel_rotations=-2.500000"),
+            -2.5,
+        )
+        for bad in ("first_wheel_rotations=nan", "first_wheel_rotations=inf"):
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                rio.rotations_of(f"sim_gateway: {bad}")
+
+    # REQ-DEV-06
+    def test_judge_silence_rejects_invalid_digital_or_pwm_samples(self):
+        def make_state(seq, sample_us, epoch, active, volts, rps,
+                       digital_outputs=(), pwm_outputs=()):
+            flags = rio.FLAG_CONFIGURED | rio.FLAG_ENABLED
+            if active:
+                flags |= rio.FLAG_COMMAND_ACTIVE
+            return {
+                "sequence": seq,
+                "sample_us": sample_us,
+                "epoch": epoch,
+                "flags": flags,
+                "last_command_sequence": 1,
+                "motors": [(1, True, rps, volts)],
+                "digital_outputs": list(digital_outputs),
+                "pwm_outputs": list(pwm_outputs),
+                "apply_failures": 0,
+                "resets": 0,
+            }
+
+        commands = {1: (100_000, [(1, 1)])}
+        base_states = [
+            make_state(1, 100_000, 1, True, 3.0, 10.0),
+            make_state(2, 195_000, 1, True, 3.0, 10.0),
+            make_state(3, 200_000, 2, False, 0.0, 0.0),
+        ]
+        # Settled at 200_000 + 4 * 5_000 = 220_000 (status_hz = 200).
+        for label, extra in (
+            ("invalid_digital_output",
+             make_state(4, 225_000, 2, False, 0.0, 0.0,
+                        digital_outputs=[(2, 0, 0)])),
+            ("invalid_pwm_output",
+             make_state(4, 225_000, 2, False, 0.0, 0.0,
+                        pwm_outputs=[(3, 0, 0.0)])),
+        ):
+            with self.subTest(label=label), self.assertRaises(RuntimeError):
+                rio.judge_silence(base_states + [extra], commands,
+                                  timeout_us=100_000, status_hz=200)
+
 
 class NothingRestoredTest(unittest.TestCase):
     def test_refuses_a_program_that_restored_a_configuration(self):

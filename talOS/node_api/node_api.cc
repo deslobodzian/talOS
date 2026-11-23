@@ -355,6 +355,14 @@ const char* talos_last_error(void) { return g_last_error.c_str(); }
 int32_t talos_run(int32_t argc, char** argv, const char* node_name,
                   const char* node_target, TalosFactory factory, void* user) {
   return Guard<int32_t>(1, [&] {
+    if (argc < 0 || (argc > 0 && argv == nullptr)) {
+      throw std::invalid_argument("invalid argc/argv");
+    }
+    for (int32_t i = 0; i < argc; ++i) {
+      if (argv[i] == nullptr) {
+        throw std::invalid_argument("null argv[" + std::to_string(i) + "]");
+      }
+    }
     return talos::detail::RunMain(argc, argv, NonNull(node_name, "node_name"),
                                   NonNull(node_target, "node_target"),
                                   MakeFactory(factory, user));
@@ -492,14 +500,12 @@ int64_t talos_node_subscribe(TalosNode* node, const char* topic,
         Check(on_message(data, message_bytes, user), "message callback");
       };
     }
-    const std::size_t index = NodeAccess::add_subscription(
-        n, NonNull(topic, "topic"), message_bytes, talos::kMessageAlignment,
-        Schema(schema), optional != 0, std::move(callback));
     // talos::Node::subscribe's rule: a callback wakes the node unless it is
     // opened to wait for the next drain.
-    if (on_message != nullptr && wake == TALOS_WAKE_ON_PUBLISH) {
-      NodeAccess::require_immediate_delivery(n, index);
-    }
+    const std::size_t index = NodeAccess::add_subscription(
+        n, NonNull(topic, "topic"), message_bytes, talos::kMessageAlignment,
+        Schema(schema), optional != 0, std::move(callback),
+        on_message != nullptr && wake == TALOS_WAKE_ON_PUBLISH);
     return static_cast<int64_t>(index);
   });
 }

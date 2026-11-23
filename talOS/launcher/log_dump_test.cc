@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <span>
 #include <sstream>
@@ -21,6 +22,8 @@
 #include "alert_test/alert_message_generated.h"
 #include "continuity_test/continuity_message_descriptor.h"
 #include "continuity_test/continuity_message_generated.h"
+#include "flatbuffers/reflection.h"
+#include "flatbuffers/reflection_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "summary_test/summary_message_descriptor.h"
 #include "summary_test/summary_message_generated.h"
@@ -1187,6 +1190,111 @@ TEST_F(LogDumpTest, RejectsInvalidOptions) {
                                              {"--until-ms", "10oops"}}) {
     Run(args, false);
   }
+}
+
+// REQ-OPS-15, REQ-OPS-37: hostile .tlog files with extreme int64 timestamps,
+// unclosed/deeply-nested braces in schema enum names, and non-UTF-8 bytes in
+// process/topic names must not crash, trigger signed overflow UB, or emit
+// invalid UTF-8 JSONL.
+TEST_F(LogDumpTest, HandlesHostileTimestampsUnclosedBracesAndNonUtf8) {
+  const std::string hostile_dir = directory_ + "/hostile";
+  std::filesystem::create_directories(hostile_dir);
+
+  // Build a verified .bfbs struct with an enum whose value name holds unclosed
+  // deeply nested braces ("{{{..."), exercising DecodedFields recursion and
+  // missing closing brace handling.
+  flatbuffers::FlatBufferBuilder builder;
+  const std::string hostile_enum_val(256, '{');
+  const auto ev_name = builder.CreateString(hostile_enum_val);
+  reflection::EnumValBuilder evb(builder);
+  evb.add_name(ev_name);
+  evb.add_value(0);
+  std::vector<flatbuffers::Offset<reflection::EnumVal>> evs{evb.Finish()};
+  const auto evs_vec = builder.CreateVectorOfSortedTables(&evs);
+  reflection::TypeBuilder etb(builder);
+  etb.add_base_type(reflection::BaseType::UByte);
+  const auto enum_underlying = etb.Finish();
+  const auto enum_name = builder.CreateString("hostile.Braces");
+  reflection::EnumBuilder eb(builder);
+  eb.add_name(enum_name);
+  eb.add_values(evs_vec);
+  eb.add_underlying_type(enum_underlying);
+  std::vector<flatbuffers::Offset<reflection::Enum>> enums{eb.Finish()};
+  const auto enums_vec = builder.CreateVectorOfSortedTables(&enums);
+
+  const auto field_name = builder.CreateString("mode");
+  reflection::TypeBuilder ftb(builder);
+  ftb.add_base_type(reflection::BaseType::UByte);
+  ftb.add_index(0);
+  const auto field_type = ftb.Finish();
+  reflection::FieldBuilder fb(builder);
+  fb.add_name(field_name);
+  fb.add_type(field_type);
+  fb.add_id(0);
+  fb.add_offset(0);
+  std::vector<flatbuffers::Offset<reflection::Field>> fields{fb.Finish()};
+  const auto fields_vec = builder.CreateVectorOfSortedTables(&fields);
+
+  const auto obj_name = builder.CreateString("hostile.Status");
+  reflection::ObjectBuilder ob(builder);
+  ob.add_name(obj_name);
+  ob.add_fields(fields_vec);
+  ob.add_is_struct(true);
+  ob.add_bytesize(1);
+  std::vector<flatbuffers::Offset<reflection::Object>> objs{ob.Finish()};
+  const auto objs_vec = builder.CreateVectorOfSortedTables(&objs);
+
+  reflection::SchemaBuilder sb(builder);
+  sb.add_objects(objs_vec);
+  sb.add_enums(enums_vec);
+  reflection::FinishSchemaBuffer(builder, sb.Finish());
+  const std::string bfbs{
+      reinterpret_cast<const char*>(builder.GetBufferPointer()),
+      builder.GetSize()};
+
+  talos::event::Registration source;
+  source.id = 1;
+  source.kind = talos::event::SourceKind::SENDER;
+  // Role is "status" so AlertsJson runs DecodedFields::Walk in jsonl mode, and
+  // contains an invalid UTF-8 byte (0xff) to verify JSON UTF-8 escaping.
+  source.name = std::string{"/bad\xff/status"};
+  source.message_bytes = 1;
+  source.schema = {"hostile.Status", 0x123456789abcdef0ULL, bfbs};
+
+  talos::event::log::LogWriter writer{
+      hostile_dir + "/hostile.tlog", std::string{"proc\xfe"},
+      talos::event::log::LogWriterOptions{1 << 16, 1, false}, 99};
+  writer.start({source}, talos::event::MonotonicTime::from_nanos(0));
+  const std::array<std::byte, 1> payload{std::byte{0}};
+  talos::event::Context ctx{};
+  ctx.kind = talos::event::EventKind::SEND;
+  ctx.source_id = 1;
+  ctx.dispatch_index = 1;
+  // Extreme int64 timestamps: INT64_MIN event_time vs 0 now/publish overflows
+  // signed int64 subtraction if not widened to unsigned difference.
+  ctx.event_time = talos::event::MonotonicTime::from_nanos(
+      std::numeric_limits<std::int64_t>::min());
+  ctx.now = talos::event::MonotonicTime::from_nanos(0);
+  ctx.publish_time = talos::event::MonotonicTime::from_nanos(
+      std::numeric_limits<std::int64_t>::max());
+  ctx.sequence = 1;
+  writer.dispatch(ctx, payload);
+  writer.flush();
+  ASSERT_FALSE(writer.failed()) << writer.error();
+
+  const RunResult jsonl =
+      RunSplit({"--format", "jsonl", hostile_dir}, true, false);
+  EXPECT_NE(jsonl.out.find("\"process\":\"proc\\u00fe\""), std::string::npos)
+      << jsonl.out;
+  EXPECT_NE(jsonl.out.find("\"topic\":\"/bad\\u00ff/status\""),
+            std::string::npos)
+      << jsonl.out;
+  EXPECT_EQ(jsonl.out.find('\xff'), std::string::npos);
+  EXPECT_EQ(jsonl.out.find('\xfe'), std::string::npos);
+
+  const RunResult summary =
+      RunSplit({"--format", "summary", hostile_dir}, true, false);
+  EXPECT_NE(summary.out.find("records proc"), std::string::npos) << summary.out;
 }
 
 }  // namespace

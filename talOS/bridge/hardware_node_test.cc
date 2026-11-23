@@ -2668,5 +2668,72 @@ TEST(HardwareNodeTest, AbsentLocalAddressRetriesEvery100MsWithoutFallback) {
   Release(gw_res);
 }
 
+int AlwaysTransientRecvError() { return ECONNREFUSED; }
+
+// Persistent transient receive errors (such as ECONNREFUSED across all
+// kReceiveBudget iterations with zero datagrams consumed) must not leave
+// tick_receive_capped_ set and busy-spin Pass() into CPU throttling.
+// REQ-RT-20
+TEST(HardwareNodeTest, PersistentTransientReceiveErrorsDoNotBusySpinPass) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  node.set_seams({.recv_error = &AlwaysTransientRecvError});
+
+  constexpr uint64_t kStartUs = 1'000'000;
+  const HardwareNode::Wait wait = node.Pass(kStartUs);
+  EXPECT_EQ(node.socket_counters().recv_failures,
+            static_cast<uint64_t>(HardwareNode::kReceiveBudget));
+  EXPECT_GT(wait.until_us, kStartUs)
+      << "transient receive errors with 0 datagrams requested immediate retry";
+  EXPECT_FALSE(wait.ignore_input);
+  EXPECT_EQ(node.wakeups().throttled, 0u);
+}
+
+// RULES.md 3: config pushes executed on the RT bridge loop (initial push,
+// retry after enabled refusal, or gateway reboot) must not heap-allocate.
+// REQ-RT-06
+TEST(HardwareNodeTest, PushConfigDuringTickDoesNotAllocate) {
+  if (const auto why = talos::testing::AllocationProbe::Unsupported();
+      !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  const uint64_t config_id = NodeConfigId(cfg);
+
+  // Warm up the first State/boot stderr log and initial config push before
+  // measuring.
+  uint64_t now_us = 1'000'000;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id + 1, 11, 1, 1'000), now_us));
+  // Drain the initial config chunks sent to the gateway.
+  protocol::DecodedFrame drained;
+  while (link.gateway.TryReceive(&drained) == protocol::UdpStatus::kOk) {
+  }
+
+  // Trigger a retry push via a second mismatched-config State past the 50 ms
+  // backoff, plus a direct PushConfig() call: zero heap allocations allowed.
+  now_us += 100'000;
+  std::array<uint8_t, kMaxStateSize> encoded{};
+  const std::size_t n =
+      Encode(TrustState(config_id + 1, 11, 1, 101'000), encoded);
+  ASSERT_GT(n, 0u);
+  ASSERT_EQ(link.gateway.SendFrame(protocol::FrameType::kHardwareState, 0,
+                                   now_us, encoded.data(), n),
+            protocol::UdpStatus::kOk);
+  ASSERT_TRUE(DatagramQueued(node));
+
+  talos::testing::AllocationProbe probe;
+  probe.start();
+  node.Tick(now_us);
+  node.PushConfig(now_us + 1'000);
+  const uint64_t allocations = probe.stop();
+  EXPECT_EQ(allocations, 0u) << probe.sites();
+}
+
 }  // namespace
 }  // namespace talos::hardware

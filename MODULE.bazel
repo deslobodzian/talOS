@@ -90,11 +90,18 @@ studio_npm.npm_translate_lock(
 use_repo(studio_npm, "studio_npm")
 
 # Studio network bridge: immutable uWebSockets v20.51.0 and its uSockets gitlink.
+# uws_security_and_ub.patch fixes three null-pointer UBs (Safari 15 upgrade
+# memset without Sec-WebSocket-Extensions, >=16 KiB formatMessage memcpy,
+# BackPressure::append on partial drain), trims only RFC 9110 OWS instead of
+# signed char < 33 (which stripped 0x80..0xFF), rejects RFC 9112 smuggling
+# duplicates (Host, Content-Length, Transfer-Encoding), and validates chunk hex.
 studio_http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
 studio_http_archive(
     name = "studio_uws",
     build_file = "//studio/bridge:uws.BUILD.bazel",
+    patch_args = ["-p1"],
+    patches = ["//third_party:uws_security_and_ub.patch"],
     sha256 = "8d50fae3aee565ec58d4b999ff44ce8bb0b78665fff7f5861528fcd4b1385e8a",
     strip_prefix = "uWebSockets-53e835c1fa71ea64303b48418fec46533318bf91",
     type = "tar.gz",

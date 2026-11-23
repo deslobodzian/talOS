@@ -5,6 +5,7 @@ raise, with the C++ message, or with the Python exception a callback raised.
 """
 
 import ctypes
+import math
 import os
 import threading
 
@@ -468,3 +469,38 @@ def handle(pointer):
 
 def encode(text):
     return text.encode() if isinstance(text, str) else text
+
+
+INT32_MIN, INT32_MAX = -(1 << 31), (1 << 31) - 1
+INT64_MIN, INT64_MAX = -(1 << 63), (1 << 63) - 1
+UINT32_MAX = (1 << 32) - 1
+UINT64_MAX = (1 << 64) - 1
+
+
+def check_int(value, lo, hi, what):
+    """Checks that `value` is an int (not bool) in [lo, hi], preventing silent
+    ctypes modulo wraparound."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{what} must be an int, got {type(value).__name__}")
+    if not lo <= value <= hi:
+        raise ValueError(f"{what} out of range [{lo}, {hi}]: {value}")
+    return int(value)
+
+
+def duration_ns(seconds, what):
+    """Converts a finite duration in seconds to int64 nanoseconds without
+    letting ctypes wrap c_int64."""
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+        raise TypeError(
+            f"{what} must be a number, got {type(seconds).__name__}")
+    if isinstance(seconds, int):
+        ns = seconds * 1_000_000_000
+    else:
+        scaled = seconds * 1e9
+        if not math.isfinite(scaled):
+            raise ValueError(
+                f"{what} overflows int64 nanoseconds: {seconds!r}")
+        ns = round(scaled)
+    if not INT64_MIN <= ns <= INT64_MAX:
+        raise ValueError(f"{what} overflows int64 nanoseconds: {seconds!r}")
+    return ns

@@ -54,6 +54,11 @@ inline bool ValidObject(const reflection::Object& object) {
 // services) has base_type and element bytes within reflection::BaseType's
 // defined range, else null.
 inline const reflection::Schema* VerifySchema(std::string_view bfbs) {
+  if (bfbs.data() == nullptr || reinterpret_cast<std::uintptr_t>(bfbs.data()) %
+                                        alignof(flatbuffers::uoffset_t) !=
+                                    0) {
+    return nullptr;
+  }
   flatbuffers::Verifier verifier{
       reinterpret_cast<const std::uint8_t*>(bfbs.data()), bfbs.size()};
   if (!reflection::VerifySchemaBuffer(verifier)) return nullptr;

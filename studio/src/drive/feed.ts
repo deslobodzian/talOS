@@ -147,11 +147,13 @@ export type Counters = {
 
 const seconds = (ms: number) => (ms / 1000).toFixed(1) + ' s';
 
+const MAX_SUMMARY_NODES = 256;
+
 export function parseSummary(v: unknown): DriveSummary|null {
   if (typeof v !== 'object' || v === null) return null;
   const s = v as Record<string, unknown>;
   if (typeof s.registry !== 'boolean' || typeof s.supervised !== 'boolean' ||
-      !Array.isArray(s.nodes))
+      !Array.isArray(s.nodes) || s.nodes.length > MAX_SUMMARY_NODES)
     return null;
   const nodes: SummaryNode[] = [];
   for (const n of s.nodes) {
@@ -174,7 +176,8 @@ export function parseSummary(v: unknown): DriveSummary|null {
     supervised: s.supervised,
     registry: s.registry,
     nodes,
-    omitted: typeof s.omitted === 'number' && s.omitted > 0 ? s.omitted : 0
+    omitted: typeof s.omitted === 'number' && Number.isSafeInteger(s.omitted) && s.omitted > 0 ?
+        s.omitted : 0
   };
   if (s.launch_refused === true) {
     summary.launch_refused = true;
@@ -475,11 +478,13 @@ export class DriveModel {
     const snapshots: Snapshot[] = [];
     try {
       // Page by page, to know whether a value page applied before a failure
-      // (a page that decodes after the dictionary may be one).
+      // (a completed snapshot or a staged multi-page value update, never a
+      // repeated dictionary page).
       for (const page of splitPages(bytes)) {
-        const valuePage = this.decoder.currentDictionary() !== null;
-        snapshots.push(...this.decoder.decodeAll(page));
-        if (valuePage) this.valuesThisSocket = true;
+        const decoded = this.decoder.decodeAll(page);
+        snapshots.push(...decoded);
+        if (decoded.length > 0 || this.decoder.hasPendingValues())
+          this.valuesThisSocket = true;
       }
     } catch {
       this.counters.malformed_binary++;
@@ -525,6 +530,13 @@ export class DriveModel {
   private onSnapshot(s: Snapshot, now: number) {
     const held = this.latest;
     const sameSocket = this.tickThisSocket;
+    // Ignore out-of-order (decreasing sequence_id) frames on the same socket
+    // and stream: rolling `latest` backward would let a subsequent heartbeat
+    // repeat of `held` falsely look newer and refresh fresh().
+    if (sameSocket && held !== null && s.stream_id === held.stream_id &&
+        BigInt(s.sequence_id) < BigInt(held.sequence_id)) {
+      return;
+    }
     const newer = held === null || s.stream_id !== held.stream_id ||
         BigInt(s.sequence_id) > BigInt(held.sequence_id);
     const dictChanged = sameSocket && held !== null &&

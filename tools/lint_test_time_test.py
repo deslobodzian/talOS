@@ -592,6 +592,54 @@ class LintTestTimeTest(unittest.TestCase):
                 self.assertEqual(failures, 1, out)
                 self.assertIn(f"{path}:{expected_line}: {kind}", out)
 
+    # REQ-RT-17: C++ line splices, prefixed raw strings, aliased node loads,
+    # numeric flaky=1, and duplicate allowlist lines must not slip past.
+    def test_lexer_bypasses_aliased_node_load_and_duplicate_allowlist_fail(self):
+        # 1. C++ phase-2 backslash-newline splice inside an identifier.
+        spliced_sleep = "std::this_thread::sleep_\\\n" + "for(1ms);\n"
+        failures, out = lint({"talOS/rtms/rtms_test.cc": spliced_sleep})
+        self.assertEqual(failures, 1, out)
+        self.assertIn("talOS/rtms/rtms_test.cc:1: sleep", out)
+
+        # 2. Prefixed C++ raw strings (`u8R`, `LR`, `uR`, `UR`) containing
+        #    quotes and `/*` must not open a block comment that swallows EOF.
+        for prefix in ("LR", "u8R", "uR", "UR"):
+            with self.subTest(prefix=prefix):
+                src = (
+                    f'const auto* s = {prefix}"(quote " /* not a comment)";\n'
+                    + SLEEP
+                )
+                failures, out = lint({"talOS/rtms/rtms_test.cc": src})
+                self.assertEqual(failures, 1, out)
+                self.assertIn("talOS/rtms/rtms_test.cc:2: sleep", out)
+
+        # 3. Aliased `load()` of `talos_cc_node` still marks the node package.
+        aliased_build = (
+            'load("//talOS/build:contract.bzl", my_node = "talos_cc_node")\n'
+            'my_node(name = "node", srcs = ["motor.cc"])\n'
+        )
+        failures, out = lint({
+            "bench/main_processor/motor/BUILD": aliased_build,
+            "bench/main_processor/motor/motor.cc": CLOCK_GETTIME,
+        })
+        self.assertEqual(failures, 1, out)
+        self.assertIn("bench/main_processor/motor/motor.cc:1: clock", out)
+
+        # 4. Bazel accepts integer `flaky = 1` as truthy on test rules.
+        failures, out = lint({"talOS/node/BUILD": "    fla" + "ky = 1,\n"})
+        self.assertEqual(failures, 1, out)
+        self.assertIn("talOS/node/BUILD:1: retry", out)
+
+        # 5. Duplicate allowlist entries for the same (path, kind) fail closed.
+        path = "talOS/launcher/launcher_test.cc"
+        dup_allowlist = (
+            f"{path} sleep 1 first reason\n"
+            f"{path} sleep 2 widened reason\n"
+        )
+        failures, out = lint({path: SLEEP + SLEEP}, dup_allowlist)
+        self.assertGreaterEqual(failures, 1, out)
+        self.assertIn("duplicate", out.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

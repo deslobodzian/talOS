@@ -251,7 +251,7 @@ class Node:
     def every(self, period, fn):
         """Calls fn() every `period` seconds, besides update()."""
         _abi.ok(lib.talos_node_every(
-            self._handle, round(period * _NS),
+            self._handle, _abi.duration_ns(period, "period"),
             self._keep(_abi.CALLBACK(_abi.callback(lambda _: fn()))), None))
 
     def _keep(self, c_callback):
@@ -336,6 +336,8 @@ class BytePublisher(_OnNode):
             raise TypeError(f"expected bytes-like object, got "
                             f"{type(data).__name__}")
         raw = bytes(data)
+        if len(raw) > _abi.UINT32_MAX:
+            raise ValueError(f"message too large: {len(raw)} bytes")
         return _abi.boolean(lib.talos_byte_publisher_send(
             self._node, self._index, raw, len(raw)))
 
@@ -364,7 +366,8 @@ class StateMachine(_OnNode):
             self._node, self._to_int(initial)))
 
     def _to_int(self, state):
-        return int(state.value if isinstance(state, enum.Enum) else state)
+        raw = state.value if isinstance(state, enum.Enum) else state
+        return _abi.check_int(raw, _abi.INT64_MIN, _abi.INT64_MAX, "state")
 
     def _from_int(self, raw):
         return self._enum_type(raw) if self._enum_type is not None else int(raw)

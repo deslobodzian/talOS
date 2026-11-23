@@ -3610,6 +3610,107 @@ TEST(LogBackgroundWriter, WriterThreadRunsAsBackground) {
   ::unlink(path.c_str());
 }
 
+// REQ-OPS-14, REQ-OPS-15: FindLogFiles and LogSegmentFiles must not throw
+// std::filesystem::filesystem_error on unreadable directories, symlink loops,
+// or concurrent directory mutations, while preserving sorted discovery on valid
+// session directories.
+TEST(LogCapture, FindLogFilesAndLogSegmentFilesHandleDirectoryErrors) {
+  namespace fs = std::filesystem;
+  const fs::path root = fs::path{::testing::TempDir()} /
+                        ("talos_find_logs_err_" + std::to_string(::getpid()));
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  ASSERT_TRUE(fs::create_directories(root, ec)) << ec.message();
+
+  // Normal directory with base log, rotated segments, and non-.tlog files.
+  const fs::path valid_dir = root / "valid";
+  ASSERT_TRUE(fs::create_directories(valid_dir, ec));
+  const fs::path base_log = valid_dir / "alpha.tlog";
+  const fs::path seg0 = valid_dir / "alpha.segment0.tlog";
+  const fs::path seg2 = valid_dir / "alpha.segment2.tlog";
+  const fs::path other_log = valid_dir / "beta.tlog";
+  const fs::path ignored = valid_dir / "notes.txt";
+  for (const fs::path& p : {base_log, seg0, seg2, other_log, ignored}) {
+    std::ofstream file{p};
+    ASSERT_TRUE(file.good());
+  }
+  EXPECT_EQ(FindLogFiles(valid_dir.string()),
+            (std::vector<std::string>{seg0.string(), seg2.string(),
+                                      base_log.string(), other_log.string()}));
+  EXPECT_EQ(LogSegmentFiles(base_log.string()),
+            (std::vector<std::string>{seg0.string(), seg2.string(),
+                                      base_log.string()}));
+
+  // Missing path and symlink loop never throw.
+  const fs::path missing = root / "does_not_exist";
+  EXPECT_NO_THROW({
+    EXPECT_EQ(FindLogFiles(missing.string()),
+              (std::vector<std::string>{missing.string()}));
+  });
+  EXPECT_NO_THROW({
+    EXPECT_TRUE(LogSegmentFiles((missing / "alpha.tlog").string()).empty());
+  });
+
+  const fs::path loop_a = root / "loop_a";
+  const fs::path loop_b = root / "loop_b";
+  fs::create_symlink(loop_b, loop_a, ec);
+  fs::create_symlink(loop_a, loop_b, ec);
+  ASSERT_FALSE(ec) << ec.message();
+  EXPECT_NO_THROW({
+    EXPECT_EQ(FindLogFiles(loop_a.string()),
+              (std::vector<std::string>{loop_a.string()}));
+  });
+  EXPECT_NO_THROW({
+    EXPECT_TRUE(LogSegmentFiles((loop_a / "alpha.tlog").string()).empty());
+  });
+
+  // Unreadable directory (mode 0000): is_directory is true, directory_iterator
+  // fails with EACCES; neither helper may throw.
+  if (::geteuid() != 0) {
+    const fs::path unreadable = root / "unreadable";
+    ASSERT_TRUE(fs::create_directories(unreadable, ec));
+    {
+      std::ofstream file{unreadable / "alpha.tlog"};
+      ASSERT_TRUE(file.good());
+    }
+    ASSERT_EQ(::chmod(unreadable.c_str(), 0), 0);
+    EXPECT_NO_THROW(
+        { EXPECT_TRUE(FindLogFiles(unreadable.string()).empty()); });
+    EXPECT_NO_THROW({
+      EXPECT_TRUE(
+          LogSegmentFiles((unreadable / "alpha.tlog").string()).empty());
+    });
+    ::chmod(unreadable.c_str(), 0700);
+  }
+
+  // Concurrent entry churn during iteration must not throw.
+  const fs::path churn_dir = root / "churn";
+  ASSERT_TRUE(fs::create_directories(churn_dir, ec));
+  std::atomic<bool> stop{false};
+  std::thread mutator{[&] {
+    for (int i = 0; !stop.load(std::memory_order_relaxed); ++i) {
+      const fs::path p =
+          churn_dir / ("alpha.segment" + std::to_string(i % 16) + ".tlog");
+      if ((i / 16) % 2 == 0) {
+        std::ofstream file{p};
+        (void)file.good();
+      } else {
+        std::error_code rm_ec;
+        fs::remove(p, rm_ec);
+      }
+    }
+  }};
+  for (int i = 0; i < 50; ++i) {
+    EXPECT_NO_THROW({ (void)FindLogFiles(churn_dir.string()); });
+    EXPECT_NO_THROW(
+        { (void)LogSegmentFiles((churn_dir / "alpha.tlog").string()); });
+  }
+  stop.store(true, std::memory_order_relaxed);
+  mutator.join();
+
+  fs::remove_all(root, ec);
+}
+
 #if defined(__linux__)
 // This process's thread ids (/proc/self/task).
 std::set<pid_t> ThreadIds() {

@@ -39,10 +39,13 @@ namespace talos::rio {
 enum class ProgramMode : uint8_t { kDisabled, kAutonomous, kTeleop, kTest };
 
 // The mode to report for Driver Station flags (DsFlags): disabled unless
-// kEnabled (WPILib's IsDisabled), else autonomous, test or teleop, in that
-// order, as TimedRobot reports them.
+// kEnabled and not kEStop (matching Robot.cpp's enable gate), else autonomous,
+// test or teleop, in that order, as TimedRobot reports them.
 constexpr ProgramMode ProgramModeOf(uint32_t flags) {
-  if ((flags & driver_station::kEnabled) == 0) return ProgramMode::kDisabled;
+  if ((flags & driver_station::kEnabled) == 0 ||
+      (flags & driver_station::kEStop) != 0) {
+    return ProgramMode::kDisabled;
+  }
   if ((flags & driver_station::kAutonomous) != 0) {
     return ProgramMode::kAutonomous;
   }

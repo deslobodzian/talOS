@@ -961,13 +961,9 @@ static zarray_t* detect_with_external_stages(apriltag_detector_t* td,
     return zarray_create(sizeof(apriltag_detection_t*));
   }
 
-  if (td->wp == NULL || td->nthreads != workerpool_get_nthreads(td->wp)) {
-    workerpool_destroy(td->wp);
-    td->wp = workerpool_create(td->nthreads);
-    if (td->wp == NULL) {
-      destroy_clusters(external_clusters);
-      return zarray_create(sizeof(apriltag_detection_t*));
-    }
+  if (!ensure_workerpool(td)) {
+    destroy_clusters(external_clusters);
+    return zarray_create(sizeof(apriltag_detection_t*));
   }
 
   timeprofile_clear(td->tp);
@@ -1310,12 +1306,8 @@ static zarray_t* detect_with_external_stages(apriltag_detector_t* td,
 }
 
 image_u8_t* apriltag_threshold_cpu(apriltag_detector_t* td, image_u8_t* im) {
-  if (td->wp == NULL || td->nthreads != workerpool_get_nthreads(td->wp)) {
-    workerpool_destroy(td->wp);
-    td->wp = workerpool_create(td->nthreads);
-    if (td->wp == NULL) {
-      return NULL;
-    }
+  if (!ensure_workerpool(td)) {
+    return NULL;
   }
   return threshold(td, im);
 }

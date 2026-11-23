@@ -2831,7 +2831,7 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
     EXPECT_FALSE(Decode(over_cap, copy));
   }
 
-  // ConfigAck rejects truncated payloads.
+  // ConfigAck rejects truncated and trailing-byte payloads.
   ConfigAckPayload ack{};
   ack.config_id = 0x0102030405060708ull;
   ack.status = ConfigAckStatus::kOk;
@@ -2845,6 +2845,9 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   EXPECT_EQ(decoded_ack.status, ack.status);
   EXPECT_FALSE(DecodeConfigAck(
       std::span<const uint8_t>{ack_bytes.data(), sizeof(ConfigAckPayload) - 1},
+      decoded_ack));
+  EXPECT_FALSE(DecodeConfigAck(
+      std::span<const uint8_t>{ack_bytes.data(), sizeof(ConfigAckPayload) + 1},
       decoded_ack));
 
   // ConfigAssembler rejects both truncated and trailing-byte chunks.

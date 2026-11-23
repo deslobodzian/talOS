@@ -168,17 +168,20 @@ def lock_file(topic, namespace):
 def remove_segments(session, namespace):
     """Unlinks the session's topics, registry and lock files left in its namespace."""
     topics = {REGISTRY}
-    def collect(value):
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if key == "name" and isinstance(item, str) and item.startswith("/"):
-                    topics.add(item)
-                collect(item)
-        elif isinstance(value, list):
-            for item in value:
-                collect(item)
     if session is not None and (session / "graph.json").is_file():
-        collect(json.loads((session / "graph.json").read_text()))
+        try:
+            stack = [json.loads((session / "graph.json").read_text(errors="replace"))]
+        except (OSError, ValueError, RecursionError):
+            stack = []
+        while stack:
+            value = stack.pop()
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key == "name" and isinstance(item, str) and item.startswith("/"):
+                        topics.add(item)
+                    stack.append(item)
+            elif isinstance(value, list):
+                stack.extend(value)
     for topic in topics:
         try:
             shm_unlink(shm_name(topic, namespace))
@@ -234,10 +237,13 @@ class Session:
                 return {}
             self.directory = found[0].parent
         try:
-            manifest = json.loads((self.directory / "manifest.json").read_text())
-        except (OSError, ValueError):
+            manifest = json.loads((self.directory / "manifest.json").read_text(errors="replace"))
+        except (OSError, ValueError, RecursionError):
             return {}  # replaced by rename, so only absent before the first write
-        return {node["name"]: node for node in manifest["nodes"]}
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("nodes"), list):
+            return {}
+        return {node["name"]: node for node in manifest["nodes"]
+                if isinstance(node, dict) and isinstance(node.get("name"), str)}
 
     def wait(self, predicate, timeout_s, what):
         deadline = time.monotonic() + timeout_s
@@ -256,6 +262,8 @@ class Session:
         """
         node = self.nodes()[name]
         pid, count = node["pid"], node["restart_count"]
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise RuntimeError(f"{name}: refusing to signal non-positive pid {pid!r}")
         if while_down is not None:
             os.kill(self.process.pid, signal.SIGSTOP)
         try:

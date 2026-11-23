@@ -550,6 +550,20 @@ can_id = 2
        "homing_v = -1.0\nhoming_stall_us = 50000\n"
        "homing_stall_current_a = 20.0\nhoming_min_push_us = 50000\n"
        "homing_min_travel_rot = 0.05\n"},
+      // Large valid durations whose sum would overflow signed 64-bit ns must
+      // still fail validation without signed integer overflow UB.
+      {"homing_timeout_us",
+       "tolerance_rot = 0.1\nhoming = \"stall\"\nmin_rot = 0.0\n"
+       "max_rot = 1.0\nhoming_timeout_us = 1\nhoming_stall_rps = 0.1\n"
+       "homing_v = -1.0\nhoming_stall_us = 5000000000000000\n"
+       "homing_stall_current_a = 20.0\n"
+       "homing_min_push_us = 5000000000000000\n"
+       "homing_min_travel_rot = 0.05\n"},
+      // Absolute window endpoints overflowing to +-inf are refused.
+      {"absolute_offset_rot", absolute +
+                                  "min_rot = 1.2e308\nmax_rot = 1.7e308\n"
+                                  "absolute_rot_per_sensor_rot = 1.0e308\n"
+                                  "absolute_offset_rot = 1.5e308\n"},
   };
   for (const auto& [key, table] : bad) expect_refused(key, toml(table));
   {  // a negative ratio with the margin inside its window is accepted
@@ -1568,6 +1582,9 @@ TEST(PositionMechanism, NonFinitePositionDoesNotLatchHoldOrPassHomeFrameJump) {
     wrist.SetMotor(1e308);  // 1e308 - (-1e308) = +inf in software frame
     wrist.sim.step(10ms);   // let SimHardware publish +inf and the node read it
     ASSERT_FALSE(std::isfinite(wrist.mech().position_rot()));
+    // Both hold() and set_goal() stay neutral on non-finite position feedback.
+    wrist.Drive(0.25, 20ms);
+    wrist.ExpectNeutral();
     wrist.node.hold_mode = true;
     wrist.Drive(0.25, 20ms);
     wrist.ExpectNeutral();
@@ -1586,6 +1603,90 @@ TEST(PositionMechanism, NonFinitePositionDoesNotLatchHoldOrPassHomeFrameJump) {
                   30.0);  // 1e308 - (-1e308) = +inf; inf - inf = NaN
     hood.Drive(0.5, 300ms);
     EXPECT_FALSE(hood.mech().homed());
+  }
+}
+
+// On a wrapped mechanism, hold() clamps the physical position to [min_rot,
+// max_rot] without wrapping it across a full turn, both after overshooting a
+// limit and when back-driven past half a turn during an active hold.
+// REQ-SAFE-36
+TEST(PositionMechanism, HoldOnWrappedTurretClampsWithoutWrappingAcrossTurns) {
+  {
+    SCOPED_TRACE("overshoot past max_rot holds at max_rot, not max_rot - wrap");
+    Rig turret{"turret"};
+    turret.SetMotor(0.78);  // 0.03 rot past max_rot (0.75)
+    turret.Start();
+    turret.node.hold_mode = true;
+    turret.Drive(0.0, 20ms);
+    EXPECT_EQ(turret.Applied().mode, Mode::kMotionMagic);
+    EXPECT_NEAR(turret.Applied().demand, 0.75, 1e-9);
+    EXPECT_NEAR(turret.mech().goal_rot(), 0.75, 1e-9);
+  }
+  {
+    SCOPED_TRACE("back-drive past half a turn keeps the original held stop");
+    Rig turret{"turret"};
+    turret.SetMotor(-0.5);
+    turret.Start();
+    turret.node.hold_mode = true;
+    turret.Drive(0.0, 20ms);
+    ASSERT_NEAR(turret.Applied().demand, -0.5, 1e-9);
+    turret.SetMotor(0.1);  // pushed 0.6 rot (> wrap_rot / 2)
+    turret.Drive(0.0, 20ms);
+    EXPECT_NEAR(turret.Applied().demand, -0.5, 1e-9);
+    EXPECT_NEAR(turret.mech().goal_rot(), -0.5, 1e-9);
+  }
+}
+
+// Huge finite positions stay finite in arm gravity feedforward (without
+// overflowing 2*pi*(pos - zero) to cos(inf) = NaN) and in wrap() dead-zone
+// clamping on extreme finite travels.
+// REQ-SAFE-36
+TEST(PositionMechanism, ArmGravityAndWrapDeadZoneHandleExtremeFinitePositions) {
+  {
+    SCOPED_TRACE("arm gravity reduces turns before multiplying by 2*pi");
+    Rig arm{"arm"};
+    arm.SetMotor(1e308);
+    arm.Start();
+    arm.Drive(0.25, 20ms);
+    EXPECT_TRUE(arm.mech().driving());
+    EXPECT_EQ(arm.Applied().mode, Mode::kMotionMagic);
+    EXPECT_TRUE(std::isfinite(arm.mech().gravity_v()));
+    EXPECT_LE(std::abs(arm.mech().gravity_v()), 1.0 + 1e-12);
+  }
+  {
+    SCOPED_TRACE("wrap dead zone picks the nearer stop without overflow");
+    constexpr const char* kHugeSectorToml = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+[subsystems.sector.motors.sector]
+can_id = 1
+feedback = "RemoteCANcoder"
+feedback_sensor = "sector_cc"
+position_frame = "absolute"
+[subsystems.sector.sensors.sector_cc]
+type = "CANcoder"
+can_id = 2
+[subsystems.sector.sector]
+tolerance_rot = 0.01
+wrap_rot = 1.0e308
+min_rot = 1.2e308
+max_rot = 1.6e308
+)";
+    Sim sim = Sim::FromToml(kHugeSectorToml);
+    auto& node = sim.add<PositionNode>("sector");
+    SimHardware hw{sim};
+    hw.enable();
+    hw.set_motor("sector", "sector", 1.2e308, 0.0);
+    hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+    sim.step(10ms);
+    for (int i = 0; i < 4; ++i) {
+      PublishTarget(sim, "sector", "teleop",
+                    control::PositionTarget{1.0e308, 0.0});
+      sim.step(5ms);
+    }
+    EXPECT_TRUE(node.mech.driving());
+    EXPECT_DOUBLE_EQ(node.mech.goal_rot(), 1.2e308);
   }
 }
 

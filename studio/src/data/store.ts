@@ -254,7 +254,7 @@ export class TelemetryStore {
     const breaks: number[] = [];
     for (let i = start + 1; i <= end; i++)
       if (this.streamStarts[this.phys(i)]) breaks.push(i - start);
-    const values: Record<string, Float64Array> = {};
+    const values: Record<string, Float64Array> = Object.create(null);
     for (const name of channels) {
       const column = this.columns.get(name);
       values[name] = column ?
@@ -327,7 +327,8 @@ export class TelemetryStore {
       const kind = dictionary.kinds?.[name];
       if (kind !== undefined && kind !== ChannelKind.Double &&
           kind !== ChannelKind.Bool)
-        exact[name] = this.exacts.get(name)?.get(slot) ?? BigInt(value).toString();
+        exact[name] = this.exacts.get(name)?.get(slot) ??
+            (Number.isInteger(value) ? BigInt(value).toString() : String(value));
     }
     const units: Record<string, string> = Object.create(null);
     const labels: Record<string, string[]> = Object.create(null);

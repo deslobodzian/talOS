@@ -58,7 +58,8 @@ std::string_view ToString(ReadinessReason reason) {
 
 ReadinessReason CheckReadiness(const ReadinessInput& input,
                                const ReadinessLimits& limits) {
-  if (input.pose_age_us < 0 || input.pose_age_us > limits.max_pose_age_us) {
+  if (limits.max_pose_age_us <= 0 || input.pose_age_us < 0 ||
+      input.pose_age_us > limits.max_pose_age_us) {
     return ReadinessReason::kStale;
   }
   if (!input.solution_valid) return ReadinessReason::kNoSolution;
@@ -113,9 +114,10 @@ Readiness ReadinessGate::Update(const ReadinessInput& input,
     return {false, reason, 0};
   }
   // A streak continues only from the immediately preceding tick; a gap, a
-  // repeat or a step back starts it over.
-  const bool continues =
-      passing_tick_count_ > 0 && tick_index == last_passing_tick_index_ + 1;
+  // repeat, a step back, or a uint64 wraparound starts it over.
+  const bool continues = passing_tick_count_ > 0 &&
+                         tick_index > last_passing_tick_index_ &&
+                         tick_index - last_passing_tick_index_ == 1;
   if (!continues) {
     passing_tick_count_ = 1;
   } else if (passing_tick_count_ < limits_.settle_tick_count) {

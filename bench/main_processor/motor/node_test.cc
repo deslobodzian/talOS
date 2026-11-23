@@ -447,6 +447,30 @@ TEST_F(MotorTest, ReportsLimitSwitchesAndClearsThemOnStaleState) {
   EXPECT_FALSE(State().reverse_limit());
 }
 
+// REQ-CONTRACT-25: if gateway-to-node clock mapping jitter places an
+// acquisition timestamp slightly ahead of node.now(), the reported uint64
+// age clamps to 0 rather than underflowing near UINT64_MAX (or colliding with
+// the UINT64_MAX unknown sentinel).
+TEST_F(MotorTest, FutureClockMappedAcquisitionClampsAgeToZero) {
+  Enable();
+  hw.set_motor("motor", "kraken", 1.0, 2.0, 0, 0);
+  sim.step(10ms);
+  ASSERT_TRUE(State().acquisition_valid());
+  auto status = sim.latest<bridge::BridgeStatus>("/hw/status");
+  ASSERT_TRUE(status.has_value());
+  bridge::BridgeStatus shifted = *status;
+  shifted.mutate_clock_offset_us(status->clock_offset_us() + 50'000);
+  // Suppress SimHardware's next State/BridgeStatus while link remains fresh.
+  hw.lose_states(2);
+  sim.publish("/hw/status", shifted);
+  sim.step(5ms);
+  const MotorState s = State();
+  EXPECT_TRUE(s.connected());
+  EXPECT_TRUE(s.acquisition_valid());
+  EXPECT_EQ(s.position_age_us(), 0u);
+  EXPECT_EQ(s.velocity_age_us(), 0u);
+}
+
 // The bench config binds the swerve module's lane too, and teleop needs a
 // reader of every bound lane; this stands in for the swerve module node,
 // whose package this one may not depend on.

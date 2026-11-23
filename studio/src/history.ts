@@ -112,7 +112,7 @@ export class TelemetryHistory {
   private replace(kept: Snapshot[]) {
     const timeline = new Timeline(this.timeline.capacity);
     for (const f of kept) timeline.append(f);
-    timeline.lastArrivalMs = this.timeline.lastArrivalMs;
+    timeline.lastArrivalMs = kept.length ? this.timeline.lastArrivalMs : 0;
     this.timeline = timeline;
     this.prune();
     this.hooks.replaced?.(kept);

@@ -180,7 +180,7 @@ TEST_F(LoopConsoleTest, DroppedWatchdogReportsArePrintedWhenTheyRise) {
 // (EAGAIN): the console prints the first drop immediately and coalesces a burst
 // through RioLog to at most one line per second carrying the cumulative
 // send_would_block count, without printing anything when no drop occurred.
-// REQ-RT-22, REQ-OPS-16
+// REQ-RT-22, REQ-OPS-20
 TEST_F(LoopConsoleTest,
        SendWouldBlockBurstPrintsAtMostOncePerSecondWithCumulativeCount) {
   console_.ObserveSendWouldBlock(0);

@@ -20,7 +20,7 @@
 namespace talos::driver_station {
 namespace {
 
-constexpr std::uint16_t kGoldenVersion = 11;
+constexpr std::uint16_t kGoldenVersion = 12;
 constexpr std::size_t kPacketBytes = 678;
 constexpr std::uint64_t kPacketHash = 0xd7173f183d6a229b;
 

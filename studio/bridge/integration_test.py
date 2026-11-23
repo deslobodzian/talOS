@@ -545,6 +545,38 @@ class BridgeIntegration(unittest.TestCase):
                 with socket.create_connection(("127.0.0.1", http_port), timeout=3) as http:
                     http.sendall(b"GET /%2e%2e/secret HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
                     self.assertIn(b"400 Bad Request", http.recv(1024))
+                # Safari 15 User-Agent without Sec-WebSocket-Extensions must not
+                # trigger null-pointer memset UB in uWS upgrade, and arbitrary
+                # client Sec-WebSocket-Protocol values are not reflected.
+                with socket.create_connection(("127.0.0.1", bare_port), timeout=3) as safari_ws:
+                    key = base64.b64encode(os.urandom(16)).decode()
+                    safari_ws.sendall((
+                        f"GET /telemetry HTTP/1.1\r\nHost: localhost\r\n"
+                        f"User-Agent: Mozilla/5.0 Version/15.1 Safari/605.1.15\r\n"
+                        f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                        f"Sec-WebSocket-Key: {key}\r\n"
+                        f"Sec-WebSocket-Protocol: ignored-subproto\r\n"
+                        f"Sec-WebSocket-Version: 13\r\n\r\n").encode())
+                    safari_headers = b""
+                    while not safari_headers.endswith(b"\r\n\r\n"):
+                        safari_headers += receive(safari_ws, 1)
+                    self.assertIn(b"101 Switching Protocols", safari_headers)
+                    self.assertNotIn(b"Sec-WebSocket-Protocol", safari_headers)
+                # Duplicate Content-Length smuggling is rejected with 400, and
+                # non-GET methods answer 405 Method Not Allowed.
+                with socket.create_connection(("127.0.0.1", bare_port), timeout=3) as smuggle:
+                    smuggle.sendall(
+                        b"GET /system.json HTTP/1.1\r\nHost: localhost\r\n"
+                        b"Content-Length: 0\r\nContent-Length: 40\r\n\r\n"
+                        b"GET /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    self.assertIn(b"400 Bad Request", smuggle.recv(1024))
+                with socket.create_connection(("127.0.0.1", bare_port), timeout=3) as post_sock:
+                    post_sock.sendall(
+                        b"POST /system.json HTTP/1.1\r\nHost: localhost\r\n"
+                        b"Connection: close\r\n\r\n")
+                    post_reply = post_sock.recv(1024)
+                    self.assertIn(b"405 Method Not Allowed", post_reply)
+                    self.assertIn(b"Allow: GET", post_reply)
                 # Static files are read synchronously on the polling thread,
                 # so one past the 4 MiB cap is refused rather than read.
                 oversized = Path(webroot, "oversized.js")

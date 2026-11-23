@@ -21,11 +21,13 @@
 #include <future>
 #include <iterator>
 #include <latch>
+#include <limits>
 #include <memory>
 #include <random>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "rtms.h"
@@ -87,6 +89,44 @@ TEST(LayoutValidation, RejectsInvalidOptionsBeforeMapping) {
     EXPECT_THROW((RTMSQueue{path, 8, 8, kSchema, slots}),
                  std::invalid_argument);
   }
+}
+
+// REQ-CONTRACT-21: overflowing message_size, alignment, or stride * slots
+// calculations must fail before mapping or unlinking any existing segment.
+TEST(LayoutValidation, RejectsOverflowingGeometryBeforeMapping) {
+  constexpr std::size_t kMaxSize = std::numeric_limits<std::size_t>::max();
+  const std::string path = make_test_path("overflow");
+  ::shm_unlink(ShmObjectName(path).c_str());
+
+  // Values that wrap publish_time_offset_, slot_stride, or stride_ * slots_
+  // around 2^64 back into small byte counts.
+  for (const auto& [message_size, alignment, slots] :
+       std::array<std::tuple<std::size_t, std::size_t, std::size_t>, 4>{{
+           {kMaxSize - 5, 8, 2},
+           {kMaxSize - 10, 8, 2},
+           {std::size_t{1} << 62, 8, 4},
+           {8, std::size_t{1} << 63, 2},
+       }}) {
+    EXPECT_THROW((RTMSQueue{path, message_size, alignment, kSchema, slots}),
+                 std::overflow_error);
+    const int fd = ::shm_open(ShmObjectName(path).c_str(), O_RDONLY, 0);
+    EXPECT_EQ(fd, -1) << "overflowing geometry created a segment";
+    if (fd != -1) {
+      ::close(fd);
+      ::shm_unlink(ShmObjectName(path).c_str());
+    }
+  }
+
+  // A session_owner with overflowing geometry must not unlink an existing
+  // segment before rejecting the invalid layout.
+  RTMSQueue live{path, 8, 8, kSchema, 2, {.session_owner = true}};
+  EXPECT_THROW(
+      (RTMSQueue{
+          path, std::size_t{1} << 62, 8, kSchema, 4, {.session_owner = true}}),
+      std::overflow_error);
+  const int fd = ::shm_open(ShmObjectName(path).c_str(), O_RDONLY, 0);
+  EXPECT_NE(fd, -1) << "failed session_owner unlinked the existing segment";
+  if (fd != -1) ::close(fd);
 }
 
 // REQ-CONTRACT-21: an attach rejects a segment whose offset or stride is wrong
@@ -1767,6 +1807,40 @@ TEST(RTMSWake, ArmReportsWhetherTheReaderIsCaughtUp) {
   subscriber.release_reader(reader);
   EXPECT_FALSE(subscriber.arm_wake(reader))
       << "a released slot must be read (INACTIVE), not slept on";
+}
+
+// Updating a slot's wake receiver while its waiters bit is already set clears
+// the stale arm bit so the next arm_wake() executes its seq_cst fetch_or after
+// publishing the new wake_id, preventing a weak-memory-order lost wake.
+// REQ-RT-19
+TEST(RTMSWake, UpdatingWakeReceiverOnArmedSlotReSyncsArm) {
+  const std::string path = make_test_path("wake_swap");
+  RTMSQueue writer = WakeQueue(path, publisher_options());
+  RTMSQueue subscriber = WakeQueue(path, sequence_options());
+  const std::size_t reader = RegisterReader(subscriber);
+  SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
+  const auto* header = static_cast<const RTMSHeader*>(mapping.ptr());
+  ASSERT_NE(header, nullptr);
+
+  talos::WakeReceiver first;
+  talos::WakeReceiver second;
+  subscriber.set_reader_wake(reader, first.id());
+  ASSERT_TRUE(subscriber.arm_wake(reader));
+  ASSERT_NE(header->writer.waiters.load(std::memory_order_acquire) &
+                (std::uint64_t{1} << reader),
+            0u);
+
+  subscriber.set_reader_wake(reader, second.id());
+  EXPECT_EQ(header->writer.waiters.load(std::memory_order_acquire) &
+                (std::uint64_t{1} << reader),
+            0u)
+      << "stale arm bit remained set after switching wake receiver";
+
+  ASSERT_TRUE(subscriber.arm_wake(reader));
+  ASSERT_EQ(writer.write(BytesOf({1, 1.0F})), WriteResult::SUCCESS);
+  EXPECT_EQ(WakeReadable(second, kWakeHangBoundMs), 1);
+  EXPECT_EQ(WakeReadable(first, 0), 0);
+  second.drain();
 }
 
 // Each armed reader is woken by the next publication, and only once per arm

@@ -1,13 +1,38 @@
 #include <unistd.h>
 
+#include <charconv>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "talOS/launcher/launcher.h"
 
 namespace {
+
+int ParseIntFlag(std::string_view flag, std::string_view value, int min_value) {
+  int parsed = 0;
+  const char* const end = value.data() + value.size();
+  const auto [ptr, ec] = std::from_chars(value.data(), end, parsed);
+  if (value.empty() || ec != std::errc{} || ptr != end || parsed < min_value) {
+    throw std::invalid_argument("invalid value for " + std::string{flag} +
+                                ": " + std::string{value});
+  }
+  return parsed;
+}
+
+uint64_t ParseUint64Flag(std::string_view flag, std::string_view value) {
+  uint64_t parsed = 0;
+  const char* const end = value.data() + value.size();
+  const auto [ptr, ec] = std::from_chars(value.data(), end, parsed);
+  if (value.empty() || ec != std::errc{} || ptr != end) {
+    throw std::invalid_argument("invalid value for " + std::string{flag} +
+                                ": " + std::string{value});
+  }
+  return parsed;
+}
 
 // Node targets resolve to bazel-bin/... paths, and a relative --config path
 // is workspace-relative, so the launcher only makes sense with the
@@ -47,9 +72,9 @@ int main(int argc, char** argv) {
       } else if (arg == "--local-port" && i + 1 < argc) {
         options.local_port = talos::config::ParsePortFlag(arg, argv[++i]);
       } else if (arg == "--duration-s" && i + 1 < argc) {
-        options.duration_s = std::stoi(argv[++i]);
+        options.duration_s = ParseIntFlag(arg, argv[++i], 0);
       } else if (arg == "--session-id" && i + 1 < argc) {
-        options.session_id = std::stoull(argv[++i]);
+        options.session_id = ParseUint64Flag(arg, argv[++i]);
       } else if (arg == "--sim") {
         options.simulation = true;
       } else if (arg == "--start-sim-gateway") {
@@ -72,7 +97,7 @@ int main(int argc, char** argv) {
       } else if (arg == "--describe-as-launch") {
         options.describe_as_launch = true;
       } else if (arg == "--describe-timeout-ms" && i + 1 < argc) {
-        options.describe_timeout_ms = std::stoi(argv[++i]);
+        options.describe_timeout_ms = ParseIntFlag(arg, argv[++i], 1);
       } else if (arg == "--replay-inputs" && i + 1 < argc) {
         options.replay_inputs = argv[++i];
       } else if (arg == "--only" && i + 1 < argc) {
@@ -80,16 +105,13 @@ int main(int argc, char** argv) {
       } else if (arg == "--allow-capped-replay") {
         options.allow_capped_replay = true;
       } else if (arg == "--max-restarts" && i + 1 < argc) {
-        options.max_restarts = std::stoi(argv[++i]);
-        if (*options.max_restarts < 0) {
-          throw std::invalid_argument("--max-restarts must be >= 0");
-        }
+        options.max_restarts = ParseIntFlag(arg, argv[++i], 0);
       } else if (arg == "--restart-window-ms" && i + 1 < argc) {
-        options.restart_window_ms = std::stoi(argv[++i]);
+        options.restart_window_ms = ParseIntFlag(arg, argv[++i], 1);
       } else if (arg == "--heartbeat-periods" && i + 1 < argc) {
-        options.heartbeat_periods = std::stoi(argv[++i]);
+        options.heartbeat_periods = ParseIntFlag(arg, argv[++i], 1);
       } else if (arg == "--heartbeat-startup-grace-ms" && i + 1 < argc) {
-        options.heartbeat_startup_grace_ms = std::stoi(argv[++i]);
+        options.heartbeat_startup_grace_ms = ParseIntFlag(arg, argv[++i], 0);
       } else if (arg == "--help" || arg == "-h") {
         std::cout
             << "usage: launcher (--config PATH | --bundle PATH) "

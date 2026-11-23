@@ -53,20 +53,30 @@ class BenchSwerveModule {
           std::clamp(target->drive_velocity_rps(), -max_drive_velocity_rps_,
                      max_drive_velocity_rps_);
       const double measured_rot = steer_.position();
-      const auto setpoint = talos::geometry::OptimizeSwerveModule(
-          asked, kTwoPi * target->steer_angle_rot(), kTwoPi * measured_rot);
-      drive_rps = setpoint.speed;
-      steer_rot = measured_rot + setpoint.steer_delta_rad / kTwoPi;
-      reversed = setpoint.reversed;
-      drive_.set_velocity(drive_rps);
-      steer_.set_position(steer_rot);
-      mode = ModuleMode::DRIVE;
+      if (std::isfinite(measured_rot)) {
+        const double asked_rad =
+            kTwoPi * std::remainder(target->steer_angle_rot(), 1.0);
+        const double measured_rad = kTwoPi * std::remainder(measured_rot, 1.0);
+        const auto setpoint = talos::geometry::OptimizeSwerveModule(
+            asked, asked_rad, measured_rad);
+        const double next_steer_rot =
+            measured_rot + setpoint.steer_delta_rad / kTwoPi;
+        if (std::isfinite(setpoint.speed) && std::isfinite(next_steer_rot)) {
+          drive_rps = setpoint.speed;
+          steer_rot = next_steer_rot;
+          reversed = setpoint.reversed;
+          drive_.set_velocity(drive_rps);
+          steer_.set_position(steer_rot);
+          mode = ModuleMode::DRIVE;
+        }
+      }
     }
     auto& link = node_.extension<talos::HardwareLink>();
     constexpr auto unknown = std::numeric_limits<std::uint64_t>::max();
     state_.send(ModuleState{
         static_cast<std::uint64_t>(node_.now().nanos()),
-        link.fresh() ? static_cast<std::uint64_t>(link.age().count() / 1000)
+        link.fresh() ? static_cast<std::uint64_t>(
+                           std::max<std::int64_t>(0, link.age().count()) / 1000)
                      : unknown,
         drive_.position(),
         drive_.velocity(),

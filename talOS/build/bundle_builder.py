@@ -127,13 +127,16 @@ def stage_link(name, dest, rf_rel, link, target, bundle_root):
     its own location, so a copy of it elsewhere would not run (a py_binary
     venv's bin/python3; the node's stage-2 bootstrap then adds the venv's
     site-packages itself). Any other file is staged as a copy."""
-    if not (target.startswith(bundle_root) and os.path.isfile(target)):
+    real_root = os.path.realpath(bundle_root)
+    real_target = os.path.realpath(target)
+    if not (real_target.startswith(real_root + os.sep)
+            and os.path.isfile(real_target)):
         sys.exit(f"bundle: node '{name}': runfile {rf_rel} links to {link}, "
                  "which the bundle does not hold")
-    if not os.access(target, os.X_OK):
-        safe_copy(target, dest)
+    if not os.access(real_target, os.X_OK):
+        safe_copy(real_target, dest)
         return
-    write_exec_script(dest, target,
+    write_exec_script(dest, real_target,
                       f"{rf_rel} -> {link}, kept out of the bundle as a link.")
 
 
@@ -598,6 +601,7 @@ def main():
 
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
+    out_dir = os.path.realpath(out_dir)
 
     bin_dir = os.path.join(out_dir, "bin")
     config_dir = os.path.join(out_dir, "config")
@@ -629,10 +633,14 @@ def main():
     # renaming or moving any file relative to the others, the root config
     # too, changes it. Stored in the manifest so a session can say exactly
     # which configuration it ran.
+    config_root = config_dir + os.sep
     staged_bytes = {}
     for entry in [config] + config_files:
         rel = staged(entry)
-        dest = os.path.join(config_dir, rel)
+        dest = os.path.normpath(os.path.join(config_dir, rel))
+        if not dest.startswith(config_root):
+            sys.exit(f"bundle: config file {entry['short_path']} escapes "
+                     f"config/ ({rel})")
         safe_copy(entry["src_path"], dest)
         with open(dest, "rb") as f:
             staged_bytes[rel] = f.read()
@@ -684,13 +692,18 @@ def main():
             for rf in rf_entries:
                 rf_src = rf["src_path"]
                 rf_rel = rf["rf_rel"]
+                norm_rel = os.path.normpath(rf_rel)
+                if (os.path.isabs(rf_rel) or norm_rel in (os.curdir, os.pardir)
+                        or norm_rel.startswith(os.pardir + os.sep)):
+                    sys.exit(f"bundle: node '{name}': runfile path {rf_rel!r} "
+                             "escapes runfiles root")
                 if os.path.islink(rf_src) and not os.path.exists(rf_src):
-                    links.append((rf_rel, os.readlink(rf_src)))
+                    links.append((norm_rel, os.readlink(rf_src)))
                     continue
                 if not os.path.exists(rf_src):
                     sys.exit(f"bundle: node '{name}': runfile {rf_rel} is "
                              f"missing: {rf_src}")
-                files[os.path.normpath(rf_rel)] = rf_src
+                files[norm_rel] = rf_src
             runtimes = runtime_repositories(files, links)
             for repo in unselected_runtimes(files, runtimes):
                 sys.exit(f"bundle: node '{name}': its runfiles carry the "

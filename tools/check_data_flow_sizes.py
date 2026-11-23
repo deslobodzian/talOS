@@ -24,7 +24,10 @@ import re
 import sys
 
 DOC = "docs/DATA_FLOW.md"
-MARKER = re.compile(r"<!-- size: ([a-z0-9_.]+) -->(?:\*\*)?\s*([0-9][0-9,]*)?")
+MARKER = re.compile(
+    r"<!--\s*size\s*:([^>]*?)-->(?:\*\*)?[ \t]*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)?"
+)
+VALID_INT_TOKEN = re.compile(r"^(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)$")
 
 
 def parse_sizes(text):
@@ -33,23 +36,33 @@ def parse_sizes(text):
     for line in text.splitlines():
         if line.strip():
             name, value = line.split()
+            if name in sizes:
+                raise ValueError(f"duplicate size entry: {name}")
             sizes[name] = int(value)
     return sizes
 
 
 def markers(doc_text):
-    """(line number, name, stated value or None) for each marker."""
+    """(line number, name, stated value or None or raw bad string) per marker."""
     found = []
     for number, line in enumerate(doc_text.splitlines(), start=1):
         for match in MARKER.finditer(line):
-            value = match.group(2)
-            found.append((number, match.group(1),
-                          int(value.replace(",", "")) if value else None))
+            name = match.group(1).strip()
+            raw = match.group(2)
+            if raw is None:
+                value = None
+            elif VALID_INT_TOKEN.fullmatch(raw):
+                value = int(raw.replace(",", ""))
+            else:
+                value = raw
+            found.append((number, name, value))
     return found
 
 
 def check(sizes, doc_text, doc=DOC):
     """Each problem, as a line to print."""
+    if not sizes:
+        return [f"{doc}: no sizes provided by data_flow_sizes"]
     problems, marked = [], set()
     for line, name, stated in markers(doc_text):
         marked.add(name)

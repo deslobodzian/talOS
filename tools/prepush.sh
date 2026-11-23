@@ -526,7 +526,7 @@ else
 fi
 
 run_step checkout-unchanged sh -c \
-  'out="$(git status --porcelain --untracked-files=all)"; [ -z "$out" ] || { printf "%s\n" "$out"; exit 1; }' ||
+  'out="$(git status --porcelain --untracked-files=all)" && { [ -z "$out" ] || { printf "%s\n" "$out"; exit 1; }; }' ||
   true
 
 if [ "$skip_studio" = 1 ]; then

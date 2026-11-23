@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -273,6 +274,105 @@ TEST(TelemetryChannels, HostileSchemaIsRefusedNamingTheTopic) {
                 std::string::npos)
           << error.what();
     }
+  }
+
+  // Non-struct table, zero bytesize, and out-of-bounds field offset are also
+  // rejected naming the topic.
+  for (const auto& [is_struct, bytesize, offset] :
+       {std::tuple{false, 8, std::uint16_t{0}},
+        std::tuple{true, 0, std::uint16_t{0}},
+        std::tuple{true, 4, std::uint16_t{4}}}) {
+    flatbuffers::FlatBufferBuilder fbb;
+    const auto t_start = fbb.StartTable();
+    fbb.AddElement<std::int8_t>(
+        reflection::Type::VT_BASE_TYPE,
+        static_cast<std::int8_t>(reflection::BaseType::Double), 0);
+    const flatbuffers::Offset<reflection::Type> ftype{fbb.EndTable(t_start)};
+    const auto fn = fbb.CreateString("x_m");
+    const auto f = reflection::CreateField(fbb, fn, ftype, 0, offset);
+    std::vector<flatbuffers::Offset<reflection::Field>> fields{f};
+    const auto obj = reflection::CreateObjectDirect(fbb, "t.bad", &fields,
+                                                    is_struct, 1, bytesize);
+    std::vector<flatbuffers::Offset<reflection::Object>> objs{obj};
+    std::vector<flatbuffers::Offset<reflection::Enum>> enums;
+    reflection::FinishSchemaBuffer(
+        fbb, reflection::CreateSchemaDirect(fbb, &objs, &enums));
+    const std::string bfbs{
+        reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
+    EXPECT_THROW(FlattenTopic("/crafted/status", "t.bad", bfbs),
+                 std::invalid_argument);
+  }
+}
+
+// EnumLabels handles schemas with omitted/null enum vectors safely, and
+// deterministic seeded mutation fuzzing over FlattenTopic/EnvelopeChannels/
+// ReadChannel/ReadDriverStation never crashes or triggers ASan/UBSan.
+TEST(TelemetryChannels, EnumLabelsNullSafeAndSeededMutationFuzz) {
+  {
+    flatbuffers::FlatBufferBuilder fbb;
+    const auto start = fbb.StartTable();
+    const flatbuffers::Offset<reflection::Schema> s{fbb.EndTable(start)};
+    reflection::FinishSchemaBuffer(fbb, s);
+    const auto* raw_schema = reflection::GetSchema(fbb.GetBufferPointer());
+    EXPECT_TRUE(EnumLabels(*raw_schema, 0).empty());
+    EXPECT_TRUE(EnumLabels(*raw_schema, -1).empty());
+  }
+
+  const schema::Identity mixed = schema::Of<schema_test::Mixed>();
+  const schema::Identity arrays = schema::Of<schema_test::Arrays>();
+  const std::array<std::string_view, 2> seeds = {mixed.bfbs, arrays.bfbs};
+  std::mt19937_64 rng(0x4348414e4e454cULL);
+
+  for (int iter = 0; iter < 1500; ++iter) {
+    const std::string_view seed = seeds[static_cast<std::size_t>(iter) % 2];
+    std::string bfbs(seed);
+    const std::uint64_t mode = rng() % 4;
+    if (mode == 0 && bfbs.size() > 8) {
+      bfbs.resize(1 + (rng() % bfbs.size()));
+    } else if (mode == 1 && !bfbs.empty()) {
+      for (std::size_t k = 0; k < 3; ++k) {
+        char& byte = bfbs[rng() % bfbs.size()];
+        byte = static_cast<char>(static_cast<unsigned char>(byte) ^
+                                 (1u << (rng() % 8)));
+      }
+    } else if (mode == 2) {
+      bfbs.resize(rng() % 128);
+      for (char& c : bfbs) c = static_cast<char>(rng() & 0xffu);
+    }
+
+    std::vector<std::byte> payload(rng() % 128);
+    for (std::byte& b : payload) b = static_cast<std::byte>(rng() & 0xffu);
+
+    for (std::string_view topic : {"/demo/status", "/demo/state"}) {
+      try {
+        FlattenOptions opts;
+        opts.truncate = (iter & 1) != 0;
+        const auto channels =
+            FlattenTopic(topic, "schema_test.Mixed", bfbs, opts);
+        std::uint64_t raw = 0;
+        for (const auto& ch : channels) {
+          (void)ReadChannel(ch, payload, raw);
+        }
+      } catch (const std::invalid_argument& e) {
+        // Malformed fuzzed .bfbs schemas are expected to throw
+        // invalid_argument.
+        (void)e;
+      }
+      try {
+        const auto channels =
+            EnvelopeChannels(topic, "schema_test.Mixed", bfbs);
+        std::uint64_t raw = 0;
+        for (const auto& ch : channels) {
+          (void)ReadChannel(ch, payload, raw);
+        }
+      } catch (const std::invalid_argument& e) {
+        // Malformed fuzzed .bfbs schemas are expected to throw
+        // invalid_argument.
+        (void)e;
+      }
+    }
+    std::array<std::uint64_t, kDriverStationChannelCount> ds{};
+    (void)ReadDriverStation(payload, ds);
   }
 }
 

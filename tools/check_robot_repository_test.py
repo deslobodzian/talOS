@@ -116,8 +116,12 @@ class CheckRobotRepositoryTest(unittest.TestCase):
                 ('# bazel_dep(name = "talos", version = "0.0.0")\n', False),
                 ('local_path_override(module_name = "talos", path = "t")\n',
                  False),
+                ('not_bazel_dep(name = "talos", version = "0.0.0")\n', False),
+                ('"""bazel_dep(name = "talos", version = "0.0.0")"""\n', False),
+                ('bazel_dep(name = "talos\', version = "0.0.0")\n', False),
                 ("bazel_dep(name = 'talos', version = '0.0.0')\n", True),
                 ('bazel_dep(version = "0.0.0", name = "talos")\n', True),
+                ('bazel_dep(version = ("0.0.0"), name = "talos")\n', True),
                 ('bazel_dep(\n    name = "talos",\n'
                  '    dev_dependency = True,\n)\n', True)):
             with self.subTest(module=module):
