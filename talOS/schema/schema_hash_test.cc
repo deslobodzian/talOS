@@ -300,6 +300,43 @@ TEST(SchemaHash, RejectsInvalidReflectionIndicesLayoutsAndCycles) {
         talos::schema::canonical_struct(*schema, *schema->objects()->Get(0))
             .empty());
   }
+
+  // Out-of-range raw BaseType bytes (-128, 127) are rejected by struct_hash
+  // without casting to reflection::BaseType.
+  for (const std::int8_t bad_byte :
+       {static_cast<std::int8_t>(-128), static_cast<std::int8_t>(127)}) {
+    SCOPED_TRACE("raw BaseType=" + std::to_string(bad_byte));
+    flatbuffers::FlatBufferBuilder builder;
+    const auto obj_name = builder.CreateString("bad.Struct");
+    const auto field_name = builder.CreateString("x");
+    const auto type_start = builder.StartTable();
+    builder.AddElement<std::int8_t>(reflection::Type::VT_BASE_TYPE, bad_byte,
+                                    0);
+    const flatbuffers::Offset<reflection::Type> type{
+        builder.EndTable(type_start)};
+    reflection::FieldBuilder fb(builder);
+    fb.add_name(field_name);
+    fb.add_type(type);
+    const auto field = fb.Finish();
+    const auto fields = builder.CreateVector(&field, 1);
+    reflection::ObjectBuilder ob(builder);
+    ob.add_name(obj_name);
+    ob.add_fields(fields);
+    ob.add_is_struct(true);
+    ob.add_bytesize(8);
+    const auto obj = ob.Finish();
+    const auto objects = builder.CreateVector(&obj, 1);
+    const auto enums = builder.CreateVector(
+        std::vector<flatbuffers::Offset<reflection::Enum>>{});
+    reflection::SchemaBuilder sb(builder);
+    sb.add_objects(objects);
+    sb.add_enums(enums);
+    reflection::FinishSchemaBuffer(builder, sb.Finish());
+    const std::vector<std::uint8_t> bytes(
+        builder.GetBufferPointer(),
+        builder.GetBufferPointer() + builder.GetSize());
+    EXPECT_FALSE(Hash(bytes, "bad.Struct"));
+  }
 }
 
 }  // namespace

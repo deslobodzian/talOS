@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "flatbuffers/reflection.h"
+#include "talOS/schema/verify.h"
 
 namespace talos::schema {
 
@@ -45,11 +46,6 @@ struct ResolvedField {
   std::string leaf_name;
   std::string enclosing_name;
 };
-
-// The schema in `bfbs` once it verifies as a reflection.Schema and every
-// Type's base_type and element bytes are within reflection::BaseType's defined
-// range, else null.
-const reflection::Schema* VerifySchema(std::string_view bfbs);
 
 // Bytes of a scalar base type (Bool through Double, UType included); 0 for
 // anything else, so also the test for a scalar.

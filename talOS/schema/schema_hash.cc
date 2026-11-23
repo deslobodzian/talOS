@@ -4,7 +4,7 @@
 
 #include "flatbuffers/hash.h"
 #include "flatbuffers/reflection.h"
-#include "flatbuffers/verifier.h"
+#include "talOS/schema/verify.h"
 
 namespace talos::schema {
 namespace {
@@ -141,9 +141,10 @@ std::uint64_t struct_hash(const reflection::Schema& schema,
 std::optional<std::uint64_t> struct_hash(const std::uint8_t* bfbs,
                                          std::size_t size,
                                          std::string_view name) {
-  flatbuffers::Verifier verifier(bfbs, size);
-  if (!reflection::VerifySchemaBuffer(verifier)) return std::nullopt;
-  const reflection::Schema& schema = *reflection::GetSchema(bfbs);
+  const reflection::Schema* verified =
+      VerifySchema({reinterpret_cast<const char*>(bfbs), size});
+  if (verified == nullptr) return std::nullopt;
+  const reflection::Schema& schema = *verified;
   const reflection::Object* object =
       schema.objects() != nullptr
           ? schema.objects()->LookupByKey(std::string(name).c_str())

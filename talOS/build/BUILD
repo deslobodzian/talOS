@@ -213,6 +213,7 @@ cc_binary(
     deps = [
         "//talOS/schema:schema_hash",
         "//talOS/schema:unit_suffix",
+        "//talOS/schema:verify",
         "@flatbuffers//:runtime_cc",
     ],
 )
