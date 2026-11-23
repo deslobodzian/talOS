@@ -227,9 +227,20 @@ struct Sim::Impl {
     for (std::size_t i = 0; i < periodic.size();) {
       bool keep = true;
       while (keep && now >= periodic[i].next) {
-        // Re-index across fn(): it may append to `periodic` via Sim::every().
-        auto fn = periodic[i].fn;
-        keep = fn();
+        // Move out rather than copying `std::function` so Sim::step() never
+        // heap-allocates under AllocationProbe while still staying safe if
+        // `fn()` appends to `periodic` via SimAccess::every().
+        auto fn = std::move(periodic[i].fn);
+        struct RestoreFn {
+          std::vector<Periodic>& vec;
+          std::size_t idx;
+          std::function<bool()>& fn;
+          ~RestoreFn() { vec[idx].fn = std::move(fn); }
+        };
+        {
+          RestoreFn restore{periodic, i, fn};
+          keep = fn();
+        }
         if (periodic[i].period > Duration::max() - periodic[i].next) {
           periodic[i].next = Duration::max();
           break;
