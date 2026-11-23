@@ -42,6 +42,26 @@ struct RawTagDetection {
   bool valid{true};
 };
 
+// Converts an apriltag::Detection into the float RawTagDetection wire layout
+// returned by ComputeBackend::Execute() implementations.
+inline RawTagDetection ToRawTagDetection(const apriltag::Detection& det) {
+  RawTagDetection raw;
+  raw.id = det.id;
+  raw.hamming = det.hamming;
+  raw.decision_margin = det.decision_margin;
+  raw.center_x = static_cast<float>(det.center.x);
+  raw.center_y = static_cast<float>(det.center.y);
+  for (std::size_t i = 0; i < 4; ++i) {
+    raw.corners[2 * i] = static_cast<float>(det.corners[i].x);
+    raw.corners[2 * i + 1] = static_cast<float>(det.corners[i].y);
+  }
+  for (int i = 0; i < 9; ++i) {
+    raw.homography[i] = static_cast<float>(det.homography(i / 3, i % 3));
+  }
+  raw.valid = true;
+  return raw;
+}
+
 // Outcome of executing a compute backend on a single frame.
 struct BackendExecutionResult {
   bool success{false};

@@ -114,22 +114,9 @@ BackendExecutionResult CpuAprilTagBackend::Execute(const Frame& frame) {
       std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now() - t_detect_start)
           .count();
+  result.detections.reserve(detections.size());
   for (const auto& det : detections) {
-    RawTagDetection raw;
-    raw.id = det.id;
-    raw.hamming = det.hamming;
-    raw.decision_margin = det.decision_margin;
-    raw.center_x = static_cast<float>(det.center.x);
-    raw.center_y = static_cast<float>(det.center.y);
-    for (std::size_t i = 0; i < 4; ++i) {
-      raw.corners[2 * i] = static_cast<float>(det.corners[i].x);
-      raw.corners[2 * i + 1] = static_cast<float>(det.corners[i].y);
-    }
-    for (int i = 0; i < 9; ++i) {
-      raw.homography[i] = static_cast<float>(det.homography(i / 3, i % 3));
-    }
-    raw.valid = true;
-    result.detections.push_back(raw);
+    result.detections.push_back(ToRawTagDetection(det));
   }
   result.effective_backend = "cpu";
   auto t_end = std::chrono::steady_clock::now();

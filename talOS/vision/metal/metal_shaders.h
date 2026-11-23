@@ -5,7 +5,13 @@ namespace talos::vision::metal {
 inline constexpr const char* kMetalShadersSource = R"(#include <metal_stdlib>
 using namespace metal;
 
-// 1. rgb_to_gray: converts RGB/RGBA/BGR/BGRA/YUYV textures/buffers to 8-bit grayscale luminance
+// Helper: integer BT.601 luminance matching CPU conversion.
+inline uchar rgb_to_luma(uint r, uint g, uint b) {
+    return static_cast<uchar>((299 * r + 587 * g + 114 * b + 500) / 1000);
+}
+
+// Helper: samples pixel (x, y) from an RGB/RGBA/BGR/BGRA/YUYV/GRAY buffer as
+// 8-bit grayscale luminance.
 // format:
 //   0 = RGB (3 bytes/px: R, G, B)
 //   1 = RGBA (4 bytes/px: R, G, B, A)
@@ -13,6 +19,41 @@ using namespace metal;
 //   3 = GRAY (1 byte/px: Y)
 //   4 = BGR (3 bytes/px: B, G, R)
 //   5 = BGRA (4 bytes/px: B, G, R, A)
+inline uchar sample_gray_pixel(
+    device const uchar* input_buf,
+    uint x,
+    uint y,
+    uint in_stride,
+    uint format)
+{
+    if (format == 0) {
+        // RGB
+        uint idx = y * in_stride + x * 3;
+        return rgb_to_luma(input_buf[idx], input_buf[idx + 1], input_buf[idx + 2]);
+    } else if (format == 1) {
+        // RGBA
+        uint idx = y * in_stride + x * 4;
+        return rgb_to_luma(input_buf[idx], input_buf[idx + 1], input_buf[idx + 2]);
+    } else if (format == 2) {
+        // YUYV: byte order Y0, U0, Y1, V0 (4 bytes per 2 pixels)
+        uint pair_start = (x / 2) * 4;
+        uint y_offset = (x % 2 == 0) ? 0 : 2;
+        return input_buf[y * in_stride + pair_start + y_offset];
+    } else if (format == 4) {
+        // BGR
+        uint idx = y * in_stride + x * 3;
+        return rgb_to_luma(input_buf[idx + 2], input_buf[idx + 1], input_buf[idx]);
+    } else if (format == 5) {
+        // BGRA
+        uint idx = y * in_stride + x * 4;
+        return rgb_to_luma(input_buf[idx + 2], input_buf[idx + 1], input_buf[idx]);
+    } else {
+        // Already GRAY
+        return input_buf[y * in_stride + x];
+    }
+}
+
+// 1. rgb_to_gray: converts RGB/RGBA/BGR/BGRA/YUYV textures/buffers to 8-bit grayscale luminance
 kernel void rgb_to_gray(
     device const uchar* input_buf [[buffer(0)]],
     device uchar* output_buf [[buffer(1)]],
@@ -27,46 +68,8 @@ kernel void rgb_to_gray(
         return;
     }
 
-    uchar gray = 0;
-    if (format == 0) {
-        // RGB
-        uint idx = gid.y * in_stride + gid.x * 3;
-        uint r = input_buf[idx];
-        uint g = input_buf[idx + 1];
-        uint b = input_buf[idx + 2];
-        gray = static_cast<uchar>((299 * r + 587 * g + 114 * b + 500) / 1000);
-    } else if (format == 1) {
-        // RGBA
-        uint idx = gid.y * in_stride + gid.x * 4;
-        uint r = input_buf[idx];
-        uint g = input_buf[idx + 1];
-        uint b = input_buf[idx + 2];
-        gray = static_cast<uchar>((299 * r + 587 * g + 114 * b + 500) / 1000);
-    } else if (format == 2) {
-        // YUYV: byte order Y0, U0, Y1, V0 (4 bytes per 2 pixels)
-        uint pair_start = (gid.x / 2) * 4;
-        uint y_offset = (gid.x % 2 == 0) ? 0 : 2;
-        gray = input_buf[gid.y * in_stride + pair_start + y_offset];
-    } else if (format == 4) {
-        // BGR
-        uint idx = gid.y * in_stride + gid.x * 3;
-        uint b = input_buf[idx];
-        uint g = input_buf[idx + 1];
-        uint r = input_buf[idx + 2];
-        gray = static_cast<uchar>((299 * r + 587 * g + 114 * b + 500) / 1000);
-    } else if (format == 5) {
-        // BGRA
-        uint idx = gid.y * in_stride + gid.x * 4;
-        uint b = input_buf[idx];
-        uint g = input_buf[idx + 1];
-        uint r = input_buf[idx + 2];
-        gray = static_cast<uchar>((299 * r + 587 * g + 114 * b + 500) / 1000);
-    } else {
-        // Already GRAY
-        gray = input_buf[gid.y * in_stride + gid.x];
-    }
-
-    output_buf[gid.y * out_stride + gid.x] = gray;
+    output_buf[gid.y * out_stride + gid.x] =
+        sample_gray_pixel(input_buf, gid.x, gid.y, in_stride, format);
 }
 
 // 2. decimate_2x: 2x downsampling matching upstream image_u8_decimate(..., 2.0f)
@@ -109,49 +112,8 @@ kernel void rgb_to_gray_decimate_2x(
         return;
     }
 
-    uint x0 = gid.x * 2;
-    uint y0 = gid.y * 2;
-
-    uchar gray = 0;
-    if (format == 0) {
-        // RGB
-        uint idx = y0 * in_stride + x0 * 3;
-        uint r = input_buf[idx];
-        uint g = input_buf[idx + 1];
-        uint b = input_buf[idx + 2];
-        gray = static_cast<uchar>((299 * r + 587 * g + 114 * b + 500) / 1000);
-    } else if (format == 1) {
-        // RGBA
-        uint idx = y0 * in_stride + x0 * 4;
-        uint r = input_buf[idx];
-        uint g = input_buf[idx + 1];
-        uint b = input_buf[idx + 2];
-        gray = static_cast<uchar>((299 * r + 587 * g + 114 * b + 500) / 1000);
-    } else if (format == 2) {
-        // YUYV
-        uint pair_start = (x0 / 2) * 4;
-        uint y_offset = (x0 % 2 == 0) ? 0 : 2;
-        gray = input_buf[y0 * in_stride + pair_start + y_offset];
-    } else if (format == 4) {
-        // BGR
-        uint idx = y0 * in_stride + x0 * 3;
-        uint b = input_buf[idx];
-        uint g = input_buf[idx + 1];
-        uint r = input_buf[idx + 2];
-        gray = static_cast<uchar>((299 * r + 587 * g + 114 * b + 500) / 1000);
-    } else if (format == 5) {
-        // BGRA
-        uint idx = y0 * in_stride + x0 * 4;
-        uint b = input_buf[idx];
-        uint g = input_buf[idx + 1];
-        uint r = input_buf[idx + 2];
-        gray = static_cast<uchar>((299 * r + 587 * g + 114 * b + 500) / 1000);
-    } else {
-        // GRAY
-        gray = input_buf[y0 * in_stride + x0];
-    }
-
-    output_buf[gid.y * out_stride + gid.x] = gray;
+    output_buf[gid.y * out_stride + gid.x] =
+        sample_gray_pixel(input_buf, gid.x * 2, gid.y * 2, in_stride, format);
 }
 
 // 3. gradient_and_threshold: computes Sobel gradient magnitude and quantized gradient directions / adaptive threshold
