@@ -460,12 +460,19 @@ class SimGatewayStartup(unittest.TestCase):
                 4 * period_us,
                 f"catch-up burst across first 5 post-pause ticks: {post_pause_gaps[:15]}",
             )
+            # Any single late tick delayed by d < period recovers on the next
+            # tick (gap = period - d), so the following pair (period - d) +
+            # period can be just above period (e.g. 4.8 ms + 10.0 ms = 14.8 ms)
+            # without any catch-up burst. For d >= period, NextTickDeadline
+            # realigns to now + period (the SIGSTOP pause case guarded by the
+            # first assertion above), so two consecutive post-pause ticks still
+            # span at least one full period (vs < 1 ms in a catch-up burst).
             two_tick_spans = [
                 a + b for a, b in zip(post_pause_gaps, post_pause_gaps[1:])
             ]
             self.assertGreaterEqual(
                 min(two_tick_spans),
-                3 * period_us // 2,
+                period_us,
                 f"catch-up burst in post-pause pair: gaps = {post_pause_gaps[:15]}",
             )
 
