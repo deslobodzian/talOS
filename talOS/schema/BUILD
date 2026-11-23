@@ -21,7 +21,8 @@ cc_library(
 )
 
 # talos::schema::VerifySchema: structural verification plus raw BaseType range
-# validation over every reflection::Type in a .bfbs schema. Header-only so
+# validation over every reflection::Type in a .bfbs schema; ValueSize, the
+# bounds-checked size of a struct field's value. Header-only so
 # targets inside libtalos_node.so can share it without affecting link closures.
 cc_library(
     name = "verify",
