@@ -51,6 +51,70 @@ class CheckDepsListedTest(unittest.TestCase):
              "docs/METHODOLOGY.md §13: eigen is not a bazel_dep of "
              "MODULE.bazel"])
 
+    # REQ-DEV-34, METHODOLOGY.md §13 rule 5
+    def test_starlark_bypasses_and_fail_closed_constructs_are_caught(self):
+        # Nested parens, inline comments between `name =` and the string,
+        # positional names, parenthesized/concatenated/triple-quoted strings
+        # must all be discovered rather than slipping past the check.
+        evasive_module = (
+            'module(name = "talos")\n'
+            'bazel_dep(\n'
+            '    version = ("1.0"),\n'
+            '    name = "after_parens",\n'
+            ')\n'
+            'bazel_dep(\n'
+            '    name = # inline comment\n'
+            '        "after_comment",\n'
+            '    version = "1.0",\n'
+            ')\n'
+            'bazel_dep("positional_dep", "1.0")\n'
+            'bazel_dep(name = ("paren_" + "concat"), version = "1.0")\n'
+            'bazel_dep(name = """triple_quoted""", version = "1.0")\n'
+        )
+        expected = (
+            "after_comment",
+            "after_parens",
+            "paren_concat",
+            "positional_dep",
+            "triple_quoted",
+        )
+        self.assertEqual(
+            check_deps_listed.check(evasive_module, methodology(*expected)), [])
+        problems = check_deps_listed.check(evasive_module, methodology())
+        for dep in expected:
+            self.assertIn(
+                f"MODULE.bazel: bazel_dep {dep} is not listed in "
+                "docs/METHODOLOGY.md §13",
+                problems,
+            )
+
+        # include(), dynamic bazel_dep names, and syntax errors fail closed.
+        for label, bad_module in (
+            ("include", 'module(name = "talos")\ninclude("//deps.MODULE.bazel")\n'),
+            ("dynamic_name", 'bazel_dep(name = get_dep(), version = "1.0")\n'),
+            ("syntax_error", 'bazel_dep(name = "broken",\n'),
+        ):
+            with self.subTest(label=label):
+                self.assertTrue(
+                    check_deps_listed.check(bad_module, methodology()),
+                    f"{label} silently passed",
+                )
+
+        # Fenced code examples inside §13 must not end or overwrite the table.
+        fenced_doc = (
+            "## 13. Open source first\n\n"
+            "```markdown\n"
+            "## 14. Fake heading inside code fence\n"
+            "| Bazel module | For |\n|---|---|\n| `fake` | example |\n"
+            "```\n\n"
+            "| Bazel module | For |\n|---|---|\n| `rules_cc` | build |\n"
+        )
+        self.assertEqual(
+            check_deps_listed.check(
+                'bazel_dep(name = "rules_cc", version = "1.0")\n', fenced_doc),
+            [],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

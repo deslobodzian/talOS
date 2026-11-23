@@ -18,11 +18,12 @@ import subprocess
 import sys
 import urllib.parse
 
-FENCE = re.compile(r"^\s*(```|~~~)")
+OPEN_FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
+CLOSE_FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})[ \t]*$")
 INLINE_CODE = re.compile(r"(`+)(?:(?!\1).)+?\1")
 INLINE_LINK = re.compile(
     r"!?\[(?:[^\[\]]|\[[^\[\]]*\])*\]\(\s*(<[^>]*>|[^\s()]*(?:\([^\s()]*\)"
-    r"[^\s()]*)*)(?:\s+[\"'(][^)]*)?\)")
+    r"[^\s()]*)*)(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\s*\)")
 REFERENCE = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*(<[^>]*>|\S+)")
 HEADING = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
 HTML_ANCHOR = re.compile(r"<a\s+(?:[^>]*\s)?(?:id|name)\s*=\s*[\"']([^\"']+)")
@@ -31,16 +32,22 @@ SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 
 def lines_outside_code(text):
     """(line number, line) for each line outside fenced code."""
-    fence = None
+    fence_char, fence_len = None, 0
     for number, line in enumerate(text.splitlines(), 1):
-        match = FENCE.match(line)
-        if fence:
-            if match and match.group(1) == fence:
-                fence = None
+        if fence_char is not None:
+            close = CLOSE_FENCE.match(line)
+            if (close and close.group(1)[0] == fence_char and
+                    len(close.group(1)) >= fence_len):
+                fence_char, fence_len = None, 0
             continue
-        if match:
-            fence = match.group(1)
-            continue
+        open_m = OPEN_FENCE.match(line)
+        if open_m:
+            marker, info = open_m.group(1), open_m.group(2)
+            # In CommonMark, a backtick fence's info string cannot contain
+            # backticks (so ```code``` at line start is inline code, not a fence).
+            if not (marker[0] == "`" and "`" in info):
+                fence_char, fence_len = marker[0], len(marker)
+                continue
         yield number, line
 
 
@@ -56,9 +63,10 @@ def slug(heading):
 
 
 def anchors(text):
-    """Every anchor a markdown file defines."""
+    """Every anchor a markdown file defines outside fenced code."""
     found, seen = set(), {}
     for _, line in lines_outside_code(text):
+        found.update(a.lower() for a in HTML_ANCHOR.findall(line))
         match = HEADING.match(line)
         if not match:
             continue
@@ -66,7 +74,6 @@ def anchors(text):
         count = seen.get(base, 0)
         seen[base] = count + 1
         found.add(base if count == 0 else f"{base}-{count}")
-    found.update(HTML_ANCHOR.findall(text))
     return found
 
 
@@ -115,7 +122,7 @@ def check(files, read, out=sys.stdout):
             else:
                 resolved = source
             why = None
-            if resolved.startswith(".."):
+            if resolved == ".." or resolved.startswith("../"):
                 why = "leaves the repository"
             elif resolved not in tracked and resolved not in directories:
                 why = "no such tracked file or directory"

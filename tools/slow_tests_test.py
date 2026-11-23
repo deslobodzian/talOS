@@ -279,6 +279,59 @@ class SlowTestsTest(unittest.TestCase):
                                  "--testlogs", os.path.join(root, "testlogs")])
         self.assertNotEqual(raised.exception.code, 0)
 
+    # REQ-DEV-25: empty --enforce, unknown/malformed --lanes entries, NaN
+    # durations, truncated cache_status, and root-package tests must fail
+    # closed rather than silently passing overruns.
+    def test_fail_closed_on_empty_enforce_bad_lanes_nan_and_root_package(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TEST_TMPDIR")) as root:
+            write_tree(root, (
+                ("lanes.txt", "//pkg:slow_test intergration\n"),
+                ("testlogs/pkg/slow_test/test.cache_status",
+                 cache_status(25_000)),
+                ("testlogs/root_test/test.cache_status",
+                 cache_status(6_000)),
+            ))
+            testlogs = os.path.join(root, "testlogs")
+            lanes_file = os.path.join(root, "lanes.txt")
+
+            # Empty --enforce must be refused (usage error), not pass with 0
+            # enforced lanes.
+            for bad_enforce in ("", ",,,"):
+                with self.subTest(enforce=bad_enforce), \
+                        self.assertRaises(SystemExit) as raised, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    slow_tests.main(["--check", "--testlogs", testlogs,
+                                     "--enforce", bad_enforce])
+                self.assertNotEqual(raised.exception.code, 0)
+
+            # A misspelled lane name in --lanes must fail closed rather than
+            # silently becoming unenforced.
+            with self.assertRaises((SystemExit, ValueError)):
+                slow_tests.read_lanes(io.StringIO(
+                    "//pkg:slow_test intergration\n"))
+            with self.assertRaises(SystemExit) as raised, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                slow_tests.main(["--check", "--lanes", lanes_file,
+                                 "--testlogs", testlogs])
+            self.assertNotEqual(raised.exception.code, 0)
+
+            # Root-package test //:root_test under bazel-testlogs must not be
+            # skipped.
+            results = dict(slow_tests.from_testlogs(testlogs))
+            self.assertIn("//:root_test", results)
+            self.assertEqual(results["//:root_test"], 6.0)
+
+        # Non-finite or negative durations must not pass budget checks.
+        with self.assertRaises(ValueError):
+            slow_tests.xml_seconds(
+                '<testsuites time="NaN"><testsuite name="a"/></testsuites>')
+        with self.assertRaises(ValueError):
+            slow_tests.duration_seconds({"testAttemptDuration": "NaNs"})
+
+        # A truncated length-delimited field in test.cache_status returns None.
+        truncated = b"\x60" + varint(5900) + b"\x52\x7fshort"
+        self.assertIsNone(slow_tests.cache_status_seconds(truncated))
+
 
 if __name__ == "__main__":
     unittest.main()

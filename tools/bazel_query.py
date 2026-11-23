@@ -14,14 +14,14 @@ The scripts import it as `tools.bazel_query` under Bazel and as
 import os
 import re
 
-_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\r")
 _BAZEL_ERROR_LINE_RE = re.compile(r"^ERROR:\s*(.+)$")
 _BAZEL_TRANSITIVE_SUMMARY_RE = re.compile(
     r"^Evaluation of query .* failed: errors were encountered while computing "
     r"transitive closure$")
 _BAZEL_WORKSPACE_REF_RE = re.compile(r"referenced by '(?:@@)?//")
 _BAZEL_EXTERNAL_PATH_RE = re.compile(
-    r"^(?:[A-Za-z]:)?[^\s:]*[/\\]external[/\\][^/\\:]+[/\\]")
+    r"^(?:[A-Za-z]:[/\\]|/)[^\s:]*[/\\]external[/\\][^/\\:]+[/\\]")
 _BAZEL_EXTERNAL_PKG_RE = re.compile(
     r"^(?:error loading package|no such package|Skipping) '@@?[^'/@]+//")
 
@@ -31,7 +31,11 @@ def exit_3_is_external_only(stderr):
     belongs to an external `@` repository (plus Bazel's transitive-closure
     summary line). Any workspace package error, workspace reference, unknown
     error, or empty stderr fails closed (returns False)."""
-    workspace_prefix = os.path.realpath(os.getcwd()) + os.sep
+    cwd = os.getcwd()
+    workspace_prefixes = {
+        os.path.realpath(cwd) + os.sep,
+        os.path.abspath(cwd) + os.sep,
+    }
     saw_external = False
     saw_any_error = False
     for raw_line in stderr.splitlines():
@@ -45,7 +49,7 @@ def exit_3_is_external_only(stderr):
             continue
         if _BAZEL_WORKSPACE_REF_RE.search(body):
             return False
-        if body.startswith(workspace_prefix):
+        if any(body.startswith(p) for p in workspace_prefixes):
             return False
         if (_BAZEL_EXTERNAL_PATH_RE.match(body) or
                 _BAZEL_EXTERNAL_PKG_RE.match(body)):

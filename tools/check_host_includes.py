@@ -26,6 +26,7 @@ Exit: 0 clean, 1 host headers found, 2 usage error, unreadable `.d` file, or no 
 
 import argparse
 import os
+import re
 import sys
 
 # Include trees a compiler searches by default that host packages install
@@ -72,17 +73,35 @@ wchar.h wctype.h wordexp.h
 """.split())
 
 
+RULE_SEP = re.compile(r"(?<!\\):(?:\s|$)")
+
+
 def parse_depfile(text):
     """Returns the rules of a Make-style dependency file as lists of their
     prerequisites, the compiled source first; a phony rule (-MP) has none."""
     rules = []
-    for line in text.replace("\\\n", " ").splitlines():
-        _, sep, rest = line.partition(": ")
-        if sep:
+    joined = text.replace("\\\r\n", " ").replace("\\\n", " ")
+    for line in joined.splitlines():
+        match = RULE_SEP.search(line)
+        if match:
+            rest = line[match.end():]
             # A '\ ' is an escaped space inside a path.
             tokens = rest.replace("\\ ", "\0").split()
             rules.append([t.replace("\0", " ") for t in tokens])
     return rules
+
+
+def _normalize_allow(allow):
+    out = []
+    for entry in allow:
+        trailing = entry.endswith("/")
+        norm = os.path.normpath(entry)
+        if norm.startswith("//"):
+            norm = "/" + norm.lstrip("/")
+        if trailing and not norm.endswith("/"):
+            norm += "/"
+        out.append(norm)
+    return out
 
 
 def is_multiarch(segment):
@@ -128,6 +147,7 @@ def check(paths, allow):
     found = []
     read_errors = []
     count = 0
+    norm_allow = _normalize_allow(allow)
     for depfile in depfiles(paths):
         try:
             with open(depfile, encoding="utf-8", errors="replace") as f:
@@ -137,11 +157,13 @@ def check(paths, allow):
             continue
         rules = parse_depfile(text)
         if not rules:
+            if text.strip():
+                read_errors.append((depfile, "no Make rule found in depfile"))
             continue
         count += 1
         for prerequisites in rules:
             for header in prerequisites:
-                bad = host_violation(header, allow)
+                bad = host_violation(header, norm_allow)
                 if bad is not None:
                     found.append((prerequisites[0], bad))
     return sorted(set(found)), count, read_errors
