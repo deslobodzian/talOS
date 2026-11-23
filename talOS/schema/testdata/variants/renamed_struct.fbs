@@ -1,0 +1,16 @@
+// float_level.fbs with Reading renamed to Sample inside Holder: Holder has
+// identical bytesize (8), alignment (4), field name/offset and inner fields;
+// only the nested struct's name changes.
+namespace schema_variant;
+
+enum Kind : ubyte { RAW, FILTERED }
+
+struct Sample {
+  level_m:float;
+  kind:Kind;
+  ok:bool;
+}
+
+struct Holder {
+  reading:Sample;
+}

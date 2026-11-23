@@ -1,0 +1,15 @@
+// float_level.fbs with Kind backed by signed byte instead of ubyte: same
+// size (8), alignment (4), enum name and values, different underlying type.
+namespace schema_variant;
+
+enum Kind : byte { RAW, FILTERED }
+
+struct Reading {
+  level_m:float;
+  kind:Kind;
+  ok:bool;
+}
+
+struct Holder {
+  reading:Reading;
+}

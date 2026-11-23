@@ -1,0 +1,15 @@
+// float_level.fbs with Reading forced to 8-byte alignment: same size (8)
+// and identical field names, types and offsets, different minalign (4 -> 8).
+namespace schema_variant;
+
+enum Kind : ubyte { RAW, FILTERED }
+
+struct Reading (force_align: 8) {
+  level_m:float;
+  kind:Kind;
+  ok:bool;
+}
+
+struct Holder {
+  reading:Reading;
+}

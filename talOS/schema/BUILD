@@ -151,23 +151,34 @@ talos_messages(
     ],
 )
 
-# schema_variant (an enum, a struct using it, a struct nesting that) in five
-# spellings compiled separately, so the struct names stay the same: a
-# same-size field type change, a field rename, an enum renumbering, and a
-# comment/whitespace change of the same schema.
+# schema_variant in separately compiled spellings so struct names stay the
+# same: a comment/whitespace change, same-size type/name/offset/alignment/enum
+# changes, trailing padding, nested struct rename, and fixed-array length.
 _VARIANTS = [
+    "aligned_reading",
+    "array_len_2",
+    "array_len_3",
     "float_level",
     "float_level_reformatted",
     "int_level",
+    "padded_reading",
+    "renamed_enum",
+    "renamed_enum_value",
     "renamed_level",
+    "renamed_struct",
     "renumbered_kind",
+    "signed_kind",
+    "swapped_fields",
 ]
 
 genrule(
     name = "variants",
     srcs = ["testdata/variants/%s.fbs" % v for v in _VARIANTS],
     outs = ["variants/%s.bfbs" % v for v in _VARIANTS],
-    cmd = "$(execpath @flatbuffers//:flatc) --binary --schema -o $(RULEDIR)/variants $(SRCS)",
+    cmd = "tmp=$$(mktemp -d) && trap 'rm -rf $$tmp' EXIT && " +
+          "mkdir $$tmp/variants && cp $(SRCS) $$tmp/variants && " +
+          "$(execpath @flatbuffers//:flatc) --binary --schema " +
+          "--bfbs-filenames $$tmp -o $(RULEDIR)/variants $$tmp/variants/*.fbs",
     tools = ["@flatbuffers//:flatc"],
     # rtms_test attaches the float/int variants to prove the attach check.
     visibility = ["//talOS/rtms:__pkg__"],
@@ -199,15 +210,22 @@ py_test(
     name = "schema_hash_py_test",
     size = "small",
     srcs = ["schema_hash_py_test.py"],
-    data = ["variants/%s.bfbs" % v for v in _VARIANTS],
-    env = _VARIANT_ENV,
+    data = ["variants/%s.bfbs" % v for v in _VARIANTS] + [
+        "//talOS/build:descriptor_gen",
+    ],
+    env = dict(
+        _VARIANT_ENV,
+        TALOS_DESCRIPTOR_GEN = "$(rlocationpath //talOS/build:descriptor_gen)",
+    ),
     legacy_create_init = False,
     main = "schema_hash_py_test.py",
     deps = [
+        ":reflection_py",
         ":talos_schema",
         ":test_messages_py",
         "//talOS/build/messages_deps_test/consumer:messages_py",
         "//talOS/build/messages_deps_test/geometry:messages_py",
+        "@pypi//flatbuffers",
         "@rules_python//python/runfiles",
     ],
 )

@@ -1,0 +1,13 @@
+// array_len_2.fbs with samples_m length changed from 2 to 3: same bytesize
+// (8), alignment (4), field names, offsets and element type; only
+// fixed_length changes (2 -> 3).
+namespace schema_variant;
+
+struct Series {
+  samples_m:[ubyte:3];
+  level_m:float;
+}
+
+struct SeriesHolder {
+  series:Series;
+}

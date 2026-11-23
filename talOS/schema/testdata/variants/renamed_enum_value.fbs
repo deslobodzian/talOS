@@ -1,0 +1,15 @@
+// float_level.fbs with Kind.FILTERED renamed to SMOOTHED: same size (8),
+// alignment (4), enum name, underlying type and numeric values.
+namespace schema_variant;
+
+enum Kind : ubyte { RAW, SMOOTHED }
+
+struct Reading {
+  level_m:float;
+  kind:Kind;
+  ok:bool;
+}
+
+struct Holder {
+  reading:Reading;
+}
