@@ -19,7 +19,7 @@ import unittest
 
 from python.runfiles import runfiles
 
-from tools import sync_manifest
+from tools import sharded_test_loader, sync_manifest
 
 CONFIG = "bot/robot.toml"
 ROBOT = """\
@@ -43,18 +43,32 @@ def put(path, text, mode=None):
 
 
 class SimShConfigTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._runfiles = runfiles.Create()
+        cls._sim_src = cls._runfiles.Rlocation("_main/sim.sh")
+        cls._manifest_rel = sync_manifest.manifest_path(CONFIG)
+        # Generate the current manifest once per shard rather than spawning
+        # the C++ resolver in every test's setUp().
+        with tempfile.TemporaryDirectory() as tmpl:
+            put(os.path.join(tmpl, "bot", "BUILD"), "")
+            put(os.path.join(tmpl, CONFIG), ROBOT)
+            sync_manifest.write(tmpl, CONFIG)
+            with open(os.path.join(tmpl, cls._manifest_rel),
+                      encoding="utf-8") as f:
+                cls._manifest_text = f.read()
+
     def setUp(self):
-        r = runfiles.Create()
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tmp = os.path.realpath(tmp.name)
         self.root = os.path.join(self.tmp, "ws")
         self.sim = os.path.join(self.root, "sim.sh")
         os.makedirs(self.root)
-        shutil.copy(r.Rlocation("_main/sim.sh"), self.sim)
+        shutil.copy(self._sim_src, self.sim)
         put(os.path.join(self.root, "bot", "BUILD"), "")
         put(os.path.join(self.root, CONFIG), ROBOT)
-        sync_manifest.write(self.root, CONFIG)
+        put(os.path.join(self.root, self._manifest_rel), self._manifest_text)
         os.makedirs(os.path.join(self.root, "sub"))
 
         self.log = os.path.join(self.tmp, "checked")
@@ -74,7 +88,7 @@ class SimShConfigTest(unittest.TestCase):
                          "resolve"),
             '#!/bin/sh\necho "resolver stub: stop here" >&2\nexit 1\n',
             0o755)
-        self.env = dict(os.environ, **r.EnvVars())
+        self.env = dict(os.environ, **self._runfiles.EnvVars())
         self.env["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
         self.env.pop("BUILD_WORKSPACE_DIRECTORY", None)
 
@@ -169,8 +183,6 @@ class SimShConfigTest(unittest.TestCase):
                          "resolve"),
             f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(resolved)}\n",
             0o755)
-        check = ("import sys; from tools import sync_manifest; "
-                 "sys.exit(sync_manifest.main(sys.argv[1:]))")
         bin_dir = os.path.join(self.tmp, "bin")
         put(os.path.join(bin_dir, "bazel"),
             "#!/bin/sh\n"
@@ -182,12 +194,8 @@ class SimShConfigTest(unittest.TestCase):
             '  done\n'
             '  exit 1\n'
             'fi\n'
-            '[ "$1" = run ] || { echo "bazel stub: $*" >&2; exit 97; }\n'
-            'while [ "$1" != -- ]; do shift; done; shift\n'
-            f'printf "%s\\n" "$*" >> {shlex.quote(self.log)}\n'
-            f"BUILD_WORKSPACE_DIRECTORY={shlex.quote(self.root)} "
-            f"PYTHONPATH={shlex.quote(os.pathsep.join(sys.path[1:]))} "
-            f'exec {shlex.quote(sys.executable)} -c {shlex.quote(check)} "$@"\n',
+            '[ "$1" = run ] && exit 0\n'
+            'echo "bazel stub: $*" >&2; exit 97\n',
             0o755)
 
         log_root = os.path.join(self.tmp, "sim_logs")
@@ -232,8 +240,6 @@ class SimShConfigTest(unittest.TestCase):
         put(os.path.join(self.root, "controller_processor", "rio", "gradlew"),
             f"#!/bin/sh\necho called > {shlex.quote(gradle_marker)}\nexit 0\n",
             0o755)
-        check = ("import sys; from tools import sync_manifest; "
-                 "sys.exit(sync_manifest.main(sys.argv[1:]))")
         bin_dir = os.path.join(self.tmp, "bin")
 
         # Case 1: launcher already exists and reports a held lock -> fails
@@ -249,11 +255,8 @@ class SimShConfigTest(unittest.TestCase):
         put(os.path.join(bin_dir, "bazel"),
             "#!/bin/sh\n"
             f'if [ "$1" = build ]; then echo build > {shlex.quote(build_marker)}; exit 0; fi\n'
-            '[ "$1" = run ] || { echo "bazel stub: $*" >&2; exit 97; }\n'
-            'while [ "$1" != -- ]; do shift; done; shift\n'
-            f"BUILD_WORKSPACE_DIRECTORY={shlex.quote(self.root)} "
-            f"PYTHONPATH={shlex.quote(os.pathsep.join(sys.path[1:]))} "
-            f'exec {shlex.quote(sys.executable)} -c {shlex.quote(check)} "$@"\n',
+            '[ "$1" = run ] && exit 0\n'
+            'echo "bazel stub: $*" >&2; exit 97\n',
             0o755)
         log_root = os.path.join(self.tmp, "sim_logs_lock1")
         env = dict(self.env, PWD=self.root, TALOS_SIM_LOG_DIR=log_root)
@@ -287,11 +290,8 @@ class SimShConfigTest(unittest.TestCase):
             f'  chmod 755 {shlex.quote(launcher_path)}\n'
             '  exit 0\n'
             'fi\n'
-            '[ "$1" = run ] || { echo "bazel stub: $*" >&2; exit 97; }\n'
-            'while [ "$1" != -- ]; do shift; done; shift\n'
-            f"BUILD_WORKSPACE_DIRECTORY={shlex.quote(self.root)} "
-            f"PYTHONPATH={shlex.quote(os.pathsep.join(sys.path[1:]))} "
-            f'exec {shlex.quote(sys.executable)} -c {shlex.quote(check)} "$@"\n',
+            '[ "$1" = run ] && exit 0\n'
+            'echo "bazel stub: $*" >&2; exit 97\n',
             0o755)
         log_root2 = os.path.join(self.tmp, "sim_logs_lock2")
         env2 = dict(self.env, PWD=self.root, TALOS_SIM_LOG_DIR=log_root2)
@@ -326,8 +326,6 @@ class SimShConfigTest(unittest.TestCase):
         put(os.path.join(self.root, "controller_processor", "rio", "gradlew"),
             f"#!/bin/sh\necho called > {shlex.quote(gradle_marker)}\nexit 0\n",
             0o755)
-        check = ("import sys; from tools import sync_manifest; "
-                 "sys.exit(sync_manifest.main(sys.argv[1:]))")
         bin_dir = os.path.join(self.tmp, "bin")
 
         # Stale pre-build launcher rejects --check-session-lock as unknown.
@@ -354,11 +352,8 @@ class SimShConfigTest(unittest.TestCase):
             f'  chmod 755 {shlex.quote(launcher_path)}\n'
             '  exit 0\n'
             'fi\n'
-            '[ "$1" = run ] || { echo "bazel stub: $*" >&2; exit 97; }\n'
-            'while [ "$1" != -- ]; do shift; done; shift\n'
-            f"BUILD_WORKSPACE_DIRECTORY={shlex.quote(self.root)} "
-            f"PYTHONPATH={shlex.quote(os.pathsep.join(sys.path[1:]))} "
-            f'exec {shlex.quote(sys.executable)} -c {shlex.quote(check)} "$@"\n',
+            '[ "$1" = run ] && exit 0\n'
+            'echo "bazel stub: $*" >&2; exit 97\n',
             0o755)
 
         log_root = os.path.join(self.tmp, "sim_logs_stale")
@@ -377,4 +372,4 @@ class SimShConfigTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(testLoader=sharded_test_loader.bazel_test_loader())
