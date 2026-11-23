@@ -152,13 +152,7 @@ class Sim:
 
     def publish(self, msg, topic, message=None, /, **fields):
         """Publishes on `topic`, like Publisher.send."""
-        if message is not None and fields:
-            raise TypeError(
-                "publish() takes either a message or field keyword arguments, "
-                "not both")
-        mtype = message_type(msg)
-        data = mtype.forward(message) if message is not None else (
-            mtype.encode(fields))
+        data = message_type(msg).payload("publish", message, fields)
         _abi.ok(lib.talos_sim_publish_raw(self._handle, _abi.encode(topic),
                                           data, len(data)))
 
@@ -184,13 +178,8 @@ class Sim:
         talos.TargetLane would: stamped with driver_station_generation, or
         with `mode_since_us` for a producer that has not seen the current
         mode (a target queued from an earlier one, a stale view: 0)."""
-        if message is not None and fields:
-            raise TypeError(
-                "publish_target() takes either a message or field keyword "
-                "arguments, not both")
         mtype = message_type(msg)
-        data = mtype.forward(message) if message is not None else (
-            mtype.encode(fields))
+        data = mtype.payload("publish_target", message, fields)
         _abi.ok(lib.talos_sim_publish_target(
             self._handle, _abi.encode(subsystem), _abi.encode(source), data,
             mtype.size, mtype.alignment, _generation(mode_since_us)))
