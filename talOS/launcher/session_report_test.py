@@ -1,5 +1,6 @@
 import json
 import os
+import pathlib
 import re
 import struct
 import subprocess
@@ -1382,6 +1383,85 @@ class SessionReportTest(unittest.TestCase):
         self.assertEqual(v_timeout["enabled state gaps"]["verdict"], "PASS")
         self.assertEqual(only_timeout["enabled_gaps"], 0)
         self.assertEqual(only_timeout["enabled_gap_bound_ms"], 100.0)
+
+    # REQ-OPS-16: hostile manifest.json inputs (non-object roots, deeply nested
+    # JSON, NaN/Infinity literals, wrong field types) and non-finite decoded
+    # scalars must never raise uncaught tracebacks or emit invalid NaN JSON.
+    def test_adversarial_manifests_and_non_finite_scalars(self):
+        binary = runfiles.Create().Rlocation("_main/talOS/launcher/session_report")
+        hostile_cli_manifests = [
+            ("list root", "[]"),
+            ("null root", "null"),
+            ("int root", "123"),
+            ("deep nesting", '{"a":' * 1500 + "1" + "}" * 1500),
+            ("nan literal", '{"nodes": [], "period_us": NaN}'),
+            ("inf literal", '{"nodes": [], "period_us": Infinity}'),
+            ("nodes null", '{"nodes": null}'),
+            ("nodes non-dict item", '{"nodes": ["not_a_dict"]}'),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            session = pathlib.Path(directory)
+            for label, text in hostile_cli_manifests:
+                with self.subTest(manifest=label):
+                    (session / "manifest.json").write_text(text)
+                    result = subprocess.run([binary, str(session)],
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertNotIn("no .tlog files", result.stderr)
+                    self.assertIn("session_report:", result.stderr)
+
+        # Wrong-typed optional node/session fields in analyze/markdown must not
+        # raise TypeError or AttributeError.
+        hostile_manifest = {
+            "session_id": 1,
+            "end_wall_ns": 100,
+            "launcher_log": 12345,
+            "git_revision": 42,
+            "talos_git_revision": 99,
+            "nodes": [{
+                "name": None,
+                "binary_sha256": 12345,
+                "requests_skipped": 2,
+                "requests_skipped_by_subsystem": "not_a_dict",
+                "runs": [{"pid": 1, "start_wall_ns": "bad", "end_wall_ns": 10}],
+                "runs_dropped": "bad",
+            }],
+        }
+        report = session_report.analyze(hostile_manifest, [])
+        self.assertIsNone(
+            session_report.launcher_drops(pathlib.Path("/nonexistent"), hostile_manifest))
+        rendered = session_report.markdown(report)
+        self.assertIn("# Session report", rendered)
+        # Valid strict JSON (no NaN/Infinity).
+        json.dumps(report, allow_nan=False)
+
+        # Overflowing float literal (1e500 -> inf) in decoded /hw/status must
+        # never poison clock_drift_ppm or JSON serialization with NaN/Infinity.
+        status_records = [
+            dict(process="hardware_node", kind="SEND", topic="/hw/status",
+                 now_ms=0.0, event_ms=0.0, publish_ms=0.0,
+                 decoded="{clock_offset_valid: true, clock_boot_id: 1, "
+                         "clock_resets_count: 0, clock_offset_us: 1e500}"),
+            dict(process="hardware_node", kind="SEND", topic="/hw/status",
+                 now_ms=20.0, event_ms=20.0, publish_ms=20.0,
+                 decoded="{clock_offset_valid: true, clock_boot_id: 1, "
+                         "clock_resets_count: 0, clock_offset_us: 1e500}"),
+        ]
+        self.assertIsNone(session_report.clock_drift_ppm(status_records, {}))
+        overflow_report = session_report.analyze(
+            {"end_wall_ns": 1, "nodes": []}, status_records)
+        json.dumps(overflow_report, allow_nan=False)
+
+        # Merged sorted spans keep across_gap exact across thousands of gaps.
+        many_gaps = [
+            {"process": "p", "start_ms": float(i * 10), "end_ms": float(i * 10 + 2),
+             "first_lost_ms": float(i * 10), "last_lost_ms": float(i * 10 + 1)}
+            for i in range(2000)
+        ]
+        spans = session_report.lost_spans(many_gaps)
+        self.assertTrue(session_report.across_gap(spans, {"p"}, 5000.5, 5000.9))
+        self.assertFalse(session_report.across_gap(spans, {"p"}, 5002.0, 5009.0))
 
 
 if __name__ == "__main__":

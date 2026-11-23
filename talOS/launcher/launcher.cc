@@ -593,10 +593,15 @@ int Launcher::RefuseLaunch(std::string_view reason,
   const auto watchdog = notifier.watchdog_interval();
   const auto start_time = options_.supervision_clock();
   SupervisionTime next_watchdog = SupervisionTime::max();
+  const auto deadline_after = [](SupervisionTime start, int duration_s) {
+    if (duration_s <= 0) return SupervisionTime::max();
+    const auto offset = std::chrono::duration_cast<SupervisionTime::duration>(
+        std::chrono::seconds{static_cast<int64_t>(duration_s)});
+    if (start > SupervisionTime::max() - offset) return SupervisionTime::max();
+    return start + offset;
+  };
   const SupervisionTime deadline =
-      options_.duration_s > 0
-          ? start_time + std::chrono::seconds(options_.duration_s)
-          : SupervisionTime::max();
+      deadline_after(start_time, options_.duration_s);
 
   bool stop_sent = false;
   bool ready_sent = false;
@@ -615,7 +620,8 @@ int Launcher::RefuseLaunch(std::string_view reason,
         }
         continue;
       }
-      if (n == 0) {
+      if (n == 0 ||
+          (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
         ::close(stdout_fd);
         stdout_fd = -1;
       }
@@ -674,11 +680,13 @@ int Launcher::RefuseLaunch(std::string_view reason,
     if (port_announced && !ready_sent) {
       notifier.Send("READY=1");
       ready_sent = true;
-      if (watchdog) next_watchdog = now + *watchdog;
+      if (watchdog) {
+        next_watchdog = ServiceNotifier::NextDeadline(now, *watchdog);
+      }
     }
     if (ready_sent && watchdog && now >= next_watchdog) {
       notifier.Send("WATCHDOG=1");
-      next_watchdog = now + *watchdog;
+      next_watchdog = ServiceNotifier::NextDeadline(now, *watchdog);
     }
     if (!stop_sent && (process::stop_requested.load() || now >= deadline)) {
       stop_sent = true;
@@ -759,6 +767,16 @@ int Launcher::RunSession(StopSignals& stop_signals) {
       return 1;
     }
     return 0;
+  }
+  if (options_.describe_timeout_ms <= 0) {
+    constexpr std::string_view kMessage = "--describe-timeout-ms must be > 0";
+    ConsoleLine(std::cerr) << "launcher: " << kMessage << "\n";
+    return RefuseLaunch(kMessage, nullptr, stop_signals);
+  }
+  if (options_.duration_s < 0) {
+    constexpr std::string_view kMessage = "--duration-s must be >= 0";
+    ConsoleLine(std::cerr) << "launcher: " << kMessage << "\n";
+    return RefuseLaunch(kMessage, nullptr, stop_signals);
   }
   // The flag overrides every graph refusal, the safety ones included
   // (REQ-SAFE-27/28) and the live-endpoint refusal, so it never reaches a
@@ -895,11 +913,14 @@ int Launcher::RunSession(StopSignals& stop_signals) {
         "failed to load config from " + options_.config_path + ": " + e.what();
     ConsoleLine(std::cerr) << "launcher: " << message << "\n";
     if (config_was_relative) {
-      ConsoleLine(std::cerr)
-          << "launcher: working directory is "
-          << std::filesystem::current_path()
-          << "; run from the repository root or pass an absolute "
-             "--config path\n";
+      std::error_code cwd_ec;
+      const auto cwd = std::filesystem::current_path(cwd_ec);
+      if (!cwd_ec) {
+        ConsoleLine(std::cerr)
+            << "launcher: working directory is " << cwd
+            << "; run from the repository root or pass an absolute "
+               "--config path\n";
+      }
     }
     return RefuseLaunch(message, nullptr, stop_signals);
   }
@@ -1276,10 +1297,14 @@ int Launcher::RunSession(StopSignals& stop_signals) {
 
   // The deadline starts with the session, so a bridge that never comes up
   // cannot push the session's end out.
-  const auto deadline = options_.duration_s > 0
-                            ? options_.supervision_clock() +
-                                  std::chrono::seconds(options_.duration_s)
-                            : std::chrono::steady_clock::time_point::max();
+  const auto deadline = [&] {
+    if (options_.duration_s <= 0) return SupervisionTime::max();
+    const auto start = options_.supervision_clock();
+    const auto offset = std::chrono::duration_cast<SupervisionTime::duration>(
+        std::chrono::seconds{static_cast<int64_t>(options_.duration_s)});
+    if (start > SupervisionTime::max() - offset) return SupervisionTime::max();
+    return start + offset;
+  }();
 
   const uint16_t remote_port = EffectiveRemotePort(robot_config, options_);
   const uint16_t local_port = EffectiveLocalPort(robot_config, options_);
@@ -1473,9 +1498,24 @@ int Launcher::RunOnRecordedInputs(const std::vector<NodeSpec>& specs) {
     return 1;
   }
   // The new log must not land among the logs being read.
-  const auto relative = std::filesystem::weakly_canonical(options_.output_dir)
-                            .lexically_relative(std::filesystem::canonical(
-                                options_.replay_inputs));
+  std::error_code canon_ec;
+  const auto replay_canon =
+      std::filesystem::canonical(options_.replay_inputs, canon_ec);
+  if (canon_ec) {
+    ConsoleLine(std::cerr) << "launcher: cannot resolve --replay-inputs "
+                           << options_.replay_inputs << ": "
+                           << canon_ec.message() << "\n";
+    return 1;
+  }
+  const auto output_canon =
+      std::filesystem::weakly_canonical(options_.output_dir, canon_ec);
+  if (canon_ec) {
+    ConsoleLine(std::cerr) << "launcher: cannot resolve --output-dir "
+                           << options_.output_dir << ": " << canon_ec.message()
+                           << "\n";
+    return 1;
+  }
+  const auto relative = output_canon.lexically_relative(replay_canon);
   if (!relative.empty() && *relative.begin() != "..") {
     ConsoleLine(std::cerr)
         << "launcher: --output-dir must not be the replayed session's "
@@ -2316,7 +2356,7 @@ void Launcher::Supervise(SessionManifest& manifest,
     auto wake = SupervisionTime::max();
     const auto due = [&wake](SupervisionTime at) { wake = std::min(wake, at); };
     // The pass's WATCHDOG=1 went out at about `now`.
-    if (watchdog) due(now + *watchdog);
+    if (watchdog) due(ServiceNotifier::NextDeadline(now, *watchdog));
     if (refreshes_locks) due(next_lock_refresh);
     if (stop_phase == StopPhase::kBridge) {
       if (!bridge_killed && now < bridge_stop_deadline) {

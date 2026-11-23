@@ -15,6 +15,7 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -147,10 +148,11 @@ bool StopWithin(int stop_fd, std::chrono::milliseconds wait) {
     if (wait.count() > 0) std::this_thread::sleep_for(wait);
     return false;
   }
+  const int poll_ms = static_cast<int>(std::clamp<std::int64_t>(
+      wait.count(), 0, std::numeric_limits<int>::max()));
   ::pollfd stop{stop_fd, POLLIN, 0};
   // EINTR ends the wait early, which every caller's loop absorbs.
-  return ::poll(&stop, 1, static_cast<int>(wait.count())) > 0 &&
-         (stop.revents & POLLIN) != 0;
+  return ::poll(&stop, 1, poll_ms) > 0 && (stop.revents & POLLIN) != 0;
 }
 
 }  // namespace
@@ -160,12 +162,22 @@ bool ProbeDescribe(const std::vector<std::string>& args,
                    introspect::Description& out, std::string& error,
                    int injected_spawn_failures, int stop_fd) {
   error.clear();
+  if (timeout <= std::chrono::milliseconds{0}) {
+    error = "describe timeout must be positive (" +
+            std::to_string(timeout.count()) + "ms)";
+    return false;
+  }
   const std::string stopped_error = "the launch was stopped";
   if (StopWithin(stop_fd, std::chrono::milliseconds{0})) {
     error = stopped_error;
     return false;
   }
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  const auto now = std::chrono::steady_clock::now();
+  const auto max_delta = std::chrono::steady_clock::time_point::max() - now;
+  const auto clamped_timeout = std::chrono::nanoseconds{timeout} > max_delta
+                                   ? max_delta
+                                   : std::chrono::nanoseconds{timeout};
+  const auto deadline = now + clamped_timeout;
   int answer = -1;
   pid_t pid = -1;
   auto backoff = kProbeSpawnRetryFirst;
@@ -204,6 +216,7 @@ bool ProbeDescribe(const std::vector<std::string>& args,
   std::string text;
   bool timed_out = false;
   bool stopped = false;
+  int active_stop_fd = stop_fd;
   constexpr std::size_t kMaxDescribeBytes = std::size_t{4} * 1024 * 1024;
   for (;;) {
     const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -212,11 +225,12 @@ bool ProbeDescribe(const std::vector<std::string>& args,
       timed_out = true;
       break;
     }
-    // A negative stop_fd is ignored.
+    const int poll_ms = static_cast<int>(std::clamp<std::int64_t>(
+        left.count(), 0, std::numeric_limits<int>::max()));
+    // A negative active_stop_fd is ignored.
     std::array<::pollfd, 2> waiting{
-        {{answer, POLLIN, 0}, {stop_fd, POLLIN, 0}}};
-    const int ready =
-        ::poll(waiting.data(), waiting.size(), static_cast<int>(left.count()));
+        {{answer, POLLIN, 0}, {active_stop_fd, POLLIN, 0}}};
+    const int ready = ::poll(waiting.data(), waiting.size(), poll_ms);
     if (ready < 0) {
       if (errno == EINTR) continue;
       error = std::string{"poll() failed: "} + std::strerror(errno);
@@ -230,6 +244,10 @@ bool ProbeDescribe(const std::vector<std::string>& args,
       stopped = true;
       break;
     }
+    if ((waiting[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+      active_stop_fd = -1;
+    }
+    if (waiting[0].revents == 0) continue;
     char buffer[4096];
     const ssize_t got = ::read(answer, buffer, sizeof(buffer));
     if (got < 0) {
@@ -260,7 +278,7 @@ bool ProbeDescribe(const std::vector<std::string>& args,
         timed_out = true;
         break;
       }
-      if (StopWithin(stop_fd, std::chrono::milliseconds{1})) {
+      if (StopWithin(active_stop_fd, std::chrono::milliseconds{1})) {
         stopped = true;
         break;
       }

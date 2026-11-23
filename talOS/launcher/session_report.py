@@ -13,10 +13,34 @@ import sys
 from python.runfiles import runfiles
 
 
+def _reject_non_finite_json(token):
+    raise ValueError(f"non-finite JSON constant: {token}")
+
+
+def load_manifest(path):
+    """Reads and validates a session manifest.json object."""
+    try:
+        manifest = json.loads(Path(path).read_text(encoding="utf-8"),
+                              parse_constant=_reject_non_finite_json)
+    except RecursionError as error:
+        raise ValueError(f"{path}: manifest JSON nested too deeply") from error
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{path}: manifest JSON is not valid UTF-8") from error
+    if not isinstance(manifest, dict):
+        raise ValueError(f"{path}: manifest root must be a JSON object")
+    nodes = manifest.get("nodes")
+    if not isinstance(nodes, list) or not all(isinstance(n, dict) for n in nodes):
+        raise ValueError(f"{path}: manifest 'nodes' must be a list of objects")
+    return manifest
+
+
 def stats(values, unit="ms"):
     """Count, min, median, nearest-rank p99 and max, each named with its unit;
     None for no values (a row with no sample is not measured, not 0)."""
-    values = sorted(values)
+    values = sorted(
+        v for v in values
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    )
     if not values:
         return None
     return {"count": len(values), f"min_{unit}": values[0],
@@ -28,8 +52,17 @@ def stats(values, unit="ms"):
 def scalars(decoded):
     # DecodeToText uses descriptor field names and decimal scalar values. Only
     # top-level status scalars are consumed; nested target contents are not.
-    return {key: json.loads(value) for key, value in re.findall(
-        r"(?:\{|,)\s*(\w+):\s*(true|false|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*(?=[,}])", decoded)}
+    if not isinstance(decoded, str):
+        return {}
+    found = {}
+    for key, value in re.findall(
+        r"(?:\{|,)\s*(\w+):\s*(true|false|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*(?=[,}])", decoded
+    ):
+        parsed = json.loads(value)
+        if isinstance(parsed, float) and not math.isfinite(parsed):
+            continue
+        found[key] = parsed
+    return found
 
 
 def stream(records, topic):
@@ -138,7 +171,8 @@ def delivery_summary(node):
 def delivery_count(node, key):
     """`key=value`; the bridge's skipped requests also per subsystem."""
     split = node.get("requests_skipped_by_subsystem") if key == "requests_skipped" else None
-    detail = f" ({', '.join(f'{k}={v}' for k, v in split.items())})" if split else ""
+    detail = (f" ({', '.join(f'{k}={v}' for k, v in split.items())})"
+              if isinstance(split, dict) and split else "")
     return f"{key}={node[key]}{detail}"
 
 
@@ -174,8 +208,10 @@ def launcher_drops(session, manifest):
     order noted; None when the manifest names no launcher log (written before
     it did). The file is read beside the manifest, wherever the session was
     copied."""
+    if not isinstance(manifest, dict):
+        return None
     name = manifest.get("launcher_log")
-    if not name:
+    if not isinstance(name, str) or not name or "\x00" in name:
         return None
     path = Path(session) / Path(name).name
     try:
@@ -206,22 +242,46 @@ def lost_spans(gaps):
     record it dropped named (its now, event and publish times):
     [min(start_ms, first_lost_ms), last_lost_ms], or [start_ms, end_ms] for a
     GAP without its detail. The record capture resumed with, at end_ms, was
-    kept, so a detailed span stops at the last record lost."""
-    spans = {}
+    kept, so a detailed span stops at the last record lost. Overlapping
+    intervals are sorted and merged per process so across_gap is O(log G)."""
+    raw = {}
     for gap in gaps:
         first, last = gap.get("first_lost_ms"), gap.get("last_lost_ms")
         low = gap["start_ms"] if first is None else min(gap["start_ms"], first)
-        spans.setdefault(gap["process"], []).append(
-            (low, gap["end_ms"] if last is None else last))
-    return spans
+        high = gap["end_ms"] if last is None else last
+        if math.isnan(low) or math.isnan(high):
+            continue
+        if low > high:
+            low, high = high, low
+        raw.setdefault(gap["process"], []).append((low, high))
+    merged = {}
+    for process, intervals in raw.items():
+        intervals.sort()
+        out = []
+        for start, end in intervals:
+            if out and start <= out[-1][1]:
+                if end > out[-1][1]:
+                    out[-1] = (out[-1][0], end)
+            else:
+                out.append((start, end))
+        merged[process] = out
+    return merged
 
 
 def across_gap(spans, processes, low, high):
     """Whether [low, high] meets a lost span of any of these processes' logs:
     a record of theirs could be missing inside it, so an interval it bounds
     is not measured."""
-    return any(start <= high and low <= end
-               for process in processes for start, end in spans.get(process, ()))
+    if math.isnan(low) or math.isnan(high):
+        return False
+    for process in processes:
+        intervals = spans.get(process)
+        if not intervals:
+            continue
+        index = bisect.bisect_right(intervals, (high, math.inf)) - 1
+        if index >= 0 and low <= intervals[index][1]:
+            return True
+    return False
 
 
 def request_to_command(records, spans=None):
@@ -506,18 +566,25 @@ def clock_drift_ppm(status_records, spans):
     two samples) and pooled across runs. It is the two oscillators' relative
     drift; no latency is computed across the clocks. None without two valid
     samples at different times in one run."""
-    lost = sorted(span for process in {r["process"] for r in status_records[:1]}
+    status_processes = {r["process"] for r in status_records[:1]}
+    lost = sorted(span for process in status_processes
                   for span in spans.get(process, ()))
+    lost_ends = [end for _, end in lost]
     runs = {}
     for r in status_records:
         fields = scalars(r["decoded"])
         time = r["publish_ms"]
-        if (fields.get("clock_offset_valid") is not True or "clock_offset_us" not in fields
-                or any(start <= time <= end for start, end in lost)):
+        offset = fields.get("clock_offset_us")
+        if (fields.get("clock_offset_valid") is not True
+                or not isinstance(offset, (int, float)) or isinstance(offset, bool)
+                or not math.isfinite(offset)
+                or not isinstance(time, (int, float)) or isinstance(time, bool)
+                or not math.isfinite(time)
+                or across_gap(spans, status_processes, time, time)):
             continue
         run = (fields.get("clock_boot_id"), fields.get("clock_resets_count"),
-               sum(end < time for _, end in lost))
-        runs.setdefault(run, []).append((time, fields["clock_offset_us"]))
+               bisect.bisect_left(lost_ends, time))
+        runs.setdefault(run, []).append((time, offset))
     covariance = variance = 0.0
     for samples in runs.values():
         mean_time = statistics.fmean(time for time, _ in samples)
@@ -526,7 +593,10 @@ def clock_drift_ppm(status_records, spans):
                           for time, offset in samples)
         variance += sum((time - mean_time) ** 2 for time, _ in samples)
     # µs of offset per ms of time, × 1000: µs per s, which is ppm.
-    return covariance / variance * 1000 if variance else None
+    if not variance or not math.isfinite(variance) or not math.isfinite(covariance):
+        return None
+    ppm = covariance / variance * 1000
+    return ppm if math.isfinite(ppm) else None
 
 
 def alert_summary(records, spans=None):
@@ -676,6 +746,11 @@ def recorded_bound(manifest, key):
 
 
 def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_decoded=None):
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be a JSON object")
+    manifest_nodes = manifest.get("nodes")
+    if not isinstance(manifest_nodes, list) or not all(isinstance(n, dict) for n in manifest_nodes):
+        raise ValueError("manifest 'nodes' must be a list of objects")
     # hardware_not_decoded: log_dump's line for a session recorded under
     # another hardware protocol. Its Driver Station packets were not decoded,
     # so nothing that needs the enabled bit is measured; /hw/state cadence
@@ -896,7 +971,7 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
         "session unfinished (end_wall_ns = 0: no normal shutdown)"]
     # Only recording nodes (non-empty log_path) are acceptance evidence. Host
     # processes without an event log (studio_bridge, sim_gateway) are not.
-    issues += [f"{n.get('name')}: {flag}" for n in manifest["nodes"] if n.get("log_path")
+    issues += [f"{n.get('name')}: {flag}" for n in manifest_nodes if n.get("log_path")
                for flag in ("quarantined", "recorder_failed", "log_capped", "log_gap")
                if n.get(flag)]
     # A record the reader skipped is missing from every measurement above.
@@ -908,22 +983,26 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
         issues.append(hardware_not_decoded)
     simulation = bool(manifest.get("simulation"))
     realtime_issues = [issue for issue in (realtime_issue(n, simulation)
-                                           for n in manifest["nodes"]) if issue]
-    delivery = [issue for n in manifest["nodes"] for issue in delivery_issues(n)]
+                                           for n in manifest_nodes) if issue]
+    delivery = [issue for n in manifest_nodes for issue in delivery_issues(n)]
     # Bridge and control loops --sim excuses: they never asked for realtime.
-    realtime_exempt = [n.get("name") for n in manifest["nodes"] if simulation
+    realtime_exempt = [n.get("name") for n in manifest_nodes if simulation
                        and n.get("loop_tier") in ACTUATION_TIERS
                        and n.get("realtime") == "not_requested"]
-    talos_rev = manifest.get("talos_git_revision") or ""
+    talos_rev = manifest.get("talos_git_revision")
+    talos_rev = talos_rev if isinstance(talos_rev, str) else ""
     talos_revision = (
         talos_rev + (" (dirty)" if manifest.get("talos_git_dirty") else "")
         if talos_rev else ""
     )
+    config_sha = manifest.get("config_sha256")
+    config_sha = config_sha if isinstance(config_sha, str) and config_sha else "NOT RECORDED (non-bundle launch)"
+    git_rev = manifest.get("git_revision")
+    git_rev = git_rev if isinstance(git_rev, str) and git_rev else "NOT RECORDED (unstamped or non-bundle)"
     return {"session_id": manifest.get("session_id"),
-            "config_sha256": manifest.get("config_sha256") or "NOT RECORDED (non-bundle launch)",
+            "config_sha256": config_sha,
             # A --config=release bundle's source revision; older manifests lack it.
-            "git_revision": (manifest.get("git_revision") or "NOT RECORDED (unstamped or non-bundle)")
-                            + (" (dirty)" if manifest.get("git_dirty") else ""),
+            "git_revision": git_rev + (" (dirty)" if manifest.get("git_dirty") else ""),
             # Present only when a separate robot repo was stamped against a
             # talOS git checkout (REPO-4).
             **({"talos_git_revision": talos_revision} if talos_revision else {}),
@@ -935,13 +1014,21 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
                        "loop_tier": n.get("loop_tier") or "—",
                        "realtime": realtime_summary(n),
                        "delivery": delivery_summary(n)}
-                      for n in manifest["nodes"]],
+                      for n in manifest_nodes],
             # Every run and why it ended (launcher README "Session manifest");
             # absent in manifests written before the launcher recorded runs.
-            "runs": {n.get("name"): {"binary_sha256": n.get("binary_sha256", ""),
-                                     "runs": n.get("runs", []),
-                                     "runs_dropped": n.get("runs_dropped", 0)}
-                     for n in manifest["nodes"]},
+            "runs": {
+                n.get("name"): {
+                    "binary_sha256": n.get("binary_sha256") if isinstance(n.get("binary_sha256"), str) else "",
+                    "runs": [r for r in n.get("runs", []) if isinstance(r, dict)]
+                            if isinstance(n.get("runs"), list) else [],
+                    "runs_dropped": n.get("runs_dropped")
+                                    if isinstance(n.get("runs_dropped"), int)
+                                    and not isinstance(n.get("runs_dropped"), bool)
+                                    else 0,
+                }
+                for n in manifest_nodes
+            },
             "session_issues": issues,
             "realtime_issues": realtime_issues,
             "realtime_exempt": realtime_exempt,
@@ -1083,13 +1170,18 @@ def markdown(report):
               "|---|---|---:|---:|---:|---:|---:|---|"]
     for name, node in report["runs"].items():
         for index, run in enumerate(node["runs"]):
-            ended = run["end_wall_ns"]
-            seconds = f"{(ended - run['start_wall_ns']) / 1e9:.3f}" if ended else "running"
+            ended = run.get("end_wall_ns")
+            started = run.get("start_wall_ns")
+            if (isinstance(ended, (int, float)) and not isinstance(ended, bool) and ended
+                    and isinstance(started, (int, float)) and not isinstance(started, bool)):
+                seconds = f"{(ended - started) / 1e9:.3f}"
+            else:
+                seconds = "running"
             # A run after the dropped ones is numbered as it was spawned.
             number = index if index == 0 else index + node["runs_dropped"]
             lines.append(f"| {name} | {node['binary_sha256'][:12] or '—'} | {number} | "
-                         f"{run['pid']} | {seconds} | {run['exit_code']} | "
-                         f"{run['exit_signal']} | {run['reason']} |")
+                         f"{run.get('pid')} | {seconds} | {run.get('exit_code')} | "
+                         f"{run.get('exit_signal')} | {run.get('reason')} |")
         if node["runs_dropped"]:
             lines.append(f"| {name} | | | | | | | {node['runs_dropped']} runs after the first dropped |")
     lines += ["", "## Session completeness"] + (
@@ -1101,7 +1193,7 @@ def markdown(report):
         ["- " + s for s in report["realtime_issues"]] or [judged])
     if report["realtime_exempt"]:
         lines.append("- not judged (--sim, realtime never requested): "
-                     + ", ".join(report["realtime_exempt"]))
+                     + ", ".join(str(x) for x in report["realtime_exempt"]))
     lines += ["", "## Delivery loss"] + [f"- {n['name']}: {n['delivery']}"
                                          for n in report["nodes"]]
     drops = report["output_drops"]
@@ -1136,7 +1228,7 @@ def markdown(report):
     if not report["target_age_at_tick"]:
         lines.append("Target age at tick: NOT MEASURED (no Target selected a lane).")
     for n in report["nodes"]:
-        if any(k.startswith(n["name"] + ":") for k in report["timer_lateness"]):
+        if any(k.startswith(f"{n['name']}:") for k in report["timer_lateness"]):
             continue
         if n["name"] == bridge["process"]:
             # The bridge sleeps until a datagram, a request or a duty is due.
@@ -1219,24 +1311,27 @@ def main():
                         help="exit 2 unless every required verdict passes and the session is complete")
     args = parser.parse_args()
     try:
-        manifest = json.loads((args.session / "manifest.json").read_text())
+        manifest = load_manifest(args.session / "manifest.json")
         result = subprocess.run([log_dump_path(), "--format", "jsonl", str(args.session)],
-                                capture_output=True, text=True, check=True)
+                                capture_output=True, text=True, errors="replace", check=True)
         not_decoded = HARDWARE_NOT_DECODED.search(result.stderr)
         for disagreement in HARDWARE_PROTOCOL_DISAGREES.findall(result.stderr):
             print(f"session_report: {disagreement}", file=sys.stderr)
-        report = analyze(manifest, [json.loads(line) for line in result.stdout.splitlines()],
+        records = [json.loads(line, parse_constant=_reject_non_finite_json)
+                   for line in result.stdout.splitlines()]
+        report = analyze(manifest, records,
                          DAMAGED_LOG.findall(result.stderr),
                          launcher_drops(args.session, manifest),
                          not_decoded[1] if not_decoded else None)
-        print(json.dumps(report, indent=2) if args.json else markdown(report))
+        print(json.dumps(report, indent=2, allow_nan=False) if args.json else markdown(report))
         if not args.strict:
             return 0
         failures = strict_failures(report)
         for failure in failures:
             print(f"session_report: strict: {failure}", file=sys.stderr)
         return 2 if failures else 0
-    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, KeyError, TypeError, RecursionError,
+            subprocess.CalledProcessError) as error:
         print(f"session_report: {error}", file=sys.stderr)
         if isinstance(error, subprocess.CalledProcessError):
             print(error.stderr, file=sys.stderr)

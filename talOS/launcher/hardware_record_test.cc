@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <span>
@@ -767,6 +768,54 @@ TEST(HardwareProtocolCheck, TheBridgesRecordedVersionComesFirst) {
       }
     }
   }
+  std::filesystem::remove_all(dir);
+}
+
+// REQ-OPS-51: extreme event_time_ns values in a corrupted bridge log must not
+// cause signed int64 subtraction overflow while scanning for /hw/status.
+TEST(HardwareProtocolVersionTest,
+     BridgeStatusSearchHandlesExtremeTimestampsWithoutOverflow) {
+  const std::string dir =
+      testing::TempDir() + "/bridge_protocol_extreme_ts_" + std::to_string(42);
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::string log_path = dir + "/hardware_node.tlog";
+
+  using Packet = talos::Descriptor<talos::hardware::Packet>;
+  talos::event::Registration state;
+  state.id = 0;
+  state.kind = talos::event::SourceKind::SENDER;
+  state.name = std::string{talos::hardware::kStateTopic};
+  state.message_bytes = sizeof(talos::hardware::Packet);
+  state.schema = {std::string{Packet::kName}, Packet::kHash, {}};
+  talos::event::Registration status_source =
+      StatusSource(1, talos::event::SourceKind::SENDER);
+
+  talos::event::log::LogWriter writer{
+      log_path, "hardware_node",
+      talos::event::log::LogWriterOptions{1 << 14, 1, false}, 42};
+  writer.start({state, status_source},
+               talos::event::MonotonicTime::from_nanos(0));
+  talos::event::Context ctx{};
+  ctx.kind = talos::event::EventKind::SEND;
+  ctx.event_time = talos::event::MonotonicTime::from_nanos(
+      std::numeric_limits<std::int64_t>::min());
+  ctx.now = ctx.event_time;
+  ctx.publish_time = ctx.event_time;
+  writer.send(ctx, 0, Encoded(talos::hardware::State{}), 0, 1);
+
+  bridge::BridgeStatus status{};
+  status.mutate_protocol_version_id(talos::protocol::kProtocolVersion);
+  ctx.event_time = talos::event::MonotonicTime::from_nanos(
+      std::numeric_limits<std::int64_t>::max());
+  ctx.now = ctx.event_time;
+  ctx.publish_time = ctx.event_time;
+  writer.send(ctx, 1, std::as_bytes(std::span{&status, 1}), 0, 1);
+  writer.flush();
+  ASSERT_FALSE(writer.failed()) << writer.error();
+
+  const auto recorded = talos::launcher::RecordedProtocolVersion({log_path});
+  EXPECT_TRUE(recorded.bridge.empty());
   std::filesystem::remove_all(dir);
 }
 

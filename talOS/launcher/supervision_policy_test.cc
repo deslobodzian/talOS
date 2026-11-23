@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <random>
 #include <string>
 #include <string_view>
@@ -509,6 +510,36 @@ TEST(SupervisionPolicy, HeartbeatTimeoutIsTenPeriodsWithA500MsFloor) {
   EXPECT_EQ(HeartbeatTimeout(5000, periods), 500ms);
   EXPECT_EQ(HeartbeatTimeout(100000, periods), 1s);
   EXPECT_EQ(HeartbeatTimeout(1000, periods), 500ms);
+}
+
+// REQ-OPS-05, REQ-OPS-45: extreme period_us or heartbeat_periods saturate
+// without signed int64 overflow in multiplication, us->ns conversion, or
+// NextLook deadline addition.
+TEST(SupervisionPolicy, ExtremeTimeoutArgumentsDoNotOverflow) {
+  const auto max_i64 = std::numeric_limits<int64_t>::max();
+  const auto max_int = std::numeric_limits<int>::max();
+  // Multiplication overflow (period_us * heartbeat_periods > INT64_MAX) and
+  // microseconds-to-nanoseconds overflow (> INT64_MAX / 1000).
+  const auto huge_mul = HeartbeatTimeout(max_i64 / 2, max_int);
+  const auto huge_ns = HeartbeatTimeout(10'000'000, 1'000'000'000);
+  EXPECT_GT(huge_mul, kMinHeartbeatTimeout);
+  EXPECT_GT(huge_ns, kMinHeartbeatTimeout);
+  // Non-positive arguments fall back safely to the 500 ms floor.
+  EXPECT_EQ(HeartbeatTimeout(0, 10), kMinHeartbeatTimeout);
+  EXPECT_EQ(HeartbeatTimeout(-5000, max_int), kMinHeartbeatTimeout);
+  EXPECT_EQ(HeartbeatTimeout(max_i64, std::numeric_limits<int>::min()),
+            kMinHeartbeatTimeout);
+
+  // RunLiveness::NextLook must not overflow SupervisionTime with huge limits.
+  const LivenessLimits extreme{
+      .heartbeat_timeout = huge_mul,
+      .startup_grace = std::chrono::milliseconds{max_i64 / 1'000'000},
+      .construction_timeout = std::chrono::milliseconds{max_i64 / 1'000'000},
+  };
+  RunLiveness run;
+  const SupervisionTime late = SupervisionTime{} + std::chrono::hours{24 * 365};
+  run.Begin(late);
+  EXPECT_GT(run.NextLook(extreme), late);
 }
 
 }  // namespace
