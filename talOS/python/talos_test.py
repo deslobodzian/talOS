@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import re
+import struct
 import subprocess
 import sys
 import textwrap
@@ -1259,6 +1260,84 @@ class TargetTest(unittest.TestCase):
         # The lift is enabled and in teleop: the current generation drives.
         self.hold("teleop", 2.0, 0.01)
         self.assertEqual(self.applied(), (talos.Mode.VOLTAGE, 2.0))
+
+    # REQ-DEV-08
+    def test_publish_target_stamps_newest_ds_generation_or_explicit_mode(self):
+        from talos._messages import message_type
+
+        goal_type = message_type(Goal)
+        envelope_size = 16 + goal_type.size
+
+        def read_envelope(sim, subsystem, source):
+            buf = ctypes.create_string_buffer(envelope_size)
+            topic = f"/{subsystem}/target/{source}".encode()
+            found = _abi.ok(_abi.lib.talos_sim_latest_raw(
+                sim._handle, topic, buf, envelope_size))
+            self.assertEqual(found, 1)
+            mode_since_us, active, padding = struct.unpack_from(
+                "=QB7s", buf.raw, 0)
+            self.assertEqual(padding, b"\0" * 7)
+            return mode_since_us, active, goal_type.decode(buf.raw[16:])
+
+        # Before any Driver Station packet is published, generation is 0.
+        sim = Sim.from_toml(ROBOT_TOML)
+        hw = SimHardware(sim)
+        self.assertEqual(sim.driver_station_generation, 0)
+        sim.publish_target(Goal, "lift", "teleop", height_rot=1.0,
+                           enabled=True, tick_count=1)
+        gen, active, msg = read_envelope(sim, "lift", "teleop")
+        self.assertEqual((gen, active, msg.height_rot, msg.tick_count),
+                         (0, 1, 1.0, 1))
+
+        # First active mode (teleop): default publish_target stamps DS gen.
+        hw.set_driver_station(enabled=True, teleop=True)
+        sim.step(0.02)
+        teleop_gen = sim.driver_station_generation
+        self.assertGreater(teleop_gen, 0)
+        sim.publish_target(Goal, "lift", "teleop", height_rot=2.0,
+                           enabled=True, tick_count=2)
+        gen, active, msg = read_envelope(sim, "lift", "teleop")
+        self.assertEqual((gen, active, msg.height_rot, msg.tick_count),
+                         (teleop_gen, 1, 2.0, 2))
+
+        # Disabled DS packet names no active mode: default stamps 0.
+        hw.set_driver_station(enabled=False, teleop=True)
+        sim.step(0.02)
+        self.assertEqual(sim.driver_station_generation, 0)
+        sim.publish_target(Goal, "lift", "teleop", height_rot=2.5,
+                           enabled=True, tick_count=3)
+        gen, active, msg = read_envelope(sim, "lift", "teleop")
+        self.assertEqual((gen, active, msg.height_rot, msg.tick_count),
+                         (0, 1, 2.5, 3))
+
+        # Mode transition to autonomous increments generation: default stamps
+        # the newest generation (covering pre-built message forwarding too).
+        hw.set_driver_station(enabled=True, autonomous=True)
+        sim.step(0.02)
+        auto_gen = sim.driver_station_generation
+        self.assertGreater(auto_gen, teleop_gen)
+        pre_built = goal_type.decode(goal_type.encode(
+            {"height_rot": 3.0, "enabled": True, "tick_count": 4}))
+        sim.publish_target(Goal, "lift", "auto", pre_built)
+        gen, active, msg = read_envelope(sim, "lift", "auto")
+        self.assertEqual((gen, active, msg.height_rot, msg.tick_count),
+                         (auto_gen, 1, 3.0, 4))
+
+        # Explicit mode_since_us overrides the newest DS generation: earlier
+        # generation, explicit 0 (not treated as None), and a 64-bit value.
+        for explicit_gen in (teleop_gen, 0, 0x123456789ABCDEF0):
+            with self.subTest(mode_since_us=explicit_gen):
+                sim.publish_target(Goal, "lift", "auto", height_rot=4.0,
+                                   enabled=True, tick_count=5,
+                                   mode_since_us=explicit_gen)
+                gen, active, msg = read_envelope(sim, "lift", "auto")
+                self.assertEqual((gen, active, msg.height_rot, msg.tick_count),
+                                 (explicit_gen, 1, 4.0, 5))
+
+        # release_target clears active and stamps the newest DS generation.
+        sim.release_target(Goal, "lift", "auto")
+        gen, active, _ = read_envelope(sim, "lift", "auto")
+        self.assertEqual((gen, active), (auto_gen, 0))
 
     def test_lane_sends_and_releases(self):
         sim = Sim.from_toml(ROBOT_TOML)
