@@ -217,6 +217,7 @@ constexpr double kFollowerSignalMinHz = 20.0;
 constexpr uint16_t kConfigureFailedMessage = 0;
 constexpr uint16_t kCanBusStatusMessage = 7;
 constexpr uint16_t kCanBusReaderMessage = 8;
+constexpr uint16_t kRestoreFailedMessage = 13;
 constexpr uint16_t kProLicenceRefusedMessage = 16;
 static_assert(kProLicenceRefusedMessage + hw::kMaxMotors <= 32);
 
@@ -304,6 +305,20 @@ void RecordConfigureException(std::optional<hw::ConfigError>& last_error,
     // Never let a secondary exception (e.g. bad_alloc) escape.
   }
 }
+
+// Logs an exception from BeginRestoreAfterReset() or PollRestore() without
+// heap allocation on the SCHED_FIFO loop thread or letting any exception
+// escape.
+void LogRestoreException(talos::rio::RioLog& log, const char* detail) noexcept {
+  talos::rio::LogEvent event;
+  event.index = kRestoreFailedMessage;
+  const char* message = (detail != nullptr && detail[0] != '\0')
+                            ? detail
+                            : "unexpected exception";
+  std::snprintf(event.text, sizeof event.text, "[phoenix] restore failed: %s",
+                message);
+  log.Post(event);
+}
 }  // namespace
 
 PhoenixBackend::PhoenixBackend(bool is_simulation, talos::rio::RioLog* log)
@@ -319,6 +334,8 @@ PhoenixBackend::PhoenixBackend(bool is_simulation, talos::rio::RioLog* log)
                      log_->Post(event);
                    }},
       is_simulation_{is_simulation} {
+  unavailable_.reserve(hw::kMaxMotors + hw::kMaxSensors);
+  restoring_ids_.reserve(hw::kMaxMotors + hw::kMaxSensors);
   if (owned_log_) owned_log_->Start();
 #ifndef __FRC_ROBORIO__
   // WPILib's simulated battery defaults to 12 V, below a pre-match battery
@@ -380,6 +397,10 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   const std::lock_guard devices_lock{devices_mutex_};
   restore_operations_.clear();
   unavailable_.clear();
+  unavailable_.reserve(hw::kMaxMotors + hw::kMaxSensors);
+  restoring_ids_.clear();
+  restoring_ids_.reserve(hw::kMaxMotors + hw::kMaxSensors);
+  restore_launch_failed_ = false;
   foc_unlicensed_.clear();
   signal_ids_.clear();
   last_error_.reset();
@@ -614,17 +635,17 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   licence_read_.fill(false);
   foc_unlicensed_.reserve(hw::kMaxMotors);
   bool first_error_posted = false;
-  for (std::size_t i = 0; i < c.motors.size(); ++i) {
+  const auto check_licence = [&](std::size_t i) {
     const auto& m = c.motors[i];
     const bool master_foc =
         m.master_id != 0 &&
         std::any_of(c.motors.begin(), c.motors.end(), [&](const auto& other) {
           return other.id == m.master_id && other.foc;
         });
-    if (!m.foc && !master_foc) continue;
+    if (!m.foc && !master_foc) return;
     restore_operations_.push_back(
         {m.id, [this, i] { return RestoreProLicence(i); }});
-    if (licence_refused_[i]) continue;  // Its master's refusal took it.
+    if (licence_refused_[i]) return;  // Its master's refusal took it.
     ctre::phoenix::StatusCode status;
     const auto licensed = ReadProLicence(i, status);
     if (!licensed) {
@@ -635,9 +656,18 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
       RefuseProLicence(i, true);
       first_error_posted |= !had_error && last_error_.has_value();
     }
+  };
+  // Pass 1: check masters before followers so a follower preceding its
+  // unlicensed foc master in config.motors is never read itself
+  // (REQ-CONTRACT-39) and its restore op runs after its master's.
+  for (std::size_t i = 0; i < c.motors.size(); ++i) {
+    if (c.motors[i].master_id == 0) check_licence(i);
   }
-  for (std::size_t i = 0; i < c.motors.size(); ++i)
-    if (licence_refused_[i]) foc_unlicensed_.push_back(c.motors[i].id);
+  // Pass 2: check followers of foc masters not already refused with their
+  // master.
+  for (std::size_t i = 0; i < c.motors.size(); ++i) {
+    if (c.motors[i].master_id != 0) check_licence(i);
+  }
   GroupSignalsByNetwork(c);
 
 #ifndef __FRC_ROBORIO__
@@ -722,6 +752,11 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     restore_operations_.push_back(
         {s.id, [operation] { return operation().IsOK(); }});
   }
+  // A licence refusal is permanent until the next Configure: populate
+  // foc_unlicensed_ and erase every refused motor (and follower) from
+  // unavailable_ so no failed config or signal-rate apply leaves it churning
+  // the restore loop.
+  SyncUnlicensedAndPruneUnavailable();
   // A licence refusal posted its own line already.
   if (!ok && last_error_ && !first_error_posted) {
     const auto& error = *last_error_;
@@ -824,6 +859,21 @@ bool PhoenixBackend::RestoreProLicence(std::size_t index) {
   return true;
 }
 
+void PhoenixBackend::SyncUnlicensedAndPruneUnavailable() {
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    const uint16_t id = config_.motors[i].id;
+    if (licence_refused_[i] &&
+        std::find(foc_unlicensed_.begin(), foc_unlicensed_.end(), id) ==
+            foc_unlicensed_.end()) {
+      foc_unlicensed_.push_back(id);
+    }
+  }
+  std::erase_if(unavailable_, [this](uint16_t id) {
+    return std::find(foc_unlicensed_.begin(), foc_unlicensed_.end(), id) !=
+           foc_unlicensed_.end();
+  });
+}
+
 bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
   const PhaseTimer timer{*log_, talos::rio::TickPhase::kDevices};
   // HasResetOccurred reports (and clears) one device's reset latch.
@@ -867,58 +917,110 @@ bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
 }
 
 void PhoenixBackend::BeginRestoreAfterReset(std::span<const uint16_t> ids) {
-  restoring_ids_.assign(ids.begin(), ids.end());
+  restore_launch_failed_ = false;
+  restoring_ids_.clear();
+  const auto restoring_contains = [&](uint16_t id) {
+    return std::find(restoring_ids_.begin(), restoring_ids_.end(), id) !=
+           restoring_ids_.end();
+  };
+  for (const uint16_t id : ids) {
+    if (!restoring_contains(id) &&
+        restoring_ids_.size() < restoring_ids_.capacity()) {
+      restoring_ids_.push_back(id);
+    }
+  }
   // Re-apply the affected control chain, never unrelated device settings.
   for (std::size_t pass = 0; pass < config_.motors.size(); ++pass) {
     for (const auto& motor : config_.motors) {
-      const auto contains = [&](uint16_t id) {
-        return std::find(restoring_ids_.begin(), restoring_ids_.end(), id) !=
-               restoring_ids_.end();
-      };
-      if (!contains(motor.id) &&
-          ((motor.master_id != 0 && contains(motor.master_id)) ||
+      if (!restoring_contains(motor.id) &&
+          ((motor.master_id != 0 && restoring_contains(motor.master_id)) ||
            (motor.feedback == hw::Feedback::kRemoteCANcoder &&
-            contains(motor.feedback_sensor_id))))
+            restoring_contains(motor.feedback_sensor_id))) &&
+          restoring_ids_.size() < restoring_ids_.capacity()) {
         restoring_ids_.push_back(motor.id);
+      }
     }
   }
-  for (auto id : restoring_ids_) {
+  for (const uint16_t id : restoring_ids_) {
     if (std::find(unavailable_.begin(), unavailable_.end(), id) ==
-        unavailable_.end())
+            unavailable_.end() &&
+        unavailable_.size() < unavailable_.capacity()) {
       unavailable_.push_back(id);
-  }
-  restore_ = std::async(std::launch::async, [this, ids = restoring_ids_] {
-    std::vector<uint16_t> failures;
-    for (const auto& operation : restore_operations_) {
-      if (std::find(ids.begin(), ids.end(), operation.id) == ids.end())
-        continue;
-      if (!operation.apply() && std::find(failures.begin(), failures.end(),
-                                          operation.id) == failures.end())
-        failures.push_back(operation.id);
     }
-    return failures;
-  });
+  }
+  hw::FixedVector<uint16_t, hw::kMaxMotors + hw::kMaxSensors> worker_ids;
+  for (const uint16_t id : restoring_ids_) {
+    if (worker_ids.size() < worker_ids.capacity()) worker_ids.push_back(id);
+  }
+  auto work = [this,
+               ids = worker_ids]() -> std::optional<std::vector<uint16_t>> {
+    try {
+      std::vector<uint16_t> failures;
+      for (const auto& operation : restore_operations_) {
+        if (std::find(ids.begin(), ids.end(), operation.id) == ids.end())
+          continue;
+        if (!operation.apply() && std::find(failures.begin(), failures.end(),
+                                            operation.id) == failures.end()) {
+          failures.push_back(operation.id);
+        }
+      }
+      return failures;
+    } catch (const std::exception& e) {
+      LogRestoreException(*log_, e.what());
+      return std::nullopt;
+    } catch (...) {
+      LogRestoreException(*log_, "unknown exception");
+      return std::nullopt;
+    }
+  };
+  try {
+    restore_ = launch_restore_
+                   ? launch_restore_(std::move(work))
+                   : std::async(std::launch::async, std::move(work));
+  } catch (const std::exception& e) {
+    restore_ = {};
+    restore_launch_failed_ = true;
+    LogRestoreException(*log_, e.what());
+  } catch (...) {
+    restore_ = {};
+    restore_launch_failed_ = true;
+    LogRestoreException(*log_, "unknown exception");
+  }
 }
 
 PhoenixBackend::RestoreStatus PhoenixBackend::PollRestore() {
+  if (restore_launch_failed_) {
+    restore_launch_failed_ = false;
+    return RestoreStatus::kFailed;
+  }
   if (!restore_.valid()) return RestoreStatus::kDone;
   if (restore_.wait_for(std::chrono::seconds{0}) != std::future_status::ready)
     return RestoreStatus::kPending;
-  const auto failures = restore_.get();
+  std::optional<std::vector<uint16_t>> failures;
+  try {
+    failures = restore_.get();
+  } catch (const std::exception& e) {
+    restore_ = {};
+    LogRestoreException(*log_, e.what());
+    SyncUnlicensedAndPruneUnavailable();
+    return RestoreStatus::kFailed;
+  } catch (...) {
+    restore_ = {};
+    LogRestoreException(*log_, "unknown exception");
+    SyncUnlicensedAndPruneUnavailable();
+    return RestoreStatus::kFailed;
+  }
   // A licence the restore read unlicensed fails its motor before the motor
   // leaves unavailable_, so it is never reported valid in between. Reserved
   // at Configure: no allocation on the loop thread.
-  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
-    const uint16_t id = config_.motors[i].id;
-    if (licence_refused_[i] &&
-        std::find(foc_unlicensed_.begin(), foc_unlicensed_.end(), id) ==
-            foc_unlicensed_.end())
-      foc_unlicensed_.push_back(id);
+  SyncUnlicensedAndPruneUnavailable();
+  if (!failures.has_value()) {
+    return RestoreStatus::kFailed;
   }
   std::erase_if(unavailable_, [this, &failures](uint16_t id) {
     return std::find(restoring_ids_.begin(), restoring_ids_.end(), id) !=
                restoring_ids_.end() &&
-           std::find(failures.begin(), failures.end(), id) == failures.end();
+           std::find(failures->begin(), failures->end(), id) == failures->end();
   });
   return RestoreStatus::kDone;
 }

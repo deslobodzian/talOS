@@ -41,6 +41,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -1389,6 +1390,47 @@ class PhoenixBackendRecovery : public ::testing::Test {
   static void MarkUnavailable(PhoenixBackend& backend, uint16_t id) {
     backend.unavailable_.push_back(id);
   }
+  static std::size_t UnavailableCapacity(const PhoenixBackend& backend) {
+    return backend.unavailable_.capacity();
+  }
+  static std::size_t RestoringIdsCapacity(const PhoenixBackend& backend) {
+    return backend.restoring_ids_.capacity();
+  }
+  static const uint16_t* UnavailableData(const PhoenixBackend& backend) {
+    return backend.unavailable_.data();
+  }
+  static const uint16_t* RestoringIdsData(const PhoenixBackend& backend) {
+    return backend.restoring_ids_.data();
+  }
+  static void PushRestoreOp(PhoenixBackend& backend, uint16_t id,
+                            std::function<bool()> op) {
+    backend.restore_operations_.push_back({id, std::move(op)});
+  }
+  static void PopRestoreOp(PhoenixBackend& backend) {
+    backend.restore_operations_.pop_back();
+  }
+  static void SetRestoreException(PhoenixBackend& backend,
+                                  std::exception_ptr ex) {
+    using Result = decltype(backend.restore_.get());
+    std::promise<Result> p;
+    p.set_exception(std::move(ex));
+    backend.restore_ = p.get_future();
+  }
+  using RestoreTask = PhoenixBackend::RestoreTask;
+  static void SetRestoreLauncher(
+      PhoenixBackend& backend,
+      std::function<
+          std::future<std::optional<std::vector<uint16_t>>>(RestoreTask)>
+          launcher) {
+    backend.launch_restore_ = std::move(launcher);
+  }
+  static ::testing::AssertionResult WaitRestoreReady(PhoenixBackend& backend) {
+    if (!backend.restore_.valid())
+      return ::testing::AssertionFailure() << "restore future is not valid";
+    if (backend.restore_.wait_for(kReadyTimeout) != std::future_status::ready)
+      return ::testing::AssertionFailure() << "restore stayed pending";
+    return ::testing::AssertionSuccess();
+  }
   static void SetConfigureFuture(PhoenixBackend& backend,
                                  std::future<bool> future) {
     backend.configure_ = std::move(future);
@@ -1942,6 +1984,10 @@ class PhoenixBackendFoc : public ::testing::Test {
       PhoenixBackend& backend,
       std::function<std::optional<bool>(std::size_t)> licensed) {
     backend.pro_licensed_ = std::move(licensed);
+  }
+  static void PushRestoreOp(PhoenixBackend& backend, uint16_t id,
+                            std::function<bool()> op) {
+    backend.restore_operations_.push_back({id, std::move(op)});
   }
   // Configures until no device's answer was lost to a stalled simulator
   // (AwaitAnswer's rule), so the first configure error is the one under
@@ -2598,4 +2644,200 @@ TEST_F(PhoenixBackendRecovery, AsyncConfigureCatchesExceptionsAsFailure) {
     ASSERT_TRUE(backend.last_config_error().has_value());
     EXPECT_FALSE(backend.last_config_error()->message.empty());
   }
+}
+
+// Device restoration runs on a worker thread and is started/polled on the
+// SCHED_FIFO RoboRIO loop thread. Configure() must preallocate unavailable_
+// and restoring_ids_ so BeginRestoreAfterReset never allocates for them on
+// the loop thread, and any exception from a restore operation or restore_.get()
+// must be caught, logged via RioLog, and reported as RestoreStatus::kFailed
+// while keeping the affected IDs unavailable for backed-off retry.
+// REQ-SAFE-24
+// REQ-RT-07
+TEST_F(PhoenixBackendRecovery,
+       RestorePreallocatesAndCatchesExceptionsAsFailure) {
+  EnsureHal();
+  Console console;
+  hw::Config config;
+  auto master = TestMotor(10, "lift", 1);
+  auto follower = TestMotor(20, "follower", 2);
+  follower.master_id = 10;
+  config.motors = {master, follower};
+  PhoenixBackend backend(true, console.log());
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  // 1. Configure() reserves unavailable_ and restoring_ids_ for the full
+  // device budget so BeginRestoreAfterReset does not reallocate them.
+  constexpr std::size_t kBudget = hw::kMaxMotors + hw::kMaxSensors;
+  EXPECT_GE(UnavailableCapacity(backend), kBudget);
+  EXPECT_GE(RestoringIdsCapacity(backend), kBudget);
+  const uint16_t* unavailable_before = UnavailableData(backend);
+  const uint16_t* restoring_before = RestoringIdsData(backend);
+
+  const auto contains = [](const std::vector<uint16_t>& ids, uint16_t id) {
+    return std::find(ids.begin(), ids.end(), id) != ids.end();
+  };
+
+  // 2. A restore operation throwing std::exception inside the worker must not
+  // escape PollRestore(), must return kFailed, log, and keep the chain
+  // unavailable without reallocating unavailable_/restoring_ids_.
+  PushRestoreOp(backend, 10, []() -> bool {
+    throw std::runtime_error("injected restore op error");
+  });
+  const std::array<uint16_t, 1> ids{10};
+  ASSERT_NO_THROW(backend.BeginRestoreAfterReset(ids));
+  EXPECT_EQ(UnavailableData(backend), unavailable_before);
+  EXPECT_EQ(RestoringIdsData(backend), restoring_before);
+  ASSERT_TRUE(WaitRestoreReady(backend));
+  hw::Backend::RestoreStatus status = hw::Backend::RestoreStatus::kPending;
+  ASSERT_NO_THROW(status = backend.PollRestore());
+  EXPECT_EQ(status, hw::Backend::RestoreStatus::kFailed);
+  EXPECT_TRUE(contains(backend.UnavailableDevices(), 10));
+  EXPECT_TRUE(contains(backend.UnavailableDevices(), 20));
+  EXPECT_FALSE(
+      console
+          .Lines({"[phoenix]", "restore failed", "injected restore op error"})
+          .empty());
+  PopRestoreOp(backend);
+
+  // 3. Same for a non-std::exception thrown by a restore operation.
+  PushRestoreOp(backend, 10, []() -> bool { throw 42; });
+  ASSERT_NO_THROW(backend.BeginRestoreAfterReset(ids));
+  ASSERT_TRUE(WaitRestoreReady(backend));
+  ASSERT_NO_THROW(status = backend.PollRestore());
+  EXPECT_EQ(status, hw::Backend::RestoreStatus::kFailed);
+  EXPECT_TRUE(contains(backend.UnavailableDevices(), 10));
+  PopRestoreOp(backend);
+
+  // 4. PollRestore() itself catches both std::exception and unknown exceptions
+  // stored directly in restore_, keeping the devices unavailable and resetting
+  // restore_ cleanly.
+  {
+    SetRestoreException(
+        backend,
+        std::make_exception_ptr(std::runtime_error("injected future error")));
+    ASSERT_NO_THROW(status = backend.PollRestore());
+    EXPECT_EQ(status, hw::Backend::RestoreStatus::kFailed);
+    EXPECT_TRUE(contains(backend.UnavailableDevices(), 10));
+    EXPECT_FALSE(
+        console.Lines({"[phoenix]", "restore failed", "injected future error"})
+            .empty());
+  }
+  {
+    SetRestoreException(backend, std::make_exception_ptr(42));
+    ASSERT_NO_THROW(status = backend.PollRestore());
+    EXPECT_EQ(status, hw::Backend::RestoreStatus::kFailed);
+    EXPECT_TRUE(contains(backend.UnavailableDevices(), 10));
+  }
+
+  // 5. Thread exhaustion (EAGAIN / std::system_error) when launching the
+  // async restore worker is caught in BeginRestoreAfterReset, logged, leaves
+  // the chain unavailable, and reports RestoreStatus::kFailed on PollRestore.
+  SetRestoreLauncher(
+      backend,
+      [](RestoreTask) -> std::future<std::optional<std::vector<uint16_t>>> {
+        throw std::system_error(
+            std::make_error_code(std::errc::resource_unavailable_try_again),
+            "injected EAGAIN");
+      });
+  ASSERT_NO_THROW(backend.BeginRestoreAfterReset(ids));
+  ASSERT_NO_THROW(status = backend.PollRestore());
+  EXPECT_EQ(status, hw::Backend::RestoreStatus::kFailed);
+  EXPECT_TRUE(contains(backend.UnavailableDevices(), 10));
+  EXPECT_TRUE(contains(backend.UnavailableDevices(), 20));
+  EXPECT_FALSE(console.Lines({"[phoenix]", "restore failed", "injected EAGAIN"})
+                   .empty());
+  SetRestoreLauncher(backend, nullptr);
+
+  // 6. After clean failure handling, a subsequent restore pass succeeds and
+  // clears UnavailableDevices().
+  ASSERT_TRUE(RestorePass(backend, ids));
+  EXPECT_TRUE(backend.UnavailableDevices().empty());
+}
+
+// Config validation allows a follower motor to precede its master in
+// config.motors. Configure() must check masters before followers so a follower
+// of an unlicensed foc master is never read itself, and neither Configure() nor
+// PollRestore() may leave a motor in both foc_unlicensed_ and unavailable_
+// (which would churn BeginRestoreAfterReset forever).
+// REQ-CONTRACT-39
+TEST_F(PhoenixBackendFoc,
+       FollowerBeforeUnlicensedMasterIsNotReadAndNeverChurnsUnavailable) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  auto follower = TestMotor(20, "follower", 2);
+  follower.master_id = 10;
+  auto lift = TestMotor(10, "lift", 1);
+  lift.foc = true;
+  // Follower intentionally precedes its foc master in config.motors.
+  config.motors = {follower, lift};
+  Console console;
+  PhoenixBackend backend(true, console.log());
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  // 1. Configure(): follower would time out (nullopt) if read, while master
+  // reads unlicensed (false). Master must be checked first, follower must not
+  // be read at all, and UnavailableDevices() must be empty.
+  std::vector<std::size_t> checked;
+  SetProLicensed(backend, [&checked](std::size_t i) -> std::optional<bool> {
+    checked.push_back(i);
+    return i == 1 ? std::optional<bool>{false} : std::nullopt;
+  });
+  ASSERT_TRUE(ConfigureAnswered(backend, config));
+  EXPECT_EQ(std::count(checked.begin(), checked.end(), std::size_t{0}), 0)
+      << "follower was read despite its master being unlicensed";
+  EXPECT_GE(std::count(checked.begin(), checked.end(), std::size_t{1}), 1);
+  EXPECT_TRUE(backend.UnavailableDevices().empty())
+      << "unlicensed follower/master left in UnavailableDevices()";
+  EXPECT_FALSE(
+      console.Lines({"[phoenix]", "check_pro_license", "'lift'"}).empty());
+  EXPECT_FALSE(
+      console.Lines({"[phoenix]", "check_pro_license", "'follower'"}).empty());
+  const std::array<hw::MotorRequest, 2> commands{
+      Request(20, hw::Mode::kVoltage, 0.0),
+      Request(10, hw::Mode::kVoltage, 6.0)};
+  hw::State state;
+  PumpReads(backend, state, commands, 15);
+  EXPECT_FALSE(state.motors[0].valid);
+  EXPECT_FALSE(state.motors[1].valid);
+  ASSERT_TRUE(ApplySent(backend, commands));
+  EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut");
+  EXPECT_EQ(AppliedControl(backend, 1), "NeutralOut");
+
+  // 2. PollRestore(): both master and follower initially get no answer at
+  // Configure() (both unavailable). During restore, the follower still fails
+  // (timeout/disconnected op) while the master reads unlicensed. PollRestore()
+  // must refuse both and erase both from UnavailableDevices() so the restore
+  // loop never churns on them.
+  std::optional<bool> master_licence;
+  std::optional<bool> follower_licence;
+  checked.clear();
+  SetProLicensed(backend, [&](std::size_t i) -> std::optional<bool> {
+    checked.push_back(i);
+    return i == 1 ? master_licence : follower_licence;
+  });
+  ASSERT_TRUE(ConfigureAnswered(backend, config));
+  ASSERT_FALSE(backend.UnavailableDevices().empty());
+
+  checked.clear();
+  master_licence = false;
+  follower_licence = std::nullopt;
+  // Also simulate a failing device restore op on the follower (e.g. absent
+  // follower failing apply_talonfx_config) in the same restore pass.
+  PushRestoreOp(backend, 20, []() { return false; });
+  ASSERT_TRUE(RestorePass(backend, backend.UnavailableDevices()));
+  EXPECT_EQ(std::count(checked.begin(), checked.end(), std::size_t{0}), 0)
+      << "follower licence was read during restore after master read "
+         "unlicensed";
+  EXPECT_TRUE(backend.UnavailableDevices().empty())
+      << "unlicensed follower remained in UnavailableDevices() after restore";
+  PumpReads(backend, state, commands, 15);
+  EXPECT_FALSE(state.motors[0].valid);
+  EXPECT_FALSE(state.motors[1].valid);
+  ASSERT_TRUE(ApplySent(backend, commands));
+  EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut");
+  EXPECT_EQ(AppliedControl(backend, 1), "NeutralOut");
 }
