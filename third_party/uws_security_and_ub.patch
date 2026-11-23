@@ -1,0 +1,147 @@
+diff -ru a/src/App.h b/src/App.h
+--- a/src/App.h
++++ b/src/App.h
+@@ -417,7 +417,10 @@
+                     /* Nasty, ugly Safari 15 hack */
+                     if (hasBrokenCompression(req->getHeader("user-agent"))) {
+                         std::string_view secWebSocketExtensions = req->getHeader("sec-websocket-extensions");
+-                        memset((void *) secWebSocketExtensions.data(), ' ', secWebSocketExtensions.length());
++                        /* talos patch: getHeader returns {nullptr, 0} when absent; memset(nullptr, ..., 0) is UB. */
++                        if (secWebSocketExtensions.length()) {
++                            memset((void *) secWebSocketExtensions.data(), ' ', secWebSocketExtensions.length());
++                        }
+                     }
+ 
+                     behavior.upgrade(res, req, (struct us_socket_context_t *) webSocketContext);
+diff -ru a/src/AsyncSocketData.h b/src/AsyncSocketData.h
+--- a/src/AsyncSocketData.h
++++ b/src/AsyncSocketData.h
+@@ -31,7 +31,10 @@
+     }
+     BackPressure() = default;
+     void append(const char *data, size_t length) {
+-        buffer.append(data, length);
++        /* talos patch: write(nullptr, 0) drains via append(nullptr, 0); skip zero-length append (UB). */
++        if (length) {
++            buffer.append(data, length);
++        }
+     }
+     void erase(unsigned int length) {
+         pendingRemoval += length;
+diff -ru a/src/ChunkedEncoding.h b/src/ChunkedEncoding.h
+--- a/src/ChunkedEncoding.h
++++ b/src/ChunkedEncoding.h
+@@ -44,16 +44,21 @@
+         /* Consume everything higher than 32 */
+         while (data.length() && data.data()[0] > 32) {
+ 
+-            unsigned char digit = (unsigned char)data.data()[0];
+-            if (digit >= 'a') {
+-                digit = (unsigned char) (digit - ('a' - ':'));
+-            } else if (digit >= 'A') {
+-                digit = (unsigned char) (digit - ('A' - ':'));
++            /* talos patch: accept only valid ASCII hex digits [0-9A-Fa-f]. */
++            unsigned char ch = (unsigned char)data.data()[0];
++            unsigned int number;
++            if (ch >= '0' && ch <= '9') {
++                number = (unsigned int) (ch - '0');
++            } else if (ch >= 'a' && ch <= 'f') {
++                number = (unsigned int) (ch - 'a' + 10);
++            } else if (ch >= 'A' && ch <= 'F') {
++                number = (unsigned int) (ch - 'A' + 10);
++            } else {
++                state = STATE_IS_ERROR;
++                return;
+             }
+ 
+-            unsigned int number = ((unsigned int) digit - (unsigned int) '0');
+-
+-            if (number > 16 || (chunkSize(state) & STATE_SIZE_OVERFLOW)) {
++            if (chunkSize(state) & STATE_SIZE_OVERFLOW) {
+                 state = STATE_IS_ERROR;
+                 return;
+             }
+diff -ru a/src/HttpParser.h b/src/HttpParser.h
+--- a/src/HttpParser.h
++++ b/src/HttpParser.h
+@@ -365,13 +365,13 @@
+                 headers->value = std::string_view(preliminaryValue, (size_t) (postPaddedBuffer - preliminaryValue));
+                 postPaddedBuffer += 2;
+ 
+-                /* Trim trailing whitespace (SP, HTAB) */
+-                while (headers->value.length() && headers->value.back() < 33) {
++                /* talos patch: trim only RFC 9110 OWS (SP, HTAB); signed char < 33 also stripped 0x80..0xFF. */
++                while (headers->value.length() && (headers->value.back() == ' ' || headers->value.back() == '\t')) {
+                     headers->value.remove_suffix(1);
+                 }
+ 
+                 /* Trim initial whitespace (SP, HTAB) */
+-                while (headers->value.length() && headers->value.front() < 33) {
++                while (headers->value.length() && (headers->value.front() == ' ' || headers->value.front() == '\t')) {
+                     headers->value.remove_prefix(1);
+                 }
+                 
+@@ -421,28 +421,35 @@
+             /* Store HTTP version (ancient 1.0 or 1.1) */
+             req->ancientHttp = false;
+ 
+-            /* Add all headers to bloom filter */
++            /* talos patch: add all headers to bloom filter and reject RFC 9112 smuggling duplicates. */
+             req->bf.reset();
++            unsigned int hostCount = 0;
++            unsigned int contentLengthCount = 0;
++            unsigned int transferEncodingCount = 0;
+             for (HttpRequest::Header *h = req->headers; (++h)->key.length(); ) {
+                 req->bf.add(h->key);
++                if (h->key == "host") {
++                    ++hostCount;
++                } else if (h->key == "content-length") {
++                    ++contentLengthCount;
++                } else if (h->key == "transfer-encoding") {
++                    ++transferEncodingCount;
++                }
+             }
+-            
+-            /* Break if no host header (but we can have empty string which is different from nullptr) */
+-            if (!req->getHeader("host").data()) {
++
++            /* RFC 9112 3.2: HTTP/1.1 requests MUST have exactly one Host header. */
++            if (hostCount != 1) {
+                 return {HTTP_ERROR_400_BAD_REQUEST, FULLPTR};
+             }
+ 
+-            /* RFC 9112 6.3
+-            * If a message is received with both a Transfer-Encoding and a Content-Length header field,
+-            * the Transfer-Encoding overrides the Content-Length. Such a message might indicate an attempt
+-            * to perform request smuggling (Section 11.2) or response splitting (Section 11.1) and
+-            * ought to be handled as an error. */
++            /* RFC 9112 6.3: reject duplicate Content-Length, empty Content-Length,
++             * duplicate or empty Transfer-Encoding, or both Transfer-Encoding and Content-Length. */
+             std::string_view transferEncodingString = req->getHeader("transfer-encoding");
+             std::string_view contentLengthString = req->getHeader("content-length");
+-            if (transferEncodingString.length() && contentLengthString.length()) {
+-                /* Returning fullptr is the same as calling the errorHandler */
+-                /* We could be smart and set an error in the context along with this, to indicate what 
+-                 * http error response we might want to return */
++            if (contentLengthCount > 1 || transferEncodingCount > 1 ||
++                (transferEncodingCount > 0 && contentLengthCount > 0) ||
++                (transferEncodingCount > 0 && !transferEncodingString.length()) ||
++                (contentLengthCount > 0 && !contentLengthString.length())) {
+                 return {HTTP_ERROR_400_BAD_REQUEST, FULLPTR};
+             }
+ 
+diff -ru a/src/WebSocketProtocol.h b/src/WebSocketProtocol.h
+--- a/src/WebSocketProtocol.h
++++ b/src/WebSocketProtocol.h
+@@ -238,7 +238,10 @@
+     }
+ 
+     messageLength = headerLength + length;
+-    memcpy(dst + headerLength, src, length);
++    /* talos patch: WebSocket::send passes (nullptr, 0) for >=16 KiB header-only formatting; memcpy(dst, nullptr, 0) is UB. */
++    if (length) {
++        memcpy(dst + headerLength, src, length);
++    }
+ 
+     if (!isServer) {
+ 
