@@ -2,7 +2,9 @@
 
 import collections
 import io
+import os
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -1559,6 +1561,88 @@ class CheckNodeSourcesTest(unittest.TestCase):
                                           io.StringIO()), \
                         self.assertRaises(RuntimeError):
                     bazel.query("somepath(//talOS/..., //bench/...)")
+
+    # REQ-SAFE-27, REQ-CONTRACT-16: a leading UTF-8 BOM (\xef\xbb\xbf / \ufeff)
+    # accepted by GCC/Clang must not hide line-1 #include directives.
+    def test_utf8_bom_does_not_bypass_include_directives(self):
+        cases = (
+            ("bom_forbidden_include", '\ufeff#include "talOS/node/access.h"\n'),
+            ("bom_digraph_include", '\ufeff%:include "talOS/node/access.h"\n'),
+            ("bom_computed_include", "\ufeff#include HEADER_MACRO\n"),
+            ("bom_non_cpp_include", '\ufeff#include "secret.txt"\n'),
+        )
+        for name, body in cases:
+            with self.subTest(name=name):
+                files = {
+                    "bench/arm/BUILD": self.NODE_BUILD,
+                    "bench/arm/arm.cc": body,
+                }
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn("bench/arm/arm.cc:1:", out)
+
+        # Disk read via read_source_file also strips raw UTF-8 BOM bytes.
+        with tempfile.TemporaryDirectory(
+                dir=os.environ.get("TEST_TMPDIR")) as root:
+            src = os.path.join(root, "arm.cc")
+            with open(src, "wb") as f:
+                f.write(b'\xef\xbb\xbf#include "talOS/node/access.h"\n')
+            text = check_layers.read_source_file(src)
+            self.assertFalse(text.startswith("\ufeff"))
+            violations = check_layers.scan_cpp_text("bench/arm/arm.cc", text)
+            self.assertTrue(
+                any(v.kind == "forbidden-include" and v.line == 1
+                    for v in violations),
+                violations)
+
+    # REQ-SAFE-27, REQ-CONTRACT-16: Starlark `includes = [...]` adds -isystem
+    # search paths that can shorten #include paths past --source-only checks.
+    def test_starlark_includes_attribute_is_refused(self):
+        bad_builds = (
+            ("includes_into_talos",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'includes = ["../../talOS/node"])\n'),
+            ("includes_dot_shortens_path",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'includes = ["."])\n'),
+            ("includes_via_variable",
+             'INC = ["../../talOS/node"]\n'
+             'cc_library(name = "arm", srcs = ["arm.cc"], includes = INC)\n'),
+            ("includes_via_select",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'includes = select({"//conditions:default": ["."]}))\n'),
+            ("includes_via_kwargs_splat",
+             'OPTS = {"includes": ["../../talOS/node"]}\n'
+             'cc_library(name = "arm", srcs = ["arm.cc"], **OPTS)\n'),
+        )
+        for name, build in bad_builds:
+            with self.subTest(bad=name):
+                files = {
+                    "bench/arm/BUILD": build,
+                    "bench/arm/arm.cc": "int ok = 1;\n",
+                }
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn("bench/arm/BUILD:", out)
+
+        # Explicitly empty `includes = []` / `includes = None` adds no search
+        # path and stays allowed.
+        for name, build in (
+            ("empty_list",
+             'cc_library(name = "arm", srcs = ["arm.cc"], includes = [])\n'),
+            ("none_value",
+             'cc_library(name = "arm", srcs = ["arm.cc"], includes = None)\n'),
+            ("empty_var",
+             'INC = []\n'
+             'cc_library(name = "arm", srcs = ["arm.cc"], includes = INC)\n'),
+        ):
+            with self.subTest(ok=name):
+                files = {
+                    "bench/arm/BUILD": build,
+                    "bench/arm/arm.cc": "int ok = 1;\n",
+                }
+                failures, out = run_sources(files)
+                self.assertEqual(failures, 0, f"{name}: {out}")
 
 
 if __name__ == "__main__":
