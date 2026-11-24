@@ -1,9 +1,11 @@
 import type {Snapshot} from '../core';
+import type {AlertLatch} from './alerts';
 import type {PlaybackState, SystemState} from './types';
 import type {SessionManifest} from './manifest';
 
 export type WorkerMessage =
     {type: 'frames'; frames: Snapshot[]; reset: boolean} |
+    {type: 'alerts'; latch: AlertLatch} |
     {type: 'playback'; state: PlaybackState} |
     ({type: 'system'} & SystemState) |
     {type: 'manifest'; manifest: SessionManifest|null; error: string} |

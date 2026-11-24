@@ -298,6 +298,9 @@ int main(int argc, char** argv) {
     std::vector<talos::hardware::sim::HomeSwitch> home_switches;
     std::vector<talos::hardware::sim::SwerveModuleSpec> swerve_modules;
     std::vector<talos::hardware::sim::HardStop> hard_stops;
+    std::optional<talos::hardware::sim::BatteryModel> battery_model;
+    std::optional<talos::hardware::sim::ChassisDynamics> chassis_dynamics;
+    std::vector<talos::hardware::sim::MechanismSpec> mechanisms;
     {
       const auto robot_config = talos::config::ParseRobotConfig(config_path);
       ports = talos::simulation::ResolveGatewayPorts(robot_config, port_flag,
@@ -326,6 +329,35 @@ int main(int argc, char** argv) {
                               .min_rot = stop.min_rot,
                               .max_rot = stop.max_rot});
       }
+      if (robot_config.simulation.battery) {
+        const auto& b = *robot_config.simulation.battery;
+        battery_model = talos::hardware::sim::BatteryModel{
+            .nominal_voltage_v = b.nominal_voltage_v,
+            .internal_resistance_ohm = b.internal_resistance_ohm,
+            .base_current_a = b.base_current_a,
+            .brownout_voltage_v = b.brownout_voltage_v,
+        };
+      }
+      if (robot_config.simulation.chassis) {
+        const auto& c = *robot_config.simulation.chassis;
+        chassis_dynamics = talos::hardware::sim::ChassisDynamics{
+            .mass_kg = c.mass_kg,
+            .moment_of_inertia_kg_m2 = c.moment_of_inertia_kg_m2.value_or(0.0),
+            .traction_coefficient = c.traction_coefficient.value_or(0.0),
+        };
+      }
+      mechanisms.reserve(robot_config.simulation.mechanisms.size());
+      for (const auto& mech : robot_config.simulation.mechanisms) {
+        mechanisms.push_back({
+            .motor = mech.motor,
+            .inertia_kg_m2 = mech.inertia_kg_m2,
+            .load = mech.load == talos::config::SimulationLoadKind::kFlywheel
+                        ? talos::hardware::sim::LoadKind::kFlywheel
+                        : talos::hardware::sim::LoadKind::kRoller,
+            .viscous_damping_nm_per_radps = mech.viscous_damping_nm_per_radps,
+            .static_friction_nm = mech.static_friction_nm,
+        });
+      }
     }
     talos::hardware::SimBackend ideal;
     talos::hardware::sim::PhysicsSimBackend physics_backend{options};
@@ -353,14 +385,23 @@ int main(int argc, char** argv) {
     // meant to exercise.
     //
     // The wire carries no motor type, home switches ([digital_inputs.*]
-    // sim_motor) or [simulation] swerve geometry / hard stops: bound by name
-    // before Reconfigure, they apply on the first State and survive any config
-    // the bridge pushes later.
+    // sim_motor) or [simulation] swerve geometry, hard stops, battery,
+    // chassis, or mechanism inertia: configured before Reconfigure, they apply
+    // on the first State and survive any config the bridge pushes later.
     physics_backend.SetLocalMotorTypes(hw_config);
     physics_backend.SetHomeSwitches(std::move(home_switches));
     physics_backend.SetHardStops(std::move(hard_stops));
     if (!swerve_modules.empty()) {
       physics_backend.SetSwerveModules(std::move(swerve_modules));
+    }
+    if (battery_model) {
+      physics_backend.SetBatteryModel(*battery_model);
+    }
+    if (chassis_dynamics) {
+      physics_backend.SetChassisDynamics(*chassis_dynamics);
+    }
+    if (!mechanisms.empty()) {
+      physics_backend.SetMechanisms(std::move(mechanisms));
     }
     if (!gateway.Reconfigure(hw_config)) {
       throw std::runtime_error(

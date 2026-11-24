@@ -107,14 +107,46 @@ struct SimulationHardStop {
   bool operator==(const SimulationHardStop&) const = default;
 };
 
-// Optional `[simulation]` table: physics simulator geometry and end-of-travel
-// hard stops that stay off the hardware wire and never affect
-// hardware::ConfigurationId.
+struct SimulationBatteryConfig {
+  double nominal_voltage_v{12.8};
+  double internal_resistance_ohm{0.0};
+  double base_current_a{0.0};
+  double brownout_voltage_v{6.75};
+
+  bool operator==(const SimulationBatteryConfig&) const = default;
+};
+
+struct SimulationChassisConfig {
+  double mass_kg{0.0};                            // required > 0 when present
+  std::optional<double> moment_of_inertia_kg_m2;  // optional > 0
+  std::optional<double> traction_coefficient;     // optional > 0
+
+  bool operator==(const SimulationChassisConfig&) const = default;
+};
+
+enum class SimulationLoadKind : std::uint8_t { kRoller = 0, kFlywheel = 1 };
+
+struct SimulationMechanismConfig {
+  std::string motor;          // required non-empty master motor, no duplicates
+  double inertia_kg_m2{0.0};  // required > 0 (mechanism-shaft J)
+  SimulationLoadKind load{SimulationLoadKind::kRoller};
+  double viscous_damping_nm_per_radps{0.0};  // optional >= 0
+  double static_friction_nm{0.0};            // optional >= 0
+
+  bool operator==(const SimulationMechanismConfig&) const = default;
+};
+
+// Optional `[simulation]` table: physics simulator geometry, battery, chassis,
+// mechanisms, and end-of-travel hard stops that stay off the hardware wire and
+// never affect hardware::ConfigurationId.
 struct SimulationConfig {
   static constexpr double kDefaultWheelRadiusM = 0.0508;
   double wheel_radius_m{kDefaultWheelRadiusM};
   std::vector<SimulationSwerveModule> swerve_modules;
   std::vector<SimulationHardStop> hard_stops;
+  std::optional<SimulationBatteryConfig> battery;
+  std::optional<SimulationChassisConfig> chassis;
+  std::vector<SimulationMechanismConfig> mechanisms;
 
   bool operator==(const SimulationConfig&) const = default;
 };

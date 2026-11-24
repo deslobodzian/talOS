@@ -78,6 +78,7 @@ std::chrono::milliseconds RestartSchedule::Schedule(
 
 void RestartSchedule::Started(SupervisionTime now) {
   starts_.push_back(now);
+  last_exit_clean_ = false;
   pending_ = false;
   quarantined_ = false;
 }

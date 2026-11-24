@@ -69,12 +69,15 @@ std::shared_ptr<ComputeBackend> MakeGpuBackend(const PipelineConfig& config) {
 std::shared_ptr<ComputeBackend> MakeBackend(const PipelineConfig& config) {
   if (config.backend_name == "metal" || config.backend_name == "auto") {
     auto backend = MakeGpuBackend(config);
-    if (config.backend_name == "metal" && !backend->supports_gpu()) {
+    if (config.backend_name == "metal" &&
+        (!backend || !backend->supports_gpu())) {
       throw std::invalid_argument(
           "backend metal device unavailable; select auto to allow CPU "
           "fallback");
     }
-    return backend;
+    if (backend) {
+      return backend;
+    }
   }
   return std::make_shared<CpuAprilTagBackend>(config.detector_options);
 }
@@ -138,8 +141,12 @@ AprilTagPipeline::AprilTagPipeline(const PipelineConfig& config,
     std::string info;
     try {
       gpu = MakeGpuBackend(gpu_config);
-      info = gpu->device_info();
-      if (!gpu->supports_gpu()) gpu.reset();
+      if (!gpu) {
+        info = "gpu backend factory returned null";
+      } else {
+        info = gpu->device_info();
+        if (!gpu->supports_gpu()) gpu.reset();
+      }
     } catch (const std::exception& error) {
       gpu.reset();
       info = error.what();
