@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Eigen/Dense>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -176,7 +177,10 @@ class FieldLayout {
   void set_default_tag_size_m(double size_m) { default_tag_size_m_ = size_m; }
 
   void SetTagPose(int tag_id, const talos::geometry::SE3<double>& T_field_tag) {
-    tag_poses_[tag_id] = T_field_tag;
+    if (tag_poses_.insert_or_assign(tag_id, T_field_tag).second) {
+      tag_ids_.insert(
+          std::lower_bound(tag_ids_.begin(), tag_ids_.end(), tag_id), tag_id);
+    }
   }
 
   std::optional<talos::geometry::SE3<double>> GetTagPose(int tag_id) const {
@@ -190,6 +194,9 @@ class FieldLayout {
   bool HasTag(int tag_id) const {
     return tag_poses_.find(tag_id) != tag_poses_.end();
   }
+
+  // Returns all tag IDs present in this layout in strictly increasing order.
+  const std::vector<int>& TagIds() const { return tag_ids_; }
 
   double GetTagSize(int tag_id) const {
     auto it = custom_tag_sizes_.find(tag_id);
@@ -206,12 +213,14 @@ class FieldLayout {
   size_t size() const { return tag_poses_.size(); }
   void Clear() {
     tag_poses_.clear();
+    tag_ids_.clear();
     custom_tag_sizes_.clear();
   }
 
  private:
   double default_tag_size_m_{0.1651};
   std::unordered_map<int, talos::geometry::SE3<double>> tag_poses_;
+  std::vector<int> tag_ids_;
   std::unordered_map<int, double> custom_tag_sizes_;
 };
 

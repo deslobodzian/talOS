@@ -119,9 +119,7 @@ inline void SimulateVisibleTags(
       0.0, cam.pixel_noise_std > 0.0 ? cam.pixel_noise_std : 1.0);
   const bool add_noise = rng && !geometry_only && cam.pixel_noise_std > 0.0;
 
-  // FieldLayout offers lookup by id only; probe the plausible id range.
-  // FRC fields number tags densely from 1, so 256 covers every season.
-  for (int tag_id = 1; tag_id <= 256; ++tag_id) {
+  for (const int tag_id : layout.TagIds()) {
     const auto tag_pose = layout.GetTagPose(tag_id);
     if (!tag_pose.has_value()) continue;
     const talos::geometry::SE3<double> T_camera_tag =

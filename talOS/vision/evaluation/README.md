@@ -1,9 +1,11 @@
 # Recording evaluation
 
 `recording_eval` runs the camera node's detection and localization (the same
-`AprilTagPipeline` and `MultiTagPoseSolver`, with `vision.toml`'s shared
-detector settings unless overridden) over a [recording](../playback/README.md)
-and reports how well it detects and tracks tags. It is run by hand on
+`AprilTagPipeline` and `MultiTagPoseSolver`, defaulting to `decimate=2.0`,
+`threads=2`, `sigma=0.0`, `refine_edges=true`, `hamming=1`, `min_margin=30.0`,
+and `pixel_std_px=0.33` unless overridden) over a
+[recording](../playback/README.md) and reports how well it detects and tracks
+tags. It is run by hand on
 footage that cannot be checked in (third-party licences, size); tests use
 footage the repo renders.
 
