@@ -1779,23 +1779,74 @@ int HoldPort(uint16_t port) {
   return fd;
 }
 
+struct ReceivedCommandFrame {
+  uint64_t sequence{0};
+  uint64_t sent_us{0};
+  Command command{};
+};
+
+// The next hardware command frame the gateway receives, with its frame header
+// sequence and send timestamp, skipping other frame types; nullopt after
+// kReceiveHangBound (a bound on a hang only).
+std::optional<ReceivedCommandFrame> NextCommandFrame(
+    protocol::RuntimeUdpPeer& gateway) {
+  protocol::DecodedFrame frame{};
+  while (protocol::testing::ReceiveFrame(gateway, &frame) ==
+         protocol::UdpStatus::kOk) {
+    if (frame.header.type != protocol::FrameType::kHardwareCommand) continue;
+    ReceivedCommandFrame received{
+        frame.header.sequence, frame.header.monotonic_time_us, {}};
+    if (!Decode(std::span<const uint8_t>{frame.payload, frame.payload_size},
+                received.command)) {
+      return std::nullopt;
+    }
+    return received;
+  }
+  return std::nullopt;
+}
+
 // A socket that can no longer send (shut down for writing: EPIPE, as from a
 // macOS socket the kernel marked defunct around sleep and wake) is closed by
 // the send that finds it and replaced on the same ports: the first attempt
 // on the next Tick, any later one kReopenRetryUs after the last. Nothing is
-// sent while it is closed, and the duty that could not be sent goes out on the
-// new socket. On macOS without SO_NOSIGPIPE that first send kills the test
+// sent while it is closed, the duty that could not be sent goes out on the
+// new socket, and outbound frame sequences increase strictly monotonically
+// across the reopen (never resetting to 1, which would fail the gateway's
+// replay gate). On macOS without SO_NOSIGPIPE that first send kills the test
 // with SIGPIPE instead.
 // REQ-RT-22
 TEST(HardwareNodeTest, ASocketThatCannotSendIsReplacedAndFramesFlowAgain) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint16_t roller = cfg.subsystems.at("intake").motors[0];
   Link link;
   ASSERT_TRUE(link.Open(cfg));
   HardwareNode& node = link.node.value();
   protocol::RuntimeUdpPeer& gateway = link.gateway;
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+
   constexpr uint64_t kStartUs = 1'000'000;
   node.Tick(kStartUs);
   ASSERT_EQ(NextProbeUs(gateway), kStartUs);
+
+  // Establish a live gateway state and send outbound commands before the
+  // socket breaks so header.sequence advances well past 1 prior to reopen.
+  ASSERT_TRUE(InjectState(node, gateway, TrustState(config_id, 11, 1, 1'000),
+                          kStartUs + 1'000));
+  ASSERT_GT(ReceiveConfigs(gateway), 0u);
+  PublishCommand(intake_pub, IntakeRequest(cfg, 4.0));
+  node.Tick(kStartUs + 2'000);
+  const auto cmd_before_1 = NextCommandFrame(gateway);
+  ASSERT_TRUE(cmd_before_1.has_value());
+  EXPECT_GT(cmd_before_1->sequence, 1u);
+  EXPECT_DOUBLE_EQ(MotorOf(cmd_before_1->command, roller).demand, 4.0);
+
+  PublishCommand(intake_pub, IntakeRequest(cfg, 5.0));
+  node.Tick(kStartUs + 3'000);
+  const auto cmd_before_2 = NextCommandFrame(gateway);
+  ASSERT_TRUE(cmd_before_2.has_value());
+  EXPECT_GT(cmd_before_2->sequence, cmd_before_1->sequence);
+  EXPECT_DOUBLE_EQ(MotorOf(cmd_before_2->command, roller).demand, 5.0);
 
   // The unanswered probe's retry, 100001 us on, finds the socket broken.
   ASSERT_EQ(shutdown(node.udp_fd(), SHUT_WR), 0);
@@ -1823,7 +1874,50 @@ TEST(HardwareNodeTest, ASocketThatCannotSendIsReplacedAndFramesFlowAgain) {
   node.Tick(retry_us);
   EXPECT_GE(node.udp_fd(), 0);
   EXPECT_EQ(node.socket_counters().reopens, 1u);
-  EXPECT_EQ(NextProbeUs(gateway), retry_us);
+
+  // Both the retried probe and the pending neutral command go out on the
+  // replacement socket with header.sequence strictly above cmd_before_2.
+  std::optional<uint64_t> probe_after_us;
+  std::optional<uint64_t> probe_after_seq;
+  std::optional<ReceivedCommandFrame> neutral_after;
+  protocol::DecodedFrame frame{};
+  while ((!probe_after_us || !neutral_after) &&
+         protocol::testing::ReceiveFrame(gateway, &frame) ==
+             protocol::UdpStatus::kOk) {
+    if (frame.header.type == protocol::FrameType::kClockProbe) {
+      probe_after_us = frame.header.monotonic_time_us;
+      probe_after_seq = frame.header.sequence;
+    } else if (frame.header.type == protocol::FrameType::kHardwareCommand) {
+      ReceivedCommandFrame received{
+          frame.header.sequence, frame.header.monotonic_time_us, {}};
+      ASSERT_TRUE(
+          Decode(std::span<const uint8_t>{frame.payload, frame.payload_size},
+                 received.command));
+      neutral_after = received;
+    }
+  }
+  ASSERT_TRUE(probe_after_us.has_value());
+  EXPECT_EQ(*probe_after_us, retry_us);
+  EXPECT_GT(*probe_after_seq, cmd_before_2->sequence);
+  ASSERT_TRUE(neutral_after.has_value());
+  EXPECT_GT(neutral_after->sequence, cmd_before_2->sequence);
+  EXPECT_GT(neutral_after->sequence, *probe_after_seq);
+  EXPECT_EQ(MotorOf(neutral_after->command, roller).mode, Mode::kNeutral);
+
+  // A fresh driving command after socket replacement keeps increasing the
+  // sequence monotonically as well.
+  const uint64_t fresh_sample_us = 202'001;
+  ASSERT_TRUE(InjectState(node, gateway,
+                          TrustState(config_id, 11, 1, fresh_sample_us),
+                          retry_us + 1'000));
+  Command after_req = IntakeRequest(cfg, 6.0);
+  after_req.observed_time_us = fresh_sample_us;
+  PublishCommand(intake_pub, after_req);
+  node.Tick(retry_us + 2'000);
+  const auto cmd_after = NextCommandFrame(gateway);
+  ASSERT_TRUE(cmd_after.has_value());
+  EXPECT_GT(cmd_after->sequence, neutral_after->sequence);
+  EXPECT_DOUBLE_EQ(MotorOf(cmd_after->command, roller).demand, 6.0);
 }
 
 int pending_send_error = 0;
