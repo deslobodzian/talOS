@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {test} from 'node:test';
 
+import {FIELD_HEIGHT_M} from '../src/panels/field/geometry';
 import {AlertLevel, ChannelKind, type ChannelSpec, dictionaryId, encodeDictionaryPages, encodeValuePages, rawFromDouble} from '../src/encode';
 import {CONNECTING_GRACE_MS, DEAD_AFTER_MS, DECODE_RETRY_MS, DriveModel, type DriveSocket, type Link, RECONNECT_MS, RENDER_MS, REPLACED_CODE, SILENCE_MS, STALE_MS} from '../src/drive/feed';
 import {type Layout, layoutsEqual, parseLayout, trackedChannels} from '../src/drive/layout';
@@ -2024,4 +2025,60 @@ test('reconnect keyframe on same stream with sequence_id <= held stays stale and
     assert.doesNotMatch(widgetHtml(render(h), 'Flywheel'), /STALE/);
     assert.match(widgetHtml(render(h), 'Flywheel'), /60\.5/);
   }
+});
+
+// REQ-OPS-39, REQ-OPS-49: if a layout reload adds a field widget when `x` was
+// already tracked (e.g. from a graph widget) and `y` is newly tracked,
+// fieldWidget must pair matching timestamps rather than zipping from index 0.
+test('fieldWidget aligns trail coordinates by matching timestamp after layout reload', () => {
+  const xCh = 'pose_estimator/state/pose/x_m';
+  const yCh = 'pose_estimator/state/pose/y_m';
+  const yawCh = 'pose_estimator/state/pose/yaw_rad';
+  const fieldLayout = parseLayout({
+    columns: 4, rows: 2, update_hz: 20,
+    widgets: [{
+      kind: 'field', at: [0, 0, 4, 2], title: 'Field', trail_s: 10,
+      channels: {x: xCh, y: yCh, yaw: yawCh}
+    }]
+  });
+  const fieldW = fieldLayout.widgets[0];
+
+  // Start tracking only x (as if an earlier layout only graphed x).
+  const sock = new FakeSocket();
+  const model = new DriveModel('ws://robot/drive', () => sock, [xCh], LAYOUT);
+  let now = 0;
+  model.clock = () => now;
+  model.start(0);
+  sock.onopen!();
+  sock.send(
+      ...encodeDictionaryPages(header(1), CHANNELS),
+      ...update(1, {...NOMINAL, [xCh]: 1, [yCh]: 1, [yawCh]: 0}, true));
+  for (let seq = 2; seq <= 5; seq++) {
+    now += 50;
+    sock.send(...update(seq, {[xCh]: seq, [yCh]: seq}, false));
+  }
+  assert.equal(model.history(xCh).length, 5);
+  assert.equal(model.history(yCh).length, 0);
+
+  // Layout reload adds the field widget, newly tracking y (seeded at seq 5).
+  model.setLayout([xCh, yCh], LAYOUT);
+  assert.equal(model.history(xCh).length, 5);
+  assert.equal(model.history(yCh).length, 1);
+
+  // Push two more ticks: seq 6 -> (6, 6), seq 7 -> (7, 7).
+  for (let seq = 6; seq <= 7; seq++) {
+    now += 50;
+    sock.send(...update(seq, {[xCh]: seq, [yCh]: seq}, false));
+  }
+  assert.equal(model.history(xCh).length, 7);
+  assert.equal(model.history(yCh).length, 3);
+
+  const html = renderWidget(fieldW, model, now);
+  const match = html.match(/<polyline class="trail" points="([^"]+)"\/>/);
+  assert.ok(match, `expected trail polyline in ${html}`);
+  const expected = [5, 6, 7]
+      .map(v => `${v.toFixed(2)},${(FIELD_HEIGHT_M - v).toFixed(2)}`)
+      .join(' ');
+  assert.equal(match[1], expected,
+               `trail paired misaligned indices instead of matching timestamps: ${match[1]}`);
 });

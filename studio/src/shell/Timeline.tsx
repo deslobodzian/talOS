@@ -23,7 +23,7 @@ function ScrubTrack() {
 
   const onTrackClick = (e: React.MouseEvent) => {
     const rect = svgRef.current?.getBoundingClientRect();
-    if (!rect) return;
+    if (!rect || !(rect.width > 0)) return;
     const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
     const t = start + BigInt(Math.round(Number(end - start) * frac));
     actions.seek(t.toString());

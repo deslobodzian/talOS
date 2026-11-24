@@ -24,7 +24,14 @@ export function Sparkline({values, width = 120, height = 28, stroke = '#48e1cf',
       }
     }
     if (count < 1) return null;
-    const range = max - min || 1;
+    const span = max - min;
+    const halfSpan = max * 0.5 - min * 0.5;
+    const norm = (v: number): number => {
+      if (!(span > 0)) return 0.5;
+      if (Number.isFinite(span)) return (v - min) / span;
+      if (!(halfSpan > 0) || !Number.isFinite(halfSpan)) return 0.5;
+      return (v * 0.5 - min * 0.5) / halfSpan;
+    };
     const pad = 2;
     const out: string[] = [];
     const runs: string[] = [];
@@ -43,7 +50,7 @@ export function Sparkline({values, width = 120, height = 28, stroke = '#48e1cf',
         continue;
       }
       const x = (n === 1 ? .5 : i / (n - 1)) * (width - 2 * pad) + pad;
-      const y = height - pad - ((v - min) / range) * (height - 2 * pad);
+      const y = height - pad - norm(v) * (height - 2 * pad);
       out.push(`${x.toFixed(1)},${y.toFixed(1)}`);
     }
     endRun();
