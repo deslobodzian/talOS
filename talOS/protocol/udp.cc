@@ -389,7 +389,8 @@ UdpStatus RuntimeUdpPeer::TryReceive(DecodedFrame* out) {
   const bool long_run_restart =
       below_last && stats_.last_received_sequence - seq > kReorderWindow;
   const bool short_run_restart =
-      below_last && last_below_sequence_ != 0 && seq > last_below_sequence_ &&
+      below_last && seq <= kReorderWindow && last_below_sequence_ != 0 &&
+      seq > last_below_sequence_ &&
       below_ascending_count_ + 1 >= kRestartAscendingSteps;
   if (stats_.last_received_sequence == 0 || long_run_restart ||
       short_run_restart) {

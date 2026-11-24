@@ -17,12 +17,20 @@
 #include "gtest/gtest.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/process/host_qualification.h"
 
 namespace talos::event::log {
 namespace {
 
+constexpr std::size_t kMaxTrackedRecords = 16384;
+
 struct SharedProgress {
   std::atomic<std::uint64_t> committed{0};
+  // Steady-clock nanoseconds when record `index` (1-based,
+  // index < kMaxTrackedRecords) returned from dispatch(). Written relaxed
+  // before `committed.store(index, release)` so any acquire load seeing
+  // `committed >= index` reads the matching timestamp.
+  std::atomic<std::int64_t> commit_ns[kMaxTrackedRecords]{};
 };
 
 struct MappedProgress {
@@ -68,6 +76,12 @@ std::vector<std::byte> Payload(std::uint64_t index) {
     Context context{};
     context.dispatch_index = i;
     writer.dispatch(context, Payload(i));
+    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    if (i < kMaxTrackedRecords) {
+      progress->commit_ns[i].store(now_ns, std::memory_order_relaxed);
+    }
     progress->committed.store(i, std::memory_order_release);
     std::this_thread::sleep_for(std::chrono::milliseconds{5});
   }
@@ -104,20 +118,22 @@ std::uint64_t IntactPrefix(const std::string& path, bool& in_order) {
 // not full only at its periodic sync, once a second, so a SIGKILLed
 // hardware_node lost the last 826 ms of its log on the bench (2026-11-11).
 // Here the parent verifies the default 10 ms write_interval, waits until the
-// child has written kRecords so the file and writer thread are live, notes a
-// later committed index (committed_before_kill) from shared memory, waits
-// until the writer flushes through committed_before_kill to `.tlog` (still
-// orders of magnitude below the 1 h sync and 15 s chunk, bounded only by the
-// 10 s hang deadline per docs/TESTING.md §6.3), and SIGKILLs the child mid-
-// stream: every record up to committed_before_kill must remain intact and in
-// order in `.tlog`.
+// child has written kRecords so the file and writer thread are live, lets the
+// child keep streaming for 150 ms without pre-waiting for those records to hit
+// disk, and SIGKILLs the child mid-stream: every record committed more than
+// 100 ms before SIGKILL (10x write_interval, orders of magnitude below the 1 h
+// sync and 15 s chunk fill, catching 250 ms–1 s write_interval regressions)
+// must survive intact and in order in `.tlog`.
 // REQ-OPS-31
 TEST(LogKill, KilledWriterKeepsRecordsWrittenBeforeTheKill) {
   constexpr auto kExpectedWriteInterval = std::chrono::milliseconds{10};
   ASSERT_EQ(LogWriter::Options{}.write_interval, kExpectedWriteInterval);
+  // REQ-OPS-31: 10 ms write_interval plus writer scheduling delay; 100 ms is
+  // generous against scheduling jitter while catching 250 ms–1 s regressions.
+  constexpr auto kFlushBound = std::chrono::milliseconds{100};
+  constexpr auto kPostSeenWindow = std::chrono::milliseconds{150};
 
   constexpr std::uint64_t kRecords = 20;
-  constexpr std::uint64_t kAdditionalRecords = 10;
   const std::string path = ::testing::TempDir() + "/talos_log_kill_" +
                            std::to_string(::getpid()) + ".tlog";
 
@@ -128,48 +144,101 @@ TEST(LogKill, KilledWriterKeepsRecordsWrittenBeforeTheKill) {
   ASSERT_GE(child, 0);
   if (child == 0) LogUntilKilled(path, progress.ptr);
 
-  // The deadline only bounds a hang (docs/TESTING.md §6.3).
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  // Start StallMeter only after fork() so the child stays single-threaded.
+  // Judged only on a host whose scheduling stalls stay well inside the margin
+  // between the 10 ms write_interval and the 100 ms survival bound
+  // (docs/TESTING.md §6.7).
+  talos::process::StallMeter host;
+
+  // The 10 s deadline only bounds a hang (docs/TESTING.md §6.3).
+  std::chrono::steady_clock::time_point deadline{};
+  std::chrono::steady_clock::time_point kill_time{};
   bool in_order = true;
   std::uint64_t seen = 0;
-  std::uint64_t committed_before_kill = 0;
-  std::uint64_t flushed = 0;
-  while (std::chrono::steady_clock::now() < deadline) {
+  std::uint64_t first_post_seen = 0;
+  std::int64_t first_post_seen_ns = 0;
+  bool reached_kill_window = false;
+  for (bool first = true;; first = false) {
+    const auto now = std::chrono::steady_clock::now();
+    if (first) deadline = now + std::chrono::seconds{10};
+    if (now >= deadline) {
+      kill_time = now;
+      break;
+    }
     if (seen < kRecords) {
       seen = IntactPrefix(path, in_order);
-    } else if (committed_before_kill == 0) {
+    } else {
       const std::uint64_t committed =
           progress.ptr->committed.load(std::memory_order_acquire);
-      if (committed >= seen + kAdditionalRecords) {
-        committed_before_kill = committed;
+      if (first_post_seen == 0 && committed > seen &&
+          seen + 1 < kMaxTrackedRecords) {
+        first_post_seen = seen + 1;
+        first_post_seen_ns = progress.ptr->commit_ns[first_post_seen].load(
+            std::memory_order_relaxed);
       }
-    } else {
-      flushed = IntactPrefix(path, in_order);
-      if (flushed >= committed_before_kill) break;
+      if (first_post_seen != 0) {
+        const auto now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                now.time_since_epoch())
+                .count();
+        if (now_ns - first_post_seen_ns >=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                kPostSeenWindow)
+                .count()) {
+          kill_time = now;
+          reached_kill_window = true;
+          break;
+        }
+      }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
   ASSERT_EQ(::kill(child, SIGKILL), 0);
   int status = 0;
   ASSERT_EQ(::waitpid(child, &status, 0), child);
+  const std::uint64_t stall_us = host.Stop();
+  constexpr std::uint64_t kMaxStallUs = 25000;
+  if (stall_us >= kMaxStallUs) {
+    ::testing::Test::RecordProperty("host_unqualified", "true");
+  }
+  ASSERT_LT(stall_us, kMaxStallUs)
+      << "[HOST_UNQUALIFIED] host unqualified: an ordinary thread's 1 ms sleep "
+         "overran by "
+      << stall_us << " us (limit " << kMaxStallUs << " us)";
   ASSERT_TRUE(WIFSIGNALED(status)) << "child exited with " << status;
   ASSERT_GE(seen, kRecords) << "the log held " << seen << " records after 10 s"
                             << " of logging at 200 Hz with no sync due";
-  ASSERT_GE(committed_before_kill, seen + kAdditionalRecords)
-      << "child did not commit " << kAdditionalRecords << " records after seen";
-  ASSERT_GE(flushed, committed_before_kill)
-      << "writer did not flush committed records within 10 s "
-      << "(flushed=" << flushed
-      << ", committed_before_kill=" << committed_before_kill
-      << ", seen=" << seen << ")";
+  ASSERT_TRUE(reached_kill_window)
+      << "child did not stream past post-seen window within 10 s";
+
+  const std::uint64_t final_committed =
+      progress.ptr->committed.load(std::memory_order_acquire);
+  const auto kill_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           kill_time.time_since_epoch())
+                           .count();
+  const auto bound_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(kFlushBound).count();
+  const std::uint64_t tracked = std::min(
+      final_committed, static_cast<std::uint64_t>(kMaxTrackedRecords - 1));
+  std::uint64_t expected_survived = 0;
+  for (std::uint64_t i = 1; i <= tracked; ++i) {
+    const std::int64_t commit_ns =
+        progress.ptr->commit_ns[i].load(std::memory_order_relaxed);
+    if (kill_ns - commit_ns > bound_ns) {
+      expected_survived = i;
+    } else {
+      break;
+    }
+  }
+  ASSERT_GE(expected_survived, first_post_seen)
+      << "no post-seen record was committed more than 100 ms before SIGKILL";
 
   const std::uint64_t kept = IntactPrefix(path, in_order);
   EXPECT_TRUE(in_order) << "records out of order, damaged or wrong";
-  EXPECT_GE(kept, committed_before_kill)
-      << "SIGKILL lost records already flushed to the log "
-      << "(kept=" << kept << ", committed_before_kill=" << committed_before_kill
-      << ", seen=" << seen << ")";
+  EXPECT_GE(kept, expected_survived)
+      << "SIGKILL lost records committed > 100 ms before the kill "
+      << "(kept=" << kept << ", expected_survived=" << expected_survived
+      << ", final_committed=" << final_committed << ", seen=" << seen << ")";
   ::unlink(path.c_str());
 }
 

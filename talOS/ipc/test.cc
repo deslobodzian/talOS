@@ -165,6 +165,68 @@ TEST(SubscriberTest, SubscriberIgnoresPublisherAndSessionOwnerOptions) {
   }
 }
 
+// A publisher must never act as session owner (replacing an existing segment
+// or unlinking the segment on close while subscribers remain), even when the
+// caller passes RTMSOptions with session_owner=true.
+// REQ-OPS-03
+TEST(PublisherTest, PublisherIgnoresSessionOwnerOption) {
+  const RTMSOptions session_owner_options{
+      .overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
+      .read_mode = ReadMode::SEQUENCE,
+      .publisher = true,
+      .session_owner = true,
+  };
+
+  // Fresh topic: publisher must not mark the segment session-owned or unlink
+  // it on destruction while a subscriber is still attached.
+  {
+    const std::string topic = Topic("pub_no_owner");
+    std::optional<ipc::Publisher<IPCMessage::TestMessage>> first;
+    first.emplace(topic, session_owner_options);
+    EXPECT_FALSE(first->queue().session_owned());
+    ipc::Subscriber<IPCMessage::TestMessage> subscriber{topic};
+    ASSERT_EQ(first->write(IPCMessage::TestMessage{1, 0.5F}),
+              WriteResult::SUCCESS);
+    const auto m1 = subscriber.read_next();
+    ASSERT_TRUE(m1.has_value());
+    EXPECT_EQ(m1->message.message_id(), 1);
+
+    first.reset();
+    // If `first` had acted as session_owner, its destructor would have
+    // unlinked the segment, so `second` would create a new segment that
+    // `subscriber` never sees.
+    ipc::Publisher<IPCMessage::TestMessage> second{topic};
+    ASSERT_EQ(second.write(IPCMessage::TestMessage{2, 1.5F}),
+              WriteResult::SUCCESS);
+    const auto m2 = subscriber.read_next();
+    ASSERT_TRUE(m2.has_value());
+    EXPECT_EQ(m2->message.message_id(), 2);
+  }
+
+  // Existing segment: opening with session_owner=true must neither replace
+  // the subscriber's segment nor unlink it on destruction.
+  {
+    const std::string topic = Topic("pub_no_replace");
+    ipc::Subscriber<IPCMessage::TestMessage> early{topic};
+    {
+      ipc::Publisher<IPCMessage::TestMessage> transient{topic,
+                                                        session_owner_options};
+      EXPECT_FALSE(transient.queue().session_owned());
+      ASSERT_EQ(transient.write(IPCMessage::TestMessage{7, 2.5F}),
+                WriteResult::SUCCESS);
+      const auto m7 = early.read_next();
+      ASSERT_TRUE(m7.has_value());
+      EXPECT_EQ(m7->message.message_id(), 7);
+    }
+    ipc::Publisher<IPCMessage::TestMessage> replacement{topic};
+    ASSERT_EQ(replacement.write(IPCMessage::TestMessage{8, 3.5F}),
+              WriteResult::SUCCESS);
+    const auto m8 = early.read_next();
+    ASSERT_TRUE(m8.has_value());
+    EXPECT_EQ(m8->message.message_id(), 8);
+  }
+}
+
 // When all 32 reader slots are occupied during rejoin(), the subscriber stays
 // unregistered (registered() == false, arm_wake() == false) until a slot frees,
 // then claims it and reports the exact dropped count for every message

@@ -316,6 +316,13 @@ TEST(ProcessTest, TiersMapToOrderedPolicies) {
     EXPECT_LE(policy.constraint, policy.period);
   }
   {
+    const LoopPolicy floor_policy =
+        PolicyFor({.period = 50us, .tier = LoopTier::kControl});
+    EXPECT_EQ(floor_policy.period, 50us);
+    EXPECT_EQ(floor_policy.computation, 50us);
+    EXPECT_EQ(floor_policy.constraint, 50us);
+  }
+  {
     const LoopPolicy short_policy =
         PolicyFor({.period = 60us, .tier = LoopTier::kControl});
     EXPECT_EQ(short_policy.period, 60us);
@@ -496,13 +503,17 @@ TEST(ProcessTest, RealtimeReportsWhatTheOsGrantedForEveryTier) {
 }
 
 #if defined(__APPLE__)
-// Control loops with valid periods above 100 ms (computation = period / 2 >
-// XNU's 50 ms max_rt_quantum) must still be granted the time-constraint policy
-// with clamped computation rather than failing KERN_INVALID_ARGUMENT.
-// REQ-RT-08
+// Control loops whose period/2 falls outside XNU's [50 us, 50 ms] RT quantum
+// bounds (both the 50 us floor, e.g. period = 50 us -> 25 us before clamping,
+// and the 50 ms ceiling, e.g. 125 ms / 200 ms) must still be granted the
+// time-constraint policy with clamped computation rather than failing
+// KERN_INVALID_ARGUMENT.
+// REQ-RT-08, REQ-RT-09
 TEST(ProcessTest, LongControlPeriodsGrantTimeConstraintOnMacOs) {
   ::unsetenv("TALOS_REALTIME");
-  for (const std::chrono::nanoseconds period : {125ms, 200ms}) {
+  for (const std::chrono::nanoseconds period :
+       {std::chrono::nanoseconds{50us}, std::chrono::nanoseconds{125ms},
+        std::chrono::nanoseconds{200ms}}) {
     SCOPED_TRACE(period.count());
     const Outcome outcome = ConfigureOnFreshThread(LoopTier::kControl, period);
     EXPECT_EQ((outcome.returned.refused & kStepPolicy) == 0, outcome.applied)
@@ -560,6 +571,94 @@ TEST(ProcessTest, DurableSyncPreservesBadFdErrorAndSyncsOpenFile) {
   ASSERT_EQ(::write(fd, &payload, 1), 1);
   EXPECT_EQ(DurableSync(fd), 0);
   ::close(fd);
+}
+
+// The F_FULLFSYNC -> fsync fallback must only engage on unsupported-operation
+// errors (ENOTSUP, EOPNOTSUPP, EINVAL, ENOTTY). Real I/O or descriptor errors
+// (EIO, ENOSPC, EBADF) must return -1 with errno preserved and never invoke
+// fsync(). Both syscalls must retry EINTR.
+// REQ-OPS-12, REQ-OPS-08
+TEST(ProcessTest, DurableSyncFallbackOnlyMasksUnsupportedFullSyncErrors) {
+  // Retries EINTR on full_sync and skips fsync when full_sync succeeds.
+  {
+    int full_calls = 0;
+    int fsync_calls = 0;
+    const int rc = detail::DurableSyncWithFallback(
+        [&]() noexcept {
+          if (++full_calls == 1) {
+            errno = EINTR;
+            return -1;
+          }
+          return 0;
+        },
+        [&]() noexcept {
+          ++fsync_calls;
+          return 0;
+        });
+    EXPECT_EQ(rc, 0);
+    EXPECT_EQ(full_calls, 2);
+    EXPECT_EQ(fsync_calls, 0);
+  }
+
+  // Real errors preserve errno and never fall back to fsync.
+  for (const int real_error : {EIO, ENOSPC, EBADF}) {
+    SCOPED_TRACE(real_error);
+    int full_calls = 0;
+    int fsync_calls = 0;
+    errno = 0;
+    const int rc = detail::DurableSyncWithFallback(
+        [&]() noexcept {
+          ++full_calls;
+          errno = real_error;
+          return -1;
+        },
+        [&]() noexcept {
+          ++fsync_calls;
+          errno = 0;
+          return 0;
+        });
+    EXPECT_EQ(rc, -1);
+    EXPECT_EQ(errno, real_error);
+    EXPECT_EQ(full_calls, 1);
+    EXPECT_EQ(fsync_calls, 0);
+  }
+
+  // Unsupported errors fall back to fsync (retrying EINTR) and propagate
+  // fsync's success or failure errno.
+  for (const int unsupported_error : {ENOTSUP, EOPNOTSUPP, EINVAL, ENOTTY}) {
+    SCOPED_TRACE(unsupported_error);
+    int fsync_calls = 0;
+    const int ok_rc = detail::DurableSyncWithFallback(
+        [&]() noexcept {
+          errno = unsupported_error;
+          return -1;
+        },
+        [&]() noexcept {
+          if (++fsync_calls == 1) {
+            errno = EINTR;
+            return -1;
+          }
+          return 0;
+        });
+    EXPECT_EQ(ok_rc, 0);
+    EXPECT_EQ(fsync_calls, 2);
+
+    int fail_fsync_calls = 0;
+    errno = 0;
+    const int fail_rc = detail::DurableSyncWithFallback(
+        [&]() noexcept {
+          errno = unsupported_error;
+          return -1;
+        },
+        [&]() noexcept {
+          ++fail_fsync_calls;
+          errno = EIO;
+          return -1;
+        });
+    EXPECT_EQ(fail_rc, -1);
+    EXPECT_EQ(errno, EIO);
+    EXPECT_EQ(fail_fsync_calls, 1);
+  }
 }
 
 // A helper thread doing unbounded work (camera capture, detection) must run

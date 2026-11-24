@@ -731,6 +731,59 @@ TEST(RollerWithSensor, RequestIsTiedToItsUpdate) {
   EXPECT_EQ(hw.applied_motor("intake", "roller").mode, Mode::kNeutral);
 }
 
+// A request lasts one tick even where nothing else gates it: with
+// AllowUntargetedOutputs the devices flush does not neutralize a tick with no
+// target, so the roller alone must stop driving when the owner stops asking
+// (both kIntaking and kHolding with hold_v).
+// REQ-SAFE-38
+TEST(RollerWithSensor, OneRequestDrivesOneTick) {
+  struct OnceNode {
+    explicit OnceNode(Node& node) : roller{node, "roller"} {
+      AllowUntargetedOutputs(node);
+    }
+    void update() {
+      if (ask) roller.set_goal(RollerCommand::kIntake);
+      roller.update();
+      ++ticks;
+    }
+    RollerWithSensor roller;
+    bool ask = false;
+    int ticks = 0;
+  };
+  for (const bool with_piece : {false, true}) {
+    SCOPED_TRACE(with_piece ? "kHolding" : "kIntake");
+    auto sim = Sim::FromToml(kRobotToml);
+    auto& node = sim.add<OnceNode>("intake");
+    SimHardware hw{sim};
+    hw.enable();
+    hw.set_digital_input("intake", "beam", with_piece);
+    hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+    sim.step(10ms);
+
+    const int before_ask = node.ticks;
+    node.ask = true;
+    sim.step(5ms);
+    ASSERT_GT(node.ticks, before_ask);
+    ASSERT_TRUE(node.roller.driving());
+    ASSERT_EQ(node.roller.phase(),
+              with_piece ? RollerPhase::kHolding : RollerPhase::kIntaking);
+    ASSERT_DOUBLE_EQ(node.roller.output_v(), with_piece ? 1.0 : 6.0);
+    ASSERT_EQ(hw.applied_motor("intake", "roller").mode, Mode::kVoltage);
+    ASSERT_DOUBLE_EQ(hw.applied_motor("intake", "roller").demand,
+                     with_piece ? 1.0 : 6.0);
+
+    const int before_idle = node.ticks;
+    node.ask = false;
+    sim.step(5ms);
+    ASSERT_GT(node.ticks, before_idle);
+    EXPECT_FALSE(node.roller.driving());
+    EXPECT_DOUBLE_EQ(node.roller.output_v(), 0.0);
+    EXPECT_EQ(node.roller.phase(),
+              with_piece ? RollerPhase::kHolding : RollerPhase::kIdle);
+    EXPECT_EQ(hw.applied_motor("intake", "roller").mode, Mode::kNeutral);
+  }
+}
+
 // With no live request (the lane is stale: the owner calls stop()) the roller
 // is neutral, yet the piece sensor is still tracked, and a timed eject still
 // finishes its clock while enabled rather than freezing mid-run.
@@ -787,31 +840,67 @@ can_id = 1
 [subsystems.intake.digital_inputs.beam]
 dio = 0
 [subsystems.intake.roller]
-intake_v = 6.0
-eject_v = -6.0
 )"} + table);
     sim.add<RollerNode>("intake");
   };
-  EXPECT_NO_THROW(add("sensor = \"beam\"\neject_us = 100000\n"));
-  EXPECT_NO_THROW(
-      add("sensor = \"beam\"\neject_us = 100000\n"
-          "sensor_debounce_us = 9223372036854775\n"));
+  const std::string base = "intake_v = 6.0\neject_v = -6.0\n";
+  EXPECT_NO_THROW(add(base + "sensor = \"beam\"\neject_us = 100000\n"));
+  EXPECT_NO_THROW(add(base + "sensor = \"beam\"\neject_us = 100000\n"
+                             "sensor_debounce_us = 9223372036854775\n"
+                             "feed_us = 9223372036854775\n"));
   const std::vector<std::pair<std::string, std::string>> bad{
-      {"roller.sensor", "eject_us = 100000\n"},
-      {"beam_typo", "sensor = \"beam_typo\"\neject_us = 100000\n"},
-      {"roller.eject_us", "sensor = \"beam\"\neject_us = 0\n"},
-      {"roller.eject_us", "sensor = \"beam\"\n"},
-      {"roller.eject_us", "sensor = \"beam\"\neject_us = 18446744073709552\n"},
-      {"roller.feed_us", "sensor = \"beam\"\neject_us = 100000\nfeed_us = 0\n"},
+      {"roller.sensor", base + "eject_us = 100000\n"},
+      {"beam_typo", base + "sensor = \"beam_typo\"\neject_us = 100000\n"},
+      {"roller.intake_v",
+       "sensor = \"beam\"\neject_v = -6.0\n"
+       "eject_us = 100000\n"},
+      {"roller.intake_v",
+       "sensor = \"beam\"\nintake_v = inf\n"
+       "eject_v = -6.0\neject_us = 100000\n"},
+      {"roller.intake_v",
+       "sensor = \"beam\"\nintake_v = -inf\n"
+       "eject_v = -6.0\neject_us = 100000\n"},
+      {"roller.intake_v",
+       "sensor = \"beam\"\nintake_v = nan\n"
+       "eject_v = -6.0\neject_us = 100000\n"},
+      {"roller.eject_v",
+       "sensor = \"beam\"\nintake_v = 6.0\n"
+       "eject_us = 100000\n"},
+      {"roller.eject_v",
+       "sensor = \"beam\"\nintake_v = 6.0\n"
+       "eject_v = inf\neject_us = 100000\n"},
+      {"roller.eject_v",
+       "sensor = \"beam\"\nintake_v = 6.0\n"
+       "eject_v = -inf\neject_us = 100000\n"},
+      {"roller.eject_v",
+       "sensor = \"beam\"\nintake_v = 6.0\n"
+       "eject_v = nan\neject_us = 100000\n"},
+      {"roller.eject_us", base + "sensor = \"beam\"\neject_us = 0\n"},
+      {"roller.eject_us", base + "sensor = \"beam\"\n"},
+      {"roller.eject_us",
+       base + "sensor = \"beam\"\neject_us = 18446744073709552\n"},
+      {"roller.feed_v",
+       base + "sensor = \"beam\"\neject_us = 100000\nfeed_v = inf\n"},
+      {"roller.feed_v",
+       base + "sensor = \"beam\"\neject_us = 100000\nfeed_v = -inf\n"},
+      {"roller.feed_v",
+       base + "sensor = \"beam\"\neject_us = 100000\nfeed_v = nan\n"},
+      {"roller.feed_us",
+       base + "sensor = \"beam\"\neject_us = 100000\nfeed_us = 0\n"},
+      {"roller.feed_us", base + "sensor = \"beam\"\neject_us = 100000\n"
+                                "feed_us = 9223372036854776\n"},
+      {"roller.sensor_debounce_us", base +
+                                        "sensor = \"beam\"\neject_us = 100000\n"
+                                        "sensor_debounce_us = -1\n"},
       {"roller.sensor_debounce_us",
-       "sensor = \"beam\"\neject_us = 100000\nsensor_debounce_us = -1\n"},
-      {"roller.sensor_debounce_us",
-       "sensor = \"beam\"\neject_us = 100000\n"
-       "sensor_debounce_us = 9223372036854776\n"},
-      {"roller.hold_v", "sensor = \"beam\"\neject_us = 100000\nhold_v = inf\n"},
+       base + "sensor = \"beam\"\neject_us = 100000\n"
+              "sensor_debounce_us = 9223372036854776\n"},
       {"roller.hold_v",
-       "sensor = \"beam\"\neject_us = 100000\nhold_v = -inf\n"},
-      {"roller.hold_v", "sensor = \"beam\"\neject_us = 100000\nhold_v = nan\n"},
+       base + "sensor = \"beam\"\neject_us = 100000\nhold_v = inf\n"},
+      {"roller.hold_v",
+       base + "sensor = \"beam\"\neject_us = 100000\nhold_v = -inf\n"},
+      {"roller.hold_v",
+       base + "sensor = \"beam\"\neject_us = 100000\nhold_v = nan\n"},
   };
   for (const auto& [key, table] : bad) {
     SCOPED_TRACE(table);

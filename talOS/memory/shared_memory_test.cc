@@ -284,6 +284,38 @@ TEST(SharedMemory, FailedMmapUnlinksOnlyOnCreate) {
   shm_unlink(name.c_str());
 }
 
+// REQ-CONTRACT-21: attaching with a larger size than the existing segment
+// rejects with std::runtime_error and leaves the existing segment intact.
+TEST(SharedMemory, AttachRejectsUndersizedSegmentWithoutUnlinking) {
+  const long raw_page = ::sysconf(_SC_PAGESIZE);
+  ASSERT_GT(raw_page, 0);
+  const std::size_t page = static_cast<std::size_t>(raw_page);
+  const std::string path = "/undersized_" + std::to_string(::getpid());
+  const auto name = ShmObjectName(path);
+  shm_unlink(name.c_str());
+
+  SharedMemoryPtr creator{path, page};
+  ASSERT_EQ(creator.mode(), SharedMemoryMode::CREATE);
+  ASSERT_NE(creator.ptr(), nullptr);
+  static_cast<unsigned char*>(creator.ptr())[0] = 0xA5u;
+
+  EXPECT_THROW((SharedMemoryPtr{path, page * 2}), std::runtime_error);
+
+  const int fd = shm_open(name.c_str(), O_RDWR, 0666);
+  ASSERT_NE(fd, -1) << "rejected attach unlinked the existing segment";
+  struct stat st {};
+  EXPECT_EQ(::fstat(fd, &st), 0);
+  EXPECT_EQ(st.st_size, static_cast<off_t>(page));
+  ::close(fd);
+
+  SharedMemoryPtr intact{path, page};
+  EXPECT_EQ(intact.mode(), SharedMemoryMode::ATTACH);
+  ASSERT_NE(intact.ptr(), nullptr);
+  EXPECT_EQ(static_cast<const unsigned char*>(intact.ptr())[0], 0xA5u);
+
+  shm_unlink(name.c_str());
+}
+
 // A name the exclusive create finds can be unlinked by its last holder before
 // the attach that follows. The name is then free, so the mapping creates it
 // rather than failing.
@@ -381,6 +413,50 @@ TEST(ShmObjectNameTest, NamespacesAreStableIsolatedAndIdempotent) {
   EXPECT_EQ(first.find_first_not_of("0123456789abcdef", 2), std::string::npos);
   EXPECT_NE(first, ShmObjectName("/hw/command", "run-a"));
   EXPECT_NE(ShmObjectName("/c", "ab"), ShmObjectName("/bc", "a"));
+}
+
+namespace {
+
+[[noreturn]] void RunShmEnvCheck(const char* shm_ns, const char* test_tmpdir,
+                                 std::string_view expected_ns) {
+  if (shm_ns != nullptr) {
+    ::setenv("TALOS_SHM_NAMESPACE", shm_ns, 1);
+  } else {
+    ::unsetenv("TALOS_SHM_NAMESPACE");
+  }
+  if (test_tmpdir != nullptr) {
+    ::setenv("TEST_TMPDIR", test_tmpdir, 1);
+  } else {
+    ::unsetenv("TEST_TMPDIR");
+  }
+  const std::string actual = ShmObjectName("/hw/state");
+  const std::string expected = ShmObjectName("/hw/state", expected_ns);
+  if (actual != expected) {
+    std::fprintf(stderr, "actual=%s expected=%s\n", actual.c_str(),
+                 expected.c_str());
+    std::fflush(stderr);
+    std::_Exit(1);
+  }
+  std::_Exit(0);
+}
+
+}  // namespace
+
+// 1-arg ShmObjectName caches process namespace precedence: TALOS_SHM_NAMESPACE
+// (even when empty, disabling TEST_TMPDIR), else TEST_TMPDIR, else
+// unnamespaced. Runs each combination in a fresh re-executed child so the
+// function-local static namespace cache initializes cleanly from that child's
+// environment. REQ-CONTRACT-22
+TEST(ShmObjectNameTest, OneArgOverloadResolvesEnvironmentPrecedence) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(RunShmEnvCheck("custom-ns", "/tmp/ignored", "custom-ns"),
+              ::testing::ExitedWithCode(0), "");
+  EXPECT_EXIT(RunShmEnvCheck("", "/tmp/ignored", ""),
+              ::testing::ExitedWithCode(0), "");
+  EXPECT_EXIT(RunShmEnvCheck(nullptr, "/tmp/test-run", "/tmp/test-run"),
+              ::testing::ExitedWithCode(0), "");
+  EXPECT_EXIT(RunShmEnvCheck(nullptr, nullptr, ""),
+              ::testing::ExitedWithCode(0), "");
 }
 
 namespace {
