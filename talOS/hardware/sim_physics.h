@@ -957,6 +957,30 @@ class PhysicsSimBackend final : public SimBackendBase {
                                                : 0.0;
   }
 
+  // The motors Configure hands ExternalPlant::Bind for `config`, in config
+  // order: each motor's name, gear (rotor_to_sensor_ratio *
+  // sensor_to_mechanism_ratio, each 1 when not positive and finite) and the
+  // winding constants of its motor_type. A program building a plant before
+  // attaching it reads them here. The names are views into `config`, valid
+  // while it lives unchanged. Configure passes its configuration after
+  // SetLocalMotorTypes has applied the local motor types, so a program
+  // passes its own parse of the robot config.
+  [[nodiscard]] static std::vector<PlantMotor> PlantMotors(
+      const Config& config) {
+    std::vector<PlantMotor> motors;
+    motors.reserve(config.motors.size());
+    for (const MotorConfig& m : config.motors) {
+      const MotorModel model = MotorModelFor(m.motor_type.value);
+      motors.push_back({m.name.view(), GearOf(m),
+                        model.torque_constant_nm_per_a(),
+                        model.back_emf_v_per_radps(), model.resistance_ohm(),
+                        model.no_load_damping_nm_per_radps()});
+    }
+    return motors;
+  }
+  // The names would view into a temporary.
+  static std::vector<PlantMotor> PlantMotors(const Config&& config) = delete;
+
   // The external plant (sim_plant.h), bound at the next Configure; nullptr
   // detaches it. Not owned: it must outlive this backend's use of it. It
   // survives every Configure, and its clock (plant_time()) restarts here.
@@ -1216,20 +1240,29 @@ class PhysicsSimBackend final : public SimBackendBase {
            FeedbackOffset(i);
   }
 
-  double RotorToSensor(std::size_t i) const {
-    const double ratio = config_.motors[i].rotor_to_sensor_ratio;
+  static double RotorToSensorOf(const MotorConfig& m) {
+    const double ratio = m.rotor_to_sensor_ratio;
     return std::isfinite(ratio) && ratio > 0.0 ? ratio : 1.0;
+  }
+  static double SensorToMechanismOf(const MotorConfig& m) {
+    const double ratio = m.sensor_to_mechanism_ratio;
+    return std::isfinite(ratio) && ratio > 0.0 ? ratio : 1.0;
+  }
+  // Rotor rotations per mechanism rotation.
+  static double GearOf(const MotorConfig& m) {
+    const double gear = RotorToSensorOf(m) * SensorToMechanismOf(m);
+    return std::isfinite(gear) && gear > 0.0 ? gear : 1.0;
+  }
+
+  double RotorToSensor(std::size_t i) const {
+    return RotorToSensorOf(config_.motors[i]);
   }
 
   double SensorToMechanism(std::size_t i) const {
-    const double ratio = config_.motors[i].sensor_to_mechanism_ratio;
-    return std::isfinite(ratio) && ratio > 0.0 ? ratio : 1.0;
+    return SensorToMechanismOf(config_.motors[i]);
   }
 
-  double Gear(std::size_t i) const {
-    const double gear = RotorToSensor(i) * SensorToMechanism(i);
-    return std::isfinite(gear) && gear > 0.0 ? gear : 1.0;
-  }
+  double Gear(std::size_t i) const { return GearOf(config_.motors[i]); }
 
   int MotorIndex(uint16_t id) const {
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
@@ -1286,17 +1319,7 @@ class PhysicsSimBackend final : public SimBackendBase {
                       std::to_string(step_us)});
     }
     const std::size_t n = config_.motors.size();
-    std::array<PlantMotor, kMaxMotors> motors{};
-    for (std::size_t i = 0; i < n; ++i) {
-      const MotorModel model =
-          MotorModelFor(config_.motors[i].motor_type.value);
-      motors[i] = {config_.motors[i].name.view(),
-                   Gear(i),
-                   model.torque_constant_nm_per_a(),
-                   model.back_emf_v_per_radps(),
-                   model.resistance_ohm(),
-                   model.no_load_damping_nm_per_radps()};
-    }
+    const std::vector<PlantMotor> motors = PlantMotors(config_);
     std::vector<PlantInput> inputs;
     inputs.reserve(world_inputs_.size());
     bound_world_inputs_.reserve(world_inputs_.size());
@@ -1310,8 +1333,8 @@ class PhysicsSimBackend final : public SimBackendBase {
     }
     ConfigError error;
     std::array<bool, kMaxMotors> owned{};
-    if (!plant_->Bind(std::span<const PlantMotor>(motors.data(), n), inputs,
-                      std::span<bool>(owned.data(), n), error)) {
+    if (!plant_->Bind(motors, inputs, std::span<bool>(owned.data(), n),
+                      error)) {
       return RefusePlant(std::move(error));
     }
     owned_ = owned;

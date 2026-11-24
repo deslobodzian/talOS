@@ -3189,7 +3189,10 @@ class FakePlant final : public sim::ExternalPlant {
       error = *refusal;
       return false;
     }
+    bound_motors.assign(motors.begin(), motors.end());
+    bound_names.clear();
     for (std::size_t i = 0; i < motors.size(); ++i) {
+      bound_names.emplace_back(motors[i].name);
       owned[i] =
           std::find(binds.begin(), binds.end(), motors[i].name) != binds.end();
     }
@@ -3244,6 +3247,9 @@ class FakePlant final : public sim::ExternalPlant {
   std::optional<sim::PlantChassis> chassis_state;
   std::array<bool, 4> closed{};
   std::vector<std::string> sensors;
+  // What the last Bind received; the names copied, as a plant must.
+  std::vector<sim::PlantMotor> bound_motors;
+  std::vector<std::string> bound_names;
   std::vector<int> step_log;
   std::vector<sim::PlantDrive> last_drives;
 };
@@ -3890,6 +3896,65 @@ TEST(SimPlant, BoundMotorsSagTheBatteryAsAnalyticOnes) {
   State state{};
   ASSERT_TRUE(backend.Read(state));
   EXPECT_NEAR(backend.supply_voltage(), 12.8 - 0.05 * (100.0 - 40.0), 1e-6);
+}
+
+// REQ-DEV-37: PlantMotors gives a program building a plant the motor list
+// Configure hands Bind: each motor's name, gear (rotor_to_sensor_ratio *
+// sensor_to_mechanism_ratio, a non-positive ratio taken as 1) and its motor
+// type's winding constants. The second motor's remote-CANcoder feedback,
+// inversion and CAN bus change none of them; the list still matches.
+TEST(SimPlant, PlantMotorsIsWhatBindReceives) {
+  Config cfg = SingleMotorConfig();
+  cfg.motors[0].rotor_to_sensor_ratio = 3.0;
+  cfg.motors[0].sensor_to_mechanism_ratio = 4.0;
+  cfg.motors[0].motor_type.value = MotorType::kKrakenX44;
+  MotorConfig arm = TestMotor(2, "arm", 2);
+  arm.bus = "canivore";
+  arm.inverted = true;
+  arm.feedback = Feedback::kRemoteCANcoder;
+  arm.feedback_sensor_id = 10;
+  arm.rotor_to_sensor_ratio = 50.0;
+  arm.sensor_to_mechanism_ratio = 0.0;  // not positive: 1
+  cfg.motors.push_back(arm);
+  SensorConfig encoder;
+  encoder.id = 10;
+  encoder.name = "arm_encoder";
+  encoder.can_id = 10;
+  encoder.bus = "canivore";
+  cfg.sensors.push_back(encoder);
+
+  const std::vector<sim::PlantMotor> motors =
+      PhysicsSimBackend::PlantMotors(cfg);
+  const sim::MotorModel x44 = sim::MotorModelFor(MotorType::kKrakenX44);
+  const sim::MotorModel x60 = sim::MotorModelFor(MotorType::kKrakenX60);
+  ASSERT_EQ(motors.size(), 2u);
+  EXPECT_EQ(motors[0].name, "roller");
+  EXPECT_EQ(motors[0].gear, 12.0);
+  EXPECT_EQ(motors[0].torque_constant_nm_per_a, x44.torque_constant_nm_per_a());
+  EXPECT_EQ(motors[0].back_emf_v_per_radps, x44.back_emf_v_per_radps());
+  EXPECT_EQ(motors[0].resistance_ohm, x44.resistance_ohm());
+  EXPECT_EQ(motors[0].no_load_damping_nm_per_radps,
+            x44.no_load_damping_nm_per_radps());
+  EXPECT_EQ(motors[1].name, "arm");
+  EXPECT_EQ(motors[1].gear, 50.0);
+  EXPECT_EQ(motors[1].torque_constant_nm_per_a, x60.torque_constant_nm_per_a());
+
+  FakePlant plant;
+  PhysicsSimBackend backend;
+  backend.SetPlant(&plant);
+  ASSERT_TRUE(backend.Configure(cfg));
+  ASSERT_EQ(plant.bound_motors.size(), motors.size());
+  for (std::size_t i = 0; i < motors.size(); ++i) {
+    SCOPED_TRACE(testing::Message() << "motor " << i);
+    EXPECT_EQ(plant.bound_names[i], motors[i].name);
+    const sim::PlantMotor& got = plant.bound_motors[i];
+    EXPECT_EQ(got.gear, motors[i].gear);
+    EXPECT_EQ(got.torque_constant_nm_per_a, motors[i].torque_constant_nm_per_a);
+    EXPECT_EQ(got.back_emf_v_per_radps, motors[i].back_emf_v_per_radps);
+    EXPECT_EQ(got.resistance_ohm, motors[i].resistance_ohm);
+    EXPECT_EQ(got.no_load_damping_nm_per_radps,
+              motors[i].no_load_damping_nm_per_radps);
+  }
 }
 
 // REQ-DEV-37: a motor no plant actuator binds behaves as under the analytic
