@@ -1462,6 +1462,108 @@ class SessionReportTest(unittest.TestCase):
         self.assertTrue(session_report.across_gap(spans, {"p"}, 5000.5, 5000.9))
         self.assertFalse(session_report.across_gap(spans, {"p"}, 5002.0, 5009.0))
 
+    # REQ-OPS-16, REQ-OPS-20: BridgeStatus ends with can_buses:[CanBusStatus:4].
+    # scalars() must track {}/[] nesting depth so nested fields never overwrite
+    # or leak into top-level scalars, and /hw/status must preserve active
+    # can_buses[0..can_bus_count-1] metrics rather than letting unused slot 3
+    # zero out active bus 0 (rio).
+    def test_scalars_respects_nesting_and_preserves_active_can_bus_metrics(self):
+        zero_bus = (
+            "{utilization_frac: 0, bus_off_count: 0, "
+            "transmit_buffer_full_count: 0, read_failure_count: 0, "
+            "receive_error_count: 0, transmit_error_count: 0, read_state: NONE}"
+        )
+
+        # Nested struct/array fields sharing names with top-level fields must
+        # never overwrite top-level scalars or leak into top-level results.
+        nested_decoded = (
+            "{states_received_count: 10, can_bus_count: 1, "
+            "nested: {states_received_count: 0, inner_metric: 99}, "
+            "can_buses: [{utilization_frac: 0.42, bus_off_count: 5, "
+            "transmit_buffer_full_count: 2, read_failure_count: 1, "
+            "receive_error_count: 3, transmit_error_count: 4, read_state: OK}, "
+            f"{zero_bus}, {zero_bus}, {zero_bus}"
+            "], trailing_flag: true}"
+        )
+        self.assertEqual(
+            session_report.scalars(nested_decoded),
+            {"states_received_count": 10, "can_bus_count": 1, "trailing_flag": True},
+        )
+        # Hostile deep nesting never raises RecursionError.
+        deep = "{a: " * 200 + "1" + "}" * 200
+        self.assertEqual(session_report.scalars(deep), {})
+
+        # Single active bus (can_bus_count: 1, rio in slot 0) with unused
+        # all-zero slots 1..3: slot 0 metrics are preserved across samples.
+        def status_record(t, bus_count, buses):
+            decoded = (
+                f"{{states_received_count: {t + 1}, can_bus_count: {bus_count}, "
+                "gateway_program: ROBORIO, "
+                f"can_buses: [{', '.join(buses)}]}}"
+            )
+            return dict(process="hardware_node", kind="SEND", topic="/hw/status",
+                        now_ms=t, event_ms=t, publish_ms=t, decoded=decoded)
+
+        bus0_s1 = (
+            "{utilization_frac: 0.42, bus_off_count: 5, "
+            "transmit_buffer_full_count: 2, read_failure_count: 1, "
+            "receive_error_count: 3, transmit_error_count: 4, read_state: OK}"
+        )
+        bus0_s2 = (
+            "{utilization_frac: 0.65, bus_off_count: 7, "
+            "transmit_buffer_full_count: 3, read_failure_count: 2, "
+            "receive_error_count: 1, transmit_error_count: 6, read_state: OK}"
+        )
+        records = [
+            status_record(0, 1, [bus0_s1, zero_bus, zero_bus, zero_bus]),
+            status_record(20, 1, [bus0_s2, zero_bus, zero_bus, zero_bus]),
+        ]
+        report = session_report.analyze({"nodes": []}, records)
+        st = report["status"]
+        self.assertEqual(st["can_bus_count"]["last"], 1)
+        self.assertNotIn("delta", st["can_bus_count"])
+        self.assertAlmostEqual(st["can_buses[0].utilization_frac"]["first"], 0.42)
+        self.assertAlmostEqual(st["can_buses[0].utilization_frac"]["last"], 0.65)
+        self.assertAlmostEqual(st["can_buses[0].utilization_frac"]["max"], 0.65)
+        self.assertEqual(st["can_buses[0].bus_off_count"]["first"], 5)
+        self.assertEqual(st["can_buses[0].bus_off_count"]["last"], 7)
+        self.assertEqual(st["can_buses[0].bus_off_count"]["delta"], 2)
+        self.assertEqual(st["can_buses[0].transmit_buffer_full_count"]["last"], 3)
+        self.assertEqual(st["can_buses[0].transmit_buffer_full_count"]["delta"], 1)
+        self.assertEqual(st["can_buses[0].read_failure_count"]["last"], 2)
+        self.assertEqual(st["can_buses[0].read_failure_count"]["delta"], 1)
+        self.assertEqual(st["can_buses[0].receive_error_count"]["first"], 3)
+        self.assertEqual(st["can_buses[0].receive_error_count"]["last"], 1)
+        self.assertEqual(st["can_buses[0].transmit_error_count"]["first"], 4)
+        self.assertEqual(st["can_buses[0].transmit_error_count"]["last"], 6)
+        # Unused slots 1..3 and un-scoped bare keys must not appear.
+        for bare in ("utilization_frac", "bus_off_count",
+                     "transmit_buffer_full_count", "read_failure_count",
+                     "receive_error_count", "transmit_error_count"):
+            self.assertNotIn(bare, st)
+        for slot in (1, 2, 3):
+            self.assertNotIn(f"can_buses[{slot}].utilization_frac", st)
+            self.assertNotIn(f"can_buses[{slot}].bus_off_count", st)
+
+        # Two active buses (rio + CANivore) with unused slots 2..3 preserve
+        # both buses independently.
+        bus1 = (
+            "{utilization_frac: 0.18, bus_off_count: 1, "
+            "transmit_buffer_full_count: 0, read_failure_count: 0, "
+            "receive_error_count: 2, transmit_error_count: 0, read_state: OK}"
+        )
+        two_bus_report = session_report.analyze(
+            {"nodes": []},
+            [status_record(0, 2, [bus0_s1, bus1, zero_bus, zero_bus])],
+        )
+        st2 = two_bus_report["status"]
+        self.assertAlmostEqual(st2["can_buses[0].utilization_frac"]["last"], 0.42)
+        self.assertEqual(st2["can_buses[0].bus_off_count"]["last"], 5)
+        self.assertAlmostEqual(st2["can_buses[1].utilization_frac"]["last"], 0.18)
+        self.assertEqual(st2["can_buses[1].bus_off_count"]["last"], 1)
+        self.assertNotIn("can_buses[2].utilization_frac", st2)
+        self.assertNotIn("can_buses[3].utilization_frac", st2)
+
 
 if __name__ == "__main__":
     unittest.main()
