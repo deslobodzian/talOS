@@ -1,6 +1,7 @@
 // Field panel tests: the pure geometry helpers (ellipse from stds, staleness
-// fade, follow viewport, zoom), config parsing, and the rendered camera layer
-// when a camera's uncertainty or heading is missing.
+// fade, follow viewport, zoom), config parsing, the rendered camera layer
+// when a camera's uncertainty or heading is missing, recorded channel
+// filtering, and series window bounds.
 
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
@@ -10,7 +11,10 @@ import {renderToStaticMarkup} from 'react-dom/server';
 
 import type {Snapshot} from '../src/core';
 import {chassisReading} from '../src/data/freshness';
+import {RecordedSource, type ReviewClock} from '../src/data/recorded';
+import type {FetchLike, ReviewBounds} from '../src/data/review';
 import {createStaticStudio, type Studio, StudioProvider} from '../src/data/studio';
+import type {ChannelInfo} from '../src/data/types';
 import {fieldPanel} from '../src/panels/field';
 import {
   FIELD_HEIGHT_PX,
@@ -85,6 +89,9 @@ test('field config parsing falls back field by field', () => {
   assert.equal(parsed.layers.velocity, true);  // non-bool falls back
   assert.equal(parsed.trailSeconds, 0.5);      // clamped to a positive floor
   assert.equal(parsed.follow, true);
+  assert.equal(fieldPanel.parseConfig({trailSeconds: 1e300}).trailSeconds, 3600);
+  assert.equal(fieldPanel.parseConfig({trailSeconds: Infinity}).trailSeconds,
+               fieldPanel.defaultConfig.trailSeconds);
 });
 
 // --- rendering --------------------------------------------------------------
@@ -193,4 +200,153 @@ test('camera position survives missing uncertainty and heading without inventing
                (missing.match(/<path\b/g) ?? []).length, 1);
   assert.equal((complete.match(/<circle\b/g) ?? []).length,
                (missing.match(/<circle\b/g) ?? []).length);
+});
+
+// --- recorded playback & window bounds --------------------------------------
+
+const REVIEW_SERVER = 'http://review.test';
+const REVIEW_BOUNDS: ReviewBounds = {
+  start_ns: '1000000000',
+  end_ns: '11000000000',
+  origin_wall_ns: '0',
+  max_series_values: 262_144,
+  max_series_channels: 256,
+  gaps: []
+};
+const STATIC_CLOCK: ReviewClock = {now: () => 0, every: () => () => {}};
+
+function seriesBuffer(columns: {
+  t: number[]; min: number[]; max: number[]; last: number[]; count: number[];
+}[]): ArrayBuffer {
+  const buckets = columns[0]?.t.length ?? 0;
+  const view = new DataView(new ArrayBuffer(8 + columns.length * buckets * 36));
+  view.setUint32(0, columns.length, true);
+  view.setUint32(4, buckets, true);
+  let at = 8;
+  for (const c of columns) {
+    for (const column of [c.t, c.min, c.max, c.last])
+      for (const v of column) view.setFloat64((at += 8) - 8, v, true);
+    for (const v of c.count) view.setUint32((at += 4) - 4, v, true);
+  }
+  return view.buffer;
+}
+
+const flush = async () => {
+  await new Promise<void>(resolve => setImmediate(resolve));
+  await new Promise<void>(resolve => setImmediate(resolve));
+};
+
+test('recorded field panel filters absent sim/camera channels and survives minimal cameras', async () => {
+  // Real-robot recording: no sim/state/pose/* channels, and a minimal camera
+  // declaring only the discovery triad (pose/x_m, x_std_m, tag_count)
+  // without pose/y_m or valid.
+  const names = [
+    `${POSE_EST}/pose/x_m`,
+    `${POSE_EST}/pose/y_m`,
+    `${POSE_EST}/pose/yaw_rad`,
+    `${POSE_EST}/valid`,
+    `${POSE_EST}/observation_accepted_count`,
+    `${CAM('front_camera')}/pose/x_m`,
+    `${CAM('front_camera')}/x_std_m`,
+    `${CAM('front_camera')}/tag_count`
+  ];
+  const present = new Set(names);
+  const channels: ChannelInfo[] = names.map(name => ({name, unit: '', labels: []}));
+  const requestedChannels: string[] = [];
+
+  const fetchFn: FetchLike = async url => {
+    const parsed = new URL(url);
+    if (parsed.pathname.endsWith('/snapshot')) {
+      const tNs = parsed.searchParams.get('t_ns') ?? REVIEW_BOUNDS.start_ns;
+      return new Response(JSON.stringify({
+        t_ns: tNs,
+        channels: {
+          [`${POSE_EST}/pose/x_m`]: {value: 2, sample_ns: tNs},
+          [`${POSE_EST}/pose/y_m`]: {value: 3, sample_ns: tNs},
+          [`${POSE_EST}/pose/yaw_rad`]: {value: 0.2, sample_ns: tNs},
+          [`${POSE_EST}/valid`]: {value: 1, sample_ns: tNs},
+          [`${CAM('front_camera')}/pose/x_m`]: {value: 2.1, sample_ns: tNs}
+        }
+      }), {status: 200});
+    }
+    if (parsed.pathname.endsWith('/series')) {
+      const cols = (parsed.searchParams.get('c') ?? '').split(',').filter(Boolean);
+      requestedChannels.push(...cols);
+      if (cols.some(c => !present.has(c))) {
+        return new Response('unknown channel', {status: 404});
+      }
+      const t = Number(REVIEW_BOUNDS.start_ns) + 2_000_000_000;
+      return new Response(seriesBuffer(cols.map(() => (
+          {t: [t], min: [2], max: [2], last: [2], count: [1]}))), {status: 200});
+    }
+    return new Response('not found', {status: 404});
+  };
+
+  const recorded = new RecordedSource(
+      REVIEW_SERVER, 'real-robot', channels, REVIEW_BOUNDS, fetchFn, STATIC_CLOCK);
+  recorded.seek('3000000000');
+  const studio = createStaticStudio();
+  studio.openRecorded(recorded);
+  try {
+    // First render queues series fetches for present channels only.
+    renderField(studio);
+    await flush();
+    // Second render reads the fetched camera series (px populated, py/valid absent).
+    const html = renderField(studio);
+    assert.ok(requestedChannels.length > 0);
+    for (const c of requestedChannels) {
+      assert.ok(present.has(c), `requested channel absent from dictionary: ${c}`);
+    }
+    assert.ok(requestedChannels.includes(`${POSE_EST}/pose/x_m`));
+    assert.ok(requestedChannels.includes(`${CAM('front_camera')}/pose/x_m`));
+    assert.equal(recorded.error, '');
+    assert.match(html, /X 2\.000 m/);
+  } finally {
+    studio.closeRecorded();
+  }
+});
+
+test('RecordedSource.series guards huge and NaN window seconds against BigInt overflow', async () => {
+  const ranges: {start: bigint; end: bigint}[] = [];
+  const fetchFn: FetchLike = async url => {
+    const parsed = new URL(url);
+    if (parsed.pathname.endsWith('/snapshot')) {
+      return new Response(JSON.stringify({
+        t_ns: parsed.searchParams.get('t_ns') ?? REVIEW_BOUNDS.start_ns,
+        channels: {}
+      }), {status: 200});
+    }
+    if (parsed.pathname.endsWith('/series')) {
+      ranges.push({
+        start: BigInt(parsed.searchParams.get('start_ns')!),
+        end: BigInt(parsed.searchParams.get('end_ns')!)
+      });
+      return new Response(seriesBuffer([
+        {t: [5_000_000_000], min: [42], max: [42], last: [42], count: [1]}
+      ]), {status: 200});
+    }
+    return new Response('not found', {status: 404});
+  };
+
+  const recorded = new RecordedSource(
+      REVIEW_SERVER, 'window-bounds', [{name: 'x', unit: '', labels: []}],
+      REVIEW_BOUNDS, fetchFn, STATIC_CLOCK);
+  try {
+    const huge = recorded.series(['x'], {seconds: 1e300}, '6000000000');
+    const nanWin = recorded.series(['x'], {seconds: NaN}, '6000000000');
+    assert.equal(huge.t0_ns, REVIEW_BOUNDS.start_ns);
+    assert.equal(nanWin.t0_ns, REVIEW_BOUNDS.start_ns);
+    await flush();
+    const hugeAfter = recorded.series(['x'], {seconds: 1e300}, '6000000000');
+    assert.equal(recorded.error, '');
+    assert.equal(ranges.length, 2);
+    const startBound = BigInt(REVIEW_BOUNDS.start_ns);
+    const endBound = BigInt(REVIEW_BOUNDS.end_ns);
+    for (const r of ranges) {
+      assert.ok(r.start >= startBound && r.start <= r.end && r.end <= endBound);
+    }
+    assert.deepEqual([...hugeAfter.values.x], [42]);
+  } finally {
+    recorded.close();
+  }
 });

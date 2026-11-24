@@ -1,6 +1,7 @@
 #include "talOS/vision/metal/metal_apriltag_backend.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -27,6 +28,7 @@ extern "C" {
 }
 
 #if defined(__APPLE__)
+#include <unistd.h>
 #define NS_PRIVATE_IMPLEMENTATION
 #define MTL_PRIVATE_IMPLEMENTATION
 #include <Foundation/Foundation.hpp>
@@ -152,6 +154,29 @@ bool ComputeValidatedStride(int width, int height, int stride,
   return true;
 }
 
+const talos::vision::apriltag::DetectorOptions& ValidateDetectorOptions(
+    const talos::vision::apriltag::DetectorOptions& opts) {
+  if (opts.threads < 1) {
+    throw std::invalid_argument("AprilTag threads must be >= 1");
+  }
+  if (!std::isfinite(opts.quad_decimate) || opts.quad_decimate <= 0.0f ||
+      opts.quad_decimate >= 32768.0f) {
+    throw std::invalid_argument(
+        "AprilTag quad_decimate must be finite and in (0, 32768)");
+  }
+  if (!std::isfinite(opts.quad_sigma) || std::fabs(opts.quad_sigma) > 64.0f) {
+    throw std::invalid_argument(
+        "AprilTag quad_sigma must be finite with |quad_sigma| <= 64");
+  }
+  if (!std::isfinite(opts.decode_sharpening)) {
+    throw std::invalid_argument("AprilTag decode_sharpening must be finite");
+  }
+  if (opts.max_hamming < 0 || opts.max_hamming > 3) {
+    throw std::invalid_argument("AprilTag max_hamming must be in [0, 3]");
+  }
+  return opts;
+}
+
 }  // namespace
 
 struct MetalAprilTagBackend::Impl {
@@ -201,12 +226,12 @@ struct MetalAprilTagBackend::Impl {
 #endif
 
   explicit Impl(const talos::vision::apriltag::DetectorOptions& opts)
-      : options{opts},
+      : options{ValidateDetectorOptions(opts)},
         cpu_backend{
             std::make_unique<talos::vision::apriltag::CpuAprilTagBackend>(
-                opts)} {
+                options)} {
     compute_cpu_backend =
-        std::make_unique<talos::vision::CpuAprilTagBackend>(opts);
+        std::make_unique<talos::vision::CpuAprilTagBackend>(options);
     InitDetector();
     InitMetal();
   }
@@ -217,19 +242,26 @@ struct MetalAprilTagBackend::Impl {
   }
 
   void InitDetector() {
-    tf = talos::vision::apriltag::CreateTagFamily(options.family_name);
-    if (tf == nullptr) {
+    apriltag_family_t* next_tf =
+        talos::vision::apriltag::CreateTagFamily(options.family_name);
+    if (next_tf == nullptr) {
       throw std::invalid_argument("Unsupported AprilTag family: " +
                                   options.family_name);
     }
+    apriltag_detector_t* next_td = apriltag_detector_create();
+    if (next_td == nullptr) {
+      talos::vision::apriltag::DestroyTagFamily(options.family_name, next_tf);
+      throw std::runtime_error("Failed to create AprilTag detector");
+    }
+    apriltag_detector_add_family_bits(next_td, next_tf, options.max_hamming);
+    next_td->nthreads = options.threads;
+    next_td->quad_decimate = options.quad_decimate;
+    next_td->quad_sigma = options.quad_sigma;
+    next_td->refine_edges = options.refine_edges ? 1 : 0;
+    next_td->decode_sharpening = options.decode_sharpening;
+    tf = next_tf;
+    td = next_td;
     active_family = options.family_name;
-    td = apriltag_detector_create();
-    apriltag_detector_add_family_bits(td, tf, options.max_hamming);
-    td->nthreads = options.threads;
-    td->quad_decimate = options.quad_decimate;
-    td->quad_sigma = options.quad_sigma;
-    td->refine_edges = options.refine_edges ? 1 : 0;
-    td->decode_sharpening = options.decode_sharpening;
   }
 
   void DestroyDetector() {
@@ -348,6 +380,7 @@ struct MetalAprilTagBackend::Impl {
 
   void SetOptions(const talos::vision::apriltag::DetectorOptions& opts) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
+    ValidateDetectorOptions(opts);
     auto next_compute_cpu =
         std::make_unique<talos::vision::CpuAprilTagBackend>(opts);
     apriltag_family_t* next_tf =
@@ -356,24 +389,32 @@ struct MetalAprilTagBackend::Impl {
       throw std::invalid_argument("Unsupported AprilTag family: " +
                                   opts.family_name);
     }
+    apriltag_detector_t* next_td = apriltag_detector_create();
+    if (next_td == nullptr) {
+      talos::vision::apriltag::DestroyTagFamily(opts.family_name, next_tf);
+      throw std::runtime_error("Failed to create AprilTag detector");
+    }
+    apriltag_detector_add_family_bits(next_td, next_tf, opts.max_hamming);
+    next_td->nthreads = opts.threads;
+    next_td->quad_decimate = opts.quad_decimate;
+    next_td->quad_sigma = opts.quad_sigma;
+    next_td->refine_edges = opts.refine_edges ? 1 : 0;
+    next_td->decode_sharpening = opts.decode_sharpening;
+    std::string next_family = opts.family_name;
+    talos::vision::apriltag::DetectorOptions next_options = opts;
     try {
       cpu_backend->SetOptions(opts);
     } catch (...) {
+      apriltag_detector_destroy(next_td);
       talos::vision::apriltag::DestroyTagFamily(opts.family_name, next_tf);
       throw;
     }
     DestroyDetector();
-    options = opts;
+    options = std::move(next_options);
     compute_cpu_backend = std::move(next_compute_cpu);
     tf = next_tf;
-    active_family = opts.family_name;
-    td = apriltag_detector_create();
-    apriltag_detector_add_family_bits(td, tf, options.max_hamming);
-    td->nthreads = options.threads;
-    td->quad_decimate = options.quad_decimate;
-    td->quad_sigma = options.quad_sigma;
-    td->refine_edges = options.refine_edges ? 1 : 0;
-    td->decode_sharpening = options.decode_sharpening;
+    td = next_td;
+    active_family = std::move(next_family);
   }
 
   std::vector<talos::vision::apriltag::Detection> CpuDetect(
@@ -450,7 +491,11 @@ struct MetalAprilTagBackend::Impl {
 
     MTL::Buffer* in_buf = nullptr;
     bool in_buf_needs_release = false;
-    if (reinterpret_cast<uintptr_t>(data) % 4096 == 0) {
+    const int raw_page_size = getpagesize();
+    const size_t page_size =
+        (raw_page_size > 0) ? static_cast<size_t>(raw_page_size) : size_t{0};
+    if (page_size > 0 && (reinterpret_cast<uintptr_t>(data) % page_size == 0) &&
+        in_bytes > 0 && (in_bytes % page_size == 0)) {
       in_buf = device->newBuffer(data, in_bytes, MTL::ResourceStorageModeShared,
                                  nullptr);
       if (in_buf != nullptr) {
@@ -779,6 +824,9 @@ struct MetalAprilTagBackend::Impl {
     if (!device || !cmd_buf || !gray_buf || width == 0 || height == 0) {
       return false;
     }
+    if (stride > 0 && stride < width) {
+      return false;
+    }
     if (!pso_tile_min_max_4x4 || !pso_tile_blur_and_threshold) {
       return false;
     }
@@ -786,6 +834,16 @@ struct MetalAprilTagBackend::Impl {
     std::lock_guard<std::recursive_mutex> lock(mutex);
 
     const uint32_t actual_stride = (stride > 0) ? stride : width;
+    if (static_cast<size_t>(actual_stride) >
+        std::numeric_limits<size_t>::max() / static_cast<size_t>(height)) {
+      return false;
+    }
+    const size_t thresh_bytes =
+        static_cast<size_t>(actual_stride) * static_cast<size_t>(height);
+    if (gray_buf->length() < thresh_bytes ||
+        (thresh_buf != nullptr && thresh_buf->length() < thresh_bytes)) {
+      return false;
+    }
     const uint32_t tw = width / 4;
     const uint32_t th = height / 4;
     if (tw == 0 || th == 0) {
@@ -796,13 +854,12 @@ struct MetalAprilTagBackend::Impl {
     MTL::Buffer* im_min_buf = cached_im_min.Ensure(device, min_max_bytes);
     MTL::Buffer* im_max_buf = cached_im_max.Ensure(device, min_max_bytes);
 
-    const size_t thresh_bytes = static_cast<size_t>(actual_stride) * height;
     MTL::Buffer* out_thresh = (thresh_buf != nullptr)
                                   ? thresh_buf
                                   : cached_thresh.Ensure(device, thresh_bytes);
     if (!gray_buf->contents() || !im_min_buf || !im_min_buf->contents() ||
         !im_max_buf || !im_max_buf->contents() || !out_thresh ||
-        !out_thresh->contents()) {
+        !out_thresh->contents() || out_thresh->length() < thresh_bytes) {
       return false;
     }
 

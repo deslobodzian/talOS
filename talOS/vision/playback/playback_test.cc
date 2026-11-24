@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cfenv>
 #include <chrono>
 #include <condition_variable>
@@ -19,6 +20,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -511,6 +513,243 @@ TEST(RecordedCameraSourceTest, LargeTimestampsDoNotOverflowInt64) {
   }
   rt_source.Stop();
   EXPECT_FALSE(rt_source.IsRunning());
+}
+
+void WriteSolidGrayFrame(const std::filesystem::path& dir,
+                         const std::string& file, int width, int height,
+                         std::uint8_t value) {
+  const cv::Mat image(height, width, CV_8UC1, cv::Scalar(value));
+  ASSERT_TRUE(cv::imwrite((dir / file).string(), image));
+}
+
+TEST(RecordedCameraSourceTest, FrameCallbackStartReturnsFalseCleanly) {
+  constexpr int kSmallW = 16;
+  constexpr int kSmallH = 16;
+  const auto dir = NewDirectory("frame_cb_start");
+  WriteSolidGrayFrame(dir, "0.png", kSmallW, kSmallH, 42);
+  WriteSolidGrayFrame(dir, "1.png", kSmallW, kSmallH, 84);
+  WriteTimeline(dir, "0.png,0\n1.png,5000000\n");
+
+  CameraSourceConfig config;
+  config.device_path = dir.string();
+  config.width = kSmallW;
+  config.height = kSmallH;
+  config.fps = 200.0;
+
+  // Realtime mode: calling Start() from FrameCallback must fail cleanly
+  // without freeing sequence_ or corrupting playback pixels.
+  {
+    RecordedCameraSource source(config,
+                                RecordedCameraSource::Pacing::kRealtime);
+    std::mutex mu;
+    std::condition_variable cv;
+    int frames = 0;
+    bool restart_ok = true;
+    bool restart_after_stop_ok = true;
+    bool saw_error = false;
+    bool disconnected = false;
+    source.SetConnectionCallback([&](ConnectionState state, std::string_view) {
+      std::lock_guard lock(mu);
+      if (state == ConnectionState::kError) saw_error = true;
+      if (state == ConnectionState::kDisconnected) {
+        disconnected = true;
+        cv.notify_one();
+      }
+    });
+    source.SetFrameCallback([&](const Frame& frame) {
+      ASSERT_EQ(frame.width(), static_cast<uint32_t>(kSmallW));
+      ASSERT_EQ(frame.height(), static_cast<uint32_t>(kSmallH));
+      ASSERT_NE(frame.data(), nullptr);
+      ASSERT_EQ(frame.size(), static_cast<size_t>(kSmallW) * kSmallH);
+      int idx = 0;
+      {
+        std::lock_guard lock(mu);
+        idx = frames++;
+      }
+      if (idx == 0) {
+        const bool ok = source.Start();
+        std::lock_guard lock(mu);
+        restart_ok = ok;
+      }
+    });
+    ASSERT_TRUE(source.Start());
+    {
+      std::unique_lock lock(mu);
+      ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds{10},
+                              [&] { return disconnected; }));
+    }
+    source.Stop();
+    EXPECT_FALSE(restart_ok);
+    EXPECT_TRUE(saw_error);
+    EXPECT_GE(frames, 1);
+
+    // Even after calling Stop() inside FrameCallback, Start() inside the same
+    // FrameCallback must still return false.
+    bool got_frame = false;
+    source.SetConnectionCallback({});
+    source.SetFrameCallback([&](const Frame&) {
+      source.Stop();
+      const bool ok = source.Start();
+      {
+        std::lock_guard lock(mu);
+        restart_after_stop_ok = ok;
+        got_frame = true;
+      }
+      cv.notify_one();
+    });
+    ASSERT_TRUE(source.Start());
+    {
+      std::unique_lock lock(mu);
+      ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds{10},
+                              [&] { return got_frame; }));
+    }
+    source.Stop();
+    EXPECT_FALSE(restart_after_stop_ok);
+    EXPECT_FALSE(source.IsRunning());
+  }
+
+  // Manual mode: calling Start() inside FrameCallback returns false and leaves
+  // the current sequence intact for subsequent frames.
+  {
+    RecordedCameraSource source(config, RecordedCameraSource::Pacing::kManual);
+    int frames = 0;
+    bool restart_ok = true;
+    source.SetFrameCallback([&](const Frame& frame) {
+      EXPECT_EQ(frame.size(), static_cast<size_t>(kSmallW) * kSmallH);
+      if (frames++ == 0) {
+        restart_ok = source.Start();
+      }
+    });
+    ASSERT_TRUE(source.Start());
+    EXPECT_EQ(source.DeliverUntil(1'000'000), 1u);
+    EXPECT_FALSE(restart_ok);
+    EXPECT_EQ(source.DeliverUntil(6'000'000), 1u);
+    EXPECT_EQ(frames, 2);
+    source.Stop();
+  }
+}
+
+TEST(RecordedCameraSourceTest,
+     ConcurrentStartStopCurrentModeAndFrameCountAreSafe) {
+  constexpr int kSmallW = 16;
+  constexpr int kSmallH = 16;
+  const auto dir = NewDirectory("concurrent_lifecycle");
+  WriteSolidGrayFrame(dir, "0.png", kSmallW, kSmallH, 10);
+  WriteSolidGrayFrame(dir, "1.png", kSmallW, kSmallH, 20);
+  WriteTimeline(dir, "0.png,0\n1.png,10000000\n");
+
+  CameraSourceConfig config;
+  config.device_path = dir.string();
+  config.width = 0;
+  config.height = 0;
+  config.fps = 100.0;
+  RecordedCameraSource source(config, RecordedCameraSource::Pacing::kRealtime);
+
+  std::atomic<int> frames_seen{0};
+  source.SetFrameCallback([&](const Frame& frame) {
+    if (frame.data() != nullptr && frame.size() > 0) {
+      frames_seen.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+
+  std::atomic<bool> done{false};
+  std::thread observer([&] {
+    while (!done.load(std::memory_order_acquire)) {
+      const CameraMode mode = source.CurrentMode();
+      EXPECT_TRUE(mode.width == 0u ||
+                  mode.width == static_cast<uint32_t>(kSmallW));
+      EXPECT_TRUE(mode.height == 0u ||
+                  mode.height == static_cast<uint32_t>(kSmallH));
+      const std::size_t count = source.frame_count();
+      EXPECT_TRUE(count == 0u || count == 2u);
+      (void)source.IsRunning();
+      (void)source.IsConnected();
+      std::this_thread::yield();
+    }
+  });
+
+  auto lifecycle_worker = [&](bool stop_every_other) {
+    for (int i = 0; i < 20; ++i) {
+      EXPECT_TRUE(source.Start());
+      if (!stop_every_other || (i % 2 == 0)) {
+        source.Stop();
+      }
+    }
+  };
+
+  std::thread t1(lifecycle_worker, false);
+  std::thread t2(lifecycle_worker, true);
+  t1.join();
+  t2.join();
+  done.store(true, std::memory_order_release);
+  observer.join();
+
+  source.Stop();
+  EXPECT_FALSE(source.IsRunning());
+  EXPECT_FALSE(source.IsConnected());
+}
+
+TEST(RecordedCameraSourceTest, FrameCallbackStopHaltsBeforeDecodingNextFrame) {
+  constexpr int kSmallW = 16;
+  constexpr int kSmallH = 16;
+  const auto dir = NewDirectory("stop_before_next_decode");
+  WriteSolidGrayFrame(dir, "0.png", kSmallW, kSmallH, 64);
+  // Corrupt second frame: if Play() or DeliverUntil() tries to decode frame 1
+  // after FrameCallback calls Stop(), Decode() will fail and increment
+  // dropped_frames().
+  std::ofstream(dir / "1.png") << "not a valid png";
+  WriteTimeline(dir, "0.png,0\n1.png,10000000000\n");
+
+  CameraSourceConfig config;
+  config.device_path = dir.string();
+  config.width = kSmallW;
+  config.height = kSmallH;
+  config.fps = 30.0;
+
+  // Realtime mode.
+  {
+    RecordedCameraSource source(config,
+                                RecordedCameraSource::Pacing::kRealtime);
+    std::mutex mu;
+    std::condition_variable cv;
+    int delivered = 0;
+    source.SetFrameCallback([&](const Frame&) {
+      source.Stop();
+      {
+        std::lock_guard lock(mu);
+        ++delivered;
+      }
+      cv.notify_one();
+    });
+    ASSERT_TRUE(source.Start());
+    {
+      std::unique_lock lock(mu);
+      ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds{10},
+                              [&] { return delivered >= 1; }));
+    }
+    source.Stop();
+    EXPECT_EQ(delivered, 1);
+    EXPECT_EQ(source.dropped_frames(), 0u);
+    EXPECT_FALSE(source.IsRunning());
+    EXPECT_FALSE(source.IsConnected());
+  }
+
+  // Manual mode: both frames are due in one DeliverUntil() call.
+  {
+    WriteTimeline(dir, "0.png,0\n1.png,10000000\n");
+    RecordedCameraSource source(config, RecordedCameraSource::Pacing::kManual);
+    int delivered = 0;
+    source.SetFrameCallback([&](const Frame&) {
+      ++delivered;
+      source.Stop();
+    });
+    ASSERT_TRUE(source.Start());
+    EXPECT_EQ(source.DeliverUntil(100'000'000), 1u);
+    EXPECT_EQ(delivered, 1);
+    EXPECT_EQ(source.dropped_frames(), 0u);
+    EXPECT_FALSE(source.IsRunning());
+    EXPECT_FALSE(source.IsConnected());
+  }
 }
 
 }  // namespace

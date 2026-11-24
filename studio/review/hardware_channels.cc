@@ -135,7 +135,9 @@ void FlattenHardware(std::string_view topic,
   std::string prefix{topic};
   if (prefix.starts_with('/')) prefix.erase(0, 1);
   for (const auto& [key, member] : decoded.items()) {
-    if (key == "type") continue;
+    // `type` is the JSON discriminator; `gateway_build_id` is a string when
+    // known and null when revision == 0, never a numeric channel.
+    if (key == "type" || key == "gateway_build_id") continue;
     Flatten(member, prefix + "/" + key, out);
   }
 }
