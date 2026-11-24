@@ -261,6 +261,29 @@ class PositionRawPyTest(unittest.TestCase):
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         self.assertEqual(self.state().homing, PositionRawPyHoming.FAILED)
 
+        # Recover by disabling, leave the switch and drive past
+        # HOME_MARGIN_ROT, then drop the zero (motor reset) at a non-zero
+        # position with the switch stuck closed: the second zero must
+        # enforce HOME_MARGIN_ROT again.
+        self.set_home(False)
+        self.hw.set_driver_station(teleop=True)  # disabled
+        self.sim.step(0.04)
+        self.teleop()
+        self.hold(1.0, 0.06)
+        self.assertEqual(self.mode(), talos.Mode.MOTION_MAGIC)
+        self.assertAlmostEqual(self.state().position_rot, 1.0, places=9)
+
+        self.set_home(True)
+        self.hw.reset_device("position_raw_py", "position_raw_py")
+        self.sim.step(0.08)  # past masked reset states; re-zeroes on switch
+        self.assertEqual(self.state().homing, PositionRawPyHoming.HOMED)
+        for _ in range(10):
+            self.hold(1.5, 0.02)
+            demand = self.hw.motor_request("position_raw_py", "position_raw_py").demand
+            self.assertLessEqual(demand, 2.9 + 0.15 + 1e-9)
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        self.assertEqual(self.state().homing, PositionRawPyHoming.FAILED)
+
     # REQ-DEV-01: off the switch, a goal past either end of the travel
     # demands that end, MAX_ROT (2.0) or 0.
     def test_goal_outside_the_travel_clamps_to_it(self):
