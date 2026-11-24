@@ -1253,6 +1253,15 @@ StrictReport RunStrictReport(const rules_cc::cc::runfiles::Runfiles& runfiles,
 // alpha (TODO.md RT-7). The bridge and beta are stubs that lose nothing.
 // REQ-OPS-43, REQ-RT-19
 TEST(Supervision, AWakeLostOnAByteTopicFailsTheStrictReport) {
+#if defined(__SANITIZE_ADDRESS__)
+  GTEST_SKIP() << "ASan runtime calls pipe() while byte_wake_loss exhausts "
+                  "RLIMIT_NOFILE";
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+  GTEST_SKIP() << "ASan runtime calls pipe() while byte_wake_loss exhausts "
+                  "RLIMIT_NOFILE";
+#endif
+#endif
   auto options = BaseOptions("byte_wake_loss");
   options.max_restarts = 0;
   options.duration_s = kHangSeconds;
