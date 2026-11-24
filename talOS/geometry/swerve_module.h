@@ -39,8 +39,7 @@ inline SwerveModuleSetpoint OptimizeSwerveModule(double speed,
   bool reversed = false;
   if (std::abs(delta) > std::numbers::pi / 2.0) {
     speed = -speed;
-    delta = std::atan2(std::sin(delta + std::numbers::pi),
-                       std::cos(delta + std::numbers::pi));
+    delta = delta > 0.0 ? delta - std::numbers::pi : delta + std::numbers::pi;
     reversed = true;
   }
   return {speed * std::max(0.0, std::cos(delta)), delta, reversed};

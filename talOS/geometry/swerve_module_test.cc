@@ -33,6 +33,15 @@ TEST(OptimizeSwerveModule, QuarterTurnIsTheFlipBoundary) {
     EXPECT_NEAR(past.steer_delta_rad, -sign * (kQuarter - 1e-6), kTight);
     EXPECT_LT(past.speed, 0.0);
     EXPECT_NEAR(past.speed, -2.0 * std::sin(1e-6), kTight);
+
+    const auto next_past = OptimizeSwerveModule(
+        2.0,
+        sign *
+            std::nextafter(kQuarter, std::numeric_limits<double>::infinity()),
+        0.0);
+    EXPECT_TRUE(next_past.reversed);
+    EXPECT_LE(std::abs(next_past.steer_delta_rad), kQuarter);
+    EXPECT_LE(next_past.speed, 0.0);
   }
 }
 
@@ -129,7 +138,7 @@ TEST(OptimizeSwerveModule, PropertySweepMaintainsQuarterTurnAndHeading) {
     const auto sp = OptimizeSwerveModule(speed, asked, measured);
     ASSERT_TRUE(std::isfinite(sp.speed));
     ASSERT_TRUE(std::isfinite(sp.steer_delta_rad));
-    EXPECT_LE(std::abs(sp.steer_delta_rad), kQuarter + 1e-12);
+    EXPECT_LE(std::abs(sp.steer_delta_rad), kQuarter);
     const double effective_heading =
         measured + sp.steer_delta_rad + (sp.reversed ? kPi : 0.0);
     EXPECT_NEAR(SO2<double>(effective_heading).boxminus(SO2<double>(asked)),

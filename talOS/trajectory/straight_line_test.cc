@@ -192,6 +192,29 @@ TEST(StraightLineTest, PureRotationTurnsTheShortWayAcrossPi) {
   EXPECT_LT(AngleDistance(line.final_pose().angle(), -3.0), 1e-12);
 }
 
+// Guards: a turn of exactly pi (given as +pi or -pi) turns CCW (positive
+// omega throughout) and lands at start.angle() + pi.
+// REQ-DEV-20
+TEST(StraightLineTest, ExactPiTurnsCounterClockwise) {
+  for (const double end_heading : {kPi, -kPi}) {
+    SCOPED_TRACE(end_heading);
+    const Trajectory line =
+        Line(MakePose(2, 3, 0.0), MakePose(2, 3, end_heading));
+    EXPECT_NEAR(line.total_time_s(), kPi / 3.0 + 3.0 / 6.0, 1e-12);
+    double prev_heading = 0.0;
+    for (const double t_s : Times(0, line.total_time_s(), 1e-3)) {
+      const TrajectorySample s = line.sample(t_s);
+      ASSERT_EQ(s.x_m, 2.0) << "t = " << t_s;
+      ASSERT_EQ(s.y_m, 3.0) << "t = " << t_s;
+      ASSERT_GE(s.omega_radps, 0.0) << "t = " << t_s;
+      ASSERT_GE(s.heading_rad, prev_heading - 1e-12) << "t = " << t_s;
+      prev_heading = s.heading_rad;
+    }
+    EXPECT_GT(line.sample(0.5 * line.total_time_s()).omega_radps, 0.0);
+    EXPECT_NEAR(line.final_sample().heading_rad, kPi, 1e-12);
+  }
+}
+
 // Guards: start == end is one sample at rest at t = 0, not a refusal.
 // REQ-DEV-20
 TEST(StraightLineTest, ZeroLengthMoveIsOneSampleAtRest) {
@@ -231,6 +254,14 @@ TEST(StraightLineTest, RefusesInvalidInputAndClears) {
   };
   const std::vector<Case> cases = {
       {"nan start x", MakePose(kNan, 0, 0), goal, kLimits, kStraightLineSamples,
+       StraightLineError::kNonFinitePose},
+      {"infinite start y", MakePose(0, kInf, 0), goal, kLimits,
+       kStraightLineSamples, StraightLineError::kNonFinitePose},
+      {"nan start heading", MakePose(0, 0, kNan), goal, kLimits,
+       kStraightLineSamples, StraightLineError::kNonFinitePose},
+      {"infinite end x", origin, MakePose(-kInf, 1, 1), kLimits,
+       kStraightLineSamples, StraightLineError::kNonFinitePose},
+      {"nan end y", origin, MakePose(1, kNan, 1), kLimits, kStraightLineSamples,
        StraightLineError::kNonFinitePose},
       {"infinite end heading", origin, MakePose(1, 1, kInf), kLimits,
        kStraightLineSamples, StraightLineError::kNonFinitePose},
@@ -310,6 +341,46 @@ TEST(StraightLineTest, HugeLimitsAvoidDistanceAccelOverflow) {
     EXPECT_NEAR(out.sample(0.5 * expected_s).vx_mps, std::sqrt(0.5) * 1e160,
                 1e-12 * 1e160);
     EXPECT_DOUBLE_EQ(out.final_sample().x_m, 0.5e200);
+  }
+  {
+    // Non-limiting axis where at * at overflows to +inf.
+    Trajectory out;
+    out.reserve(kStraightLineSamples);
+    const StraightLineLimits fast_turn{1.0, 1.0, 1e160, 1e160};
+    const StraightLineResult result = MakeStraightLine(
+        MakePose(0.0, 0.0, 0.0), MakePose(10.0, 0.0, 1.0), fast_turn, out);
+    ASSERT_TRUE(result) << ToString(result.error);
+    EXPECT_NEAR(out.total_time_s(), 11.0, 1e-12);
+    EXPECT_NEAR(out.sample(5.5).omega_radps, 1.0 / 11.0, 1e-12);
+    EXPECT_DOUBLE_EQ(out.final_sample().heading_rad, 1.0);
+  }
+  {
+    // Non-limiting axis where both at * at and 4 * accel * distance overflow
+    // to +inf (inf - inf = NaN if unscaled).
+    Trajectory out;
+    out.reserve(kStraightLineSamples);
+    const StraightLineLimits slow_turn{1e160, 1e160, 1e-10, 1e-10};
+    const StraightLineResult result = MakeStraightLine(
+        MakePose(0.0, 0.0, 0.0), MakePose(1e160, 0.0, 1.0), slow_turn, out);
+    ASSERT_TRUE(result) << ToString(result.error);
+    const double expected_s = 1e10 + 1.0;
+    EXPECT_NEAR(out.total_time_s(), expected_s, 1e-12 * expected_s);
+    const double expected_v = 1e160 / expected_s;
+    EXPECT_NEAR(out.sample(0.5 * expected_s).vx_mps, expected_v,
+                1e-9 * expected_v);
+    EXPECT_DOUBLE_EQ(out.final_sample().x_m, 1e160);
+  }
+  {
+    // Non-limiting axis where at = accel * total_s itself overflows to +inf.
+    Trajectory out;
+    out.reserve(kStraightLineSamples);
+    const StraightLineLimits extreme_turn{1e160, 1e120, 1e280, 1e280};
+    const StraightLineResult result = MakeStraightLine(
+        MakePose(0.0, 0.0, 0.0), MakePose(2e200, 0.0, 1.0), extreme_turn, out);
+    ASSERT_TRUE(result) << ToString(result.error);
+    EXPECT_NEAR(out.total_time_s(), 3e40, 1e28);
+    EXPECT_NEAR(out.sample(1.5e40).omega_radps, 1.0 / 3e40, 1e-12 / 3e40);
+    EXPECT_DOUBLE_EQ(out.final_sample().heading_rad, 1.0);
   }
 }
 
