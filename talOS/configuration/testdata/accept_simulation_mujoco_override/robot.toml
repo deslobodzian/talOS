@@ -1,0 +1,4 @@
+include = "base/robot.toml"
+
+[simulation.mujoco]
+robot_model = "mujoco/robot.xml"

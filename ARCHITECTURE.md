@@ -449,7 +449,7 @@ so `bazel run //tools:sync_manifest -- <dir>/robot.toml` writes
 `<dir>/robot_manifest.bzl` (`<stem>_manifest.bzl` for any other config name):
 `NODES`, every node label the config launches, and `CONFIG_FILES`, every file
 it reads besides itself (`include`, `path`, `defaults`, `[trajectories]`
-files, `[studio] dashboard`). `talos_bundle`, which ships them at the same relative layout, and
+files, `[studio] dashboard`, `[simulation.mujoco]` model files). `talos_bundle`, which ships them at the same relative layout, and
 `talos_graph_test` take those constants; no BUILD file lists nodes or
 subsystem files. Each config package has a `manifest_sync_test`
 (`tools/sync_manifest.bzl`). `talos_bundle` additionally runs the same check as

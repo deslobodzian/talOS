@@ -1,0 +1,9 @@
+# robot.toml's robot_model replaces the include's whole model: the include's
+# robot_model_files go with its model, so neither is read or bundled.
+accept = true
+nodes = ["//a:node"]
+files = [
+    "base/a.toml",
+    "base/robot.toml",
+    "mujoco/robot.xml",
+]

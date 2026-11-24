@@ -286,6 +286,148 @@ void RequireStudioDashboard(const std::string& where, const std::string& path) {
   RequireRegularFile(where + ": [studio] dashboard", path);
 }
 
+// [simulation.mujoco] as set in `where` (the file that sets it, or "config"
+// for a parsed table): refuses an unknown key, a robot_model or
+// robot_model_files entry that is not a non-empty string, a
+// robot_model_files that is not an array, a field that is not a string or
+// names no known field model, and, when `refuse_absolute` (paths as written
+// in a file, before they are resolved), an absolute path.
+void CheckSimulationMujoco(const toml::table& mujoco, const std::string& where,
+                           bool refuse_absolute) {
+  const std::string table = where + ": [simulation.mujoco] ";
+  for (auto&& [k, v] : mujoco) {
+    if (k.str() != "robot_model" && k.str() != "robot_model_files" &&
+        k.str() != "field") {
+      throw std::invalid_argument(table + "unknown key '" +
+                                  std::string(k.str()) + "'");
+    }
+  }
+  const auto check_path = [&](const toml::node& node, const std::string& key) {
+    const auto path = node.value_exact<std::string>();
+    if (!path || path->empty()) {
+      throw std::invalid_argument(table + key +
+                                  " must be a non-empty string path");
+    }
+    if (refuse_absolute && std::filesystem::path(*path).is_absolute()) {
+      throw std::invalid_argument(
+          table + key + " must be relative to the file that sets it, not '" +
+          *path + "'");
+    }
+  };
+  if (const auto* model = mujoco.get("robot_model")) {
+    check_path(*model, "robot_model");
+  }
+  if (const auto* files = mujoco.get("robot_model_files")) {
+    const auto* array = files->as_array();
+    if (array == nullptr) {
+      throw std::invalid_argument(
+          table + "robot_model_files must be an array of string paths");
+    }
+    for (std::size_t i = 0; i < array->size(); ++i) {
+      check_path(*array->get(i),
+                 "robot_model_files[" + std::to_string(i) + "]");
+    }
+  }
+  if (const auto* field = mujoco.get("field")) {
+    const auto value = field->value_exact<std::string>();
+    if (!value) throw std::invalid_argument(table + "field must be a string");
+    const std::string& name = *value;
+    if (!name.empty() && std::ranges::find(kSimulationMujocoFields, name) ==
+                             std::end(kSimulationMujocoFields)) {
+      std::string known;
+      for (const auto known_name : kSimulationMujocoFields) {
+        known += (known.empty() ? "" : ", ") + std::string(known_name);
+      }
+      throw std::invalid_argument(table + "field '" + name +
+                                  "' names no field model (known: " + known +
+                                  ")");
+    }
+  }
+}
+
+// The files that set [simulation.mujoco] and its model (robot_model with its
+// robot_model_files), for the checks that run once the include is merged
+// (empty: not set).
+struct MujocoSources {
+  std::string table;
+  std::string robot_model;
+};
+
+// Checks `document`'s [simulation.mujoco] (read from `file`) and rewrites its
+// paths against `file`'s directory; records in `sources` what `file` sets.
+// The file that sets robot_model sets the whole model, so robot_model_files
+// without robot_model is refused (an include's list would otherwise travel
+// with another file's model).
+void RebaseSimulationMujoco(toml::table& document, const std::string& file,
+                            MujocoSources& sources) {
+  namespace fs = std::filesystem;
+  auto* sim = document["simulation"].as_table();
+  if (sim == nullptr || !sim->contains("mujoco")) return;
+  auto* mujoco = (*sim)["mujoco"].as_table();
+  if (mujoco == nullptr) {
+    throw std::invalid_argument(file + ": [simulation.mujoco] must be a table");
+  }
+  CheckSimulationMujoco(*mujoco, file, /*refuse_absolute=*/true);
+  const fs::path base = fs::path(file).parent_path();
+  const auto rebase = [&](const std::string& path) {
+    return (base.empty() ? fs::path(path) : base / path)
+        .lexically_normal()
+        .string();
+  };
+  if (mujoco->contains("robot_model_files") &&
+      !mujoco->contains("robot_model")) {
+    throw std::invalid_argument(
+        file +
+        ": [simulation.mujoco] robot_model_files needs robot_model in the "
+        "same file");
+  }
+  sources.table = file;
+  if (const auto model = (*mujoco)["robot_model"].value_exact<std::string>()) {
+    mujoco->insert_or_assign("robot_model", rebase(*model));
+    sources.robot_model = file;
+  }
+  if (const auto* files = (*mujoco)["robot_model_files"].as_array()) {
+    toml::array rebased;
+    for (auto&& entry : *files) {
+      // CheckSimulationMujoco has refused an entry that is not a string.
+      rebased.push_back(rebase(entry.value_exact<std::string>().value_or("")));
+    }
+    mujoco->insert_or_assign("robot_model_files", std::move(rebased));
+  }
+}
+
+// The effective [simulation.mujoco] of the merged `tbl` (already rebased):
+// robot_model is required, and `data` sees the model and every listed file
+// with its label (the file that set it and the key), so a build tool lists
+// each (resolve.cc) before its absence is an error.
+void RequireSimulationMujoco(const toml::table& tbl,
+                             const MujocoSources& sources,
+                             const DataFileCallback& data) {
+  if (sources.table.empty()) return;
+  const auto* mujoco = tbl["simulation"]["mujoco"].as_table();
+  if (mujoco == nullptr) return;
+  const auto model = (*mujoco)["robot_model"].value_exact<std::string>();
+  if (!model) {
+    throw std::invalid_argument(
+        sources.table + ": [simulation.mujoco] robot_model is required");
+  }
+  const std::string model_label =
+      sources.robot_model + ": [simulation.mujoco] robot_model";
+  data(*model, model_label);
+  RequireRegularFile(model_label, *model);
+  if (const auto* files = (*mujoco)["robot_model_files"].as_array()) {
+    for (std::size_t i = 0; i < files->size(); ++i) {
+      const std::string label = sources.robot_model +
+                                ": [simulation.mujoco] robot_model_files[" +
+                                std::to_string(i) + "]";
+      const std::string path =
+          files->get(i)->value_exact<std::string>().value_or("");
+      data(path, label);
+      RequireRegularFile(label, path);
+    }
+  }
+}
+
 // [trajectories] belongs at a subsystem file's top level. Under its
 // [subsystem] header it would be merged into the subsystem's table and then
 // replaced by a top-level [trajectories], so it is refused, not dropped.
@@ -560,22 +702,47 @@ RawDevice ParseMotor(const toml::table& t, const std::string& name) {
 }
 
 // A digital input, with its simulated home switch (DigitalInputConfig::
-// sim_home_switch): the sim_closed_* keys need sim_motor, which needs a
-// finite sim_closed_at_rot. Whether sim_motor names a motor of the same
-// subsystem is checked once every device is parsed.
+// sim_home_switch) or its MuJoCo model sensor (sim_sensor), which exclude
+// each other: sim_closed_at_rot and sim_closed_above need sim_motor, which
+// needs a finite sim_closed_at_rot; sim_closed_reads needs either. Whether
+// sim_motor names a motor of the same subsystem is checked once every device
+// is parsed; whether sim_sensor names a sensor of the model is not checked
+// here, since config load does not open the model.
 RawDevice ParseDigitalInput(const toml::table& t, const std::string& name) {
   CheckDeviceKeys(t, name, "digital input",
                   {"dio", "sim_motor", "sim_closed_at_rot", "sim_closed_above",
-                   "sim_closed_reads"});
+                   "sim_closed_reads", "sim_sensor"});
   hardware::DigitalInputConfig input{.dio = ReadRequired<int>(t, "dio", name)};
   auto& sim = input.sim_home_switch;
+  if (t.contains("sim_sensor")) {
+    if (t.contains("sim_motor")) {
+      throw std::invalid_argument(
+          "sim_sensor and sim_motor for digital input " + name +
+          " exclude each other");
+    }
+    for (const char* key : {"sim_closed_at_rot", "sim_closed_above"}) {
+      if (t.contains(key)) {
+        throw std::invalid_argument(std::string(key) + " for digital input " +
+                                    name +
+                                    " applies to sim_motor, not sim_sensor");
+      }
+    }
+    input.sim_sensor.sensor =
+        ReadNonEmpty(t, "sim_sensor", "", "digital input");
+    input.sim_sensor.closed_reads =
+        Read(t, "sim_closed_reads", input.sim_sensor.closed_reads);
+    return RawDevice{.config = input};
+  }
   if (!t.contains("sim_motor")) {
-    for (const char* key :
-         {"sim_closed_at_rot", "sim_closed_above", "sim_closed_reads"}) {
+    for (const char* key : {"sim_closed_at_rot", "sim_closed_above"}) {
       if (t.contains(key)) {
         throw std::invalid_argument(std::string(key) + " for digital input " +
                                     name + " needs sim_motor");
       }
+    }
+    if (t.contains("sim_closed_reads")) {
+      throw std::invalid_argument("sim_closed_reads for digital input " + name +
+                                  " needs sim_motor or sim_sensor");
     }
     return RawDevice{.config = input};
   }
@@ -1715,7 +1882,8 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
     for (auto&& [k, v] : *sim) {
       if (k.str() != "wheel_radius_m" && k.str() != "swerve_modules" &&
           k.str() != "hard_stops" && k.str() != "battery" &&
-          k.str() != "chassis" && k.str() != "mechanisms") {
+          k.str() != "chassis" && k.str() != "mechanisms" &&
+          k.str() != "mujoco") {
         throw std::invalid_argument("[simulation] unknown key '" +
                                     std::string(k.str()) + "'");
       }
@@ -1894,6 +2062,34 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
       }
       s.mechanisms = ParseSimulationMechanisms(*mechanisms, motors_by_name);
     }
+    if (sim->contains("mujoco")) {
+      const auto* mujoco = (*sim)["mujoco"].as_table();
+      if (mujoco == nullptr) {
+        throw std::invalid_argument("[simulation.mujoco] must be a table");
+      }
+      // ResolveRobotConfig has refused absolute paths and resolved the rest,
+      // which may then be absolute.
+      CheckSimulationMujoco(*mujoco, "config", /*refuse_absolute=*/false);
+      if (!mujoco->contains("robot_model")) {
+        throw std::invalid_argument(
+            "config: [simulation.mujoco] robot_model is required");
+      }
+      SimulationMujocoConfig m{
+          .robot_model = Read<std::string>(*mujoco, "robot_model", ""),
+          .field = Read<std::string>(*mujoco, "field", "")};
+      RequireRegularFile("config: [simulation.mujoco] robot_model",
+                         m.robot_model);
+      if (const auto* files = (*mujoco)["robot_model_files"].as_array()) {
+        for (std::size_t i = 0; i < files->size(); ++i) {
+          m.robot_model_files.push_back(
+              files->get(i)->value_exact<std::string>().value_or(""));
+          RequireRegularFile("config: [simulation.mujoco] robot_model_files[" +
+                                 std::to_string(i) + "]",
+                             m.robot_model_files.back());
+        }
+      }
+      s.mujoco = std::move(m);
+    }
   }
 
   for (const auto& dev : raw_devices) {
@@ -1979,6 +2175,9 @@ toml::table ResolveRobotConfig(const std::string& path,
   // Where the effective [studio] dashboard was set: this file's wins over
   // its include's.
   std::string dashboard_source = RebaseStudioDashboard(tbl, path);
+  // [simulation.mujoco]'s paths: this file's keys win over its include's.
+  MujocoSources mujoco_sources;
+  RebaseSimulationMujoco(tbl, path, mujoco_sources);
   if (auto* manifest = tbl["subsystems"].as_array()) {
     NormalizeManifestPaths(*manifest, path);
   }
@@ -1994,6 +2193,15 @@ toml::table ResolveRobotConfig(const std::string& path,
     CheckTopLevelKeys(base);
     const std::string base_dashboard = RebaseStudioDashboard(base, inc_file);
     if (dashboard_source.empty()) dashboard_source = base_dashboard;
+    MujocoSources base_mujoco;
+    RebaseSimulationMujoco(base, inc_file, base_mujoco);
+    if (mujoco_sources.table.empty()) mujoco_sources.table = base_mujoco.table;
+    if (mujoco_sources.robot_model.empty()) {
+      mujoco_sources.robot_model = base_mujoco.robot_model;
+    } else if (auto* base_model = base["simulation"]["mujoco"].as_table()) {
+      // This file's model replaces the include's whole model, its files too.
+      base_model->erase("robot_model_files");
+    }
     std::map<std::string, TrajectorySources> base_sources;
     RebaseSubsystemTablesTrajectories(base, inc_file, base_sources);
     for (auto& [subsystem, entries] : table_sources) {
@@ -2042,6 +2250,7 @@ toml::table ResolveRobotConfig(const std::string& path,
     data(dashboard, dashboard_source + ": [studio] dashboard");
     RequireStudioDashboard(dashboard_source, dashboard);
   }
+  RequireSimulationMujoco(tbl, mujoco_sources, data);
   if (auto* subs = tbl["subsystems"].as_table()) {
     for (const auto& [subsystem, entries] : table_sources) {
       if (const auto* sub = (*subs)[subsystem].as_table()) {

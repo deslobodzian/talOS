@@ -132,6 +132,11 @@ dio = 0
 sim_motor = "arm_motor"
 sim_closed_at_rot = 0.0
 
+[subsystems.arm.digital_inputs.beam]
+dio = 1
+sim_sensor = "beam"
+sim_closed_reads = true
+
 [subsystems.arm.encoders.quad]
 type = "QuadratureEncoder"
 dio_a = 2

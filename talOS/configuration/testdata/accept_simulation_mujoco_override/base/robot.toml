@@ -1,0 +1,7 @@
+[simulation.mujoco]
+robot_model = "mujoco/old.xml"
+robot_model_files = ["mujoco/old.stl"]
+
+[[subsystems]]
+name = "a"
+path = "a.toml"
