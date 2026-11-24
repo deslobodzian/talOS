@@ -64,6 +64,17 @@ topic = "/talos/telemetry"
 [simulation]
 wheel_radius_m = 0.0508
 
+[simulation.battery]
+nominal_voltage_v = 12.6
+internal_resistance_ohm = 0.02
+base_current_a = 1.5
+brownout_voltage_v = 6.75
+
+[simulation.chassis]
+mass_kg = 54.0
+moment_of_inertia_kg_m2 = 6.0
+traction_coefficient = 1.1
+
 [[simulation.swerve_modules]]
 drive = "fl_drive"
 steer = "fl_steer"
@@ -74,6 +85,13 @@ y_m = 0.3
 motor = "arm_motor"
 min_rot = -0.5
 max_rot = 2.5
+
+[[simulation.mechanisms]]
+motor = "arm_motor"
+inertia_kg_m2 = 0.08
+load = "flywheel"
+viscous_damping_nm_per_radps = 0.01
+static_friction_nm = 0.05
 
 [subsystems.drive]
 node = "//bench/main_processor/swerve_module:node"
@@ -174,6 +192,14 @@ constexpr std::string_view kHostileKeys[] = {
     "max_torque_current_a",
     "soft_limits",
     "follow",
+    "battery",
+    "chassis",
+    "mechanisms",
+    "nominal_voltage_v",
+    "brownout_voltage_v",
+    "mass_kg",
+    "inertia_kg_m2",
+    "load",
 };
 
 std::string MutateStructureAware(std::string input, std::mt19937_64& rng) {

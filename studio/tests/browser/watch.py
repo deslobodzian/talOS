@@ -22,6 +22,19 @@ _IN_MODIFY = 0x002
 _IN_CLOSE_WRITE = 0x008
 _IN_MOVED_TO = 0x080
 _IN_CREATE = 0x100
+_IN_DELETE_SELF = 0x400
+_IN_MOVE_SELF = 0x800
+
+
+def _inode_key(path):
+    """(st_dev, st_ino) for `path`, or None if it vanished."""
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return None
+        raise
+    return (st.st_dev, st.st_ino)
 
 
 class _Inotify:
@@ -30,21 +43,29 @@ class _Inotify:
         self.fd = self.libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
         if self.fd < 0:
             raise OSError(ctypes.get_errno(), "inotify_init1")
-        self.watched = set()
+        self.watched = {}  # path -> (inode_key, wd)
 
     def add(self, path):
-        """True when `path` is newly watched."""
-        if path in self.watched:
+        """True when `path` (or its replaced inode) is newly watched."""
+        key = _inode_key(path)
+        if key is None:
             return False
-        mask = _IN_MODIFY | _IN_CLOSE_WRITE | _IN_MOVED_TO | _IN_CREATE
-        if self.libc.inotify_add_watch(self.fd, os.fsencode(path), mask) < 0:
+        prior = self.watched.get(path)
+        if prior is not None and prior[0] == key:
+            return False
+        mask = (_IN_MODIFY | _IN_CLOSE_WRITE | _IN_MOVED_TO | _IN_CREATE |
+                _IN_DELETE_SELF | _IN_MOVE_SELF)
+        wd = self.libc.inotify_add_watch(self.fd, os.fsencode(path), mask)
+        if wd < 0:
             error = ctypes.get_errno()
             if error in (errno.ENOENT, errno.ENOTDIR):
                 return False  # gone since it was listed: the next listing decides
             # Anything else (the user's watch limit, ENOSPC) would leave the
             # wait blind until its bound: fail now, naming it.
             raise OSError(error, f"inotify_add_watch: {os.strerror(error)}", path)
-        self.watched.add(path)
+        if prior is not None and prior[1] != wd:
+            self.libc.inotify_rm_watch(self.fd, prior[1])
+        self.watched[path] = (key, wd)
         return True
 
     def drain(self):
@@ -62,29 +83,49 @@ class _Kqueue:
     def __init__(self):
         self.queue = select.kqueue()
         self.fd = self.queue.fileno()
-        self.files = {}
+        self.files = {}  # path -> (fd, inode_key)
 
     def add(self, path):
-        """True when `path` is newly watched."""
-        if path in self.files:
+        """True when `path` (or its replaced inode) is newly watched."""
+        key = _inode_key(path)
+        if key is None:
+            return False
+        prior = self.files.get(path)
+        if prior is not None and prior[1] == key:
             return False
         try:
             fd = os.open(path, getattr(os, "O_EVTONLY", os.O_RDONLY))
-        except OSError:
-            return False
-        self.files[path] = fd
-        event = select.kevent(fd, filter=select.KQ_FILTER_VNODE,
-                              flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
-                              fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND)
-        self.queue.control([event], 0, 0)
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+                return False  # gone since it was listed: the next listing decides
+            raise OSError(exc.errno, f"open for kqueue watch: {exc.strerror}", path) from exc
+        try:
+            st = os.fstat(fd)
+            actual_key = (st.st_dev, st.st_ino)
+            event = select.kevent(
+                fd,
+                filter=select.KQ_FILTER_VNODE,
+                flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                fflags=(select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND |
+                        select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME),
+            )
+            self.queue.control([event], 0, 0)
+        except BaseException:
+            os.close(fd)
+            raise
+        if prior is not None:
+            os.close(prior[0])
+        self.files[path] = (fd, actual_key)
         return True
 
     def drain(self):
-        self.queue.control(None, 64, 0)
+        while self.queue.control(None, 64, 0):
+            pass
 
     def close(self):
-        for fd in self.files.values():
+        for fd, _ in self.files.values():
             os.close(fd)
+        self.files.clear()
         self.queue.close()
 
 

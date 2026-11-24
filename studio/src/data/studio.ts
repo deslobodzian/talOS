@@ -251,6 +251,9 @@ export function createWorkerStudio(
     if (data.type === 'frames') {
       store.ingest(data.frames, data.reset);
       studio.notify();
+    } else if (data.type === 'alerts') {
+      store.setAlertLatch(data.latch);
+      studio.notify();
     } else if (data.type === 'playback') {
       store.setCursor(data.state.cursor_ns);
       studio.playback = data.state;
