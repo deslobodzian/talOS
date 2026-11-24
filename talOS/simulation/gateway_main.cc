@@ -751,7 +751,7 @@ int Run(int argc, char** argv,
       const auto tick_time = talos::event::Poller::now();
       if (!start_ns && schedule_start_file) {
         if (const auto parsed = ReadScheduleStartFile(*schedule_start_file)) {
-          start_ns = *parsed;
+          start_ns = parsed;
           const int64_t late_ns = tick_time.nanos() - *start_ns;
           if (late_ns > 0) {
             std::fprintf(stderr,
