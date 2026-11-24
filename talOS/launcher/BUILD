@@ -1370,3 +1370,35 @@ cc_test(
         "@rules_cc//cc/runfiles",
     ],
 )
+
+# Edge-case regression tests for SpawnFailed exit propagation, RefuseLaunch
+# stdout draining and session lock refresh, StudioBridge::Finish exit_code,
+# and PublishedEndpoints with zero runtime sources (REQ-OPS-06, REQ-OPS-08,
+# REQ-OPS-30, REQ-OPS-33, REQ-CONTRACT-11, REQ-SAFE-29).
+cc_test(
+    name = "launcher_edge_test",
+    size = "small",
+    srcs = ["launcher_edge_test.cc"],
+    data = [":delivery_loss_node"],
+    env = {"TALOS_DELIVERY_LOSS_NODE": "$(rlocationpath :delivery_loss_node)"},
+    # Each spawn is two fork()s; see launcher_test.
+    tags = ["no_macos_sanitizer"],
+    deps = [
+        ":child_output",
+        ":first_exec",
+        ":launcher_lib",
+        ":registry_cleanup",
+        ":session",
+        ":spawn",
+        ":stop_signal_guard",
+        ":supervision_events",
+        "//talOS/configuration",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:lock_file",
+        "//talOS/introspection:names",
+        "//talOS/introspection:registry",
+        "//talOS/memory:shared_memory",
+        "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
+    ],
+)
