@@ -79,12 +79,15 @@ bool CappedLogStopped(const std::string& log_path);
 inline constexpr int kStopSignal = SIGINT;
 
 // How long a stopping session gives `hardware_node` after its kStopSignal to
-// exit before SIGKILLing it and proceeding to stop the remaining members
-// (two-phase shutdown, REQ-OPS-20).
+// quiesce (exit or set introspect::kFlagQuiesced) before SIGKILLing it and
+// waiting for reap before signaling the remaining members (two-phase shutdown,
+// REQ-OPS-20). A quiesced bridge still flushing its `.tlog` shares
+// kStopTimeout with the remaining members.
 inline constexpr std::chrono::milliseconds kBridgeStopTimeout{500};
 
-// How long a stopping session gives a member after its kStopSignal before it
-// kills the member's group (SIGKILL; run reason stop_timeout).
+// How long a stopping session gives the remaining members (and a quiesced
+// `hardware_node` still flushing its log) after phase 2 begins before it kills
+// each running member's group (SIGKILL; run reason stop_timeout).
 inline constexpr std::chrono::seconds kStopTimeout{2};
 
 // Refusal record written atomically under the log root on a phase-1 refusal

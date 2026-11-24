@@ -159,14 +159,16 @@ class HardwareNode {
   Wait Pass(uint64_t now_us);
   // Passes until a stop (process::stop_requested) or, when duration_s > 0,
   // that many seconds, then sends a shutdown neutral command
-  // (SendShutdownNeutral) before CloseWaits(), prints the exit summary, and,
-  // when no State arrived, a `hardware_node warning: ended without receiving
-  // a State` line on stderr. Returns the process's exit status: 1 when the
-  // packet log failed or has a gap, or when the run ended at its own duration
-  // without having received one State; else 0, so a stop exits 0 whether or
-  // not the controller was ever heard. The duration's 1 applies only to a
-  // bridge run directly: the launcher ends a bounded session by stopping
-  // every member at its deadline, so there the warning line (and
+  // (SendShutdownNeutral), closes waits and the UDP socket, publishes
+  // introspection, and marks its registry row kFlagQuiesced before flushing
+  // its packet log, republishing introspection, and printing and flushing the
+  // exit summary (and, when no State arrived, a `hardware_node warning: ended
+  // without receiving a State` line on stderr). Returns the process's exit
+  // status: 1 when the packet log failed or has a gap, or when the run ended at
+  // its own duration without having received one State; else 0, so a stop exits
+  // 0 whether or not the controller was ever heard. The duration's 1 applies
+  // only to a bridge run directly: the launcher ends a bounded session by
+  // stopping every member at its deadline, so there the warning line (and
   // session_report's controller-link verdict) is the evidence.
   int Run(int duration_s = 0);
 
