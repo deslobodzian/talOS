@@ -862,5 +862,135 @@ TEST_F(RecorderTest, RejectsPathTraversalReasonAndSanitizesStem) {
   }
 }
 
+TEST_F(RecorderTest, RejectsSymlinkOutputDirAndSymlinkTempOrTargetFiles) {
+  std::filesystem::create_directories(dir_);
+  const auto victim_dir = dir_ / "victim_dir";
+  std::filesystem::create_directories(victim_dir);
+  const auto victim_file = dir_ / "victim.txt";
+  {
+    std::ofstream out(victim_file);
+    out << "keep-intact";
+  }
+
+  // 1. Symlink as output_dir is refused at construction (with or without
+  // trailing slash).
+  const auto link_dir = dir_ / "link_dir";
+  std::filesystem::create_directory_symlink(victim_dir, link_dir);
+  for (const auto& path : {link_dir, link_dir / ""}) {
+    FrameRecorder::Options opts;
+    opts.output_dir = path;
+    opts.context = MakeContext();
+    EXPECT_THROW(FrameRecorder{std::move(opts)},
+                 std::filesystem::filesystem_error);
+  }
+
+  // 2. Replacing output_dir with a symlink after construction stops recording
+  // without writing into the symlink target directory.
+  const auto swapped_dir = dir_ / "swapped";
+  {
+    FrameRecorder::Options opts;
+    opts.output_dir = swapped_dir;
+    opts.context = MakeContext();
+    opts.queue_slots = 4;
+    FrameRecorder rec{std::move(opts)};
+    std::filesystem::remove(swapped_dir);
+    std::filesystem::create_directory_symlink(victim_dir, swapped_dir);
+    ASSERT_TRUE(rec.Record(MakeGrayFrame(), MakeRecord(0, "sampled")));
+  }
+  EXPECT_TRUE(std::filesystem::is_empty(victim_dir));
+
+  // 3. Pre-existing symlink at .png.tmp is never followed, clobbered, or
+  // unlinked.
+  const auto tmp_link_dir = dir_ / "tmp_link";
+  std::filesystem::create_directories(tmp_link_dir);
+  const auto png_tmp_link =
+      tmp_link_dir / "00000000000000000000_sampled.png.tmp";
+  std::filesystem::create_symlink(victim_file, png_tmp_link);
+  {
+    FrameRecorder::Options opts;
+    opts.output_dir = tmp_link_dir;
+    opts.context = MakeContext();
+    opts.queue_slots = 4;
+    FrameRecorder rec{std::move(opts)};
+    ASSERT_TRUE(rec.Record(MakeGrayFrame(), MakeRecord(0, "sampled")));
+  }
+  EXPECT_TRUE(std::filesystem::is_symlink(png_tmp_link));
+  {
+    std::ifstream in(victim_file);
+    std::string content;
+    std::getline(in, content);
+    EXPECT_EQ(content, "keep-intact");
+  }
+
+  // 4. Pre-existing symlink at target .png is refused without modifying the
+  // symlink target.
+  const auto target_link_dir = dir_ / "target_link";
+  std::filesystem::create_directories(target_link_dir);
+  const auto png_link = target_link_dir / "00000000000000000000_sampled.png";
+  std::filesystem::create_symlink(victim_file, png_link);
+  {
+    FrameRecorder::Options opts;
+    opts.output_dir = target_link_dir;
+    opts.context = MakeContext();
+    opts.queue_slots = 4;
+    FrameRecorder rec{std::move(opts)};
+    ASSERT_TRUE(rec.Record(MakeGrayFrame(), MakeRecord(0, "sampled")));
+  }
+  EXPECT_TRUE(std::filesystem::is_symlink(png_link));
+  {
+    std::ifstream in(victim_file);
+    std::string content;
+    std::getline(in, content);
+    EXPECT_EQ(content, "keep-intact");
+  }
+}
+
+TEST_F(RecorderTest,
+       ScanExistingIgnoresSymlinksAndRecordRejectsUnknownFormatAndLongReason) {
+  std::filesystem::create_directories(dir_);
+  const auto real_dir = dir_ / "external";
+  std::filesystem::create_directories(real_dir);
+  const auto ext_json = real_dir / "ext.json";
+  const auto ext_png = real_dir / "ext.png";
+  std::ofstream{ext_json} << "{}";
+  std::ofstream{ext_png} << "png";
+
+  const auto frames_dir = dir_ / "frames";
+  std::filesystem::create_directories(frames_dir);
+  const auto sym_json = frames_dir / "00000000000000000001_sampled.json";
+  const auto sym_png = frames_dir / "00000000000000000001_sampled.png";
+  std::filesystem::create_symlink(ext_json, sym_json);
+  std::filesystem::create_symlink(ext_png, sym_png);
+
+  FrameRecorder::Options opts;
+  opts.output_dir = frames_dir;
+  opts.context = MakeContext();
+  opts.max_bytes = 0;  // Would trim every scanned regular pair at construction.
+  opts.sample_hz = 1e12;
+  opts.queue_slots = 4;
+  FrameRecorder rec{std::move(opts)};
+
+  // Symlinked entries were ignored by ScanExisting and untouched by Trim.
+  EXPECT_TRUE(std::filesystem::is_symlink(sym_json));
+  EXPECT_TRUE(std::filesystem::is_symlink(sym_png));
+
+  // Unknown pixel format, "." reason, and overlong reason are dropped cleanly.
+  const Frame bad_format{0,
+                         0,
+                         0,
+                         MonotonicTime::from_nanos(0),
+                         4,
+                         2,
+                         4,
+                         static_cast<PixelFormat>(99),
+                         std::vector<std::uint8_t>(8, 0)};
+  EXPECT_FALSE(rec.Record(bad_format, MakeRecord(10, "sampled")));
+  EXPECT_FALSE(rec.Record(MakeGrayFrame(), MakeRecord(11, ".")));
+  EXPECT_FALSE(
+      rec.Record(MakeGrayFrame(), MakeRecord(12, std::string(128, 'a'))));
+  EXPECT_EQ(rec.recorded(), 0u);
+  EXPECT_EQ(rec.dropped(), 3u);
+}
+
 }  // namespace
 }  // namespace talos::vision::recording
