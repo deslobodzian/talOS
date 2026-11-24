@@ -154,6 +154,9 @@ struct SimulationMujocoConfig {
   std::string robot_model;                     // resolved
   std::vector<std::string> robot_model_files;  // resolved
   std::string field;                           // "" = flat carpet
+  // The seed a field's game rules draw from: 0 to 2^63 - 1 (a TOML integer
+  // is signed 64-bit; a negative one is refused).
+  std::uint64_t seed{1};
   bool operator==(const SimulationMujocoConfig&) const = default;
 };
 

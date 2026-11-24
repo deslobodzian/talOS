@@ -16,6 +16,7 @@
 
 #include "bridge/bridge_status_generated.h"
 #include "geometry/geometry_generated.h"
+#include "sim/sim_generated.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/log/format.h"
 #include "talOS/hardware/config.h"
@@ -144,6 +145,7 @@ int main() {
                                        "pose_estimate.slot_bytes");
   PrintMessage<geometry::OdometrySample>("odometry_sample.bytes",
                                          "odometry_sample.slot_bytes");
+  PrintMessage<sim::MatchState>("match_state.bytes", "match_state.slot_bytes");
   const std::size_t telemetry_slot =
       rtms_slot_stride(tw::slot_bytes, kByteTopicAlignment);
   Print("telemetry.slot_stride_bytes", telemetry_slot);

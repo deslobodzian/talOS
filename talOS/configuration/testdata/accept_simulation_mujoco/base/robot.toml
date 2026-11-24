@@ -2,6 +2,7 @@
 robot_model = "mujoco/robot.xml"
 robot_model_files = ["mujoco/meshes/a.stl", "mujoco/meshes/b.stl"]
 field = ""
+seed = 5
 
 [[subsystems]]
 name = "a"

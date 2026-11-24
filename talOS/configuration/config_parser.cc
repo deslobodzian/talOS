@@ -290,14 +290,15 @@ void RequireStudioDashboard(const std::string& where, const std::string& path) {
 // for a parsed table): refuses an unknown key, a robot_model or
 // robot_model_files entry that is not a non-empty string, a
 // robot_model_files that is not an array, a field that is not a string or
-// names no known field model, and, when `refuse_absolute` (paths as written
-// in a file, before they are resolved), an absolute path.
+// names no known field model, a seed that is not a non-negative integer,
+// and, when `refuse_absolute` (paths as written in a file, before they are
+// resolved), an absolute path.
 void CheckSimulationMujoco(const toml::table& mujoco, const std::string& where,
                            bool refuse_absolute) {
   const std::string table = where + ": [simulation.mujoco] ";
   for (auto&& [k, v] : mujoco) {
     if (k.str() != "robot_model" && k.str() != "robot_model_files" &&
-        k.str() != "field") {
+        k.str() != "field" && k.str() != "seed") {
       throw std::invalid_argument(table + "unknown key '" +
                                   std::string(k.str()) + "'");
     }
@@ -341,6 +342,13 @@ void CheckSimulationMujoco(const toml::table& mujoco, const std::string& where,
       throw std::invalid_argument(table + "field '" + name +
                                   "' names no field model (known: " + known +
                                   ")");
+    }
+  }
+  if (const auto* seed = mujoco.get("seed")) {
+    const auto value = seed->value_exact<std::int64_t>();
+    if (!value || *value < 0) {
+      throw std::invalid_argument(
+          table + "seed must be an integer from 0 to 9223372036854775807");
     }
   }
 }
@@ -2077,6 +2085,11 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
       SimulationMujocoConfig m{
           .robot_model = Read<std::string>(*mujoco, "robot_model", ""),
           .field = Read<std::string>(*mujoco, "field", "")};
+      // CheckSimulationMujoco has refused a seed that is not a non-negative
+      // integer.
+      if (const auto seed = (*mujoco)["seed"].value_exact<std::int64_t>()) {
+        m.seed = static_cast<std::uint64_t>(*seed);
+      }
       RequireRegularFile("config: [simulation.mujoco] robot_model",
                          m.robot_model);
       if (const auto* files = (*mujoco)["robot_model_files"].as_array()) {

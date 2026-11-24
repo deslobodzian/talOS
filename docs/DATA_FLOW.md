@@ -337,17 +337,21 @@ separate.
 | `/<camera>/state`: a robot's camera node → a `new_subsystem --type estimator` node/telemetry | <!-- size: pose_observation.slot_bytes -->72 | <!-- size: pose_observation.bytes -->64 B geometry.PoseObservation, including padding |
 | `/<estimator>/state`: a `new_subsystem --type estimator` node → telemetry | <!-- size: pose_estimate.slot_bytes -->80 | <!-- size: pose_estimate.bytes -->72 B geometry.PoseEstimate (`talOS/msgs/layout_asserts.cc`); `valid` = fresh usable odometry, `localized` = established field-frame trust; `localized` sits in existing payload padding |
 | `/sim/state`: physics sim_gateway → telemetry and a robot's simulated sensors | <!-- size: odometry_sample.slot_bytes -->64 | <!-- size: odometry_sample.bytes -->56 B geometry.OdometrySample: sample_time_ns + Pose2d + Twist2d; 200 Hz, always valid while published; absent with ideal or WPILib/RoboRIO simulation |
+| `/sim/state/match`: a simulator's game rules (no program in this tree writes it) → telemetry | <!-- size: match_state.slot_bytes -->72 | <!-- size: match_state.bytes -->64 B sim.MatchState (`talOS/hardware/sim.fbs`): sample_time_ns, schedule_time_us, period_remaining_us, seven u32 counts (points, AUTO points and scored per alliance, shots), two u16 piece counts, the period and stage, four flags, 2 B tail padding; declared in `//talOS/hardware:sim_messages` |
 | `/talos/telemetry`: telemetry → studio_bridge | <!-- size: telemetry.slot_stride_bytes -->16392 × <!-- size: telemetry.slot_count -->64 slots | <!-- size: telemetry.dictionary_page_bytes -->16384 B byte payload capacity; ring = <!-- size: telemetry.ring_bytes -->1049088 B of slot storage; the writer overwrites, so a reader more than 63 pages behind (about 0.3 s at 100 Hz with the bench's two value pages a tick) is lapped and counts the missed pages, and a stalled reader never stops publication; the bridge never applies a tick it lost a page of |
 
 Sources: `talOS/hardware/packet.h`, `talOS/hardware/status/bridge_status.fbs`,
+`talOS/hardware/sim.fbs`,
 `talOS/devices/target.h`, `talOS/msgs/geometry.fbs`, the bench's
 `*_message.fbs` and the examples' `.fbs` files, and `talOS/telemetry/wire.h`;
 each size is the `message_bytes` the `--describe-only` graph (`graph.json`)
 of the bench's and examples' configs reports. Struct sizes include alignment
 padding: they must not be inferred by simply adding scalar field widths.
 The `/sim/state` payload is pinned by `static_assert(sizeof(geometry::OdometrySample)
-== 56)` in `talOS/simulation/gateway_main.cc`; RTMS adds its 8 B publication timestamp.
-This truth topic is local to the main processor and never crosses hardware UDP.
+== 56)` in `talOS/simulation/gateway_main.cc` and `/sim/state/match`'s by
+`static_assert(sizeof(sim::MatchState) == 64)` in
+`talOS/hardware/sim_layout_asserts.cc`; RTMS adds its 8 B publication timestamp.
+These truth topics are local to the main processor and never cross hardware UDP.
 
 The live node registry ([talOS/introspection](../talOS/introspection/README.md))
 is one more segment, `/talos_registry.6` (the number is its layout version):
