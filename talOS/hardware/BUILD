@@ -121,6 +121,7 @@ cc_library(
         "endpoint.h",
         "sim_backend.h",
         "sim_physics.h",
+        "sim_plant.h",
     ],
     visibility = [
         "//bench/main_processor/swerve_module:__pkg__",
