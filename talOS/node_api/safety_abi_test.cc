@@ -465,4 +465,273 @@ TEST_F(SafetyAbiTest, SimResumeRejectsReentrantMutations) {
   EXPECT_NE(talos_sim_node(sim_, "roller"), nullptr);
 }
 
+// REQ-SAFE-04, REQ-SAFE-36, REQ-SAFE-37: non-finite (NaN, +inf, -inf) demands,
+// feedforwards, rezeros, PWM outputs, and mechanism goals never command
+// non-neutral actuation or corrupt zero state across the C ABI.
+TEST(SafetyAbiNonFinite, NonFiniteActuationAndRezeroNeutralizeSafely) {
+  constexpr const char* kToml = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.rig.motors.wheel]
+can_id = 1
+foc = true
+max_torque_current_a = 40.0
+[subsystems.rig.sensors.gyro]
+type = "Pigeon2"
+can_id = 2
+[subsystems.rig.pwm_outputs.servo]
+channel = 0
+
+[subsystems.arm.motors.arm]
+can_id = 3
+feedback = "RemoteCANcoder"
+feedback_sensor = "arm_cc"
+position_frame = "absolute"
+[subsystems.arm.sensors.arm_cc]
+type = "CANcoder"
+can_id = 4
+[subsystems.arm.arm]
+tolerance_rot = 0.01
+units_per_rot = 360.0
+
+[subsystems.shooter.motors.flywheel]
+can_id = 5
+max_velocity_rps = 80.0
+[subsystems.shooter.flywheel]
+at_speed_entry_tick_count = 2
+)";
+
+  TalosSim* sim = talos_sim_from_toml(kToml);
+  ASSERT_NE(sim, nullptr) << talos_last_error();
+  TalosSimHardware* hw = talos_sim_hardware_create(sim);
+  ASSERT_NE(hw, nullptr) << talos_last_error();
+
+  struct RigCtx {
+    TalosNode* node = nullptr;
+    int64_t wheel = -1;
+    int64_t gyro = -1;
+    int64_t servo = -1;
+    int32_t mode = TALOS_MODE_NEUTRAL;
+    double demand = 0.0;
+    double ff = 0.0;
+    double pwm_out = 0.0;
+    bool set_pwm = false;
+    int32_t motor_rc = TALOS_OK;
+    int32_t pwm_rc = TALOS_OK;
+  } rig;
+  auto build_rig = [](TalosNode* node, void* user) -> int32_t {
+    auto& r = *static_cast<RigCtx*>(user);
+    r.node = node;
+    r.wheel = talos_device(node, TALOS_DEVICE_MOTOR, "wheel");
+    r.gyro = talos_device(node, TALOS_DEVICE_GYRO, "gyro");
+    r.servo = talos_device(node, TALOS_DEVICE_PWM, "servo");
+    if (r.wheel < 0 || r.gyro < 0 || r.servo < 0) return 1;
+    if (talos_allow_untargeted_outputs(node) != TALOS_OK) return 1;
+    return talos_node_set_update(
+        node,
+        [](void* ctx) -> int32_t {
+          auto& self = *static_cast<RigCtx*>(ctx);
+          self.motor_rc = talos_motor_set(self.node, self.wheel, self.mode,
+                                          self.demand, self.ff, 0);
+          if (self.set_pwm) {
+            self.pwm_rc = talos_pwm_set(self.node, self.servo, self.pwm_out);
+          }
+          return 0;
+        },
+        &r);
+  };
+
+  struct ArmCtx {
+    TalosNode* node = nullptr;
+    int64_t mech = -1;
+    int op = 0;  // 0=goal, 1=goal_units, 2=hold
+    double arg = 0.0;
+    double ff = 0.0;
+  } arm_ctx;
+  auto build_arm = [](TalosNode* node, void* user) -> int32_t {
+    auto& a = *static_cast<ArmCtx*>(user);
+    a.node = node;
+    a.mech = talos_position_mechanism_open(node, "arm");
+    if (a.mech < 0) return 1;
+    if (talos_allow_untargeted_outputs(node) != TALOS_OK) return 1;
+    return talos_node_set_update(
+        node,
+        [](void* ctx) -> int32_t {
+          auto& self = *static_cast<ArmCtx*>(ctx);
+          int32_t rc = TALOS_OK;
+          if (self.op == 0) {
+            rc = talos_position_mechanism_set_goal(self.node, self.mech,
+                                                   self.arg, self.ff);
+          } else if (self.op == 1) {
+            rc = talos_position_mechanism_set_goal_units(self.node, self.mech,
+                                                         self.arg, self.ff);
+          } else {
+            rc = talos_position_mechanism_hold(self.node, self.mech, self.ff);
+          }
+          if (rc != TALOS_OK) return 1;
+          return talos_position_mechanism_update(self.node, self.mech);
+        },
+        &a);
+  };
+
+  struct ShooterCtx {
+    TalosNode* node = nullptr;
+    int64_t mech = -1;
+    double vel = 0.0;
+    double ff = 0.0;
+  } shooter_ctx;
+  auto build_shooter = [](TalosNode* node, void* user) -> int32_t {
+    auto& s = *static_cast<ShooterCtx*>(user);
+    s.node = node;
+    s.mech = talos_velocity_mechanism_open(node, "flywheel");
+    if (s.mech < 0) return 1;
+    if (talos_allow_untargeted_outputs(node) != TALOS_OK) return 1;
+    return talos_node_set_update(
+        node,
+        [](void* ctx) -> int32_t {
+          auto& self = *static_cast<ShooterCtx*>(ctx);
+          if (talos_velocity_mechanism_set_goal(self.node, self.mech, self.vel,
+                                                self.ff) != TALOS_OK) {
+            return 1;
+          }
+          return talos_velocity_mechanism_update(self.node, self.mech);
+        },
+        &s);
+  };
+
+  TalosNode* rig_node = talos_sim_add(sim, "rig", build_rig, &rig);
+  ASSERT_NE(rig_node, nullptr) << talos_last_error();
+  ASSERT_NE(talos_sim_add(sim, "arm", build_arm, &arm_ctx), nullptr)
+      << talos_last_error();
+  ASSERT_NE(talos_sim_add(sim, "shooter", build_shooter, &shooter_ctx), nullptr)
+      << talos_last_error();
+
+  ASSERT_EQ(talos_sim_hardware_enable(hw, 1), TALOS_OK);
+  ASSERT_EQ(
+      talos_sim_hardware_set_motor(hw, "rig", "wheel", 1.0, 0.0, 0, 0, 0, 0, 0),
+      TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_gyro(hw, "rig", "gyro", 0.5, 0.0, 0, 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim, 15 * kMs), TALOS_OK) << talos_last_error();
+
+  const double kNaN = std::numeric_limits<double>::quiet_NaN();
+  const double kInf = std::numeric_limits<double>::infinity();
+  const double kNonFinite[] = {kNaN, kInf, -kInf};
+
+  // Rezero ignores non-finite values: zeroed remains 0.
+  for (const double bad : kNonFinite) {
+    ASSERT_EQ(talos_motor_rezero(rig_node, rig.wheel, bad), TALOS_OK);
+    ASSERT_EQ(talos_gyro_rezero(rig_node, rig.gyro, bad), TALOS_OK);
+    EXPECT_EQ(talos_motor_zeroed(rig_node, rig.wheel), 0);
+    EXPECT_EQ(talos_gyro_zeroed(rig_node, rig.gyro), 0);
+  }
+  // Establish a valid motor zero so position/motion_magic modes are active.
+  ASSERT_EQ(talos_motor_rezero(rig_node, rig.wheel, 0.0), TALOS_OK);
+  ASSERT_EQ(talos_motor_zeroed(rig_node, rig.wheel), 1);
+
+  // Motor non-finite demands across every control mode neutralize and count.
+  uint64_t prev_clamped = 0;
+  ASSERT_EQ(talos_motor_clamped_count(rig_node, rig.wheel, &prev_clamped),
+            TALOS_OK);
+  for (const int32_t mode :
+       {TALOS_MODE_DUTY_CYCLE, TALOS_MODE_VOLTAGE, TALOS_MODE_VELOCITY,
+        TALOS_MODE_POSITION, TALOS_MODE_MOTION_MAGIC,
+        TALOS_MODE_TORQUE_CURRENT}) {
+    for (const double bad : kNonFinite) {
+      rig.mode = mode;
+      rig.demand = bad;
+      rig.ff = 0.0;
+      rig.set_pwm = true;
+      rig.pwm_out = bad;
+      ASSERT_EQ(talos_sim_step(sim, 10 * kMs), TALOS_OK) << talos_last_error();
+      EXPECT_EQ(rig.motor_rc, TALOS_OK);
+      EXPECT_EQ(rig.pwm_rc, TALOS_OK);
+      TalosMotorRequest req{};
+      ASSERT_EQ(talos_sim_hardware_applied_motor(hw, "rig", "wheel", &req),
+                TALOS_OK);
+      EXPECT_EQ(req.mode, TALOS_MODE_NEUTRAL) << "mode " << mode;
+      double pwm = 1.0;
+      EXPECT_EQ(talos_sim_hardware_applied_pwm(hw, "rig", "servo", &pwm), 0);
+      uint64_t clamped = 0;
+      ASSERT_EQ(talos_motor_clamped_count(rig_node, rig.wheel, &clamped),
+                TALOS_OK);
+      EXPECT_GT(clamped, prev_clamped) << "mode " << mode;
+      prev_clamped = clamped;
+    }
+  }
+
+  // Non-finite ff_volts on FF modes neutralizes; on non-FF modes returns
+  // TALOS_ERR and leaves motor neutral.
+  for (const int32_t mode :
+       {TALOS_MODE_VELOCITY, TALOS_MODE_POSITION, TALOS_MODE_MOTION_MAGIC}) {
+    for (const double bad : kNonFinite) {
+      rig.mode = mode;
+      rig.demand = 1.0;
+      rig.ff = bad;
+      rig.set_pwm = false;
+      ASSERT_EQ(talos_sim_step(sim, 10 * kMs), TALOS_OK) << talos_last_error();
+      EXPECT_EQ(rig.motor_rc, TALOS_OK);
+      TalosMotorRequest req{};
+      ASSERT_EQ(talos_sim_hardware_applied_motor(hw, "rig", "wheel", &req),
+                TALOS_OK);
+      EXPECT_EQ(req.mode, TALOS_MODE_NEUTRAL);
+    }
+  }
+  for (const int32_t mode : {TALOS_MODE_NEUTRAL, TALOS_MODE_DUTY_CYCLE,
+                             TALOS_MODE_VOLTAGE, TALOS_MODE_TORQUE_CURRENT}) {
+    for (const double bad : kNonFinite) {
+      rig.mode = mode;
+      rig.demand = 0.5;
+      rig.ff = bad;
+      ASSERT_EQ(talos_sim_step(sim, 10 * kMs), TALOS_OK) << talos_last_error();
+      EXPECT_EQ(rig.motor_rc, TALOS_ERR) << "mode " << mode;
+      TalosMotorRequest req{};
+      ASSERT_EQ(talos_sim_hardware_applied_motor(hw, "rig", "wheel", &req),
+                TALOS_OK);
+      EXPECT_EQ(req.mode, TALOS_MODE_NEUTRAL);
+    }
+  }
+
+  // PositionMechanism & VelocityMechanism non-finite goals/ff neutralize.
+  for (const double bad : kNonFinite) {
+    for (const int op : {0, 1, 2}) {
+      arm_ctx.op = op;
+      arm_ctx.arg = (op == 2) ? 0.0 : bad;
+      arm_ctx.ff = (op == 2) ? bad : 0.0;
+      shooter_ctx.vel = bad;
+      shooter_ctx.ff = 0.0;
+      ASSERT_EQ(talos_sim_step(sim, 10 * kMs), TALOS_OK) << talos_last_error();
+      TalosMotorRequest arm_req{};
+      TalosMotorRequest vel_req{};
+      ASSERT_EQ(talos_sim_hardware_applied_motor(hw, "arm", "arm", &arm_req),
+                TALOS_OK);
+      ASSERT_EQ(
+          talos_sim_hardware_applied_motor(hw, "shooter", "flywheel", &vel_req),
+          TALOS_OK);
+      EXPECT_EQ(arm_req.mode, TALOS_MODE_NEUTRAL);
+      EXPECT_EQ(vel_req.mode, TALOS_MODE_NEUTRAL);
+    }
+    arm_ctx.op = 0;
+    arm_ctx.arg = 0.2;
+    arm_ctx.ff = bad;
+    shooter_ctx.vel = 20.0;
+    shooter_ctx.ff = bad;
+    ASSERT_EQ(talos_sim_step(sim, 10 * kMs), TALOS_OK) << talos_last_error();
+    TalosMotorRequest arm_req{};
+    TalosMotorRequest vel_req{};
+    ASSERT_EQ(talos_sim_hardware_applied_motor(hw, "arm", "arm", &arm_req),
+              TALOS_OK);
+    ASSERT_EQ(
+        talos_sim_hardware_applied_motor(hw, "shooter", "flywheel", &vel_req),
+        TALOS_OK);
+    EXPECT_EQ(arm_req.mode, TALOS_MODE_NEUTRAL);
+    EXPECT_EQ(vel_req.mode, TALOS_MODE_NEUTRAL);
+  }
+
+  talos_sim_hardware_destroy(hw);
+  talos_sim_destroy(sim);
+}
+
 }  // namespace

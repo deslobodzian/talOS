@@ -238,14 +238,11 @@ class Node:
     def publish_bytes(self, topic, max_bytes, *, slots=1024,
                       drop_newest=False, external=False):
         """A topic of variable-length messages, each at most `max_bytes`."""
-        if max_bytes > 0xFFFFFFFF:
-            raise ValueError(
-                f"max_bytes must be <= 0xFFFFFFFF, got {max_bytes}")
-        if slots > 0xFFFFFFFF:
-            raise ValueError(f"slots must be <= 0xFFFFFFFF, got {slots}")
+        max_bytes = _abi.check_int(max_bytes, 0, _abi.UINT32_MAX, "max_bytes")
+        slots = _abi.check_int(slots, 0, _abi.UINT32_MAX, "slots")
         index = _abi.index(lib.talos_node_publish_bytes(
-            self._handle, _abi.encode(topic), max(0, max_bytes),
-            max(0, slots), bool(drop_newest), bool(external)))
+            self._handle, _abi.encode(topic), max_bytes,
+            slots, bool(drop_newest), bool(external)))
         return BytePublisher(self, index)
 
     def every(self, period, fn):
