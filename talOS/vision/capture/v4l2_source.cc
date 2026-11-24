@@ -568,9 +568,13 @@ class Source final : public CameraSource {
   bool PrepareQuiescentForConfigLocked(
       std::unique_lock<std::mutex>& lifecycle) {
     if (IsSelfWorker()) {
-      return !running_.load(std::memory_order_acquire) &&
-             !IsSelfBeforeDeviceRelease() && active_teardowns_ == 0 &&
-             !worker_.joinable();
+      if (running_.load(std::memory_order_acquire) ||
+          IsSelfBeforeDeviceRelease() || active_teardowns_ > 0) {
+        return false;
+      }
+      std::lock_guard lock(state_mutex_);
+      return !worker_.joinable() ||
+             worker_.get_id() == std::this_thread::get_id();
     }
     for (;;) {
       if (running_.load(std::memory_order_acquire)) {

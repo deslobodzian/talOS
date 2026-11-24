@@ -115,7 +115,7 @@ the check in the same commit (RULES.md 9).
 | `command_timeout_us` range; actuator `period_us` limit | ARCHITECTURE.md "The tick" | **[enforced]** config load refuses |
 | Owner timeout | ARCHITECTURE.md "The tick" | **[enforced]** bridge and `SimHardware` share `//talOS/hardware:merge` |
 | `update()` allocates nothing | METHODOLOGY.md §10 | **[enforced]** C++ (`AllocationProbe`); **[review]** Python |
-| `update()` p99 duration | METHODOLOGY.md §10 | **[enforced]** on representative bench and framework C++ nodes (`//bench/main_processor:update_p99_perf_test`, `REQ-RT-07`, `perf` lane); end-to-end budget derivation open (**[gap: SPEC-4]**) |
+| `update()` p99 duration | METHODOLOGY.md §10 | **[enforced]** on representative bench, framework, and mechanism C++ nodes (`//bench/main_processor:update_p99_perf_test`, `REQ-RT-07`, `perf` lane); end-to-end budget derivation open (**[gap: SPEC-4]**) |
 | Node hops from driver input to actuator | METHODOLOGY.md §10 | **[enforced]** `LintGraph` warning (`names.h`, `REQ-RT-16`) |
 | `/hw/request` gap in simulation | the [bench simulation README](../bench/main_processor/simulation/README.md) | asserted in simulation by the bench `soak_test` (`manual`); no requirement states it (**[gap: SPEC-4]**) |
 | Target age at the selecting tick | launcher README "Session measurements" | `session_report --strict` on a recorded session; bench run open (TIME-3) |
@@ -169,12 +169,12 @@ Automated checks that keep the architecture honest.
 | `manifest_sync_test`, the `talos_bundle` stamp | `[[subsystems]]` is the only node list |
 | the Studio bindings diff in CI | checked-in TypeScript equals `telemetry.fbs` |
 | `AllocationProbe` cases ([METHODOLOGY.md §10](METHODOLOGY.md#10-performance)) | RULES.md 3, allocation part |
-| `//bench/main_processor:update_p99_perf_test` (`perf` lane, `StallMeter` host qualification) | `REQ-RT-07` / [METHODOLOGY.md §10](METHODOLOGY.md#10-performance) `update()` p99 ≤ 10 % of `period_us` on representative bench and framework C++ nodes |
+| `//bench/main_processor:update_p99_perf_test` (`perf` lane, `StallMeter` host qualification) | `REQ-RT-07` / [METHODOLOGY.md §10](METHODOLOGY.md#10-performance) `update()` p99 ≤ 10 % of `period_us` on representative bench, framework, and mechanism C++ nodes |
 | `publish` refusing `/hw/request`; setters throwing outside `update()` | RULES.md 2 |
 | config load refusals (timeouts, periods, singular sections, soft limits) | "The tick" numbers |
 | `wpilib_lockstep_test` | GradleRIO and RobotPy wheel versions agree |
 | `new_subsystem_test` golden packages | the scaffold's output builds and passes |
-| `tools/check_layers.py` (`bazel query`, CI Linux job) | ARCHITECTURE.md "Allowed dependencies" and `studio/review` viewer isolation (`REQ-SAFE-35`: no UDP `talOS/protocol:protocol`, hardware UDP endpoint `talOS/hardware:hardware`, `talOS/memory:shared_memory`, RTMS, IPC, bridge runtime, or node/devices; pure wire codecs `talOS/protocol:frame` and `talOS/hardware:codecs` allowed); its allowlist only shrinks |
+| `tools/check_layers.py` (`bazel query`, CI Linux job; `--source-only` in CI lint job and `tools/prepush.sh` via `tools/source_lints.sh`) | ARCHITECTURE.md "Allowed dependencies", C++/Starlark devices-layer bypass prevention (`RULES.md 2`), MuJoCo isolation (`//talOS/simulation/mujoco` only), and `studio/review` viewer isolation (`REQ-SAFE-35`: no UDP `talOS/protocol:protocol`, hardware UDP endpoint `talOS/hardware:hardware`, `talOS/memory:shared_memory`, RTMS, IPC, bridge runtime, or node/devices; pure wire codecs `talOS/protocol:frame` and `talOS/hardware:codecs` allowed); its allowlist only shrinks |
 | `tools/lint_test_time.py` (CI lint job) | no wall clock in tests or node code, no randomness, direct blocking I/O, logging, `print`, or locks in node code ([METHODOLOGY.md §9](METHODOLOGY.md#9-time-determinism-restart), [§10](METHODOLOGY.md#10-performance)), and no test retries (TESTING.md §6.1, §8.1); its allowlist only shrinks |
 | `tools/check_links.py` (CI lint job) | every relative markdown link and `#anchor` resolves |
 | `tools/trace.py --check` (CI lint job) | every `REQ-` tag names a catalogue requirement; every SAFE, CONTRACT and P0 requirement has a tagged test at or below its cheapest runnable tier (from Bazel lane tags, GradleRIO `phoenixTest`, and Studio node:test (`tsx --test`)) or cites a bench section or open TODO.md item; quarantines are dated and unexpired; every Bazel package is in the package scope table; its waiver list only shrinks |

@@ -231,5 +231,30 @@ TEST(FrameFuzzTest, HeaderAndEncodeBoundaryMutations) {
       LLVMFuzzerTestOneInput(out.data(), written);
     }
   }
+
+  // Overlapping payload/output buffers must be handled safely without UB
+  // (e.g. payload == out + kFrameHeaderSize, payload == out, partial overlap).
+  {
+    std::array<uint8_t, 64> payload{};
+    for (std::size_t i = 0; i < payload.size(); ++i) {
+      payload[i] = static_cast<uint8_t>((i * 29u) ^ 0xA3u);
+    }
+    std::array<uint8_t, kFrameHeaderSize + payload.size()> expected{};
+    ASSERT_EQ(EncodeFrame(FrameType::kHardwareCommand, kFlagNone, 99, 12345,
+                          payload.data(), payload.size(), expected.data(),
+                          expected.size()),
+              expected.size());
+
+    for (const std::size_t src_offset :
+         {std::size_t{0}, std::size_t{16}, kFrameHeaderSize}) {
+      std::array<uint8_t, kFrameHeaderSize + payload.size()> buf{};
+      std::memcpy(buf.data() + src_offset, payload.data(), payload.size());
+      const std::size_t written = EncodeFrame(
+          FrameType::kHardwareCommand, kFlagNone, 99, 12345,
+          buf.data() + src_offset, payload.size(), buf.data(), buf.size());
+      ASSERT_EQ(written, expected.size());
+      EXPECT_EQ(buf, expected);
+    }
+  }
 }
 #endif

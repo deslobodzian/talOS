@@ -57,7 +57,8 @@ class SE2 {
       m = w / Scalar(2) * (Scalar(1) - w2 / Scalar(12));
     } else {
       sinc = std::sin(w) / w;
-      m = (Scalar(1) - std::cos(w)) / w;
+      const Scalar half_sin = std::sin(Scalar(0.5) * w);
+      m = (Scalar(2) * half_sin * half_sin) / w;
     }
     Matrix2 v;
     v << sinc, -m, m, sinc;
@@ -103,24 +104,37 @@ class SE2 {
     return ad;
   }
 
-  // Exact right Jacobian, using ad(tau), not the homogeneous matrix Hat.
+  // Exact right Jacobian, evaluated directly from I - a ad + b ad^2 without
+  // forming w^2 or w^3 in the large-angle branch (avoiding overflow on huge
+  // |w| and 1 - cos(w) cancellation near the small-angle threshold).
   static Matrix3 RightJacobianOfExp(const Vector3& tau) {
-    Matrix3 ad = Matrix3::Zero();
-    ad(1, 0) = tau(2);
-    ad(2, 0) = -tau(1);
-    ad(1, 2) = -tau(0);
-    ad(2, 1) = tau(0);
     const Scalar w = tau(0);
-    const Scalar w2 = w * w;
-    Scalar a, b;
-    if (w2 < std::sqrt(Eigen::NumTraits<Scalar>::epsilon())) {
-      a = Scalar(0.5) - w2 / Scalar(24) + w2 * w2 / Scalar(720);
-      b = Scalar(1) / Scalar(6) - w2 / Scalar(120) + w2 * w2 / Scalar(5040);
+    const Scalar vx = tau(1);
+    const Scalar vy = tau(2);
+    Scalar a, bw, sinc, aw;
+    if (std::abs(w) < Scalar(0.05)) {
+      const Scalar w2 = w * w;
+      a = Scalar(0.5) +
+          w2 * (-Scalar(1) / Scalar(24) +
+                w2 * (Scalar(1) / Scalar(720) - w2 / Scalar(40320)));
+      const Scalar b =
+          Scalar(1) / Scalar(6) +
+          w2 * (-Scalar(1) / Scalar(120) +
+                w2 * (Scalar(1) / Scalar(5040) - w2 / Scalar(362880)));
+      sinc = Scalar(1) - b * w2;
+      aw = a * w;
+      bw = b * w;
     } else {
-      a = (Scalar(1) - std::cos(w)) / w2;
-      b = (w - std::sin(w)) / (w2 * w);
+      const Scalar half_sin = std::sin(Scalar(0.5) * w);
+      sinc = std::sin(w) / w;
+      aw = (Scalar(2) * half_sin * half_sin) / w;
+      a = aw / w;
+      bw = (Scalar(1) - sinc) / w;
     }
-    return Matrix3::Identity() - a * ad + b * ad * ad;
+    Matrix3 jr;
+    jr << Scalar(1), Scalar(0), Scalar(0), -a * vy + bw * vx, sinc, aw,
+        a * vx + bw * vy, -aw, sinc;
+    return jr;
   }
 
   // Lie algebra hat: (omega, vx, vy) -> [[0,-w,vx],[w,0,vy],[0,0,0]].

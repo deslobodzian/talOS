@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 
 import type {RobotEvent} from '../src/data/types';
+import {nextPaletteIndex} from '../src/shell/CommandPalette';
 import {
   eventCommands,
   filterCommands,
@@ -80,5 +81,27 @@ test('eventCommands sorts exact decimal timestamps numerically before limiting',
   for (const command of commands) command.run();
   assert.deepEqual(sought, ['9007199254740993', '9007199254740992', '10']);
   assert.deepEqual(events.map(event => event.t_ns), times);
+});
+
+test('nextPaletteIndex clamps stale indices before stepping Up or Down', () => {
+  // List shrank from 10 to 2 while active was 9: ArrowUp must move immediately
+  // from clamped 1 to 0, rather than decrementing 9 -> 8.
+  assert.equal(nextPaletteIndex(9, 2, -1), 0);
+  assert.equal(nextPaletteIndex(9, 2, 1), 1);
+  assert.equal(nextPaletteIndex(0, 0, 1), 0);
+  assert.equal(nextPaletteIndex(0, 3, -1), 0);
+  assert.equal(nextPaletteIndex(1, 3, 1), 2);
+});
+
+test('relativeEventTime and eventCommands tolerate malformed timestamps', () => {
+  assert.equal(relativeEventTime('bad', '1000'), '');
+  assert.equal(relativeEventTime('1000', 'bad'), '');
+  const events: RobotEvent[] = [
+    {id: 'bad', t_ns: 'not-a-number', severity: 'info', category: 'system', title: 'bad'},
+    {id: 'ok', t_ns: '500', severity: 'info', category: 'system', title: 'ok'}
+  ];
+  const cmds = eventCommands(events, () => {}, '1000', 10);
+  assert.deepEqual(cmds.map(c => c.id), ['event:ok', 'event:bad']);
+  assert.equal(cmds[1].hint, '');
 });
 

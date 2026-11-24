@@ -1,7 +1,7 @@
 // The keyboard shortcuts overlay. '?' toggles it; Escape or a click outside
 // closes it.
 
-import {useEffect} from 'react';
+import {useEffect, useRef} from 'react';
 
 const SHORTCUTS: {keys: string; label: string}[] = [
   {keys: 'Space', label: 'Play / pause'},
@@ -14,16 +14,18 @@ const SHORTCUTS: {keys: string; label: string}[] = [
 
 // Escape anywhere on the page calls `onClose` while the overlay is mounted.
 export function useEscape(onClose: () => void) {
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.preventDefault();
-        onClose();
+        onCloseRef.current();
       }
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [onClose]);
+  }, []);
 }
 
 export function ShortcutsOverlay({onClose}: {onClose: () => void}) {

@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -523,6 +524,177 @@ TEST_F(AprilTagMetalAdapterTest, RejectsUnsupportedImageDimensions) {
   image_u8_t tall_im{.width = 4, .height = 32768, .stride = 4, .buf = &dummy};
   EXPECT_EQ(apriltag_threshold_cpu(td_, &tall_im), nullptr);
   expect_empty_detect(&tall_im);
+}
+
+TEST_F(AprilTagMetalAdapterTest, RejectsInvalidQuadDecimate) {
+  image_u8_t* im = image_u8_create(64, 64);
+  ASSERT_NE(im, nullptr);
+  std::memset(im->buf, 128, static_cast<size_t>(im->stride) * im->height);
+
+  for (const float bad_decimate : {std::numeric_limits<float>::quiet_NaN(),
+                                   std::numeric_limits<float>::infinity(),
+                                   -std::numeric_limits<float>::infinity(),
+                                   0.0f, -0.0f, -1.0f, -1e20f, 32768.0f}) {
+    SCOPED_TRACE(bad_decimate);
+    td_->quad_decimate = bad_decimate;
+    EXPECT_FALSE(apriltag_image_dimensions_supported(td_, 64, 64));
+
+    zarray_t* dets_null_thresh =
+        apriltag_detector_detect_with_threshim(td_, im, nullptr);
+    ASSERT_NE(dets_null_thresh, nullptr);
+    EXPECT_EQ(zarray_size(dets_null_thresh), 0);
+    apriltag_detections_destroy(dets_null_thresh);
+
+    zarray_t* dets_with_thresh =
+        apriltag_detector_detect_with_threshim(td_, im, im);
+    ASSERT_NE(dets_with_thresh, nullptr);
+    EXPECT_EQ(zarray_size(dets_with_thresh), 0);
+    apriltag_detections_destroy(dets_with_thresh);
+  }
+
+  td_->quad_decimate = 1.0f;
+  image_u8_destroy(im);
+}
+
+TEST_F(AprilTagMetalAdapterTest, RejectsNonPositiveThreadsWithoutDivByZero) {
+  const std::string path = ResolveTestdataPath("scene_single_tag0.png");
+  ASSERT_TRUE(std::filesystem::exists(path));
+
+  image_u8_t* im = talos::vision::apriltag::LoadGrayImageU8(path);
+  ASSERT_NE(im, nullptr);
+  image_u8_t* threshim = apriltag_threshold_cpu(td_, im);
+  ASSERT_NE(threshim, nullptr);
+
+  for (const int bad_threads : {0, -1}) {
+    SCOPED_TRACE(bad_threads);
+    td_->nthreads = bad_threads;
+
+    EXPECT_EQ(apriltag_threshold_cpu(td_, im), nullptr);
+
+    zarray_t* quads = apriltag_quad_thresh_from_threshim(td_, im, threshim);
+    ASSERT_NE(quads, nullptr);
+    EXPECT_EQ(zarray_size(quads), 0);
+    zarray_destroy(quads);
+
+    zarray_t* empty_clusters = zarray_create(sizeof(zarray_t*));
+    zarray_t* cluster_quads =
+        apriltag_quad_thresh_from_gpu_clusters(td_, im, empty_clusters);
+    ASSERT_NE(cluster_quads, nullptr);
+    EXPECT_EQ(zarray_size(cluster_quads), 0);
+    zarray_destroy(cluster_quads);
+
+    zarray_t* dets = apriltag_detector_detect_with_threshim(td_, im, threshim);
+    ASSERT_NE(dets, nullptr);
+    EXPECT_EQ(zarray_size(dets), 0);
+    apriltag_detections_destroy(dets);
+
+    zarray_t* dets_null =
+        apriltag_detector_detect_with_threshim(td_, im, nullptr);
+    ASSERT_NE(dets_null, nullptr);
+    EXPECT_EQ(zarray_size(dets_null), 0);
+    apriltag_detections_destroy(dets_null);
+  }
+
+  td_->nthreads = 1;
+  image_u8_destroy(threshim);
+  image_u8_destroy(im);
+}
+
+TEST_F(AprilTagMetalAdapterTest, CorruptGpuParentsFallBackToCpuParity) {
+  const std::string path = ResolveTestdataPath("scene_single_tag0.png");
+  ASSERT_TRUE(std::filesystem::exists(path));
+
+  image_u8_t* im = talos::vision::apriltag::LoadGrayImageU8(path);
+  ASSERT_NE(im, nullptr);
+  image_u8_t* threshim = apriltag_threshold_cpu(td_, im);
+  ASSERT_NE(threshim, nullptr);
+
+  zarray_t* standard_dets = apriltag_detector_detect(td_, im);
+  ASSERT_NE(standard_dets, nullptr);
+  ASSERT_EQ(zarray_size(standard_dets), 1);
+  apriltag_detection_t* det_std = nullptr;
+  zarray_get(standard_dets, 0, reinterpret_cast<void*>(&det_std));
+
+  zarray_t* upstream_quads = apriltag_quad_thresh(td_, im);
+  ASSERT_NE(upstream_quads, nullptr);
+  const int n_upstream_quads = zarray_size(upstream_quads);
+  ASSERT_GT(n_upstream_quads, 0);
+
+  const size_t npix =
+      static_cast<size_t>(im->width) * static_cast<size_t>(im->height);
+  ASSERT_GE(npix, 3u);
+  const std::vector<uint32_t> sizes(npix, 100u);
+
+  auto destroy_quads = [](zarray_t* quads) {
+    for (int i = 0; i < zarray_size(quads); ++i) {
+      struct quad* q = nullptr;
+      zarray_get_volatile(quads, i, reinterpret_cast<void*>(&q));
+      matd_destroy(q->H);
+      matd_destroy(q->Hinv);
+    }
+    zarray_destroy(quads);
+  };
+
+  auto check_case = [&](const char* label,
+                        const std::vector<uint32_t>& bad_parents) {
+    SCOPED_TRACE(label);
+    zarray_t* quads = apriltag_quad_thresh_from_gpu_labels(
+        td_, im, threshim, bad_parents.data(), sizes.data());
+    ASSERT_NE(quads, nullptr);
+    EXPECT_EQ(zarray_size(quads), n_upstream_quads);
+    destroy_quads(quads);
+
+    zarray_t* dets = apriltag_detector_detect_with_gpu_labels(
+        td_, im, threshim, bad_parents.data(), sizes.data());
+    ASSERT_NE(dets, nullptr);
+    ASSERT_EQ(zarray_size(dets), 1);
+    apriltag_detection_t* det = nullptr;
+    zarray_get(dets, 0, reinterpret_cast<void*>(&det));
+    EXPECT_EQ(det->id, det_std->id);
+    EXPECT_EQ(det->hamming, det_std->hamming);
+    EXPECT_NEAR(det->c[0], det_std->c[0], 1e-4);
+    EXPECT_NEAR(det->c[1], det_std->c[1], 1e-4);
+    apriltag_detections_destroy(dets);
+  };
+
+  // 1. Boundary out-of-bounds parent (== npix).
+  {
+    std::vector<uint32_t> parents(npix, 0xFFFFFFFFu);
+    parents[0] = static_cast<uint32_t>(npix);
+    check_case("oob_npix", parents);
+  }
+  // 2. Far out-of-bounds parent (0x7FFFFFFEu).
+  {
+    std::vector<uint32_t> parents(npix, 0xFFFFFFFFu);
+    parents[0] = 0x7FFFFFFEu;
+    check_case("oob_far", parents);
+  }
+  // 3. Dangling parent pointing to an ignored (0xFFFFFFFFu) entry.
+  {
+    std::vector<uint32_t> parents(npix, 0xFFFFFFFFu);
+    parents[0] = 1u;
+    check_case("dangling_to_ignored", parents);
+  }
+  // 4. Cyclic parent pair (0 -> 1 -> 0).
+  {
+    std::vector<uint32_t> parents(npix, 0xFFFFFFFFu);
+    parents[0] = 1u;
+    parents[1] = 0u;
+    check_case("cyclic_pair", parents);
+  }
+  // 5. Non-canonical chain (0 -> 1 -> 2 -> 2).
+  {
+    std::vector<uint32_t> parents(npix, 0xFFFFFFFFu);
+    parents[0] = 1u;
+    parents[1] = 2u;
+    parents[2] = 2u;
+    check_case("non_canonical_chain", parents);
+  }
+
+  destroy_quads(upstream_quads);
+  apriltag_detections_destroy(standard_dets);
+  image_u8_destroy(threshim);
+  image_u8_destroy(im);
 }
 
 #if defined(__APPLE__)

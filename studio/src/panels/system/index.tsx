@@ -80,7 +80,7 @@ function SystemPanel() {
         <h2>Nodes</h2><span>{nodes.length} SHOWN</span>
       </div>
       <div className="node-grid">
-        {nodes.map(node => <NodeCard key={node.name + node.generation}
+        {nodes.map(node => <NodeCard key={`${node.name}:${node.generation}`}
                                      graph={graph} node={node}
                                      stale={system.stale}
                                      rates={system.rates}

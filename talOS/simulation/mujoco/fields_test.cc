@@ -11,10 +11,12 @@
 #include <algorithm>
 #include <cstddef>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -51,13 +53,18 @@ bool Contains(std::span<const FieldEntry> fields, std::string_view name) {
 // REQ-DEV-37
 TEST(MujocoGatewayFields, EveryConfigFieldLoadsAndNoOtherExists) {
   const std::string robot = ::testing::TempDir() + "/fields_robot.xml";
-  std::ofstream(robot) << R"(<mujoco><worldbody>
+  {
+    std::ofstream out(robot);
+    out << R"(<mujoco><worldbody>
   <body name="probe_base" pos="0 0 0.5">
     <inertial pos="0 0 0" mass="1" diaginertia="0.1 0.1 0.1"/>
   </body>
 </worldbody></mujoco>)";
+    ASSERT_TRUE(out.good()) << "failed to write " << robot;
+  }
   InstallMujocoProcessHandlers();
   const FieldResolver resolve = RunfilesFieldResolver("");
+  EXPECT_EQ(GatewayFields().size(), std::size(config::kSimulationMujocoFields));
   for (const config::SimulationMujocoField& field :
        config::kSimulationMujocoFields) {
     SCOPED_TRACE(std::string(field.name));
@@ -68,6 +75,8 @@ TEST(MujocoGatewayFields, EveryConfigFieldLoadsAndNoOtherExists) {
     EXPECT_EQ(FuelBodies(*plant), kFuelBodies.at(field.name));
     const int centre = mj_name2id(plant->model(), mjOBJ_SITE, "field_centre");
     ASSERT_GE(centre, 0);
+    EXPECT_EQ(plant->model()->site_bodyid[centre], 0)
+        << "field_centre must be attached to the world body";
     const mjtNum* at =
         plant->model()->site_pos + static_cast<std::ptrdiff_t>(3) * centre;
     // Within a millimetre: the drawings give the field to 0.01 in.
@@ -90,6 +99,14 @@ TEST(MujocoGatewayFields, EveryConfigFieldLoadsAndNoOtherExists) {
     ::sim::MatchState match;
     rules->Report(match);
     EXPECT_GT(match.pieces_in_play_count(), 0);
+  }
+  try {
+    (void)resolve("no_such_field");
+    FAIL() << "unknown field name accepted";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_NE(std::string_view(e.what()).find("no_such_field"),
+              std::string_view::npos)
+        << e.what();
   }
 }
 

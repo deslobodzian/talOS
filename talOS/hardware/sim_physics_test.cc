@@ -4284,5 +4284,299 @@ TEST(SimPlant, WorldInputReadsThePlantSensor) {
   }
 }
 
+// REQ-CONTRACT-32, REQ-DEV-10: On a slow-status bus (status_hz = 10 Hz,
+// DiagnosticMaxAgeUs = 250 ms), HeldSample keeps limit-switch flags and
+// frozen effort fields (voltage, stator/supply current) past 50 ms until
+// 250 ms, then clears limit flags and zeroes frozen effort fields at 250 ms
+// while keeping temperature until kTemperatureMaxAgeUs (500 ms).
+TEST(SimBelievability, LowStatusHzHeldSampleScalesDiagnosticMaxAge) {
+  Config c = SingleMotorConfig();
+  c.command_timeout_us = 500'000;
+  c.status_hz = 10.0;
+  const uint64_t diag_max_us = DiagnosticMaxAgeUs(c.status_hz);
+  ASSERT_EQ(diag_max_us, 250'000u);
+
+  PhysicsSimBackend backend;
+  ASSERT_TRUE(backend.Configure(c));
+  backend.SetForwardLimitPressed(1, true);
+  // Reverse voltage is not blocked by the pressed forward switch, so voltage
+  // and currents are non-zero before freezing.
+  std::array<MotorRequest, 1> cmd{{{1, Mode::kVoltage, 0, -6.0, 0.0}}};
+  ASSERT_TRUE(backend.Apply(cmd));
+  State s{};
+  constexpr uint64_t kLastReadUs = 5000;
+  s.sample_time_us = kLastReadUs;
+  ASSERT_TRUE(backend.Read(s));
+  ASSERT_EQ(s.motors[0].fault_flags, kMotorForwardHardLimitFlag);
+  ASSERT_LT(s.motors[0].voltage, -1.0);
+  ASSERT_GT(s.motors[0].stator_current_a, 1.0);
+  ASSERT_GT(s.motors[0].supply_current_a, 0.1);
+
+  // Frozen feedback: past 50 ms but below 250 ms, diagnostics stay held.
+  backend.FreezeFeedback(1);
+  for (const uint64_t age_us : {kFaultFieldMaxAgeUs, diag_max_us - 1}) {
+    SCOPED_TRACE(age_us);
+    s.sample_time_us = kLastReadUs + age_us;
+    ASSERT_TRUE(backend.Read(s));
+    EXPECT_TRUE(s.motors[0].valid);
+    EXPECT_EQ(s.motors[0].fault_flags, kMotorForwardHardLimitFlag);
+    EXPECT_LT(s.motors[0].voltage, -1.0);
+    EXPECT_GT(s.motors[0].stator_current_a, 1.0);
+    EXPECT_GT(s.motors[0].supply_current_a, 0.1);
+    EXPECT_DOUBLE_EQ(s.motors[0].temperature_c, 25.0);
+  }
+  s.sample_time_us = kLastReadUs + diag_max_us;
+  ASSERT_TRUE(backend.Read(s));
+  EXPECT_TRUE(s.motors[0].valid);
+  EXPECT_EQ(s.motors[0].fault_flags, 0u);
+  EXPECT_DOUBLE_EQ(s.motors[0].voltage, 0.0);
+  EXPECT_DOUBLE_EQ(s.motors[0].stator_current_a, 0.0);
+  EXPECT_DOUBLE_EQ(s.motors[0].supply_current_a, 0.0);
+  EXPECT_DOUBLE_EQ(s.motors[0].temperature_c, 25.0);
+
+  s.sample_time_us = kLastReadUs + kTemperatureMaxAgeUs;
+  ASSERT_TRUE(backend.Read(s));
+  EXPECT_DOUBLE_EQ(s.motors[0].temperature_c, 0.0);
+
+  // Disconnected feedback uses the same DiagnosticMaxAgeUs bound for limits.
+  backend.UnfreezeFeedback(1);
+  const uint64_t reconnect_us = kLastReadUs + kTemperatureMaxAgeUs + 5000;
+  s.sample_time_us = reconnect_us;
+  ASSERT_TRUE(backend.Read(s));
+  ASSERT_EQ(s.motors[0].fault_flags, kMotorForwardHardLimitFlag);
+  backend.SetMotorConnected(1, false);
+  s.sample_time_us = reconnect_us + diag_max_us - 1;
+  EXPECT_FALSE(backend.Read(s));
+  EXPECT_FALSE(s.motors[0].valid);
+  EXPECT_EQ(s.motors[0].fault_flags, kMotorForwardHardLimitFlag);
+  s.sample_time_us = reconnect_us + diag_max_us;
+  EXPECT_FALSE(backend.Read(s));
+  EXPECT_FALSE(s.motors[0].valid);
+  EXPECT_EQ(s.motors[0].fault_flags, 0u);
+}
+
+// REQ-DEV-10, REQ-SAFE-22: Configure rejects configs with more than kMaxMotors
+// motors without overwriting a prior valid configuration, and Apply rejects
+// spans longer than kMaxMotors.
+TEST(SimHardening, ConfigureAndApplyRejectOutOfBoundsMotorCount) {
+  PhysicsSimBackend backend;
+  ASSERT_TRUE(backend.Configure(SingleMotorConfig()));
+  std::array<MotorRequest, 1> valid_cmd{{{1, Mode::kVoltage, 0, 2.0, 0.0}}};
+  ASSERT_TRUE(backend.Apply(valid_cmd));
+
+  Config oversized;
+  for (std::size_t i = 0; i <= kMaxMotors; ++i) {
+    const std::string name = "m" + std::to_string(i);
+    oversized.motors.push_back(TestMotor(static_cast<uint16_t>(i + 1),
+                                         name.c_str(), static_cast<int>(i)));
+  }
+  EXPECT_FALSE(backend.Configure(oversized));
+  const auto err = backend.last_config_error();
+  ASSERT_TRUE(err.has_value());
+  EXPECT_NE(err.value().message.find("kMaxMotors"), std::string::npos);
+
+  std::vector<MotorRequest> oversized_cmd(kMaxMotors + 1);
+  EXPECT_FALSE(backend.Apply(oversized_cmd));
+
+  // The previously configured motor still runs cleanly after both refusals.
+  State s{};
+  s.sample_time_us = 5000;
+  ASSERT_TRUE(backend.Read(s));
+  EXPECT_TRUE(s.motors[0].valid);
+  EXPECT_NEAR(s.motors[0].voltage, 2.0, 1e-9);
+}
+
+// REQ-DEV-10, REQ-SAFE-22: Non-finite demands, feedforwards, supply voltages,
+// and non-finite or huge step sizes never poison StepAxis, DriveVoltage,
+// Motion Magic profiles, battery sag, or chassis state.
+TEST(SimHardening, NonFiniteCommandsSupplyAndExtremeDtStayFinite) {
+  const double kNan = std::numeric_limits<double>::quiet_NaN();
+  const sim::MotorModel x60 = sim::MotorModelFor(MotorType::kKrakenX60);
+  const sim::MechanismModel mech{};
+  const sim::AxisState start{1.5, 2.0};
+  for (const double bad_dt : {kNan, kInf, -kInf, -0.01}) {
+    const sim::AxisState out =
+        sim::StepAxis(x60, mech, start, 6.0, true, 12.0, bad_dt);
+    EXPECT_DOUBLE_EQ(out.rotor_position_rot, start.rotor_position_rot);
+    EXPECT_DOUBLE_EQ(out.rotor_velocity_rps, start.rotor_velocity_rps);
+  }
+  for (const double bad_v : {kNan, kInf, -kInf}) {
+    const sim::AxisState out =
+        sim::StepAxis(x60, mech, start, bad_v, true, 12.0, 0.005);
+    EXPECT_TRUE(std::isfinite(out.rotor_position_rot));
+    EXPECT_TRUE(std::isfinite(out.rotor_velocity_rps));
+  }
+
+  MotorConfig mcfg = TestMotor(1, "roller", 1);
+  mcfg.slots[0].p = 1.0;
+  mcfg.slots[0].v = 0.1;
+  for (const Mode mode : {Mode::kDutyCycle, Mode::kVoltage, Mode::kVelocity,
+                          Mode::kPosition, Mode::kMotionMagic}) {
+    for (const double bad : {kNan, kInf, -kInf}) {
+      double v = 42.0;
+      EXPECT_FALSE(
+          sim::DriveVoltage({1, mode, 0, bad, 0.0}, mcfg, 0.0, 0.0, 12.0, v));
+      EXPECT_FALSE(
+          sim::DriveVoltage({1, mode, 0, 1.0, bad}, mcfg, 0.0, 0.0, 12.0, v));
+    }
+  }
+
+  Config cfg = SingleMotorConfig();
+  cfg.motors[0].foc = true;
+  cfg.motors[0].max_torque_current_a = 40.0;
+  cfg.motors[0].slots[0].p = 1.0;
+  cfg.motors[0].slots[0].v = 0.12;
+  cfg.motors[0].cruise_velocity_rps = 5.0;
+  cfg.motors[0].acceleration_rps2 = 10.0;
+  PhysicsSimBackend backend;
+  backend.SetBatteryModel({.internal_resistance_ohm = 0.05});
+  ASSERT_TRUE(backend.Configure(cfg));
+
+  for (const Mode mode :
+       {Mode::kDutyCycle, Mode::kVoltage, Mode::kVelocity, Mode::kPosition,
+        Mode::kMotionMagic, Mode::kTorqueCurrent}) {
+    for (const double bad : {kNan, kInf, -kInf}) {
+      ASSERT_TRUE(
+          backend.Apply(std::array{MotorRequest{1, mode, 0, bad, 0.0}}));
+      backend.Step(0.005);
+      EXPECT_DOUBLE_EQ(backend.applied_voltage(0), 0.0);
+    }
+  }
+  backend.SetSupplyVoltage(kNan);
+  EXPECT_DOUBLE_EQ(backend.supply_voltage(), 0.0);
+  backend.ClearSupplyVoltageOverride();
+  ASSERT_TRUE(backend.Apply(
+      std::array{MotorRequest{1, Mode::kMotionMagic, 0, 2.0, 0.0}}));
+  for (const double dt : {kNan, kInf, -kInf, 1e300}) {
+    backend.Step(dt);
+  }
+  State s{};
+  s.sample_time_us = 5000;
+  ASSERT_TRUE(backend.Read(s));
+  EXPECT_TRUE(std::isfinite(s.motors[0].position_rot));
+  EXPECT_TRUE(std::isfinite(s.motors[0].velocity_rps));
+  EXPECT_TRUE(std::isfinite(s.motors[0].voltage));
+  EXPECT_TRUE(std::isfinite(s.motors[0].stator_current_a));
+  EXPECT_TRUE(std::isfinite(backend.supply_voltage()));
+  // Motion Magic profile was not poisoned and still converges to 2.0 rot.
+  uint64_t now_us = 5000;
+  StepBackend(backend, s, now_us, 5000, 600);
+  EXPECT_NEAR(s.motors[0].position_rot, 2.0, 0.05);
+}
+
+// REQ-SAFE-43, REQ-DEV-10: A TorqueCurrent motor stopped by its soft limit
+// recomputes its winding voltage at zero speed (so stator current stays at the
+// demanded current, not the old back-EMF voltage over R), and hardware limit
+// switches judge TorqueCurrent by its demand sign even while back-driven.
+TEST(SimHardening, TorqueCurrentSoftLimitAndBackdrivenLimitSwitch) {
+  // Part A: TorqueCurrent stopping at a soft limit keeps stator current <=
+  // demand.
+  {
+    Config cfg = SingleMotorConfig();
+    cfg.motors[0].foc = true;
+    cfg.motors[0].max_torque_current_a = 5.0;
+    cfg.motors[0].stator_limit_a = 80.0;
+    cfg.motors[0].soft_limits = true;
+    cfg.motors[0].reverse_limit_rot = -1.0;
+    cfg.motors[0].forward_limit_rot = 1.0;
+    PhysicsSimBackend backend;
+    ASSERT_TRUE(backend.Configure(cfg));
+    ASSERT_TRUE(backend.Apply(
+        std::array{MotorRequest{1, Mode::kTorqueCurrent, 0, 2.0, 0.0}}));
+    State s{};
+    uint64_t now_us = 0;
+    bool hit_limit = false;
+    for (int step = 0; step < 400; ++step) {
+      StepBackend(backend, s, now_us, 5000, 1);
+      EXPECT_LE(s.motors[0].stator_current_a, 2.0 + 1e-6) << "step " << step;
+      if (s.motors[0].position_rot >= 1.0 && s.motors[0].velocity_rps == 0.0) {
+        hit_limit = true;
+        EXPECT_NEAR(s.motors[0].stator_current_a, 2.0, 1e-6);
+        break;
+      }
+    }
+    EXPECT_TRUE(hit_limit);
+  }
+  // Part B: Back-driven at -30 rps, +10 A demands negative winding volts but
+  // forward torque, so forward limit switch blocks it and reverse allows it.
+  {
+    Config cfg = SingleMotorConfig();
+    cfg.motors[0].foc = true;
+    cfg.motors[0].max_torque_current_a = 40.0;
+    FakePlant plant;
+    plant.binds = {"roller"};
+    plant.rotors[0] = {0.0, -30.0};
+    PhysicsSimBackend backend;
+    backend.SetPlant(&plant);
+    ASSERT_TRUE(backend.Configure(cfg));
+    backend.SetForwardLimitPressed(1, true);
+    ASSERT_TRUE(backend.Apply(
+        std::array{MotorRequest{1, Mode::kTorqueCurrent, 0, 10.0, 0.0}}));
+    State s{};
+    ASSERT_TRUE(backend.Read(s));
+    EXPECT_DOUBLE_EQ(backend.applied_voltage(0), 0.0);
+    EXPECT_DOUBLE_EQ(plant.last_drives[0].volts, 0.0);
+
+    backend.SetForwardLimitPressed(1, false);
+    backend.SetReverseLimitPressed(1, true);
+    s.sample_time_us = 5000;
+    ASSERT_TRUE(backend.Read(s));
+    // Forward torque (+10 A) drives off the pressed reverse limit switch.
+    EXPECT_NEAR(s.motors[0].stator_current_a, 10.0, 1e-6);
+
+    ASSERT_TRUE(backend.Apply(
+        std::array{MotorRequest{1, Mode::kTorqueCurrent, 0, -10.0, 0.0}}));
+    s.sample_time_us = 10000;
+    ASSERT_TRUE(backend.Read(s));
+    EXPECT_DOUBLE_EQ(backend.applied_voltage(0), 0.0);
+  }
+}
+
+// REQ-DEV-37: Large period_us / small step_us cannot wrap PlantMaxSteps to 0 or
+// negative int, and extreme sample_time_us jumps advance cleanly without signed
+// overflow.
+TEST(SimPlant, HugeTimestampJumpAndLargePeriodDoNotOverflow) {
+  {
+    Config cfg = SingleMotorConfig();
+    cfg.period_us = std::numeric_limits<uint32_t>::max();
+    FakePlant plant;
+    plant.step = 2;
+    PhysicsSimBackend backend;
+    backend.SetPlant(&plant);
+    ASSERT_TRUE(backend.Configure(cfg));
+    EXPECT_EQ(backend.plant_time().max_steps,
+              static_cast<uint32_t>(std::numeric_limits<int>::max()));
+  }
+  {
+    Config cfg = SingleMotorConfig();
+    cfg.period_us = 5000;
+    FakePlant plant;
+    plant.binds = {"roller"};
+    plant.step = 5000;
+    PhysicsSimBackend backend;
+    backend.SetPlant(&plant);
+    ASSERT_TRUE(backend.Configure(cfg));
+    State s{};
+    s.sample_time_us = 5000;
+    ASSERT_TRUE(backend.Read(s));
+    s.sample_time_us =
+        5000u + static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) +
+        100'000u;
+    ASSERT_TRUE(backend.Read(s));
+    ASSERT_FALSE(plant.step_log.empty());
+    EXPECT_EQ(plant.step_log.back(), 2);
+    EXPECT_GE(backend.plant_time().lag_us, -2500);
+    EXPECT_LT(backend.plant_time().lag_us, 2500);
+    EXPECT_EQ(backend.plant_time().dropped_ticks, 1u);
+
+    s.sample_time_us = std::numeric_limits<uint64_t>::max();
+    ASSERT_TRUE(backend.Read(s));
+    EXPECT_EQ(plant.step_log.back(), 2);
+    EXPECT_GE(backend.plant_time().lag_us, -2500);
+    EXPECT_LT(backend.plant_time().lag_us, 2500);
+    EXPECT_EQ(backend.plant_time().dropped_ticks, 2u);
+  }
+}
+
 }  // namespace
 }  // namespace talos::hardware

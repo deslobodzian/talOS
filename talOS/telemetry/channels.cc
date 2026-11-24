@@ -1,11 +1,13 @@
 #include "talOS/telemetry/channels.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include "flatbuffers/flatbuffers.h"
@@ -31,18 +33,101 @@ static_assert(static_cast<int>(naming::AlertLevel::kNone) ==
                       Talos::Telemetry::AlertLevel_Error,
               "naming::AlertLevel and telemetry.fbs AlertLevel must agree");
 
+bool TryAdd(std::size_t a, std::size_t b, std::size_t& out) {
+  if (b > std::numeric_limits<std::size_t>::max() - a) return false;
+  out = a + b;
+  return true;
+}
+
+std::string TruncateForError(std::string_view text) {
+  constexpr std::size_t kMaxErrorSegment =
+      telemetry_wire::kMaxDictionaryStringBytes;
+  std::string out;
+  const std::size_t n = std::min(text.size(), kMaxErrorSegment);
+  out.reserve(n + (text.size() > kMaxErrorSegment ? 3 : 0));
+  for (std::size_t i = 0; i < n; ++i) {
+    out.push_back(text[i] == '\0' ? '?' : text[i]);
+  }
+  if (text.size() > kMaxErrorSegment) out += "...";
+  return out;
+}
+
+// Strips at most one leading '/' from `topic` and rejects empty or malformed
+// topic names (empty result, embedded NUL, or empty path segments).
+std::string_view NormalizeTopicPrefix(std::string_view topic) {
+  if (topic.find('\0') != std::string_view::npos) {
+    throw std::invalid_argument("telemetry: malformed topic name '" +
+                                TruncateForError(topic) + "'");
+  }
+  std::string_view prefix = topic;
+  if (prefix.starts_with('/')) prefix.remove_prefix(1);
+  if (prefix.empty() || prefix.starts_with('/') || prefix.ends_with('/') ||
+      prefix.find("//") != std::string_view::npos) {
+    throw std::invalid_argument("telemetry: invalid topic name '" +
+                                TruncateForError(topic) + "'");
+  }
+  return prefix;
+}
+
+// Whether a normalized (slash-stripped) topic prefix has role `status`.
+bool IsStatusTopicPrefix(std::string_view prefix) {
+  const std::size_t slash = prefix.find('/');
+  if (slash == std::string_view::npos) return false;
+  const std::size_t rest = slash + 1;
+  const std::size_t next = prefix.find('/', rest);
+  const std::string_view role = next == std::string_view::npos
+                                    ? prefix.substr(rest)
+                                    : prefix.substr(rest, next - rest);
+  return role == "status";
+}
+
+// Computes the metadata bytes (vector entries plus label text) that
+// EnumLabels(schema, enum_index) would hold, without allocating. Returns false
+// on std::size_t overflow.
+bool MeasureEnumLabels(const reflection::Schema& schema,
+                       std::int32_t enum_index, std::size_t& out_bytes) {
+  out_bytes = 0;
+  if (schema.enums() == nullptr || enum_index < 0 ||
+      static_cast<std::size_t>(enum_index) >= schema.enums()->size()) {
+    return true;
+  }
+  const auto* enum_def =
+      schema.enums()->Get(static_cast<flatbuffers::uoffset_t>(enum_index));
+  if (enum_def == nullptr || enum_def->values() == nullptr) return true;
+  std::int64_t max_value = -1;
+  for (const auto* value : *enum_def->values()) {
+    if (value != nullptr) max_value = std::max(max_value, value->value());
+  }
+  if (max_value < 0 ||
+      max_value >= static_cast<std::int64_t>(telemetry_wire::kMaxEnumLabels)) {
+    return true;
+  }
+  const std::size_t count = static_cast<std::size_t>(max_value) + 1;
+  std::array<std::size_t, telemetry_wire::kMaxEnumLabels> label_lens{};
+  for (const auto* value : *enum_def->values()) {
+    if (value != nullptr && value->name() != nullptr && value->value() >= 0) {
+      label_lens[static_cast<std::size_t>(value->value())] =
+          value->name()->size();
+    }
+  }
+  std::size_t total = count * sizeof(std::string);
+  for (std::size_t i = 0; i < count; ++i) {
+    if (!TryAdd(total, label_lens[i], total)) return false;
+  }
+  out_bytes = total;
+  return true;
+}
+
 // One topic's flattening, bounded against a schema that is damaged or
 // crafted (a recorded log's, which nothing checked against this build).
 class Flattener {
  public:
   Flattener(const reflection::Schema& schema, std::string_view topic,
-            const FlattenOptions& options, std::vector<Channel>& channels)
+            std::string_view prefix, const FlattenOptions& options,
+            std::vector<Channel>& channels)
       : schema_{schema},
         topic_{topic},
-        is_status_topic_{topic.starts_with('/')
-                             ? naming::Role(topic) == "status"
-                             : naming::Role("/" + std::string{topic}) ==
-                                   "status"},
+        is_status_topic_{IsStatusTopicPrefix(prefix)},
         options_{options},
         channels_{channels},
         open_(schema.objects()->size()) {}
@@ -63,13 +148,19 @@ class Flattener {
       Refuse(field, "expands to more than " + std::to_string(kMaxTopicStructs) +
                         " struct instances");
     }
-    const reflection::Object& object =
-        *schema_.objects()->Get(static_cast<flatbuffers::uoffset_t>(index));
-    if (!object.is_struct() || object.bytesize() <= 0 ||
-        object.fields() == nullptr) {
+    const reflection::Object* object_ptr =
+        schema_.objects()->Get(static_cast<flatbuffers::uoffset_t>(index));
+    if (object_ptr == nullptr || !object_ptr->is_struct() ||
+        object_ptr->bytesize() <= 0 || object_ptr->fields() == nullptr) {
       Refuse(field, "is not a positive-sized struct");
     }
+    const reflection::Object& object = *object_ptr;
     const auto bytes = static_cast<std::size_t>(object.bytesize());
+    const std::size_t max_remaining_fields =
+        (kMaxTopicStructs - structs_) + (kMaxTopicElements - elements_);
+    if (object.fields()->size() > max_remaining_fields) {
+      Refuse(field, "exceeds per-topic field expansion bounds");
+    }
     open_[index] = true;
     std::vector<const reflection::Field*> fields;
     fields.reserve(object.fields()->size());
@@ -85,8 +176,21 @@ class Flattener {
               });
 
     for (const auto* field_def : fields) {
-      const std::string field_name = field_def->name()->str();
-      const std::string channel_name = std::string{prefix} + "/" + field_name;
+      const std::string_view field_name = field_def->name()->string_view();
+      if (field_name.empty() ||
+          field_name.find('/') != std::string_view::npos ||
+          field_name.find('\0') != std::string_view::npos) {
+        Refuse(field_name, "has empty or malformed name");
+      }
+      if (field_name.size() >= options_.max_metadata_bytes ||
+          prefix.size() > options_.max_metadata_bytes - 1 - field_name.size()) {
+        RefuseMetadataLimit(field_name);
+      }
+      std::string channel_name;
+      channel_name.reserve(prefix.size() + 1 + field_name.size());
+      channel_name.append(prefix);
+      channel_name.push_back('/');
+      channel_name.append(field_name);
       const auto& type = *field_def->type();
       if (field_def->offset() > bytes ||
           field_def->offset() >
@@ -105,7 +209,9 @@ class Flattener {
         }
         const auto nested_bytes =
             static_cast<std::size_t>(nested_obj->bytesize());
-        if (nested_bytes > bytes - field_def->offset()) {
+        if (nested_bytes > bytes - field_def->offset() ||
+            nested_bytes >
+                std::numeric_limits<std::size_t>::max() - field_offset) {
           Refuse(field_name, "exceeds enclosing struct bounds");
         }
         Struct(nested_idx, field_name, channel_name, field_offset, depth + 1);
@@ -141,21 +247,35 @@ class Flattener {
                     count) {
           Refuse(field_name, "array offset overflows");
         }
+        if (nested && count > kMaxTopicStructs - structs_) {
+          Refuse(field_name, "expands to more than " +
+                                 std::to_string(kMaxTopicStructs) +
+                                 " struct instances");
+        }
         if (!nested && count > kMaxTopicElements - elements_) {
           Refuse(field_name, "expands to more than " +
                                  std::to_string(kMaxTopicElements) +
                                  " scalar elements");
         }
         for (std::size_t i = 0; i < count; ++i) {
-          const std::string element_name =
-              channel_name + "/" + std::to_string(i);
+          const std::string index_str = std::to_string(i);
+          if (index_str.size() >= options_.max_metadata_bytes ||
+              channel_name.size() >
+                  options_.max_metadata_bytes - 1 - index_str.size()) {
+            RefuseMetadataLimit(field_name);
+          }
+          std::string element_name;
+          element_name.reserve(channel_name.size() + 1 + index_str.size());
+          element_name.append(channel_name);
+          element_name.push_back('/');
+          element_name.append(index_str);
           const std::size_t element_offset = field_offset + i * element_bytes;
           if (nested) {
             Struct(element, field_name, element_name, element_offset,
                    depth + 1);
           } else {
-            AddScalar(type.element(), type.index(), field_name, element_name,
-                      element_offset, false);
+            AddScalar(type.element(), type.index(), field_name,
+                      std::move(element_name), element_offset, false);
           }
         }
         continue;
@@ -165,20 +285,28 @@ class Flattener {
       if (scalar_bytes == 0) {
         Refuse(field_name, "has non-scalar field type");
       }
-      if (scalar_bytes > bytes - field_def->offset()) {
+      if (scalar_bytes > bytes - field_def->offset() ||
+          scalar_bytes >
+              std::numeric_limits<std::size_t>::max() - field_offset) {
         Refuse(field_name, "exceeds enclosing struct bounds");
       }
-      AddScalar(type.base_type(), type.index(), field_name, channel_name,
-                field_offset, true);
+      AddScalar(type.base_type(), type.index(), field_name,
+                std::move(channel_name), field_offset, true);
     }
     open_[index] = false;
   }
 
  private:
   [[noreturn]] void Refuse(std::string_view field, std::string_view why) const {
-    throw std::invalid_argument("telemetry: schema for topic '" +
-                                std::string{topic_} + "': field '" +
-                                std::string{field} + "' " + std::string{why});
+    throw std::invalid_argument(
+        "telemetry: schema for topic '" + TruncateForError(topic_) +
+        "': field '" + TruncateForError(field) + "' " + std::string{why});
+  }
+
+  [[noreturn]] void RefuseMetadataLimit(std::string_view field) const {
+    Refuse(field, "exceeds the topic's " +
+                      std::to_string(options_.max_metadata_bytes) +
+                      "-byte metadata limit");
   }
 
   // The index of object `index`, refusing one the schema does not hold.
@@ -210,9 +338,31 @@ class Flattener {
                              std::to_string(options_.max_channels) +
                              " channels");
     }
+    const ChannelKind kind = KindOf(base);
+    const bool is_enum = base != reflection::BaseType::Bool &&
+                         type_index >= 0 &&
+                         (kind == Talos::Telemetry::ChannelKind_Int ||
+                          kind == Talos::Telemetry::ChannelKind_UInt);
+    const std::string_view unit =
+        (base != reflection::BaseType::Bool && !is_enum)
+            ? schema::unit_for_field(field_name)
+            : std::string_view{};
+    std::size_t label_bytes = 0;
+    if (is_enum && !MeasureEnumLabels(schema_, type_index, label_bytes)) {
+      RefuseMetadataLimit(field_name);
+    }
+    std::size_t channel_bytes = 0;
+    if (!TryAdd(sizeof(Channel), name.size(), channel_bytes) ||
+        !TryAdd(channel_bytes, unit.size(), channel_bytes) ||
+        !TryAdd(channel_bytes, label_bytes, channel_bytes) ||
+        channel_bytes > options_.max_metadata_bytes - metadata_bytes_) {
+      RefuseMetadataLimit(field_name);
+    }
+    metadata_bytes_ += channel_bytes;
+
     Channel channel;
     channel.name = std::move(name);
-    channel.kind = KindOf(base);
+    channel.kind = kind;
     channel.offset = offset;
     channel.base = base;
     if (base == reflection::BaseType::Bool) {
@@ -222,12 +372,10 @@ class Flattener {
       if (whole_field && IsStatusTopic()) {
         channel.alert = AlertLevelOf(field_name);
       }
-    } else if (type_index >= 0 &&
-               (channel.kind == Talos::Telemetry::ChannelKind_Int ||
-                channel.kind == Talos::Telemetry::ChannelKind_UInt)) {
+    } else if (is_enum) {
       channel.labels = EnumLabels(schema_, type_index);
     } else {
-      channel.unit = std::string{schema::unit_for_field(field_name)};
+      channel.unit = std::string{unit};
     }
     channels_.push_back(std::move(channel));
   }
@@ -243,6 +391,7 @@ class Flattener {
   std::vector<bool> open_;  // by object index: being flattened now
   std::size_t structs_{0};
   std::size_t elements_{0};
+  std::size_t metadata_bytes_{0};
 };
 
 Channel Unread(std::string name, ChannelKind kind, std::string unit = "",
@@ -267,8 +416,9 @@ std::vector<std::string> EnumLabels(const reflection::Schema& schema,
                                     std::int32_t enum_index) {
   std::vector<std::string> labels;
   if (schema.enums() != nullptr && enum_index >= 0 &&
-      enum_index < static_cast<std::int32_t>(schema.enums()->size())) {
-    const auto* enum_def = schema.enums()->Get(enum_index);
+      static_cast<std::size_t>(enum_index) < schema.enums()->size()) {
+    const auto* enum_def =
+        schema.enums()->Get(static_cast<flatbuffers::uoffset_t>(enum_index));
     if (enum_def == nullptr || enum_def->values() == nullptr) return labels;
     std::int64_t max_value = -1;
     for (const auto* value : *enum_def->values()) {
@@ -294,30 +444,48 @@ std::vector<Channel> FlattenTopic(std::string_view topic,
                                   std::string_view bfbs,
                                   const FlattenOptions& options,
                                   std::size_t* kept) {
+  const std::string_view prefix = NormalizeTopicPrefix(topic);
+  if (prefix.size() > options.max_metadata_bytes) {
+    throw std::invalid_argument(
+        "telemetry: schema for topic '" + TruncateForError(topic) +
+        "': exceeds the topic's " + std::to_string(options.max_metadata_bytes) +
+        "-byte metadata limit");
+  }
   const reflection::Schema* schema = schema::VerifySchema(bfbs);
   if (schema == nullptr) {
     throw std::invalid_argument(
-        "telemetry: failed to verify schema for topic '" + std::string{topic} +
-        "'");
+        "telemetry: failed to verify schema for topic '" +
+        TruncateForError(topic) + "'");
+  }
+  if (schema_name.empty() || schema_name.find('\0') != std::string_view::npos ||
+      schema_name.size() > bfbs.size()) {
+    throw std::invalid_argument(
+        "telemetry: root schema object '" + TruncateForError(schema_name) +
+        "' for topic '" + TruncateForError(topic) + "' is missing");
   }
   const reflection::Object* object =
       schema->objects() != nullptr
           ? schema->objects()->LookupByKey(std::string{schema_name}.c_str())
           : nullptr;
-  if (object == nullptr) {
-    throw std::invalid_argument("telemetry: root schema object '" +
-                                std::string{schema_name} + "' for topic '" +
-                                std::string{topic} + "' is missing");
+  if (object == nullptr || object->name() == nullptr ||
+      object->name()->string_view() != schema_name) {
+    throw std::invalid_argument(
+        "telemetry: root schema object '" + TruncateForError(schema_name) +
+        "' for topic '" + TruncateForError(topic) + "' is missing");
   }
-  std::string_view prefix = topic;
-  if (prefix.starts_with('/')) prefix.remove_prefix(1);
   std::vector<Channel> channels;
   const auto* objects = schema->objects();
   std::size_t root = 0;
-  while (objects->Get(static_cast<flatbuffers::uoffset_t>(root)) != object) {
+  while (root < objects->size() &&
+         objects->Get(static_cast<flatbuffers::uoffset_t>(root)) != object) {
     ++root;
   }
-  Flattener flattener{*schema, topic, options, channels};
+  if (root >= objects->size()) {
+    throw std::invalid_argument(
+        "telemetry: root schema object '" + TruncateForError(schema_name) +
+        "' for topic '" + TruncateForError(topic) + "' is missing");
+  }
+  Flattener flattener{*schema, topic, prefix, options, channels};
   flattener.Struct(root, schema_name, prefix, 0, 0);
   if (kept != nullptr) *kept = flattener.kept();
   return channels;
@@ -326,30 +494,57 @@ std::vector<Channel> FlattenTopic(std::string_view topic,
 std::vector<Channel> EnvelopeChannels(std::string_view topic,
                                       std::string_view inner,
                                       std::string_view bfbs) {
-  std::string prefix{topic};
-  if (prefix.starts_with('/')) prefix.erase(0, 1);
+  const std::string_view prefix = NormalizeTopicPrefix(topic);
+  constexpr std::string_view kSinceSuffix = "/mode_since_us";
+  constexpr std::string_view kActiveSuffix = "/active";
+  const std::string_view since_unit = schema::unit_for_field("mode_since_us");
+  std::size_t header_bytes = 0;
+  if (!TryAdd(sizeof(Channel), prefix.size(), header_bytes) ||
+      !TryAdd(header_bytes, kSinceSuffix.size(), header_bytes) ||
+      !TryAdd(header_bytes, since_unit.size(), header_bytes) ||
+      !TryAdd(header_bytes, sizeof(Channel), header_bytes) ||
+      !TryAdd(header_bytes, prefix.size(), header_bytes) ||
+      !TryAdd(header_bytes, kActiveSuffix.size(), header_bytes) ||
+      header_bytes > kMaxTopicMetadataBytes) {
+    throw std::invalid_argument(
+        "telemetry: schema for topic '" + TruncateForError(topic) +
+        "': exceeds the topic's " + std::to_string(kMaxTopicMetadataBytes) +
+        "-byte metadata limit");
+  }
   std::vector<Channel> channels;
   Channel since;
-  since.name = prefix + "/mode_since_us";
-  since.unit = std::string{schema::unit_for_field("mode_since_us")};
+  since.name.reserve(prefix.size() + kSinceSuffix.size());
+  since.name.append(prefix);
+  since.name.append(kSinceSuffix);
+  since.unit = std::string{since_unit};
   since.kind = Talos::Telemetry::ChannelKind_UInt;
   since.offset = 0;
   since.base = reflection::BaseType::ULong;
   channels.push_back(std::move(since));
   Channel active;
-  active.name = prefix + "/active";
+  active.name.reserve(prefix.size() + kActiveSuffix.size());
+  active.name.append(prefix);
+  active.name.append(kActiveSuffix);
   active.kind = Talos::Telemetry::ChannelKind_Bool;
   active.offset = schema::kEnvelopeActiveOffset;
   active.base = reflection::BaseType::Bool;
   channels.push_back(std::move(active));
   FlattenOptions options;
   options.max_channels = kMaxTopicChannels - channels.size();
-  for (Channel& channel :
-       FlattenTopic(std::string{topic} + "/message", inner, bfbs, options)) {
-    if (channel.offset > std::numeric_limits<std::size_t>::max() -
-                             schema::kEnvelopeHeaderBytes) {
+  options.max_metadata_bytes = kMaxTopicMetadataBytes - header_bytes;
+  std::string inner_topic;
+  inner_topic.reserve(topic.size() + std::string_view{"/message"}.size());
+  inner_topic.append(topic);
+  inner_topic.append("/message");
+  for (Channel& channel : FlattenTopic(inner_topic, inner, bfbs, options)) {
+    const std::size_t scalar_bytes = schema::ScalarSize(channel.base);
+    if (scalar_bytes == 0 ||
+        channel.offset > std::numeric_limits<std::size_t>::max() -
+                             schema::kEnvelopeHeaderBytes ||
+        channel.offset + schema::kEnvelopeHeaderBytes >
+            std::numeric_limits<std::size_t>::max() - scalar_bytes) {
       throw std::invalid_argument("telemetry: schema for topic '" +
-                                  std::string{topic} +
+                                  TruncateForError(topic) +
                                   "': envelope offset overflows");
     }
     channel.offset += schema::kEnvelopeHeaderBytes;
@@ -388,12 +583,11 @@ bool ReadDriverStation(
   if (packet.size() < kData) return false;
   std::uint32_t size = 0;
   std::memcpy(&size, packet.data(), sizeof(size));
-  std::span<const std::uint8_t> bytes;
-  if (size <= sizeof(hardware::Packet::data)) {
-    if (packet.size() - kData < size) return false;
-    bytes = {reinterpret_cast<const std::uint8_t*>(packet.data() + kData),
-             size};
+  if (size > sizeof(hardware::Packet::data) || packet.size() - kData < size) {
+    return false;
   }
+  const std::span<const std::uint8_t> bytes{
+      reinterpret_cast<const std::uint8_t*>(packet.data() + kData), size};
   driver_station::DriverStationData data;
   if (!driver_station::Decode(bytes, data)) return false;
   const std::uint32_t flags = data.fms.flags;

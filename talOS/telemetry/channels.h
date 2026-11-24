@@ -128,6 +128,24 @@ inline constexpr std::size_t kMaxTopicStructs = 4096;
 // Scalar fields and scalar-array elements visited per topic, excluded or
 // truncated channels included: bounds a crafted schema with huge scalar arrays.
 inline constexpr std::size_t kMaxTopicElements = 16384;
+// Cumulative channel metadata bytes retained per topic (ChannelMetadataBytes
+// across kept channels) and ceiling on any path prefix constructed while
+// flattening: bounds heap against adversarial or deeply nested schemas with
+// huge field or enum names (REQ-OPS-42).
+inline constexpr std::size_t kMaxTopicMetadataBytes = std::size_t{2} << 20;
+
+// The metadata bytes accounted for one flattened Channel: the Channel struct's
+// fixed fields/headers, its name and unit strings, and its enum labels (vector
+// entries plus label text). Used by FlattenOptions::max_metadata_bytes.
+inline std::size_t ChannelMetadataBytes(const Channel& channel) {
+  std::size_t total = sizeof(Channel) + channel.name.size() +
+                      channel.unit.size() +
+                      channel.labels.size() * sizeof(std::string);
+  for (const std::string& label : channel.labels) {
+    total += label.size();
+  }
+  return total;
+}
 
 // What a caller keeps of a topic. The review server takes the defaults: a
 // recorded schema past the cap is refused. Live telemetry keeps only the
@@ -141,6 +159,10 @@ struct FlattenOptions {
   // Past max_channels kept channels: return the first max_channels and go on
   // counting (FlattenTopic's `kept`) instead of throwing.
   bool truncate{false};
+  // Cumulative metadata byte budget across flattened channels (REQ-OPS-42),
+  // and upper bound on any path prefix built while walking the schema. Always
+  // throws std::invalid_argument when exceeded, even when `truncate` is true.
+  std::size_t max_metadata_bytes{kMaxTopicMetadataBytes};
 };
 
 // The wire level of `field`'s alert (naming::ParseAlertField), None when it
@@ -151,15 +173,15 @@ AlertLevel AlertLevelOf(std::string_view field);
 // `options` keeps, in field id order with nested structs and arrays
 // expanded in place, named under `topic`; a bool field's alert level from
 // AlertLevelOf when `topic`'s role is `status`, None on any other role.
-// Throws std::invalid_argument
-// naming the topic when `bfbs` does not verify or lacks the struct, or when
-// a field names an object the schema does not hold, a struct contains
-// itself, an array has zero length, structs nest deeper than kMaxNestingDepth,
-// the walk passes kMaxTopicStructs struct instances or kMaxTopicElements
-// scalar elements, or (unless options.truncate) the kept channels pass
-// options.max_channels. `kept`, when given, is set to how many
-// channels `options` kept, those past a truncating flattening's cap
-// included.
+// Throws std::invalid_argument naming the topic when `topic` is empty or
+// malformed, `bfbs` does not verify or lacks the struct, or when a field has
+// an empty or malformed name, names an object the schema does not hold, a
+// struct contains itself, an array has zero length, structs nest deeper than
+// kMaxNestingDepth, the walk passes kMaxTopicStructs struct instances,
+// kMaxTopicElements scalar elements, or options.max_metadata_bytes metadata
+// bytes, or (unless options.truncate) the kept channels pass
+// options.max_channels. `kept`, when given, is set to how many channels
+// `options` kept, those past a truncating flattening's cap included.
 std::vector<Channel> FlattenTopic(std::string_view topic,
                                   std::string_view schema_name,
                                   std::string_view bfbs,

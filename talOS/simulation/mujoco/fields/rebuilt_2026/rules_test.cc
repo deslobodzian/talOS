@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <numbers>
 #include <stdexcept>
@@ -625,6 +626,256 @@ TEST(Rebuilt2026Rules, ObservesTheMatchInputWithoutAStep) {
   match = ReportOf(rules);
   EXPECT_EQ(match.period(), sim::MatchPeriod::Teleop);
   EXPECT_EQ(match.period_remaining_us(), 125'995'000u);
+}
+
+using ModelPtr = std::unique_ptr<mjModel, void (*)(mjModel*)>;
+using DataPtr = std::unique_ptr<mjData, void (*)(mjData*)>;
+
+ModelPtr LoadField() {
+  InstallMujocoProcessHandlers();
+  std::array<char, 1024> error{};
+  ModelPtr model(mj_loadXML(FieldXml().c_str(), nullptr, error.data(),
+                            static_cast<int>(error.size())),
+                 mj_deleteModel);
+  if (!model) throw std::runtime_error(error.data());
+  return model;
+}
+
+void SetFuel(const mjModel* m, mjData* d, int k, const Vec3& pos,
+             const Vec3& vel) {
+  mjtNum* q = d->qpos + FuelQpos(m, k);
+  mjtNum* v = d->qvel + FuelDof(m, k);
+  for (int i = 0; i < 3; ++i) {
+    q[i] = pos[static_cast<std::size_t>(i)];
+    v[i] = vel[static_cast<std::size_t>(i)];
+    v[3 + i] = 0.0;
+  }
+  q[3] = 1.0;
+  q[4] = q[5] = q[6] = 0.0;
+}
+
+// REQ-DEV-40: scoring ignores non-finite positions or velocities, zero
+// downward velocity, FUEL on the cylinder's radial boundary, and out-of-play
+// reserve FUEL; a valid in-play FUEL on the z boundary scores once and is not
+// double-counted if placed back into the site while held.
+TEST(Rebuilt2026Rules, IgnoresNonFiniteReserveAndBoundaryFuel) {
+  ModelPtr m = LoadField();
+  DataPtr d(mj_makeData(m.get()), mj_deleteData);
+  mj_forward(m.get(), d.get());
+  auto rules = MakeRebuilt2026Rules(GameOptions{1});
+  rules->Attach(*m, *d);
+
+  const int site = Id(m.get(), mjOBJ_SITE, "blue_hub_score");
+  const Vec3 score = SiteAt(m.get(), "blue_hub_score");
+  const double radius = m->site_size[Row(3, site)];
+  const double half_h = m->site_size[Row(3, site) + 1];
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+
+  SetFuel(m.get(), d.get(), 0, {nan, score[1], score[2]}, {0.0, 0.0, -1.0});
+  SetFuel(m.get(), d.get(), 1, {score[0], inf, score[2]}, {0.0, 0.0, -1.0});
+  SetFuel(m.get(), d.get(), 2, score, {0.0, 0.0, -inf});
+  SetFuel(m.get(), d.get(), 3, score, {nan, 0.0, -1.0});
+  SetFuel(m.get(), d.get(), 4, score, {0.0, 0.0, 0.0});
+  SetFuel(m.get(), d.get(), 5, {score[0] + radius, score[1], score[2]},
+          {0.0, 0.0, -1.0});
+  SetFuel(m.get(), d.get(), kReserveFirst, score, {0.0, 0.0, -1.0});
+
+  ASSERT_TRUE(rules->AfterStep(*m, *d, 1, Input(Mode::kAutonomous, 0.0)));
+  sim::MatchState match = ReportOf(*rules);
+  EXPECT_EQ(match.blue_scored_count(), 0u);
+  EXPECT_EQ(match.blue_points_count(), 0u);
+  EXPECT_EQ(match.pieces_held_count(), 0u);
+  EXPECT_EQ(match.pieces_in_play_count(), kStaged);
+  EXPECT_FALSE(rules->InPlay(Id(m.get(), mjOBJ_BODY, FuelName(kReserveFirst))));
+
+  // Exact z boundary inside radius scores once; re-placing while held does not.
+  SetFuel(m.get(), d.get(), 6, {score[0], score[1], score[2] + half_h},
+          {0.0, 0.0, -1.0});
+  ASSERT_TRUE(rules->AfterStep(*m, *d, 2, Input(Mode::kAutonomous, 0.005)));
+  match = ReportOf(*rules);
+  EXPECT_EQ(match.blue_scored_count(), 1u);
+  EXPECT_EQ(match.blue_points_count(), 1u);
+  EXPECT_EQ(match.pieces_held_count(), 1u);
+  EXPECT_EQ(match.pieces_in_play_count(), kStaged - 1);
+
+  SetFuel(m.get(), d.get(), 6, score, {0.0, 0.0, -1.0});
+  ASSERT_TRUE(rules->AfterStep(*m, *d, 3, Input(Mode::kAutonomous, 0.010)));
+  match = ReportOf(*rules);
+  EXPECT_EQ(match.blue_scored_count(), 1u);
+  EXPECT_EQ(match.blue_points_count(), 1u);
+  EXPECT_EQ(match.pieces_held_count(), 1u);
+}
+
+// REQ-DEV-40: the match clock stays monotonic under backwards or unscheduled
+// ticks (never inflating time left or re-opening expired grace windows), and
+// period/grace/release-step checks do not wrap near UINT64_MAX.
+TEST(Rebuilt2026Rules, ClockHandlesWrapBackwardsAndPause) {
+  ModelPtr m = LoadField();
+  DataPtr d(mj_makeData(m.get()), mj_deleteData);
+  mj_forward(m.get(), d.get());
+
+  // Backwards and unscheduled ticks never regress time or re-open grace.
+  {
+    auto rules = MakeRebuilt2026Rules(GameOptions{1});
+    rules->Attach(*m, *d);
+    ASSERT_TRUE(rules->ObserveMatch(Input(Mode::kAutonomous, 10.0)));
+    ASSERT_TRUE(rules->ObserveMatch(Input(Mode::kAutonomous, 15.0)));
+    EXPECT_EQ(ReportOf(*rules).period_remaining_us(), 15 * kSecondUs);
+
+    ASSERT_TRUE(rules->ObserveMatch(Input(Mode::kAutonomous, 5.0)));
+    EXPECT_EQ(ReportOf(*rules).period_remaining_us(), 15 * kSecondUs);
+    ASSERT_TRUE(
+        rules->ObserveMatch(Input(Mode::kAutonomous, 0.0, true, false)));
+    EXPECT_EQ(ReportOf(*rules).period(), sim::MatchPeriod::Autonomous);
+    EXPECT_EQ(ReportOf(*rules).period_remaining_us(), 15 * kSecondUs);
+
+    // Past AUTO's 3 s grace (AUTO ended at 30 s).
+    ASSERT_TRUE(rules->ObserveMatch(Input(Mode::kNone, 35.0, false)));
+    ASSERT_FALSE(ReportOf(*rules).blue_scoring_active());
+    ASSERT_TRUE(rules->ObserveMatch(Input(Mode::kNone, 31.0, false)));
+    EXPECT_FALSE(ReportOf(*rules).blue_scoring_active());
+    ASSERT_TRUE(rules->ObserveMatch(Input(Mode::kNone, 0.0, false, false)));
+    EXPECT_FALSE(ReportOf(*rules).blue_scoring_active());
+
+    // TELEOP at 40 s -> SHIFT 2 at 80 s -> backwards/pause keep stage and time.
+    ASSERT_TRUE(rules->ObserveMatch(Input(Mode::kTeleop, 40.0)));
+    ASSERT_TRUE(rules->ObserveMatch(Input(Mode::kTeleop, 80.0)));
+    EXPECT_EQ(ReportOf(*rules).stage_index(), 2);
+    EXPECT_EQ(ReportOf(*rules).period_remaining_us(), 100 * kSecondUs);
+    ASSERT_TRUE(rules->ObserveMatch(Input(Mode::kTeleop, 42.0)));
+    EXPECT_EQ(ReportOf(*rules).stage_index(), 2);
+    EXPECT_EQ(ReportOf(*rules).period_remaining_us(), 100 * kSecondUs);
+    ASSERT_TRUE(rules->ObserveMatch(Input(Mode::kTeleop, 0.0, true, false)));
+    EXPECT_EQ(ReportOf(*rules).stage_index(), 2);
+    EXPECT_EQ(ReportOf(*rules).period_remaining_us(), 100 * kSecondUs);
+
+    // Past TELEOP's 3 s grace (ended at 180 s): backwards/pause do not reopen.
+    ASSERT_TRUE(rules->ObserveMatch(Input(Mode::kTeleop, 185.0)));
+    ASSERT_EQ(ReportOf(*rules).period(), sim::MatchPeriod::Ended);
+    ASSERT_FALSE(ReportOf(*rules).blue_scoring_active());
+    ASSERT_TRUE(rules->ObserveMatch(Input(Mode::kTeleop, 181.0)));
+    EXPECT_FALSE(ReportOf(*rules).blue_scoring_active());
+    ASSERT_TRUE(rules->ObserveMatch(Input(Mode::kNone, 0.0, false, false)));
+    EXPECT_FALSE(ReportOf(*rules).blue_scoring_active());
+  }
+
+  constexpr uint64_t kMaxUs = std::numeric_limits<uint64_t>::max();
+  auto RawInput = [](Mode mode, uint64_t us, bool enabled = true) {
+    MatchInput input;
+    input.mode = mode;
+    input.enabled = enabled;
+    input.scheduled = true;
+    input.schedule_us = us;
+    return input;
+  };
+
+  // AUTO and AUTO grace near UINT64_MAX, plus step-counter wrap on Score.
+  {
+    auto rules = MakeRebuilt2026Rules(GameOptions{1});
+    rules->Attach(*m, *d);
+    ASSERT_TRUE(rules->ObserveMatch(
+        RawInput(Mode::kAutonomous, kMaxUs - 10 * kSecondUs)));
+    EXPECT_EQ(ReportOf(*rules).period(), sim::MatchPeriod::Autonomous);
+    EXPECT_EQ(ReportOf(*rules).period_remaining_us(), 20 * kSecondUs);
+    ASSERT_TRUE(rules->ObserveMatch(
+        RawInput(Mode::kAutonomous, kMaxUs - 5 * kSecondUs)));
+    EXPECT_EQ(ReportOf(*rules).period(), sim::MatchPeriod::Autonomous);
+    EXPECT_EQ(ReportOf(*rules).period_remaining_us(), 15 * kSecondUs);
+    ASSERT_TRUE(rules->ObserveMatch(
+        RawInput(Mode::kNone, kMaxUs - 2 * kSecondUs, false)));
+    EXPECT_EQ(ReportOf(*rules).period(), sim::MatchPeriod::None);
+    EXPECT_TRUE(ReportOf(*rules).blue_scoring_active());
+    ASSERT_TRUE(rules->ObserveMatch(RawInput(Mode::kNone, kMaxUs, false)));
+    EXPECT_TRUE(ReportOf(*rules).blue_scoring_active());
+
+    SetFuel(m.get(), d.get(), 0, SiteAt(m.get(), "blue_hub_score"),
+            {0.0, 0.0, -1.0});
+    ASSERT_TRUE(rules->AfterStep(*m, *d,
+                                 std::numeric_limits<uint64_t>::max() - 10,
+                                 RawInput(Mode::kNone, kMaxUs, false)));
+    EXPECT_EQ(ReportOf(*rules).blue_scored_count(), 1u);
+    EXPECT_EQ(ReportOf(*rules).pieces_held_count(), 1u);
+  }
+
+  // TELEOP and SHIFT 1 grace near UINT64_MAX.
+  {
+    auto rules = MakeRebuilt2026Rules(GameOptions{1});
+    rules->Attach(*m, *d);
+    const uint64_t start = kMaxUs - 100 * kSecondUs;
+    ASSERT_TRUE(rules->ObserveMatch(RawInput(Mode::kTeleop, start)));
+    EXPECT_EQ(ReportOf(*rules).period(), sim::MatchPeriod::Teleop);
+    EXPECT_EQ(ReportOf(*rules).period_remaining_us(), 140 * kSecondUs);
+    ASSERT_TRUE(
+        rules->ObserveMatch(RawInput(Mode::kTeleop, start + 12 * kSecondUs)));
+    EXPECT_EQ(ReportOf(*rules).stage_index(), 1);
+    EXPECT_EQ(ReportOf(*rules).period_remaining_us(), 128 * kSecondUs);
+    EXPECT_TRUE(ReportOf(*rules).red_scoring_active());
+    ASSERT_TRUE(
+        rules->ObserveMatch(RawInput(Mode::kTeleop, start + 15 * kSecondUs)));
+    EXPECT_FALSE(ReportOf(*rules).red_scoring_active());
+  }
+}
+
+// REQ-DEV-40: re-attaching resets every match, queue, clock and PRNG field so
+// a second run is bit-identical; bad models (empty numeric, zero timestep) are
+// refused cleanly without corrupting prior state.
+TEST(Rebuilt2026Rules, ReAttachResetsAllStateAndRefusesBadModels) {
+  ModelPtr m = LoadField();
+  DataPtr d(mj_makeData(m.get()), mj_deleteData);
+  mj_forward(m.get(), d.get());
+  auto rules = MakeRebuilt2026Rules(GameOptions{1});
+
+  auto run_once = [&]() {
+    mj_resetData(m.get(), d.get());
+    mj_forward(m.get(), d.get());
+    rules->Attach(*m, *d);
+    const sim::MatchState initial = ReportOf(*rules);
+    EXPECT_EQ(initial.period(), sim::MatchPeriod::None);
+    EXPECT_EQ(initial.schedule_time_us(), 0u);
+    EXPECT_EQ(initial.blue_points_count(), 0u);
+    EXPECT_EQ(initial.blue_scored_count(), 0u);
+    EXPECT_EQ(initial.pieces_held_count(), 0u);
+    EXPECT_EQ(initial.pieces_in_play_count(), kStaged);
+    EXPECT_FALSE(initial.tie_drawn());
+    EXPECT_FALSE(initial.blue_inactive_first());
+    EXPECT_EQ(MessageOf(rules->Fms()), "");
+
+    SetFuel(m.get(), d.get(), 0, SiteAt(m.get(), "blue_hub_score"),
+            {0.0, 0.0, -1.0});
+    EXPECT_TRUE(rules->AfterStep(*m, *d, 1, Input(Mode::kTeleop, 0.0)));
+    EXPECT_TRUE(rules->AfterStep(*m, *d, static_cast<uint64_t>(1 + kDelaySteps),
+                                 Input(Mode::kTeleop, 1.0)));
+    std::array<mjtNum, 7> qpos{};
+    std::array<mjtNum, 6> qvel{};
+    std::copy_n(d->qpos + FuelQpos(m.get(), 0), qpos.size(), qpos.begin());
+    std::copy_n(d->qvel + FuelDof(m.get(), 0), qvel.size(), qvel.begin());
+    return std::tuple{ReportOf(*rules), qpos, qvel};
+  };
+
+  const auto [match_a, qpos_a, qvel_a] = run_once();
+  const auto [match_b, qpos_b, qvel_b] = run_once();
+  ASSERT_EQ(match_a.blue_points_count(), 1u);
+  ASSERT_EQ(match_a.pieces_held_count(), 0u);
+  ASSERT_TRUE(match_a.tie_drawn());
+  EXPECT_EQ(std::memcmp(&match_a, &match_b, sizeof(match_a)), 0);
+  EXPECT_EQ(qpos_a, qpos_b);
+  EXPECT_EQ(qvel_a, qvel_b);
+
+  ModelPtr bad_num(mj_copyModel(nullptr, m.get()), mj_deleteModel);
+  ASSERT_NE(bad_num, nullptr);
+  const int num_id = Id(bad_num.get(), mjOBJ_NUMERIC, "fuel_neutral_first");
+  bad_num->numeric_size[num_id] = 0;
+  EXPECT_THROW(rules->Attach(*bad_num, *d), std::invalid_argument);
+
+  ModelPtr bad_step(mj_copyModel(nullptr, m.get()), mj_deleteModel);
+  ASSERT_NE(bad_step, nullptr);
+  bad_step->opt.timestep = 0.0;
+  EXPECT_THROW(rules->Attach(*bad_step, *d), std::invalid_argument);
+
+  // Refusals leave the previously attached run's state untouched.
+  const sim::MatchState after_refusals = ReportOf(*rules);
+  EXPECT_EQ(std::memcmp(&after_refusals, &match_b, sizeof(match_b)), 0);
 }
 
 // One release's draws: the exit, the speed and the heading off the exit's +x.

@@ -250,9 +250,10 @@ and parked, waiting for its HUB to return it) or reserve (in the reserve
 row, never placed); `InPlay` answers false for a held or reserve FUEL, so
 Studio does not draw it (REQ-DEV-43).
 
-- **Scoring.** A FUEL that is not held, whose centre is inside a
-  `*_hub_score` cylinder with any downward velocity at the end of a step,
-  scores for that HUB's alliance: it counts once in `<alliance>_scored`,
+- **Scoring.** A FUEL that is in play, whose centre is inside a
+  `*_hub_score` cylinder with finite kinematics and any downward velocity at
+  the end of a step, scores for that HUB's alliance: it counts once in
+  `<alliance>_scored`,
   and earns a point if the HUB counts then (below). In the same step it is
   held: parked with no velocity at slot k, its index, at
   (0.5 + 0.2 (k mod 80), -2.5 - 0.2 floor(k / 80), radius + 0.0005) m,
@@ -277,7 +278,9 @@ Studio does not draw it (REQ-DEV-43).
 - **Periods**, on the schedule clock, judged at each match input the rules
   see (a "step" in this paragraph: one given to the plant, as at every
   gateway tick, and each step's), so a period begins on the tick whose input
-  starts it even when that tick runs no plant step. The match starts at the
+  starts it even when that tick runs no plant step. The schedule clock
+  advances monotonically while `scheduled` is true (an unscheduled or
+  backwards tick leaves it where it was). The match starts at the
   first step that is enabled, on the schedule clock and in autonomous (AUTO)
   or teleop (TELEOP without AUTO, AUTO's points 0-0); test mode starts
   nothing. AUTO ends at the first step out of autonomous, or 20 s after it

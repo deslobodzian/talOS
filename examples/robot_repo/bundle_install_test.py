@@ -36,13 +36,25 @@ from python.runfiles import runfiles
 # Bounds only a hang; each step takes about a second.
 STEP_TIMEOUT_S = 50
 
-# What a Bazel test hands its children so they find their runfiles; a
-# boot service sets none of them.
+# What a Bazel test or developer shell hands its children that a boot service
+# never sets: runfiles, Python environment, and talOS session overrides.
+# Dynamic linker search/preload variables (`LD_*`, `DYLD_*`) are also stripped.
 RUNFILES_VARIABLES = ("RUNFILES_DIR", "RUNFILES_MANIFEST_FILE",
                       "RUNFILES_MANIFEST_ONLY", "TEST_SRCDIR",
-                      "JAVA_RUNFILES", "PYTHON_RUNFILES", "PYTHONPATH",
-                      "PYTHONHOME", "VIRTUAL_ENV", "BUILD_WORKSPACE_DIRECTORY",
-                      "BUILD_WORKING_DIRECTORY")
+                      "TEST_WORKSPACE", "JAVA_RUNFILES", "PYTHON_RUNFILES",
+                      "PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE",
+                      "VIRTUAL_ENV", "BUILD_WORKSPACE_DIRECTORY",
+                      "BUILD_WORKING_DIRECTORY", "TALOS_SHM_NAMESPACE",
+                      "TALOS_LOG_DIR")
+
+
+def clean_env():
+    """Environment stripped of Bazel runfiles, Python, linker, and talOS
+    session variables so the installed bundle cannot resolve anything from the
+    build tree or host overrides."""
+    return {k: v for k, v in os.environ.items()
+            if k not in RUNFILES_VARIABLES
+            and not k.startswith(("LD_", "DYLD_"))}
 
 
 def location(path):
@@ -56,10 +68,18 @@ def build_tree_paths(bundle, deploy):
     """Directories the installed bundle must not name: Bazel's output tree
     and external repositories, this repository's checkout and talOS's."""
     paths = set()
-    built = os.path.realpath(bundle)
-    if "/execroot/" in built:
-        output_base = built.split("/execroot/", 1)[0]
-        paths |= {output_base + "/execroot/", output_base + "/external/"}
+    # Resolve a file inside the bundle, not the bundle directory itself: inside
+    # Bazel's Linux sandbox the directory is a real sandbox directory holding
+    # symlinks to the output base, so realpath(bundle) stays in sandbox/ instead
+    # of reaching the real output_base/execroot/.
+    manifest = os.path.join(bundle, "bundle_manifest.toml")
+    for candidate in (
+        os.path.dirname(os.path.realpath(manifest)),
+        os.path.realpath(bundle),
+    ):
+        if "/execroot/" in candidate:
+            output_base = candidate.split("/execroot/", 1)[0]
+            paths |= {output_base + "/execroot/", output_base + "/external/"}
     paths.add(os.path.dirname(os.path.realpath(
         location("_main/bundle_install_test.py"))) + "/")
     paths.add(os.path.dirname(os.path.dirname(os.path.realpath(deploy))) + "/")
@@ -166,12 +186,16 @@ class BundleInstallTest(unittest.TestCase):
         bundle = location("_main/robot_bundle")
         deploy = location("talos/tools/deploy.sh")
         avoid = build_tree_paths(bundle, deploy)
-        env = {k: v for k, v in os.environ.items()
-               if k not in RUNFILES_VARIABLES}
-        # deploy.sh installs read-only, so cleanup cannot remove it all;
-        # Bazel clears TEST_TMPDIR.
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        env = clean_env()
+        # Keep scratch directories inside TEST_TMPDIR and restore write bits on
+        # deploy.sh's read-only install tree before teardown so nothing leaks.
+        with tempfile.TemporaryDirectory(
+                dir=os.environ.get("TEST_TMPDIR"),
+                ignore_cleanup_errors=True) as tmp:
             logs = os.path.join(tmp, "logs")
+            staging_root = os.path.join(tmp, "staging")
+            prefix = os.path.join(tmp, "prefix")
+            step_env = dict(env, TMPDIR=tmp)
             installed = ""
             out = ""
             try:
@@ -180,23 +204,26 @@ class BundleInstallTest(unittest.TestCase):
                 # directory a person installs from.
                 built = os.path.dirname(os.path.realpath(
                     os.path.join(bundle, "bundle_manifest.toml")))
-                staging = os.path.join(tmp, "staging", "robot_bundle")
+                staging = os.path.join(staging_root, "robot_bundle")
                 shutil.copytree(built, staging, symlinks=True)
-                prefix = os.path.join(tmp, "prefix")
                 install = subprocess.run(
                     ["bash", deploy, "install", staging, "--prefix", prefix],
-                    capture_output=True, text=True, env=env, cwd=tmp,
+                    capture_output=True, text=True, env=step_env, cwd=tmp,
                     timeout=STEP_TIMEOUT_S)
                 installed = install.stdout + install.stderr
                 self.assertEqual(install.returncode, 0, installed)
                 self.assertNotIn("warning: warm-up", installed)
-                remove(os.path.dirname(staging))
+                remove(staging_root)
 
                 where = os.path.realpath(os.path.join(prefix, "current"))
                 for parent, dirs, files in os.walk(where):
                     for name in dirs + files:
                         path = os.path.join(parent, name)
                         if os.path.islink(path):
+                            self.assertTrue(
+                                os.path.exists(path),
+                                f"{path} is a dangling link to "
+                                f"{os.readlink(path)}")
                             target = os.path.realpath(path)
                             self.assertTrue(
                                 target == where
@@ -216,7 +243,8 @@ class BundleInstallTest(unittest.TestCase):
                     [os.path.join(prefix, "current", "run.sh"),
                      "--describe-only"],
                     capture_output=True, text=True, cwd=tmp,
-                    env=dict(env, TALOS_LOG_DIR=logs), timeout=STEP_TIMEOUT_S)
+                    env=dict(step_env, TALOS_LOG_DIR=logs),
+                    timeout=STEP_TIMEOUT_S)
                 out = proc.stdout + proc.stderr
                 self.assertEqual(proc.returncode, 0, out)
                 (session,) = os.listdir(logs)
@@ -249,6 +277,13 @@ class BundleInstallTest(unittest.TestCase):
                     print(f"bundle_install_test: failure artifacts preserved: "
                           f"{kept}", file=sys.stderr)
                 raise
+            finally:
+                for tree in (staging_root, prefix):
+                    if os.path.isdir(tree):
+                        try:
+                            remove(tree)
+                        except OSError:
+                            pass
 
 
 if __name__ == "__main__":

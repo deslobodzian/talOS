@@ -14,8 +14,9 @@ import type {PlaybackState, SystemState} from '../src/data/types';
 import {demoDeclaredGraph, demoSystemGraph} from '../src/demo';
 import {healthPanel} from '../src/panels/health';
 import type {AnyPanelDefinition} from '../src/panels/types';
-import {NodeCard, systemPanel, Wiring} from '../src/panels/system';
-import {timingPanel} from '../src/panels/timing';
+import {NodeCard, systemPanel, TopicTable, Wiring} from '../src/panels/system';
+import {sortTimingRows, timingPanel} from '../src/panels/timing';
+import {UnknownPanel} from '../src/panels/unknown';
 import {
   eventRates,
   GraphVersionMismatch,
@@ -24,6 +25,7 @@ import {
   SYSTEM_GRAPH_VERSION
 } from '../src/system';
 import {panelNode, splitNode} from '../src/layout/tree';
+import {PageTabs} from '../src/shell/PageTabs';
 import {Timeline} from '../src/shell/Timeline';
 import {WorkspaceArea, type WorkspaceCallbacks} from '../src/shell/WorkspaceArea';
 import {StatusStrip} from '../src/shell/StatusStrip';
@@ -445,7 +447,7 @@ test('a graph version mismatch is named by both versions, never as nothing wrong
          declared: null,
          declaredError: ''
        };
-       for (const def of [systemPanel, healthPanel]) {
+       for (const def of [systemPanel, healthPanel, timingPanel]) {
          const html = renderToStaticMarkup(
              <StudioProvider studio={createStaticStudio({system, playback: emptyPlayback})}>
                <def.component config={def.defaultConfig} setConfig={() => {}}
@@ -460,3 +462,153 @@ test('a graph version mismatch is named by both versions, never as nothing wrong
          assert.ok(!/stale/i.test(html), `${def.id} flags a stale graph`);
        }
      });
+
+test('StatusStrip marks non-finite battery, link age and estimator validity as unknown without warn',
+     () => {
+       for (const bad of [NaN, Infinity, -Infinity]) {
+         const studio = createStaticStudio({
+           frames: [{
+             stream_id: 'a', sequence_id: '1', timestamp_ns: '1000000000', dictionary_id: 1,
+             chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+             channels: {
+               'hw/status/battery_v': bad,
+               'hw/status/state_age_us': bad,
+               'pose_estimator/state/pose/x_m': 1,
+               'pose_estimator/state/pose/y_m': 2,
+               'pose_estimator/state/valid': bad,
+               'pose_estimator/state/observation_accepted_count': 0
+             },
+             units: {}, labels: {}
+           }],
+           playback: {...emptyPlayback, cursor_ns: '1000000000'}
+         });
+         const html = renderToStaticMarkup(
+             <StudioProvider studio={studio}><StatusStrip/></StudioProvider>);
+         assert.doesNotMatch(html, /— V/, html);
+         for (const label of ['Battery', 'Link age', 'Estimator']) {
+           const match = new RegExp(`class="([^"]*)"><small>${label}<\\/small><b>([^<]*)`).exec(html);
+           assert.ok(match, `missing ${label}: ${html}`);
+           const classes = match[1].split(' ');
+           assert.ok(classes.includes('unknown'), `${label} not unknown for ${bad}`);
+           assert.ok(!classes.includes('warn'), `${label} falsely warned for ${bad}`);
+           assert.equal(match[2], '—', `${label} value for ${bad}`);
+         }
+       }
+     });
+
+test('sortTimingRows sorts declared Hz highest-first and tolerates NaN rates', () => {
+  const system = state();
+  const baseNode = system.graph!.nodes[0];
+  const baseSource = baseNode.sources[0];
+  const rows = [
+    {node: baseNode, source: {...baseSource, id: 0, name: 'none', period_ns: '0'},
+     rate: NaN, declared: undefined},
+    {node: baseNode, source: {...baseSource, id: 1, name: 'slow', period_ns: '100000000'},
+     rate: 10, declared: 10},
+    {node: baseNode, source: {...baseSource, id: 2, name: 'fast', period_ns: '5000000'},
+     rate: 200, declared: 200}
+  ];
+  assert.deepEqual(
+      sortTimingRows(rows, {column: 'period', descending: true}).map(r => r.source.name),
+      ['fast', 'slow', 'none']);
+  assert.deepEqual(
+      sortTimingRows(rows, {column: 'rate', descending: true}).map(r => r.source.name),
+      ['fast', 'slow', 'none']);
+});
+
+test('Wiring counts observers of owner-published topics as connected and ignores NaN rates',
+     () => {
+       const graph = parseSystemGraph(demoSystemGraph(50n));
+       const est = graph.nodes.find(n => n.name === 'pose_estimator')!;
+       const wiringHtml = renderToStaticMarkup(
+           <Wiring graph={graph} stale={false} node={est} rates={{}}/>);
+       assert.ok(wiringHtml.includes('telemetry (observer)'), wiringHtml);
+       assert.doesNotMatch(
+           wiringHtml,
+           /class="dangling"[^>]*>[^<]*<div class="edge-topic"><code>\/pose_estimator\/state<\/code>/,
+           wiringHtml);
+
+       // NodeCard and TopicTable ignore NaN rates when a finite rate exists.
+       const dt = graph.nodes.find(n => n.name === 'drivetrain')!;
+       const timer = dt.sources.find(s => s.kind === 'TIMER')!;
+       const card = render(<NodeCard graph={graph} stale={false}
+           node={{...dt, sources: [...dt.sources, {...timer, id: timer.id + 100}]}}
+           rates={{[`drivetrain ${timer.id}`]: NaN, [`drivetrain ${timer.id + 100}`]: 150}}
+           selected={false} onSelect={() => {}}/>);
+       assert.ok(card.includes('150 Hz'), card);
+
+       const sender = dt.sources.find(s => s.kind === 'SENDER')!;
+       const topicHtml = render(
+           <TopicTable graph={graph} rates={{[`drivetrain ${sender.id}`]: NaN}}
+                       filter={sender.name} onPickNode={() => {}}/>);
+       assert.doesNotMatch(topicHtml, /NaN/, topicHtml);
+     });
+
+test('divider ignores zero-width drags and non-finite sizes', () => {
+  let calls = 0;
+  const zeroHandle = splitHandle([0.5, 0.5], () => { calls++; });
+  zeroHandle.onPointerDown!({
+    clientX: 100, pointerId: 1,
+    currentTarget: {
+      parentElement: {getBoundingClientRect: () => ({width: 0, height: 0})},
+      setPointerCapture() {}
+    }
+  } as unknown as React.PointerEvent<HTMLDivElement>);
+  zeroHandle.onPointerMove!({clientX: 110} as React.PointerEvent<HTMLDivElement>);
+  assert.equal(calls, 0);
+
+  const nanHandle = splitHandle([NaN, 0.5], () => { calls++; });
+  nanHandle.onKeyDown!({
+    key: 'ArrowRight', preventDefault() {}, stopPropagation() {}
+  } as unknown as React.KeyboardEvent<HTMLDivElement>);
+  assert.equal(calls, 0);
+});
+
+test('PageTabs renders rename input outside tab button and Escape cancels before blur',
+     () => {
+       const pages = [
+         {id: 'p1', title: 'Page 1', root: panelNode('health', 'i1', undefined)},
+         {id: 'p2', title: 'Page 2', root: panelNode('health', 'i2', undefined)}
+       ];
+       const renamed: [string, string][] = [];
+       const html = renderToStaticMarkup(
+           <PageTabs pages={pages} activePageId="p1" renamingId="p1"
+                     onSelect={() => {}} onStartRename={() => {}}
+                     onRename={(id, t) => renamed.push([id, t])}
+                     onClose={() => {}} onAdd={() => {}} onReset={() => {}}/>);
+       assert.doesNotMatch(html, /<button[^>]*role="tab"[^>]*>[^<]*<input/, html);
+       assert.ok(html.includes('class="tab-rename"'), html);
+
+       let input!: React.ReactElement<React.InputHTMLAttributes<HTMLInputElement>>;
+       function Probe() {
+         const nav = PageTabs({
+           pages, activePageId: 'p1', renamingId: 'p1',
+           onSelect() {}, onStartRename() {},
+           onRename(id, t) { renamed.push([id, t]); },
+           onClose() {}, onAdd() {}, onReset() {}
+         });
+         const list = (nav.props.children as [ViewElement[], ViewElement])[0];
+         const renameEl = (list[0].props.children as ViewElement[])[0];
+         input = componentOutput(renameEl) as typeof input;
+         return input;
+       }
+       renderToStaticMarkup(<Probe/>);
+       input.props.onKeyDown!({
+         key: 'Escape',
+         currentTarget: {value: 'Draft'},
+         preventDefault() {},
+         stopPropagation() {}
+       } as unknown as React.KeyboardEvent<HTMLInputElement>);
+       input.props.onBlur!({
+         target: {value: 'Draft'}
+       } as unknown as React.FocusEvent<HTMLInputElement>);
+       assert.deepEqual(renamed, [['p1', 'Page 1']]);
+     });
+
+test('UnknownPanel safely renders non-JSON-serializable config', () => {
+  const circular: Record<string, unknown> = {};
+  circular.self = circular;
+  const html = renderToStaticMarkup(<UnknownPanel panelId="legacy" config={circular}/>);
+  assert.ok(html.includes('legacy'), html);
+  assert.ok(html.includes('preserved'), html);
+});

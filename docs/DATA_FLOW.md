@@ -118,7 +118,9 @@ This is not a measured
 whole-bus utilization percentage: use each `/hw/status` `can_buses` slot's
 utilization (one per configured bus, the RoboRIO's and each CANivore's)
 during physical bring-up, including all other devices and control traffic.
-Temperature older than 500 ms and supply current older than 50 ms read as zero
+Temperature older than 500 ms and supply current older than
+`DiagnosticMaxAgeUs(status_hz)` (50 ms at `status_hz >= 50 Hz`, scaling as
+`ceil(2.5 s / status_hz)` below 50 Hz; `talOS/hardware/feedback.h`) read as zero
 without invalidating motion feedback, like existing effort diagnostics.
 Standalone ideal/physics simulation reports ambient 25 °C and placeholder
 supply current proportional to voltage effort; Phoenix desktop uses its SDK
@@ -462,7 +464,8 @@ largest record, at least the <!-- size: log.gap_record_total_bytes -->128 B GAP 
 each a complete version-8 log
 (its own header, manifest and schema block, then whole records). A segment
 ends when the next record would cross cap / n, or, with a window
-(`LogWriterOptions::window`, the launcher's `--log-window-us`), at the first
+(`LogWriterOptions::window`, passed by the launcher to each member as
+`--log-window-us`), at the first
 record whose time (`now_ns`) is window / n or more past the segment's first,
 so a log that stays within its bytes keeps between (n - 1) / n of the window
 and the window. Time never ends a segment sooner than the writer's
@@ -495,8 +498,11 @@ each at most one <!-- size: telemetry.dictionary_page_bytes -->**16384 B** slot;
 channels (`kMaxChannels`): a keyframe of that many, at most <!-- size: telemetry.keyframe_pages -->25 pages with
 WebSocket framing, is at most <!-- size: telemetry.keyframe_bytes -->30,250 B, inside the bridge's <!-- size: telemetry.client_burst_bytes -->**64,000 B** burst,
 which an update must fit to be sent whole (`static_assert` in `wire.h`). The
-producer refuses construction past the cap, naming the largest sources, and
-refuses a channel whose dictionary entry alone cannot fit one page. Each dictionary name, unit and enum label is at most <!-- size: telemetry.dictionary_string_bytes -->**256 B**, and an
+producer refuses construction past the cap, naming the largest sources,
+refuses a channel whose dictionary entry alone cannot fit one page, and refuses
+a dictionary whose combined dictionary-resend tick (`dictionary_pages +
+value_pages`) exceeds 63 pages (`slot_count - 1`, so one resend tick never laps
+its own first dictionary page in the 64-slot ring). Each dictionary name, unit and enum label is at most <!-- size: telemetry.dictionary_string_bytes -->**256 B**, and an
 enum channel carries at most <!-- size: telemetry.enum_labels -->**1024** labels (`wire.h`); Studio's decoder
 accepts exactly these limits, and the producer never emits past them
 ([telemetry README](../talOS/telemetry/README.md#transport-budget)). Dictionary

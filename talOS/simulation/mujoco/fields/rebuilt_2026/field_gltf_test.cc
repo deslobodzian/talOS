@@ -121,10 +121,10 @@ Glb ReadGlb(const std::string& bytes) {
   if (ReadU32(bytes, 8) != bytes.size()) throw std::runtime_error("length");
   const uint32_t json_length = ReadU32(bytes, 12);
   if (bytes.compare(16, 4, "JSON") != 0 || json_length % 4 != 0 ||
-      20 + json_length + 8 > bytes.size()) {
+      size_t{20} + json_length + 8 > bytes.size()) {
     throw std::runtime_error("JSON chunk");
   }
-  const size_t bin_at = 20 + json_length;
+  const size_t bin_at = size_t{20} + json_length;
   const uint32_t bin_length = ReadU32(bytes, bin_at);
   if (bytes.compare(bin_at + 4, 4, std::string("BIN\0", 4)) != 0 ||
       bin_length % 4 != 0 || bin_at + 8 + bin_length != bytes.size()) {
@@ -138,6 +138,7 @@ class FieldGltfTest : public ::testing::Test {
  protected:
   static void SetUpTestSuite() {
     std::ifstream file(Runfile("FIELD_GLB"), std::ios::binary);
+    ASSERT_TRUE(file.good()) << "failed to open FIELD_GLB";
     Bytes() = std::string(std::istreambuf_iterator<char>(file), {});
     std::array<char, 1024> error{};
     Model().reset(mj_loadXML(Runfile("FIELD_XML").c_str(), nullptr,
@@ -163,9 +164,12 @@ class FieldGltfTest : public ::testing::Test {
         glb.json.at("bufferViews").at(a.at("bufferView").get<int>());
     const int width = a.at("type") == "VEC3" ? 3 : 1;
     const size_t count = a.at("count").get<size_t>() * width;
-    const size_t offset = v.value("byteOffset", 0) + a.value("byteOffset", 0);
-    if (a.at("componentType") != 5126 || a.value("byteOffset", 0) + count * 4 >
-                                             v.at("byteLength").get<size_t>()) {
+    const size_t view_offset = v.value("byteOffset", size_t{0});
+    const size_t acc_offset = a.value("byteOffset", size_t{0});
+    const size_t offset = view_offset + acc_offset;
+    if (a.at("componentType") != 5126 ||
+        acc_offset + count * 4 > v.at("byteLength").get<size_t>() ||
+        offset + count * 4 > glb.bin.size()) {
       throw std::runtime_error("accessor outside its view");
     }
     std::vector<float> out(count);
@@ -187,9 +191,18 @@ TEST_F(FieldGltfTest, GlbIsValidAndSelfContained) {
   EXPECT_LE(j.at("buffers")[0].at("byteLength").get<size_t>(), glb.bin.size());
   for (const auto& v : j.at("bufferViews")) {
     EXPECT_EQ(v.at("buffer"), 0);
-    EXPECT_EQ(v.value("byteOffset", 0) % 4, 0);
-    EXPECT_LE(v.value("byteOffset", 0) + v.at("byteLength").get<size_t>(),
-              glb.bin.size());
+    const size_t offset = v.value("byteOffset", size_t{0});
+    EXPECT_EQ(offset % 4, 0U);
+    EXPECT_LE(offset + v.at("byteLength").get<size_t>(), glb.bin.size());
+  }
+  for (const auto& node : j.at("nodes")) {
+    if (!node.contains("rotation")) continue;
+    const std::vector<double> q =
+        node.at("rotation").get<std::vector<double>>();
+    ASSERT_EQ(q.size(), 4U);
+    EXPECT_NEAR(
+        std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]), 1.0,
+        1e-6);
   }
   for (const auto& mesh : j.at("meshes")) {
     for (const auto& p : mesh.at("primitives")) {
@@ -198,17 +211,21 @@ TEST_F(FieldGltfTest, GlbIsValidAndSelfContained) {
       ASSERT_TRUE(a.contains("min") && a.contains("max"));
       const std::vector<float> values = Floats(glb, position);
       for (size_t i = 0; i < values.size(); ++i) {
+        EXPECT_TRUE(std::isfinite(values[i]));
         EXPECT_GE(values[i], a.at("min")[i % 3].get<float>());
         EXPECT_LE(values[i], a.at("max")[i % 3].get<float>());
       }
       const auto& ia = j.at("accessors").at(p.at("indices").get<int>());
       const auto& iv = j.at("bufferViews").at(ia.at("bufferView").get<int>());
       ASSERT_EQ(ia.at("componentType"), 5123);
-      ASSERT_LE(ia.at("count").get<size_t>() * 2,
-                iv.at("byteLength").get<size_t>());
+      const size_t ia_offset = ia.value("byteOffset", size_t{0});
+      const size_t iv_offset = iv.value("byteOffset", size_t{0});
+      const size_t index_bytes = ia.at("count").get<size_t>() * 2;
+      ASSERT_LE(ia_offset + index_bytes, iv.at("byteLength").get<size_t>());
+      ASSERT_LE(iv_offset + ia_offset + index_bytes, glb.bin.size());
       std::vector<uint16_t> indices(ia.at("count").get<size_t>());
-      std::memcpy(indices.data(), glb.bin.data() + iv.value("byteOffset", 0),
-                  indices.size() * 2);
+      std::memcpy(indices.data(), glb.bin.data() + iv_offset + ia_offset,
+                  index_bytes);
       for (const uint16_t index : indices) {
         EXPECT_LT(index, a.at("count").get<size_t>()) << mesh.at("name");
       }
@@ -370,10 +387,14 @@ TEST_F(FieldGltfTest, PrimitivesAreClosedAndFaceOutward) {
       ASSERT_EQ(position.size(), normal.size());
       const auto& ia = j.at("accessors").at(p.at("indices").get<int>());
       const auto& iv = j.at("bufferViews").at(ia.at("bufferView").get<int>());
+      const size_t ia_offset = ia.value("byteOffset", size_t{0});
+      const size_t iv_offset = iv.value("byteOffset", size_t{0});
+      const size_t index_bytes = ia.at("count").get<size_t>() * 2;
+      ASSERT_LE(iv_offset + ia_offset + index_bytes, glb.bin.size());
       std::vector<uint16_t> index(ia.at("count").get<size_t>());
       ASSERT_EQ(index.size() % 3, 0U);
-      std::memcpy(index.data(), glb.bin.data() + iv.value("byteOffset", 0),
-                  index.size() * 2);
+      std::memcpy(index.data(), glb.bin.data() + iv_offset + ia_offset,
+                  index_bytes);
       auto at = [&](const std::vector<float>& v, uint16_t i) {
         return Vec{v[3 * size_t{i}], v[3 * size_t{i} + 1],
                    v[3 * size_t{i} + 2]};

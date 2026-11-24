@@ -24,8 +24,19 @@ void CanBusSampler::Run(const std::shared_ptr<CanBusHealth::Board>& board,
 #elif defined(__APPLE__)
   pthread_setname_np("talos-canbus");
 #endif
+  // Never let a vendor-read exception escape the thread and invoke
+  // std::terminate() mid-match; report it as a failed bus read instead.
+  const auto safe_read = [&read](std::string_view bus) noexcept {
+    try {
+      return read(bus);
+    } catch (...) {
+      CanBusHealth::Sample failed{};
+      failed.status = "exception in CAN bus status read";
+      return failed;
+    }
+  };
   const std::chrono::microseconds period{period_us};
-  while (board->SampleNext(clock(), read) && board->WaitPeriod(period)) {
+  while (board->SampleNext(clock(), safe_read) && board->WaitPeriod(period)) {
   }
   if (board->Exit()) stuck->Exited();
 }

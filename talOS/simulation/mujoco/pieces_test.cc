@@ -46,6 +46,12 @@ using hardware::MotorRequest;
 
 constexpr uint64_t kBootId = 0x9ce5;
 
+static_assert(PiecesEveryTicks(0) == 1);
+static_assert(PiecesEveryTicks(1000) == 50);
+static_assert(PiecesEveryTicks(5000) == 10);
+static_assert(PiecesEveryTicks(20000) == 3);
+static_assert(PiecesEveryTicks(100000) == 1);
+
 // A robot welded at the blue HUB, its flywheel's exit inside the HUB's
 // scoring cylinder facing down, one preload on a tray above it (as
 // gateway_bit_identity_test's): the shooter launches the preload once the
@@ -91,13 +97,26 @@ config::RobotConfig WriteConfig(const std::string& name, std::string_view robot,
   const std::filesystem::path dir =
       std::filesystem::path(::testing::TempDir()) / name;
   std::filesystem::create_directories(dir);
-  std::ofstream(dir / "robot.xml") << robot;
-  std::ofstream(dir / "robot.toml")
-      << "[robot]\nname = \"" << name
-      << "\"\nperiod_us = 5000\ncommand_timeout_us = 100000\n\n"
-      << (motors.empty() ? std::string_view{"[subsystems]\n"} : motors)
-      << "\n[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
-      << (field.empty() ? "" : "field = \"" + std::string(field) + "\"\n");
+  {
+    std::ofstream xml(dir / "robot.xml");
+    xml << robot;
+    if (!xml.good()) {
+      throw std::runtime_error("failed to write " +
+                               (dir / "robot.xml").string());
+    }
+  }
+  {
+    std::ofstream toml(dir / "robot.toml");
+    toml << "[robot]\nname = \"" << name
+         << "\"\nperiod_us = 5000\ncommand_timeout_us = 100000\n\n"
+         << (motors.empty() ? std::string_view{"[subsystems]\n"} : motors)
+         << "\n[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+         << (field.empty() ? "" : "field = \"" + std::string(field) + "\"\n");
+    if (!toml.good()) {
+      throw std::runtime_error("failed to write " +
+                               (dir / "robot.toml").string());
+    }
+  }
   return config::ParseRobotConfig((dir / "robot.toml").string());
 }
 
@@ -202,6 +221,8 @@ TEST(MujocoGatewayPieces, MessageIsTheModelsBodiesAndTheGamesPlay) {
   uint64_t published_ns = 0;
   int publications = 0;
   bool scored_seen = false;
+  std::vector<bool> was_in_play(fuel.size(), false);
+  bool transitioned_out_of_play = false;
   std::vector<float> first_x;
   int moved = 0;
   for (int i = 0; i < kTicks; ++i) {
@@ -233,8 +254,11 @@ TEST(MujocoGatewayPieces, MessageIsTheModelsBodiesAndTheGamesPlay) {
       // y >= 0, in the reserve row (y -2.0 m) or the parking slots (y -2.5
       // m and beyond, fields/rebuilt_2026/README.md); every FUEL on the
       // field is in play.
-      EXPECT_EQ(pieces.in_play()->Get(i_k), at[1] > -1.0) << "FUEL " << k;
-      in_play += pieces.in_play()->Get(i_k) ? 1 : 0;
+      const bool piece_in_play = pieces.in_play()->Get(i_k);
+      EXPECT_EQ(piece_in_play, at[1] > -1.0) << "FUEL " << k;
+      if (was_in_play[k] && !piece_in_play) transitioned_out_of_play = true;
+      if (piece_in_play) was_in_play[k] = true;
+      in_play += piece_in_play ? 1 : 0;
     }
     // The game's own count of FUEL in play, in the same tick.
     EXPECT_EQ(in_play, a.extension.match_state().pieces_in_play_count());
@@ -252,6 +276,8 @@ TEST(MujocoGatewayPieces, MessageIsTheModelsBodiesAndTheGamesPlay) {
   }
   EXPECT_EQ(publications, kTicks / 10);
   EXPECT_TRUE(scored_seen) << "no FUEL was scored: the case needs a held one";
+  EXPECT_TRUE(transitioned_out_of_play)
+      << "no in-play FUEL transitioned out of play in /sim/telemetry/pieces";
   EXPECT_GT(moved, 0) << "no FUEL moved: the case needs a moving one";
   // The reserve the robot did not preload is out of play throughout.
   EXPECT_FALSE(a.extension.game_pieces().in_play()->Get(503));
@@ -268,6 +294,7 @@ TEST(MujocoGatewayPieces, AFreeRobotIsNoPiece) {
              {.start_x_m = 2.0, .start_y_m = 2.0});
   a.Tick(0, Assembly::kStartUs);
   EXPECT_EQ(a.extension.game_pieces().pieces_count(), 0u);
+  EXPECT_EQ(a.extension.game_pieces().radius_m(), 0.0F);
   EXPECT_EQ(a.extension.game_pieces().sample_time_ns(),
             Assembly::kStartUs * 1000);
 }
@@ -287,6 +314,9 @@ std::string SphereField(const std::string& name, int count,
          << (i + 1 == count ? last_radius_m : 0.05) << "\"/></body>\n";
   }
   file << "</worldbody></mujoco>\n";
+  if (!file.good()) {
+    throw std::runtime_error("failed to write " + path.string());
+  }
   return path.string();
 }
 
@@ -322,8 +352,12 @@ TEST(MujocoGatewayPieces, RefusesMoreThan640OrTwoRadii) {
   // rules, which this model does not meet.
   try {
     Assembly a(config, SphereField("balls_640", 640, 0.05), {});
+    FAIL() << "640-piece sphere field unexpectedly passed rebuilt_2026 rules";
   } catch (const std::invalid_argument& e) {
     EXPECT_EQ(std::string(e.what()).find("game pieces"), std::string::npos)
+        << e.what();
+    EXPECT_NE(std::string(e.what()).find("rebuilt_2026 rules:"),
+              std::string::npos)
         << e.what();
   }
 }
