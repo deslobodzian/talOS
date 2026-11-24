@@ -19,6 +19,7 @@ namespace motor {
 // /motor/target/<source> envelope's 40 B message.
 static_assert(sizeof(MotorState) == 96);
 static_assert(sizeof(MotorTarget) == 40);
+static_assert(talos::hardware::kMaxMotors <= 32);
 
 // The bench's one TalonFX (docs/BENCH.md). It drives only while
 // robot_enabled, with a live target (talos::Target) and connected feedback:
@@ -95,13 +96,15 @@ class BenchMotor {
       return time ? micros(node_.now() - *time) : unknown;
     };
     const bool fault_valid = status_.fresh() && status_->health_valid();
+    const std::uint32_t fault_bit = std::uint32_t{1} << motor_.hardware_index();
     state_.send(MotorState{
         static_cast<std::uint64_t>(node_.now().nanos()), motor_.position(),
         motor_.velocity(), motor_.voltage(), motor_.current(),
         link.fresh() ? micros(link.age()) : unknown, age(position_time),
         age(velocity_time),
         position_time.has_value() && velocity_time.has_value(),
-        motor_.connected(), fault_valid && status_->motor_fault_mask() != 0,
+        motor_.connected(),
+        fault_valid && (status_->motor_fault_mask() & fault_bit) != 0,
         fault_valid, enabled, mode,
         mode != ControlMode::NEUTRAL && target_.source() == "teleop"
             ? TargetSource::TELEOP

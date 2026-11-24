@@ -130,6 +130,11 @@ constexpr std::chrono::milliseconds kBridgeProtocolPoll{20};
 // once sim_gateway exits with no pending restart.
 constexpr std::chrono::milliseconds kSimScheduleStartPoll{20};
 
+// How often Supervise polls `hardware_node`'s registry row for kFlagQuiesced
+// during phase 1 of shutdown, bounded by kBridgeStopTimeout (SIGCHLD still
+// wakes immediately if the bridge exits).
+constexpr std::chrono::milliseconds kBridgeQuiescePoll{5};
+
 // The topic ends a registry row published, or nullopt while it has
 // published none: a row is visible from its claim, and a writer that never
 // sets kFlagConstructing (the hardware bridge, the simulation gateway)
@@ -2290,9 +2295,12 @@ void Launcher::Supervise(SessionManifest& manifest,
     }
 
     // Two-phase shutdown (REQ-OPS-20): stop `hardware_node` first so the
-    // bridge stops forwarding commands (and sends its neutral) before actuator
-    // owners exit; bound the wait at kBridgeStopTimeout (SIGKILL if hung), and
-    // only after `hardware_node` has been reaped signal the remaining children.
+    // bridge sends its shutdown neutral, closes its waits and UDP socket, and
+    // stops forwarding before actuator owners exit. Bound quiescence at
+    // kBridgeStopTimeout (SIGKILL and wait for reap if hung without quiescing);
+    // once `hardware_node` has either exited or marked kFlagQuiesced, signal
+    // the remaining members and share kStopTimeout (2 s) with any quiesced
+    // bridge still flushing its `.tlog`.
     const auto running_bridge = [&]() -> std::optional<std::size_t> {
       for (std::size_t i = 0; i < procs.size(); ++i) {
         if (procs[i].name == kHardwareNodeName && procs[i].pid > 0 &&
@@ -2302,10 +2310,18 @@ void Launcher::Supervise(SessionManifest& manifest,
       }
       return std::nullopt;
     };
-    const auto signal_remaining = [&] {
+    const auto bridge_quiesced = [&](std::size_t idx) -> bool {
+      if (!registry) return false;
+      const auto row =
+          ReadRunRow(&*registry, procs[idx].pid, options_.session_id,
+                     launches[idx].spawned_monotonic_ns,
+                     [](const introspect::NodeRecord&, uint32_t) { return 0; });
+      return row.has_value() && (row->flags & introspect::kFlagQuiesced) != 0;
+    };
+    const auto signal_remaining = [&](std::optional<std::size_t> skip_idx) {
       stop_phase = StopPhase::kAllSignaled;
-      shutdown_deadline = now + kStopTimeout;
       for (std::size_t i = 0; i < procs.size(); ++i) {
+        if (skip_idx && i == *skip_idx) continue;
         const auto& proc = procs[i];
         if (proc.pid <= 0 || proc.exited) continue;
         // The exit this causes is reaped by a later pass, which reads the
@@ -2313,6 +2329,7 @@ void Launcher::Supervise(SessionManifest& manifest,
         SignalProcessGroup(proc.pid, kStopSignal);
         if (launches[i].kill_reason.empty()) launches[i].kill_reason = kRunStop;
       }
+      shutdown_deadline = options_.supervision_clock() + kStopTimeout;
     };
     if (stop_phase == StopPhase::kNone &&
         (process::stop_requested.load() || past_deadline ||
@@ -2320,18 +2337,19 @@ void Launcher::Supervise(SessionManifest& manifest,
       ConsoleLine(std::cout) << "[launcher] Stopping children...\n";
       if (const auto bridge_idx = running_bridge()) {
         stop_phase = StopPhase::kBridge;
-        bridge_stop_deadline = now + kBridgeStopTimeout;
         SignalProcessGroup(procs[*bridge_idx].pid, kStopSignal);
         if (launches[*bridge_idx].kill_reason.empty()) {
           launches[*bridge_idx].kill_reason = kRunStop;
         }
+        bridge_stop_deadline =
+            options_.supervision_clock() + kBridgeStopTimeout;
       } else {
-        signal_remaining();
+        signal_remaining(std::nullopt);
       }
     } else if (stop_phase == StopPhase::kBridge) {
       const auto bridge_idx = running_bridge();
-      if (!bridge_idx) {
-        signal_remaining();
+      if (!bridge_idx || (!bridge_killed && bridge_quiesced(*bridge_idx))) {
+        signal_remaining(bridge_idx);
       } else if (!bridge_killed && now >= bridge_stop_deadline) {
         bridge_killed = true;
         SignalProcessGroup(procs[*bridge_idx].pid, SIGKILL);
@@ -2360,7 +2378,7 @@ void Launcher::Supervise(SessionManifest& manifest,
     if (refreshes_locks) due(next_lock_refresh);
     if (stop_phase == StopPhase::kBridge) {
       if (!bridge_killed && now < bridge_stop_deadline) {
-        due(bridge_stop_deadline);
+        due(std::min(bridge_stop_deadline, now + kBridgeQuiescePoll));
       }
     } else if (stop_phase == StopPhase::kAllSignaled) {
       // Once passed, its SIGKILLs are sent; the exits they cause wake it.

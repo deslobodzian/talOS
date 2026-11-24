@@ -9,7 +9,7 @@ import math
 import os
 import threading
 
-_EXPECTED_ABI_VERSION = 40
+_EXPECTED_ABI_VERSION = 41
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int8, c_uint8, c_int16 = (ctypes.c_int8, ctypes.c_uint8, ctypes.c_int16)
@@ -231,6 +231,7 @@ _SIGNATURES = {
     "talos_motor_set": (c_int32, [c_void_p, c_int64, c_int32, c_double,
                                   c_double, c_int32]),
     "talos_motor_clamped_count": (c_int32, [c_void_p, c_int64, _P(c_uint64)]),
+    "talos_motor_hardware_index": (c_int32, [c_void_p, c_int64]),
     "talos_motor_rezero": (c_int32, [c_void_p, c_int64, c_double]),
     "talos_gyro_rezero": (c_int32, [c_void_p, c_int64, c_double]),
     "talos_motor_zeroed": (c_int32, [c_void_p, c_int64]),

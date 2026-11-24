@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 40u
+#define TALOS_NODE_ABI_VERSION 41u
 
 enum {
   TALOS_OK = 0,
@@ -241,6 +241,10 @@ int32_t talos_motor_set(TalosNode* node, int64_t index, int32_t mode,
 // Monotonic per-device count of adjusted/neutralized motor setter calls.
 int32_t talos_motor_clamped_count(TalosNode* node, int64_t index,
                                   uint64_t* out);
+// Motor::hardware_index: the motor's slot index in configured motor order
+// (0..kMaxMotors-1, the bit position in /hw/status motor_fault_mask), or
+// TALOS_ERR (-1) on error.
+int32_t talos_motor_hardware_index(TalosNode* node, int64_t index);
 // Node-shared software offsets; ignored for disconnected/non-finite samples,
 // a motor position older than RezeroAgeBound (devices.h), or non-finite
 // inputs. Motor goals translate to hardware coordinates before
