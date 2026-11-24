@@ -5,7 +5,6 @@
 #include <cstdio>
 #include <filesystem>
 #include <memory>
-#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -14,7 +13,6 @@
 #include <vector>
 
 #include "rules_cc/cc/runfiles/runfiles.h"
-#include "talOS/hardware/config_error.h"
 #include "talOS/hardware/gateway.h"
 #include "talOS/hardware/sim_plant.h"
 
@@ -40,59 +38,10 @@ constexpr std::array<std::string_view, kFields.size()> kFieldNames = [] {
   return names;
 }();
 
-// Records the motors PhysicsSimBackend::Configure hands a plant (their gear
-// and winding constants, as the backend computes them) and owns none, so the
-// model compiles with exactly what the backend's Bind will compare against.
-class MotorProbe final : public hardware::sim::ExternalPlant {
- public:
-  uint32_t step_us() const override { return 5000; }
-  bool Bind(std::span<const PlantMotor> motors,
-            std::span<const hardware::sim::PlantInput> /*inputs*/,
-            std::span<bool> /*owned*/,
-            hardware::ConfigError& /*error*/) override {
-    names_.assign(motors.size(), std::string());
-    motors_.assign(motors.begin(), motors.end());
-    for (std::size_t i = 0; i < motors.size(); ++i) {
-      names_[i] = std::string(motors[i].name);
-      motors_[i].name = names_[i];
-    }
-    bound_ = true;
-    return true;
-  }
-  bool Step(int /*steps*/,
-            std::span<const hardware::sim::PlantDrive> /*drives*/) override {
-    return false;
-  }
-  hardware::sim::PlantRotor rotor(std::size_t /*motor*/) const override {
-    return {};
-  }
-  std::optional<hardware::sim::PlantChassis> chassis() const override {
-    return std::nullopt;
-  }
-  bool input_closed(std::size_t /*input*/) const override { return false; }
-  std::string_view failure() const override { return {}; }
-
-  bool bound() const { return bound_; }
-  std::span<const PlantMotor> motors() const { return motors_; }
-
- private:
-  std::vector<std::string> names_;  // motors_' names point here
-  std::vector<PlantMotor> motors_;
-  bool bound_{false};
-};
-
 std::string OwnsChassis(std::string_view key) {
   return std::string(key) +
          ": the robot model's root body has a freejoint, so the model owns "
          "the chassis and its wheels; remove it from a mujoco_gateway config";
-}
-
-// Why the backend's last Configure refused.
-std::string RefusalText(const hardware::sim::PhysicsSimBackend& backend) {
-  const std::optional<hardware::ConfigError> error =
-      backend.last_config_error();
-  return error ? hardware::FormatConfigError(*error)
-               : std::string("the physics backend gave no reason");
 }
 
 constexpr int64_t kReportPeriodNs = 1'000'000'000;
@@ -155,23 +104,13 @@ void MujocoGatewayExtension::Configure(
   }
   const config::SimulationMujocoConfig& model = *config.simulation.mujoco;
 
-  // The motors as the backend will bind them: one source for the gear and
-  // winding constants the model's damping G^2*b_m is compiled from, and that
-  // Bind then compares exactly. The backend has no public way to compute
-  // them, so a probe plant records them from a Configure.
-  MotorProbe probe;
-  backend.SetPlant(&probe);
-  backend.Configure(config.hardware);
-  backend.SetPlant(nullptr);
-  // Unreachable while the backend refuses nothing before Bind with no
-  // world inputs set; kept so a future early refusal is not read as a model
-  // that names no motor.
-  if (!probe.bound()) {
-    throw std::invalid_argument(
-        "mujoco_gateway: the physics backend refused the config before "
-        "binding its motors: " +
-        RefusalText(backend));
-  }
+  // The motors as the backend will bind them (config.hardware carries the
+  // same local motor types the gateway hands SetLocalMotorTypes): one source
+  // for the gear and winding constants the model's damping G^2*b_m is
+  // compiled from, and that Bind then compares exactly. Their names view
+  // into `config`, which outlives MakePlant; the plant keeps no name.
+  const std::vector<PlantMotor> motors =
+      hardware::sim::PhysicsSimBackend::PlantMotors(config.hardware);
 
   const std::string field_xml =
       model.field.empty() ? std::string() : options_.field(model.field);
@@ -180,7 +119,7 @@ void MujocoGatewayExtension::Configure(
                                 .start_x_m = options.start_x_m,
                                 .start_y_m = options.start_y_m,
                                 .start_yaw_rad = options.start_yaw_rad},
-                     probe.motors());
+                     motors);
 
   if (plant_->chassis()) {
     const toml::node_view<const toml::node> simulation =
