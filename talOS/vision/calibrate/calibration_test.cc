@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -46,6 +47,54 @@ TEST(Calibration, TomlPreservesUntargetedBytes) {
   EXPECT_THROW(UpdateToml("[camera]\nfx=1\nfx=2\n", r), std::runtime_error);
   EXPECT_THROW(UpdateToml("[camera]\n[camera]\n", r), std::runtime_error);
   EXPECT_THROW(UpdateToml("[\"camera\"]\nfx=1\n", r), std::runtime_error);
+}
+TEST(Calibration, RejectsMalformedResultMatrices) {
+  auto check_bad = [](const Result& bad) {
+    EXPECT_THROW((void)Fragment(bad), std::runtime_error);
+    EXPECT_THROW((void)UpdateToml("[camera]\n", bad), std::runtime_error);
+  };
+
+  {
+    Result r = Example();
+    r.camera = cv::Mat();
+    check_bad(r);
+  }
+  {
+    Result r = Example();
+    r.camera = cv::Mat::eye(2, 2, CV_64F);
+    check_bad(r);
+  }
+  {
+    Result r = Example();
+    r.camera = cv::Mat::eye(3, 3, CV_32F);
+    check_bad(r);
+  }
+  {
+    Result r = Example();
+    r.distortion = cv::Mat();
+    check_bad(r);
+  }
+  {
+    Result r = Example();
+    r.distortion = cv::Mat::zeros(4, 1, CV_64F);
+    check_bad(r);
+  }
+  {
+    Result r = Example();
+    r.distortion = cv::Mat::zeros(5, 1, CV_32F);
+    check_bad(r);
+  }
+  {
+    Result r = Example();
+    r.camera = r.camera.clone();
+    r.camera.at<double>(0, 0) = std::numeric_limits<double>::quiet_NaN();
+    check_bad(r);
+  }
+
+  // Row-vector CV_64F distortion with 5 coefficients is valid.
+  Result row_dist = Example();
+  row_dist.distortion = (cv::Mat_<double>(1, 5) << -0.1, 0.02, 0.0, 0.0, 0.0);
+  EXPECT_FALSE(Fragment(row_dist).empty());
 }
 TEST(Calibration, RecoversRenderedDistortedBoard) {
   const auto truth = Example();

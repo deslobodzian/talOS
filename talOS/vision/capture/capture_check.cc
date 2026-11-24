@@ -201,6 +201,9 @@ int main(int argc, char** argv) {
       }
     }
     if (config.device_path.empty()) throw std::runtime_error("--device needed");
+    if (!std::isfinite(seconds) || seconds <= 0.0) {
+      throw std::runtime_error("--seconds must be finite and positive");
+    }
     auto source = talos::vision::CreatePlatformCameraSource(config);
     if (!source)
       throw std::runtime_error("no capture backend on this platform");
@@ -214,7 +217,8 @@ int main(int argc, char** argv) {
 
     std::mutex mutex;
     std::vector<double> intervals_ms;
-    intervals_ms.reserve(static_cast<size_t>(seconds * 300) + 16);
+    const double reserve_est = std::min(seconds * 300.0, 1e6);
+    intervals_ms.reserve(static_cast<size_t>(reserve_est) + 16);
     int64_t last_capture_ns = -1, first_capture_ns = -1, first_thread_cpu = -1,
             last_thread_cpu = -1;
     uint64_t frames = 0, missing = 0;
@@ -313,9 +317,10 @@ int main(int argc, char** argv) {
     source->Stop();
 
     std::lock_guard lock(mutex);
+    const double delivered_fps =
+        wall > 0.0 ? static_cast<double>(frames) / wall : 0.0;
     std::printf("wall %.2f s, frames %llu, delivered %.3f fps\n", wall,
-                static_cast<unsigned long long>(frames),
-                static_cast<double>(frames) / wall);
+                static_cast<unsigned long long>(frames), delivered_fps);
     if (frames > 1 && last_capture_ns > first_capture_ns) {
       std::printf("first frame %.0f ms after start, steady %.3f fps\n",
                   static_cast<double>(first_capture_ns - start_ns) * 1e-6,
@@ -332,7 +337,8 @@ int main(int argc, char** argv) {
                       1e-6 / static_cast<double>(frames - 1),
                   capture_scheduling.c_str());
     }
-    std::printf("process CPU %.1f%% of one core\n", 100.0 * cpu / wall);
+    const double cpu_percent = wall > 0.0 ? 100.0 * cpu / wall : 0.0;
+    std::printf("process CPU %.1f%% of one core\n", cpu_percent);
     if (backend) {
       std::printf("detected frames %llu of %llu captured, detections %llu\n",
                   static_cast<unsigned long long>(processed),

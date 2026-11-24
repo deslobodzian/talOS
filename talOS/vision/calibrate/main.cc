@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -91,8 +92,8 @@ int main(int argc, char** argv) {
       }
       return 0;
     }
-    if ((directory.empty() == device.empty()) || !(interval > 0) ||
-        !(seconds > 0)) {
+    if ((directory.empty() == device.empty()) || !std::isfinite(interval) ||
+        !(interval > 0) || !std::isfinite(seconds) || !(seconds > 0)) {
       throw std::runtime_error(
           "Choose exactly one of --images and --device; durations must be "
           "positive");
@@ -127,9 +128,10 @@ int main(int argc, char** argv) {
       if (!source->Start()) throw std::runtime_error("Cannot start capture");
       const auto start = std::chrono::steady_clock::now();
       auto next = start;
-      while (std::chrono::duration<double>(std::chrono::steady_clock::now() -
+      while (source->IsRunning() &&
+             std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                            start)
-                 .count() < seconds) {
+                     .count() < seconds) {
         const auto now = std::chrono::steady_clock::now();
         if (now >= next) {
           if (const auto* frame = mailbox.TakeNewest()) {
@@ -173,14 +175,32 @@ int main(int argc, char** argv) {
               << ", RMS reprojection error: " << result.rms << " px\n";
     std::cout << talos::vision::calibrate::Fragment(result);
     if (!update.empty()) {
-      std::ifstream input(update, std::ios::binary);
+      const std::filesystem::path target(update);
+      std::ifstream input(target, std::ios::binary);
       if (!input) throw std::runtime_error("Cannot read update file");
       const std::string text((std::istreambuf_iterator<char>(input)), {});
       const auto edited = talos::vision::calibrate::UpdateToml(text, result);
       input.close();
-      std::ofstream output(update, std::ios::binary | std::ios::trunc);
-      output << edited;
-      if (!output) throw std::runtime_error("Cannot write update file");
+      std::filesystem::path tmp = target;
+      tmp += ".tmp";
+      {
+        std::ofstream output(tmp, std::ios::binary | std::ios::trunc);
+        output << edited;
+        output.close();
+        if (!output) {
+          std::error_code rm_ec;
+          std::filesystem::remove(tmp, rm_ec);
+          throw std::runtime_error("Cannot write temporary update file");
+        }
+      }
+      std::error_code rename_ec;
+      std::filesystem::rename(tmp, target, rename_ec);
+      if (rename_ec) {
+        std::error_code rm_ec;
+        std::filesystem::remove(tmp, rm_ec);
+        throw std::runtime_error("Cannot replace update file: " +
+                                 rename_ec.message());
+      }
     }
     return 0;
   } catch (const std::exception& error) {
