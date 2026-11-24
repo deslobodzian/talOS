@@ -399,5 +399,55 @@ TEST(PipelineTest, NullGpuBackendFactoryFallsBackOrRejectsWithoutCrash) {
   }
 }
 
+TEST(PipelineTest, CpuBackendHandlesOddWidthYuyvInvalidFormatAndOversizedDims) {
+  CpuAprilTagBackend backend;
+  const auto t0 = talos::event::MonotonicTime::from_nanos(1);
+
+  // Odd-width YUYV (63x48) must not throw cv::Exception.
+  const Frame odd_small(0, 1, 1, t0, 63, 48, PixelFormat::kYuyv);
+  ASSERT_TRUE(odd_small.holds_image());
+  const auto small_res = backend.Execute(odd_small);
+  EXPECT_TRUE(small_res.success) << small_res.error_message;
+
+  // Odd-width YUYV carrying a real tag must extract luma accurately.
+  const Frame gray_tag = TagFrame();
+  const uint32_t odd_w = gray_tag.width() + 1;
+  const uint32_t odd_h = gray_tag.height();
+  Frame odd_yuyv(0, 1, 2, t0, odd_w, odd_h, PixelFormat::kYuyv);
+  uint8_t* dst = odd_yuyv.mutable_data();
+  for (uint32_t y = 0; y < odd_h; ++y) {
+    const uint8_t* src_row =
+        gray_tag.data() + static_cast<size_t>(y) * gray_tag.stride();
+    uint8_t* dst_row = dst + static_cast<size_t>(y) * odd_yuyv.stride();
+    for (uint32_t x = 0; x < odd_w; ++x) {
+      dst_row[static_cast<size_t>(x) * 2] =
+          (x < gray_tag.width()) ? src_row[x] : 255;
+      dst_row[static_cast<size_t>(x) * 2 + 1] = 128;
+    }
+  }
+  const auto yuyv_res = backend.Execute(odd_yuyv);
+  ASSERT_TRUE(yuyv_res.success) << yuyv_res.error_message;
+  ASSERT_EQ(yuyv_res.detections.size(), 1u);
+  EXPECT_EQ(yuyv_res.detections.front().id, 0);
+
+  // Unknown PixelFormat enum value fails cleanly instead of throwing.
+  const auto bad_format = static_cast<PixelFormat>(99);
+  const Frame unknown_fmt(0, 1, 3, t0, 16, 16, 16, bad_format,
+                          std::vector<uint8_t>(16u * 16u, 0));
+  ASSERT_TRUE(unknown_fmt.holds_image());
+  const auto fmt_res = backend.Execute(unknown_fmt);
+  EXPECT_FALSE(fmt_res.success);
+
+  // Stride / dimensions exceeding INT_MAX fail cleanly before OpenCV or
+  // AprilTag casts.
+  const uint8_t dummy_byte = 0;
+  const uint32_t over_int_max =
+      static_cast<uint32_t>(std::numeric_limits<int>::max()) + 1u;
+  const Frame huge_stride(0, 1, 4, t0, 1, 1, over_int_max, PixelFormat::kGray8,
+                          &dummy_byte, static_cast<size_t>(over_int_max));
+  ASSERT_TRUE(huge_stride.holds_image());
+  EXPECT_FALSE(backend.Execute(huge_stride).success);
+}
+
 }  // namespace
 }  // namespace talos::vision

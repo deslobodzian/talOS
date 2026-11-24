@@ -649,7 +649,8 @@ TEST(LocalizationTest, JointUncertaintyUsesMeanCameraRangeAndZeroAmbiguity) {
   }
   const auto shifted = SolveMultiTagRobotPose(tags, 3, mount, layout, intr);
   ASSERT_TRUE(shifted.validity.valid);
-  EXPECT_NEAR(shifted.average_distance_m, mean, 1e-12);
+  EXPECT_NEAR(shifted.average_distance_m, result.average_distance_m, 1e-8);
+  EXPECT_NEAR(shifted.average_distance_m, mean, 1e-5);
   EXPECT_NEAR(shifted.std_devs.x_std_m, result.std_devs.x_std_m, 1e-8);
 }
 
@@ -1241,6 +1242,80 @@ TEST(LocalizationTest,
       EXPECT_TRUE(std::isfinite(est.std_devs.y_std_m));
       EXPECT_TRUE(std::isfinite(est.std_devs.yaw_std_rad));
     }
+  }
+}
+
+TEST(LocalizationTest,
+     MultiTagSolverEnforcesRefinedDistanceBoundsAndUsesRefinedRange) {
+  using Pose = talos::geometry::SE3<double>;
+
+  // Case 1: True robot pose puts tags at ~6.0 m, beyond max_distance_m = 5.0,
+  // while the unrefined per-tag T_camera_tag seeds lie at ~4.0 m (passing the
+  // pre-LM filter). LM pulls the pose to 6.0 m, which must be rejected as
+  // kTooFar for both multi-tag and single-tag solves.
+  for (const int tag_count : {2, 1}) {
+    SCOPED_TRACE(tag_count);
+    JointFixture far_fixture(6.0, tag_count);
+    for (auto& tag : far_fixture.tags) {
+      const Eigen::Vector3d t = tag.T_camera_tag.translation();
+      tag.T_camera_tag =
+          Pose(tag.T_camera_tag.rotation(), t * (4.0 / t.norm()));
+    }
+    PoseValidationOptions opts;
+    opts.max_distance_m = 5.0;
+    const auto res =
+        SolveMultiTagRobotPose(far_fixture.tags, 1, far_fixture.mount,
+                               far_fixture.layout, far_fixture.intr, opts);
+    EXPECT_FALSE(res.validity.valid);
+    EXPECT_EQ(res.validity.reason, PoseInvalidReason::kTooFar);
+  }
+
+  // Case 2: True robot pose puts tags at ~0.5 m, below min_distance_m = 0.8,
+  // while the unrefined per-tag T_camera_tag seeds lie at ~1.2 m (passing the
+  // pre-LM filter). LM pulls the pose to 0.5 m, which must be rejected as
+  // kTooClose.
+  {
+    JointFixture close_fixture(0.5, 2);
+    for (auto& tag : close_fixture.tags) {
+      const Eigen::Vector3d t = tag.T_camera_tag.translation();
+      tag.T_camera_tag =
+          Pose(tag.T_camera_tag.rotation(), t * (1.2 / t.norm()));
+    }
+    PoseValidationOptions opts;
+    opts.min_distance_m = 0.8;
+    const auto res =
+        SolveMultiTagRobotPose(close_fixture.tags, 1, close_fixture.mount,
+                               close_fixture.layout, close_fixture.intr, opts);
+    EXPECT_FALSE(res.validity.valid);
+    EXPECT_EQ(res.validity.reason, PoseInvalidReason::kTooClose);
+  }
+
+  // Case 3: Refined distance (not stale pre-LM seed distance) populates
+  // average_distance_m and scales mount-angle variance in SetCovarianceStdDevs.
+  {
+    JointFixture truth_fixture(5.0, 2);
+    JointFixture perturbed_fixture = truth_fixture;
+    for (auto& tag : perturbed_fixture.tags) {
+      const Eigen::Vector3d t = tag.T_camera_tag.translation();
+      tag.T_camera_tag =
+          Pose(tag.T_camera_tag.rotation(), t * (2.0 / t.norm()));
+    }
+    PoseSolverOptions noise;
+    noise.min_xy_std_m = 0.0;
+    noise.min_yaw_std_rad = 0.0;
+    noise.mount_angle_std_rad = 0.05;
+    noise.mount_translation_std_m = 0.0;
+
+    const auto truth_res = truth_fixture.Solve(noise);
+    const auto perturbed_res = perturbed_fixture.Solve(noise);
+    ASSERT_TRUE(truth_res.validity.valid) << truth_res.validity.message;
+    ASSERT_TRUE(perturbed_res.validity.valid) << perturbed_res.validity.message;
+    EXPECT_NEAR(perturbed_res.average_distance_m, truth_res.average_distance_m,
+                1e-3);
+    EXPECT_NEAR(perturbed_res.std_devs.x_std_m, truth_res.std_devs.x_std_m,
+                1e-4);
+    EXPECT_NEAR(perturbed_res.std_devs.y_std_m, truth_res.std_devs.y_std_m,
+                1e-4);
   }
 }
 
