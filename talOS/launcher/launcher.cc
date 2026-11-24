@@ -426,6 +426,78 @@ int SummarizeLogs(std::vector<NodeProcessInfo>& procs,
   return exit_status;
 }
 
+struct LockRefreshState {
+  bool lock_lost_reported{false};
+  bool directory_lock_retaken_reported{false};
+  bool directory_lock_lost_reported{false};
+};
+
+// Refreshes the held session lock and session directory lock, logging each
+// transition once and recording manifest flags when `manifest` and
+// `session_manifest` are provided (Supervise; RefuseLaunch passes nullptr).
+// Returns whether any manifest field changed.
+bool RefreshSessionLocks(const SessionLock* session_lock,
+                         std::optional<SessionDirectoryLock>& session_directory,
+                         const FlockFunction& lock_session_directory,
+                         LockRefreshState& state,
+                         SessionManifest* manifest = nullptr,
+                         SessionManifest* session_manifest = nullptr) {
+  bool manifest_changed = false;
+  if (session_lock != nullptr && !session_lock->Refresh() &&
+      !state.lock_lost_reported) {
+    state.lock_lost_reported = true;
+    if (manifest != nullptr) manifest->session_lock_lost = true;
+    if (session_manifest != nullptr) session_manifest->session_lock_lost = true;
+    manifest_changed = manifest != nullptr || session_manifest != nullptr;
+    ConsoleLine(std::cerr)
+        << "[launcher] the session lock " << session_lock->path()
+        << " was removed; a second launcher in this namespace "
+           "would no longer be refused\n";
+  }
+  using Refreshed = SessionDirectoryLock::Refreshed;
+  // An unheld session.lock is retried only here, at supervision/refusal start
+  // and then hourly: between two tries a retention whose probe locks again may
+  // remove this session, and on a network log root this flock can block
+  // supervision and the watchdog ping (README "Session segments and logs").
+  const Refreshed directory =
+      session_directory ? session_directory->Refresh(lock_session_directory)
+                        : Refreshed::kHeld;
+  if (directory == Refreshed::kTaken) {
+    // Once: a lock taken stays held.
+    ConsoleLine(std::cerr)
+        << "[launcher] locked " << session_directory->path()
+        << ", which could not be locked when the session started; "
+           "retention passes over this session from now on\n";
+  } else if (directory == Refreshed::kRetaken &&
+             !state.directory_lock_retaken_reported) {
+    state.directory_lock_retaken_reported = true;
+    if (manifest != nullptr) manifest->directory_lock_retaken = true;
+    if (session_manifest != nullptr) {
+      session_manifest->directory_lock_retaken = true;
+    }
+    manifest_changed = manifest != nullptr || session_manifest != nullptr;
+    ConsoleLine(std::cerr)
+        << "[launcher] " << session_directory->path()
+        << " was removed while this session held it; locked it "
+           "again on a new file, so retention passes over this "
+           "session again\n";
+  } else if (directory == Refreshed::kLost &&
+             !state.directory_lock_lost_reported) {
+    state.directory_lock_lost_reported = true;
+    if (manifest != nullptr) manifest->directory_lock_lost = true;
+    if (session_manifest != nullptr) {
+      session_manifest->directory_lock_lost = true;
+    }
+    manifest_changed = manifest != nullptr || session_manifest != nullptr;
+    ConsoleLine(std::cerr)
+        << "[launcher] " << session_directory->path()
+        << " was removed and cannot be locked again (retention "
+           "holds it, or the session directory was moved away); "
+           "retention may remove this running session\n";
+  }
+  return manifest_changed;
+}
+
 }  // namespace
 
 std::string RegistryCapacityError(const introspect::RegistryReader& reader,
@@ -611,7 +683,9 @@ int Launcher::RefuseLaunch(std::string_view reason,
   const auto start_time = options_.supervision_clock();
   SupervisionTime next_watchdog = SupervisionTime::max();
   SupervisionTime next_lock_refresh = SupervisionTime::min();
-  bool lock_lost_reported = false;
+  const bool refreshes_locks =
+      session_lock_ != nullptr || session_directory_.has_value();
+  LockRefreshState lock_refresh_state;
   const auto deadline_after = [](SupervisionTime start, int duration_s) {
     if (duration_s <= 0) return SupervisionTime::max();
     const auto offset = std::chrono::duration_cast<SupervisionTime::duration>(
@@ -673,15 +747,10 @@ int Launcher::RefuseLaunch(std::string_view reason,
       break;
     }
     const SupervisionTime now = options_.supervision_clock();
-    if (session_lock_ != nullptr && now >= next_lock_refresh) {
+    if (refreshes_locks && now >= next_lock_refresh) {
       next_lock_refresh = now + kLockFileRefresh;
-      if (!session_lock_->Refresh() && !lock_lost_reported) {
-        lock_lost_reported = true;
-        ConsoleLine(std::cerr)
-            << "[launcher] the session lock " << session_lock_->path()
-            << " was removed; a second launcher in this namespace "
-               "would no longer be refused\n";
-      }
+      RefreshSessionLocks(session_lock_, session_directory_,
+                          options_.lock_session_directory, lock_refresh_state);
     }
     // Notify systemd READY=1 only once the bridge is alive and has announced
     // its listening port, so an immediate EADDRINUSE exit never falsely
@@ -708,7 +777,7 @@ int Launcher::RefuseLaunch(std::string_view reason,
     auto wake = SupervisionTime::max();
     const auto due = [&wake](SupervisionTime at) { wake = std::min(wake, at); };
     if (ready_sent && watchdog) due(next_watchdog);
-    if (session_lock_ != nullptr) due(next_lock_refresh);
+    if (refreshes_locks) due(next_lock_refresh);
     if (stop_sent) {
       if (now < shutdown_deadline) due(shutdown_deadline);
     } else {
@@ -2068,9 +2137,7 @@ void Launcher::Supervise(SessionManifest& manifest,
   auto next_lock_refresh = std::chrono::steady_clock::time_point::min();
   const bool refreshes_locks =
       session_lock_ != nullptr || session_directory_.has_value();
-  bool lock_lost_reported = false;
-  bool directory_lock_retaken_reported = false;
-  bool directory_lock_lost_reported = false;
+  LockRefreshState lock_refresh_state;
   for (;;) {
     notifier.Send("WATCHDOG=1");
     const auto now = options_.supervision_clock();
@@ -2089,55 +2156,11 @@ void Launcher::Supervise(SessionManifest& manifest,
     bool manifest_changed = false;
     if (refreshes_locks && now >= next_lock_refresh) {
       next_lock_refresh = now + kLockFileRefresh;
-      if (session_lock_ != nullptr && !session_lock_->Refresh() &&
-          !lock_lost_reported) {
-        lock_lost_reported = true;
-        manifest.session_lock_lost = true;
-        session_manifest_.session_lock_lost = true;
+      if (RefreshSessionLocks(session_lock_, session_directory_,
+                              options_.lock_session_directory,
+                              lock_refresh_state, &manifest,
+                              &session_manifest_)) {
         manifest_changed = true;
-        ConsoleLine(std::cerr)
-            << "[launcher] the session lock " << session_lock_->path()
-            << " was removed; a second launcher in this namespace "
-               "would no longer be refused\n";
-      }
-      using Refreshed = SessionDirectoryLock::Refreshed;
-      // An unheld session.lock is retried only here, at supervision start
-      // and then hourly: between two tries a retention whose probe locks
-      // again may remove this session, and on a network log root this flock
-      // can block supervision and the watchdog ping (README "Session
-      // segments and logs").
-      const Refreshed directory =
-          session_directory_
-              ? session_directory_->Refresh(options_.lock_session_directory)
-              : Refreshed::kHeld;
-      if (directory == Refreshed::kTaken) {
-        // Once: a lock taken stays held.
-        ConsoleLine(std::cerr)
-            << "[launcher] locked " << session_directory_->path()
-            << ", which could not be locked when the session started; "
-               "retention passes over this session from now on\n";
-      } else if (directory == Refreshed::kRetaken &&
-                 !directory_lock_retaken_reported) {
-        directory_lock_retaken_reported = true;
-        manifest.directory_lock_retaken = true;
-        session_manifest_.directory_lock_retaken = true;
-        manifest_changed = true;
-        ConsoleLine(std::cerr)
-            << "[launcher] " << session_directory_->path()
-            << " was removed while this session held it; locked it "
-               "again on a new file, so retention passes over this "
-               "session again\n";
-      } else if (directory == Refreshed::kLost &&
-                 !directory_lock_lost_reported) {
-        directory_lock_lost_reported = true;
-        manifest.directory_lock_lost = true;
-        session_manifest_.directory_lock_lost = true;
-        manifest_changed = true;
-        ConsoleLine(std::cerr)
-            << "[launcher] " << session_directory_->path()
-            << " was removed and cannot be locked again (retention "
-               "holds it, or the session directory was moved away); "
-               "retention may remove this running session\n";
       }
     }
     // Read-only, the attach takes no lock (RegistryMapping): no node can

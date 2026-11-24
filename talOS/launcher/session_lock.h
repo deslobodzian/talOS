@@ -239,8 +239,8 @@ inline LogRootLocks ProbeLogRootLocks(const std::filesystem::path& root,
   const int fd =
       introspect::OpenLockFile((root / kLockProbeFile).string(), O_RDONLY);
   if (fd < 0) return LogRootLocks::kSupported;
-  const bool refused = lock(fd, LOCK_SH | LOCK_NB) != 0;
-  const int code = errno;
+  int code = 0;
+  const bool refused = FlockRetryEintr(lock, fd, LOCK_SH | LOCK_NB, code) != 0;
   ::close(fd);
   if (!refused) return LogRootLocks::kSupported;
   if (code == ENOLCK) return LogRootLocks::kUnavailable;
@@ -320,14 +320,15 @@ class SessionDirectoryLock {
         if (errno == ENOENT) continue;
         return std::nullopt;
       }
-      if (lock(fd, LOCK_EX | LOCK_NB) == 0) {
+      int code = 0;
+      if (FlockRetryEintr(lock, fd, LOCK_EX | LOCK_NB, code) == 0) {
         if (introspect::LockFileIsCurrent(fd, path)) {
           return SessionDirectoryLock{fd, path};
         }
         ::close(fd);
+        error = std::make_error_code(std::errc::device_or_resource_busy);
         continue;
       }
-      const int code = errno;
       ::close(fd);
       if (FlockUnsupported(code)) {
         error = {code, std::generic_category()};
@@ -354,6 +355,9 @@ class SessionDirectoryLock {
       error = std::make_error_code(std::errc::device_or_resource_busy);
       std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
+    if (!error) {
+      error = std::make_error_code(std::errc::device_or_resource_busy);
+    }
     return std::nullopt;
   }
 
@@ -374,14 +378,8 @@ class SessionDirectoryLock {
       if (fd >= 0 || errno != EINTR) break;
     }
     if (fd < 0) return errno != ENOENT && errno != ENOTDIR;
-    int result = -1;
     int code = 0;
-    for (int attempt = 0; attempt < 100; ++attempt) {
-      errno = 0;
-      result = lock(fd, LOCK_SH | LOCK_NB);
-      code = errno;
-      if (result == 0 || code != EINTR) break;
-    }
+    const int result = FlockRetryEintr(lock, fd, LOCK_SH | LOCK_NB, code);
     ::close(fd);
     if (result == 0) return false;
     if (FlockUnsupported(code) && root_takes_no_locks) return false;
@@ -407,8 +405,8 @@ class SessionDirectoryLock {
       error = {errno, std::generic_category()};
       return std::nullopt;
     }
-    if (lock(fd, LOCK_EX | LOCK_NB) != 0) {
-      const int code = errno;
+    int code = 0;
+    if (FlockRetryEintr(lock, fd, LOCK_EX | LOCK_NB, code) != 0) {
       ::close(fd);
       if (FlockUnsupported(code) && root_takes_no_locks)
         return SessionDirectoryLock{-1, path};

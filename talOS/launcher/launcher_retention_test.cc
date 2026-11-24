@@ -585,5 +585,158 @@ TEST(LauncherRetention, RefreshRetriesTransientEwouldblockFromConcurrentProbe) {
   std::filesystem::remove_all(dir, ec);
 }
 
+// REQ-OPS-11: ProbeLogRootLocks, SessionDirectoryLock::Create,
+// SessionDirectoryLock::TakeIdle, and SessionDirectoryLock::Refresh
+// (TakeCurrent) all retry flock(2) on EINTR via FlockRetryEintr rather than
+// treating an interrupted call as a terminal failure.
+TEST(LauncherRetention, FlockEintrRetriedInProbeTakeIdleAndTakeCurrent) {
+  const std::filesystem::path base = TempPath("flock_eintr_retry");
+  std::error_code ec;
+  std::filesystem::remove_all(base, ec);
+  std::filesystem::create_directories(base);
+
+  // ProbeLogRootLocks: 1x EINTR then EOPNOTSUPP / ENOLCK / ::flock.
+  {
+    int calls = 0;
+    EXPECT_EQ(ProbeLogRootLocks(base,
+                                [&](int, int) -> int {
+                                  if (calls++ == 0) {
+                                    errno = EINTR;
+                                    return -1;
+                                  }
+                                  errno = EOPNOTSUPP;
+                                  return -1;
+                                }),
+              LogRootLocks::kUnsupported);
+    EXPECT_EQ(calls, 2);
+  }
+  {
+    int calls = 0;
+    EXPECT_EQ(ProbeLogRootLocks(base,
+                                [&](int, int) -> int {
+                                  if (calls++ == 0) {
+                                    errno = EINTR;
+                                    return -1;
+                                  }
+                                  errno = ENOLCK;
+                                  return -1;
+                                }),
+              LogRootLocks::kUnavailable);
+    EXPECT_EQ(calls, 2);
+  }
+  {
+    int calls = 0;
+    EXPECT_EQ(ProbeLogRootLocks(base,
+                                [&](int fd, int op) -> int {
+                                  if (calls++ == 0) {
+                                    errno = EINTR;
+                                    return -1;
+                                  }
+                                  return ::flock(fd, op);
+                                }),
+              LogRootLocks::kSupported);
+    EXPECT_EQ(calls, 2);
+  }
+
+  // SessionDirectoryLock::Create retries EINTR in-place and acquires the lock.
+  const std::filesystem::path session_dir = base / "100";
+  std::error_code create_err;
+  int create_calls = 0;
+  auto lock = SessionDirectoryLock::Create(
+      session_dir,
+      [](const std::filesystem::path& p, std::error_code& err) {
+        std::filesystem::create_directories(p, err);
+      },
+      create_err,
+      [&](int fd, int op) -> int {
+        if (create_calls++ == 0) {
+          errno = EINTR;
+          return -1;
+        }
+        return ::flock(fd, op);
+      });
+  ASSERT_TRUE(lock.has_value()) << create_err.message();
+  EXPECT_TRUE(lock->held());
+  EXPECT_EQ(create_calls, 2);
+
+  // SessionDirectoryLock::Refresh / TakeCurrent retries EINTR after unlink.
+  const std::filesystem::path lock_path =
+      session_dir / kSessionDirectoryLockFile;
+  ASSERT_EQ(::unlink(lock_path.c_str()), 0);
+  int retake_calls = 0;
+  const auto refreshed = lock->Refresh([&](int fd, int op) -> int {
+    if (retake_calls++ == 0) {
+      errno = EINTR;
+      return -1;
+    }
+    return ::flock(fd, op);
+  });
+  EXPECT_EQ(refreshed, SessionDirectoryLock::Refreshed::kRetaken);
+  EXPECT_EQ(retake_calls, 2);
+  EXPECT_TRUE(SessionDirectoryLock::Held(session_dir, false));
+
+  lock.reset();
+
+  // SessionDirectoryLock::TakeIdle retries EINTR and acquires the idle lock.
+  bool held = true;
+  std::error_code idle_err;
+  int idle_calls = 0;
+  auto idle_lock = SessionDirectoryLock::TakeIdle(
+      session_dir, /*root_takes_no_locks=*/false, held, idle_err,
+      [&](int fd, int op) -> int {
+        if (idle_calls++ == 0) {
+          errno = EINTR;
+          return -1;
+        }
+        return ::flock(fd, op);
+      });
+  ASSERT_TRUE(idle_lock.has_value()) << idle_err.message();
+  EXPECT_FALSE(held);
+  EXPECT_FALSE(idle_err);
+  EXPECT_TRUE(idle_lock->held());
+  EXPECT_EQ(idle_calls, 2);
+  EXPECT_TRUE(SessionDirectoryLock::Held(session_dir, false));
+
+  idle_lock.reset();
+  std::filesystem::remove_all(base, ec);
+}
+
+// REQ-OPS-11: When SessionDirectoryLock::Create exhausts its stale-inode retry
+// budget (LockFileIsCurrent is false on every attempt because session.lock is
+// unlinked immediately after locking), Create returns std::nullopt with a
+// non-empty device_or_resource_busy error rather than an empty error_code.
+TEST(LauncherRetention, CreateSetsBusyErrorWhenLockFileUnlinkedEveryAttempt) {
+  const std::filesystem::path base = TempPath("create_stale_inode");
+  std::error_code ec;
+  std::filesystem::remove_all(base, ec);
+  const std::filesystem::path session_dir = base / "101";
+  const std::filesystem::path lock_path =
+      session_dir / kSessionDirectoryLockFile;
+
+  int calls = 0;
+  std::error_code create_err;
+  const auto lock = SessionDirectoryLock::Create(
+      session_dir,
+      [](const std::filesystem::path& p, std::error_code& err) {
+        std::filesystem::create_directories(p, err);
+      },
+      create_err,
+      [&](int fd, int op) -> int {
+        ++calls;
+        const int rc = ::flock(fd, op);
+        if (rc == 0) ::unlink(lock_path.c_str());
+        return rc;
+      });
+
+  EXPECT_FALSE(lock.has_value());
+  EXPECT_EQ(calls, 100);
+  EXPECT_TRUE(static_cast<bool>(create_err));
+  EXPECT_EQ(create_err,
+            std::make_error_code(std::errc::device_or_resource_busy))
+      << create_err.message();
+
+  std::filesystem::remove_all(base, ec);
+}
+
 }  // namespace
 }  // namespace talos::launcher
