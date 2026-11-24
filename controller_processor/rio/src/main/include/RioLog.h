@@ -106,6 +106,7 @@ enum class LogKind : uint8_t {
   kApplyControl,    // control send failed/recovered (flag = failed)
   kNeutralSend,     // NeutralOut send failing/recovered (flag = failed)
   kDeviceReset,     // device reset latched (flag = sensor)
+  kCanBusStatus,    // text only; index = bus * 2 + (recovered ? 1 : 0)
   kMessage,         // text only; index names the message for rate limiting
   kCount,
 };
@@ -143,6 +144,7 @@ class RioLog {
   using Sink = std::function<void(std::string_view line)>;
   static constexpr std::size_t kCapacity = 256;
   static constexpr uint64_t kWindowUs = 1'000'000;
+  static constexpr std::size_t kKeysPerKind = 32;
 
   // Lines go to `sink` (default: stderr, each prefixed with ConsoleTime of
   // its writing, within one 20 ms drain of the event unless the logger
@@ -255,7 +257,6 @@ class RioLog {
     LogEvent last{};
   };
   void WriteCoalesced(Window& window, uint64_t now_us);
-  static constexpr std::size_t kKeysPerKind = 32;
 
   Sink sink_;
   std::unique_ptr<std::array<Cell, kCapacity>> cells_;

@@ -220,14 +220,104 @@ TEST(ClockOffset, ExchangeExpiresAndResetsWithBoot) {
   estimator.Observe(1, 1000, 10000);
   estimator.ObserveExchange(1, 8000, 1000, 10000);
   ASSERT_TRUE(estimator.accuracy_valid());
+  ASSERT_NE(estimator.bounded_offset_us(), 0);
+  ASSERT_GT(estimator.round_trip_us(), 0u);
+  ASSERT_GT(estimator.uncertainty_us(), 0u);
   estimator.Observe(1, 1001001, 1010001);
   EXPECT_FALSE(estimator.accuracy_valid());
+  EXPECT_EQ(estimator.bounded_offset_us(), 0);
+  EXPECT_EQ(estimator.round_trip_us(), 0u);
+  EXPECT_EQ(estimator.uncertainty_us(), 0u);
   estimator.ObserveExchange(1, 1008000, 1001001, 1010001);
   ASSERT_TRUE(estimator.accuracy_valid());
   estimator.Observe(2, 1, 1015000);
   EXPECT_FALSE(estimator.accuracy_valid());
+  EXPECT_EQ(estimator.bounded_offset_us(), 0);
+  EXPECT_EQ(estimator.round_trip_us(), 0u);
+  EXPECT_EQ(estimator.uncertainty_us(), 0u);
   estimator.ObserveExchange(1, 1010000, 1, 1015000);
   EXPECT_FALSE(estimator.accuracy_valid());
+  EXPECT_EQ(estimator.bounded_offset_us(), 0);
+  EXPECT_EQ(estimator.round_trip_us(), 0u);
+  EXPECT_EQ(estimator.uncertainty_us(), 0u);
+}
+
+// REQ-CONTRACT-23, REQ-OPS-20
+TEST(ClockOffset, ExpireClearsStaleExchangeWithoutNewObserve) {
+  // No prior observations: Expire is a safe no-op across extreme timestamps.
+  {
+    Estimator estimator;
+    estimator.Expire(0);
+    estimator.Expire(Estimator::kExchangeLifetimeUs + 1);
+    estimator.Expire(std::numeric_limits<std::uint64_t>::max());
+    EXPECT_FALSE(estimator.accuracy_valid());
+    EXPECT_EQ(estimator.bounded_offset_us(), 0);
+    EXPECT_EQ(estimator.round_trip_us(), 0u);
+    EXPECT_EQ(estimator.uncertainty_us(), 0u);
+  }
+
+  // Single exchange: backward timestamps do not underflow or clear validity,
+  // exact lifetime keeps the bound valid (with drift propagated), and 1 us
+  // past lifetime clears accuracy_valid() and zeroes all bound fields without
+  // an intervening Observe().
+  {
+    constexpr std::uint64_t kT1 = 8'000;
+    constexpr std::uint64_t kT2 = 1'000;
+    constexpr std::uint64_t kT4 = 10'000;
+    Estimator estimator;
+    ASSERT_TRUE(estimator.Observe(1, kT2, kT4));
+    estimator.ObserveExchange(1, kT1, kT2, kT4);
+    ASSERT_TRUE(estimator.accuracy_valid());
+    const std::int64_t initial_offset = estimator.bounded_offset_us();
+    const std::uint64_t initial_rtt = estimator.round_trip_us();
+    const std::uint64_t initial_uncertainty = estimator.uncertainty_us();
+    ASSERT_EQ(initial_offset, 8'000);
+    ASSERT_EQ(initial_rtt, 2'000u);
+    ASSERT_GT(initial_uncertainty, 0u);
+
+    estimator.Expire(0);
+    estimator.Expire(kT4 - 1);
+    EXPECT_TRUE(estimator.accuracy_valid());
+    EXPECT_EQ(estimator.bounded_offset_us(), initial_offset);
+    EXPECT_EQ(estimator.round_trip_us(), initial_rtt);
+    EXPECT_EQ(estimator.uncertainty_us(), initial_uncertainty);
+
+    estimator.Expire(kT4 + Estimator::kExchangeLifetimeUs);
+    EXPECT_TRUE(estimator.accuracy_valid());
+    EXPECT_EQ(estimator.bounded_offset_us(), initial_offset);
+    EXPECT_EQ(estimator.round_trip_us(), initial_rtt);
+    EXPECT_GT(estimator.uncertainty_us(), initial_uncertainty);
+
+    estimator.Expire(kT4 + Estimator::kExchangeLifetimeUs + 1);
+    EXPECT_FALSE(estimator.accuracy_valid());
+    EXPECT_EQ(estimator.bounded_offset_us(), 0);
+    EXPECT_EQ(estimator.round_trip_us(), 0u);
+    EXPECT_EQ(estimator.uncertainty_us(), 0u);
+  }
+
+  // Multiple kept exchanges: Expire promotes a younger higher-RTT exchange
+  // once the older minimum-RTT exchange ages out, then clears once all expire.
+  {
+    Estimator estimator;
+    ASSERT_TRUE(estimator.Observe(1, 1'000, 10'000));
+    estimator.ObserveExchange(1, 9'800, 1'000, 10'000);
+    ASSERT_TRUE(estimator.Observe(1, 501'000, 510'000));
+    estimator.ObserveExchange(1, 509'000, 501'000, 510'000);
+    ASSERT_TRUE(estimator.accuracy_valid());
+    ASSERT_EQ(estimator.round_trip_us(), 200u);
+
+    estimator.Expire(10'000 + Estimator::kExchangeLifetimeUs + 1);
+    EXPECT_TRUE(estimator.accuracy_valid());
+    EXPECT_EQ(estimator.round_trip_us(), 1'000u);
+    EXPECT_NE(estimator.bounded_offset_us(), 0);
+    EXPECT_GT(estimator.uncertainty_us(), 0u);
+
+    estimator.Expire(510'000 + Estimator::kExchangeLifetimeUs + 1);
+    EXPECT_FALSE(estimator.accuracy_valid());
+    EXPECT_EQ(estimator.bounded_offset_us(), 0);
+    EXPECT_EQ(estimator.round_trip_us(), 0u);
+    EXPECT_EQ(estimator.uncertainty_us(), 0u);
+  }
 }
 
 TEST(ClockOffset, RetainedMinimumRoundTripBoundPropagatesOscillatorDrift) {

@@ -621,8 +621,8 @@ TEST(PhoenixBackendPwm, OffSendsNoPulseAndAPulseOfZeroIsTheCentre) {
 
 // A configuration with no motor, or no device at all, is valid: the backend
 // configures it, its Read has no device signal to refresh and still reports
-// a healthy read with power health, and a digital output alone drives, reads
-// back and goes de-energized on Neutral.
+// a healthy read with power health, and digital/PWM outputs alone drive, read
+// back and go de-energized / off on Neutral (and PWM off).
 // REQ-CONTRACT-35
 TEST(PhoenixBackendNoMotor, EmptyAndDigitalOutputOnlyConfigsConfigureAndRead) {
   EnsureHal();
@@ -636,6 +636,7 @@ TEST(PhoenixBackendNoMotor, EmptyAndDigitalOutputOnlyConfigsConfigureAndRead) {
     EXPECT_TRUE(backend.Read(s));
     EXPECT_TRUE(s.health.valid);
     EXPECT_TRUE(backend.Apply({}));
+    EXPECT_TRUE(backend.ApplyOutputs({}, {}));
     backend.Neutral();
     EXPECT_TRUE(backend.Read(s));
   }
@@ -646,20 +647,49 @@ TEST(PhoenixBackendNoMotor, EmptyAndDigitalOutputOnlyConfigsConfigureAndRead) {
   d.name = "solenoid";
   d.dio = 6;
   outputs.digital_outputs.push_back(d);
+  hw::PwmConfig p;
+  p.id = 30;
+  p.name = "servo";
+  p.channel = 2;
+  outputs.pwm_outputs.push_back(p);
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(outputs));
   ASSERT_TRUE(AwaitReady(backend, outputs));
   const std::array<hw::DigitalOutputRequest, 1> on{
       hw::DigitalOutputRequest{20, true}};
-  ASSERT_TRUE(backend.ApplyOutputs(on, {}));
+  const std::array<hw::PwmRequest, 1> pulse{
+      hw::PwmRequest{30, hw::PwmMode::kPulse, 0.5}};
+  ASSERT_TRUE(backend.ApplyOutputs(on, pulse));
+  const frc::sim::PWMSim pwm_sim{2};
   hw::State s;
   ASSERT_TRUE(backend.Read(s));
   EXPECT_TRUE(s.digital_outputs[0].valid);
   EXPECT_TRUE(s.digital_outputs[0].value);
+  EXPECT_TRUE(s.pwm_outputs[0].valid);
+  EXPECT_NEAR(s.pwm_outputs[0].output, 0.5, 0.01);
+  EXPECT_GT(pwm_sim.GetPulseMicrosecond(), kCentrePulseUs);
+
+  // An explicit kOff request stops the pulse even while DIO stays on.
+  const std::array<hw::PwmRequest, 1> off{
+      hw::PwmRequest{30, hw::PwmMode::kOff, 0.0}};
+  ASSERT_TRUE(backend.ApplyOutputs(on, off));
+  ASSERT_TRUE(backend.Read(s));
+  EXPECT_TRUE(s.digital_outputs[0].valid);
+  EXPECT_TRUE(s.digital_outputs[0].value);
+  EXPECT_TRUE(s.pwm_outputs[0].valid);
+  EXPECT_DOUBLE_EQ(s.pwm_outputs[0].output, 0.0);
+  EXPECT_EQ(pwm_sim.GetPulseMicrosecond(), 0);
+
+  // Re-drive PWM, then Neutral de-energizes DIO and disables PWM.
+  ASSERT_TRUE(backend.ApplyOutputs(on, pulse));
+  ASSERT_GT(pwm_sim.GetPulseMicrosecond(), kCentrePulseUs);
   backend.Neutral();
   ASSERT_TRUE(backend.Read(s));
   EXPECT_TRUE(s.digital_outputs[0].valid);
   EXPECT_FALSE(s.digital_outputs[0].value);
+  EXPECT_TRUE(s.pwm_outputs[0].valid);
+  EXPECT_DOUBLE_EQ(s.pwm_outputs[0].output, 0.0);
+  EXPECT_EQ(pwm_sim.GetPulseMicrosecond(), 0);
 }
 
 TEST(PhoenixBackendHealth, ReportsBatteryVoltage) {
@@ -3310,14 +3340,20 @@ TEST_F(PhoenixBackendFoc,
 
 // Defense-in-depth at the backend boundary: non-finite motor demands or
 // feedforwards and out-of-range closed-loop slots (slot > 2) neutralize that
-// motor instead of reaching Phoenix SetControl, and non-finite or out-of-range
-// PWM pulse outputs disable the PWM channel instead of calling SetSpeed.
+// motor instead of reaching Phoenix SetControl, non-finite or out-of-range
+// PWM pulse outputs disable the PWM channel instead of calling SetSpeed, and
+// ApplyOutputs() rejects mismatched DIO/PWM span sizes without partial writes.
 // REQ-SAFE-03, REQ-SAFE-04
 TEST_F(PhoenixBackendFoc, ApplyNeutralizesNonFiniteInvalidSlotAndBadPwm) {
   EnsureHal();
   EnabledDs ds;
   hw::Config config;
   config.motors.push_back(TestMotor(10, "m1", 1));
+  hw::DigitalOutputConfig dio;
+  dio.id = 20;
+  dio.name = "solenoid";
+  dio.dio = 5;
+  config.digital_outputs.push_back(dio);
   hw::PwmConfig pwm;
   pwm.id = 30;
   pwm.name = "servo";
@@ -3355,16 +3391,42 @@ TEST_F(PhoenixBackendFoc, ApplyNeutralizesNonFiniteInvalidSlotAndBadPwm) {
 
   // Bad PWM pulses must disable the PWM channel (0 us pulse) rather than
   // calling SetSpeed with NaN/Inf/out-of-range.
+  const std::array<hw::DigitalOutputRequest, 1> dio_on{
+      hw::DigitalOutputRequest{20, true}};
+  const std::array<hw::DigitalOutputRequest, 1> dio_off{
+      hw::DigitalOutputRequest{20, false}};
+  const std::array<hw::PwmRequest, 1> pwm_on{
+      hw::PwmRequest{30, hw::PwmMode::kPulse, 0.25}};
+  const std::array<hw::PwmRequest, 1> pwm_off{
+      hw::PwmRequest{30, hw::PwmMode::kOff, 0.0}};
   const frc::sim::PWMSim pwm_sim{0};
   for (const double bad_output : {nan, inf, -inf, 1.5, -1.5}) {
-    ASSERT_TRUE(backend.ApplyOutputs(
-        {}, std::array{hw::PwmRequest{30, hw::PwmMode::kPulse, 0.25}}));
+    ASSERT_TRUE(backend.ApplyOutputs(dio_on, pwm_on));
     ASSERT_GT(pwm_sim.GetPulseMicrosecond(), 0);
     ASSERT_TRUE(backend.ApplyOutputs(
-        {}, std::array{hw::PwmRequest{30, hw::PwmMode::kPulse, bad_output}}));
+        dio_on,
+        std::array{hw::PwmRequest{30, hw::PwmMode::kPulse, bad_output}}));
     EXPECT_EQ(pwm_sim.GetPulseMicrosecond(), 0)
         << "bad PWM pulse " << bad_output << " was not disabled";
   }
+
+  // ApplyOutputs() must return false on any DIO or PWM span-size mismatch
+  // (matching Apply()) and must not partially apply either span.
+  ASSERT_TRUE(backend.ApplyOutputs(dio_on, pwm_on));
+  ASSERT_GT(pwm_sim.GetPulseMicrosecond(), 0);
+  const std::array<hw::DigitalOutputRequest, 2> two_dos{dio_off[0], dio_off[0]};
+  const std::array<hw::PwmRequest, 2> two_pwms{pwm_off[0], pwm_off[0]};
+  EXPECT_FALSE(backend.ApplyOutputs({}, {}));
+  EXPECT_FALSE(backend.ApplyOutputs({}, pwm_off));
+  EXPECT_FALSE(backend.ApplyOutputs(dio_off, {}));
+  EXPECT_FALSE(backend.ApplyOutputs(two_dos, pwm_off));
+  EXPECT_FALSE(backend.ApplyOutputs(dio_off, two_pwms));
+  hw::State state;
+  ASSERT_TRUE(backend.Read(state));
+  EXPECT_TRUE(state.digital_outputs[0].value)
+      << "mismatched ApplyOutputs partially mutated DIO";
+  EXPECT_GT(pwm_sim.GetPulseMicrosecond(), 0)
+      << "mismatched ApplyOutputs partially mutated PWM";
 }
 
 // Even when a follower precedes its master in config.motors, Apply() must

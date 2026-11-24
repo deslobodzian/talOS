@@ -2164,6 +2164,96 @@ TEST(LogBackgroundWriter,
   }
 }
 
+// A background writer with a single chunk (chunk_count == 1) must not wedge
+// permanently in losing() == true after an oversized record leaves earlier
+// accepted bytes in the active chunk: when GAP + resuming record exceed the
+// remaining space of that active chunk (even though GAP alone would fit),
+// append() hands over the active chunk so subsequent records can resume.
+// REQ-RT-11
+TEST(LogBackgroundWriter, SingleChunkPoolRecoversAfterOversizedRecord) {
+  const std::string path = TempPath("single_chunk_oversized_recovery");
+  constexpr std::size_t kNormalPayload = 200;
+  constexpr std::size_t kOversizedPayload = 1024;
+  std::uint64_t resumed_dispatch = 0;
+  {
+    LogWriter::Options options{512, /*chunk_count=*/1, /*background=*/true};
+    options.write_interval = std::chrono::hours{24 * 365 * 100};
+    options.sync_interval = std::chrono::hours{1};
+    LogWriter writer{path, "single_chunk_oversized", options};
+    writer.start({}, {});
+
+    const auto make_context = [](std::uint64_t dispatch) {
+      Context context{};
+      context.kind = EventKind::TIMER;
+      context.dispatch_index = dispatch;
+      context.event_time =
+          MonotonicTime::from_nanos(static_cast<std::int64_t>(dispatch) * 1000);
+      context.now = MonotonicTime::from_nanos(context.event_time.nanos() + 10);
+      return context;
+    };
+
+    // Dispatch 1: 264 B fits in the 512 B active chunk (active->used = 264).
+    writer.dispatch(make_context(1), MakePayload(kNormalPayload, 1));
+    ASSERT_FALSE(writer.losing());
+    ASSERT_EQ(writer.gaps(), 0u);
+
+    // Dispatch 2: 1088 B > 512 B opens a gap while leaving active->used = 264.
+    writer.dispatch(make_context(2), MakePayload(kOversizedPayload, 2));
+    ASSERT_TRUE(writer.losing());
+    ASSERT_EQ(writer.gaps(), 1u);
+
+    // Subsequent 200 B records (264 B) fit with GAP (<= 128 B) in an empty
+    // 512 B chunk (<= 392 B) once the earlier 264 B active chunk is handed over
+    // and written.
+    std::uint64_t d = 3;
+    ASSERT_TRUE(Eventually([&] {
+      const std::uint64_t current = d++;
+      writer.dispatch(make_context(current),
+                      MakePayload(kNormalPayload, static_cast<int>(current)));
+      if (!writer.losing()) {
+        resumed_dispatch = current;
+        return true;
+      }
+      return false;
+    })) << "single-chunk writer stayed wedged in losing() after oversized "
+           "record";
+    EXPECT_EQ(writer.gaps(), 1u);
+
+    // After flushing the recovery chunk (GAP + 264 B > half of the 512 B sole
+    // chunk), capture continues accepting 200 B records cleanly.
+    writer.flush();
+    writer.dispatch(
+        make_context(resumed_dispatch + 1),
+        MakePayload(kNormalPayload, static_cast<int>(resumed_dispatch + 1)));
+    writer.flush();
+    EXPECT_FALSE(writer.losing());
+    EXPECT_EQ(writer.gaps(), 1u);
+    EXPECT_FALSE(writer.failed()) << writer.error();
+  }
+
+  const ReadBack back = ReadAll(path, false);
+  EXPECT_EQ(back.gaps, 1u);
+  EXPECT_TRUE(back.damage.clean());
+  ASSERT_EQ(back.records.size(), 4u);
+  EXPECT_EQ(back.records[0].header.dispatch_index, 1u);
+  EXPECT_EQ(back.records[0].payload, MakePayload(kNormalPayload, 1));
+  const std::optional<LogGap> gap =
+      GapOf(back.records[1].header, back.records[1].payload);
+  ASSERT_TRUE(gap.has_value());
+  EXPECT_EQ(gap->first_dispatch_index, 2u);
+  EXPECT_EQ(gap->detail.cause,
+            static_cast<std::uint16_t>(GapCause::RECORD_TOO_LARGE));
+  EXPECT_EQ(gap->detail.flags, 0u);
+  EXPECT_EQ(back.records[2].header.dispatch_index, resumed_dispatch);
+  EXPECT_EQ(back.records[2].payload,
+            MakePayload(kNormalPayload, static_cast<int>(resumed_dispatch)));
+  EXPECT_EQ(back.records[3].header.dispatch_index, resumed_dispatch + 1);
+  EXPECT_EQ(
+      back.records[3].payload,
+      MakePayload(kNormalPayload, static_cast<int>(resumed_dispatch + 1)));
+  ::unlink(path.c_str());
+}
+
 // A gap still open at the stop is closed there: flush() or destruction, once
 // the disk returns, writes its GAP record marked GAP_CLOSED_AT_FLUSH. When the
 // run called finish() during the gap, the held EXIT follows it and gives it its
@@ -2223,6 +2313,87 @@ TEST(LogBackgroundWriter, FlushOrDestructionClosesAnOpenGapAndKeepsTheExit) {
       }
       for (const auto& file : {path, whole, copy}) ::unlink(file.c_str());
     }
+  }
+}
+
+// With chunk_count == 1 and a rotating max_bytes whose segment fits the closing
+// GAP but not GAP + EXIT, settle() must flush the closing GAP before taking the
+// held EXIT so segment rotation between them does not exhaust the 1-chunk pool
+// and silently drop EXIT.
+// REQ-RT-11 REQ-OPS-13 REQ-OPS-14
+TEST(LogBackgroundWriter,
+     SingleChunkPoolKeepsHeldExitAcrossStopSegmentRotation) {
+  for (const bool call_flush : {true, false}) {
+    SCOPED_TRACE(call_flush ? "flush" : "destruction");
+    const std::string path = TempPath(call_flush ? "single_chunk_rot_exit_flush"
+                                                 : "single_chunk_rot_exit");
+    const std::string marker = CappedMarkerPath(path);
+    for (const auto& file : LogSegmentFiles(path)) ::unlink(file.c_str());
+    ::unlink(marker.c_str());
+
+    // Empty manifest -> prefix = FileHeader (120 B), largest_record = GAP
+    // (128 B), smallest segment = 248 B. max_bytes = 2 * (120 + 160) = 560 B
+    // gives 2 rotating segments of 280 B (160 B body): closing GAP (113 B) fits
+    // in segment 0, while GAP + EXIT (113 + 64 = 177 B > 160 B) rotates to
+    // segment 1.
+    const std::uint64_t cap = 2 * (sizeof(FileHeader) + 160);
+    {
+      LogWriter::Options options{512, /*chunk_count=*/1, /*background=*/true,
+                                 cap};
+      options.write_interval = std::chrono::hours{24 * 365 * 100};
+      options.sync_interval = std::chrono::hours{1};
+      LogWriter writer{path, "single_chunk_rot_exit", options};
+      writer.start({}, {});
+
+      Context drop_ctx{};
+      drop_ctx.kind = EventKind::TIMER;
+      drop_ctx.dispatch_index = 1;
+      drop_ctx.event_time = MonotonicTime::from_nanos(1000);
+      drop_ctx.now = MonotonicTime::from_nanos(1010);
+      writer.dispatch(drop_ctx, MakePayload(1024, 1));
+      ASSERT_TRUE(writer.losing());
+      ASSERT_EQ(writer.gaps(), 1u);
+
+      Context exit_ctx{};
+      exit_ctx.kind = EventKind::EXIT;
+      exit_ctx.dispatch_index = 2;
+      exit_ctx.event_time = MonotonicTime::from_nanos(2000);
+      exit_ctx.now = MonotonicTime::from_nanos(2010);
+      writer.finish(exit_ctx);
+      EXPECT_TRUE(writer.losing());
+
+      if (call_flush) {
+        writer.flush();
+        EXPECT_FALSE(writer.losing());
+        EXPECT_FALSE(writer.failed()) << writer.error();
+      }
+    }
+
+    const std::vector<std::string> segments = LogSegmentFiles(path);
+    ASSERT_EQ(segments.size(), 2u);
+    std::vector<ReadBack::Read> all_records;
+    for (const std::string& file : segments) {
+      const ReadBack back = ReadAll(file, false);
+      EXPECT_TRUE(back.damage.clean()) << file;
+      all_records.insert(all_records.end(), back.records.begin(),
+                         back.records.end());
+    }
+    ASSERT_EQ(all_records.size(), 2u);
+    const std::optional<LogGap> gap =
+        GapOf(all_records[0].header, all_records[0].payload);
+    ASSERT_TRUE(gap.has_value());
+    EXPECT_EQ(gap->detail.cause,
+              static_cast<std::uint16_t>(GapCause::RECORD_TOO_LARGE));
+    EXPECT_EQ(gap->detail.flags, GAP_CLOSED_AT_FLUSH);
+    EXPECT_EQ(gap->detail.records, 1u);
+    EXPECT_EQ(gap->resumed_ns, 2010);
+    EXPECT_EQ(all_records[1].header.kind,
+              static_cast<std::uint16_t>(EventKind::EXIT));
+    EXPECT_EQ(all_records[1].header.dispatch_index, 2u);
+    EXPECT_EQ(all_records[1].header.now_ns, 2010);
+
+    for (const auto& file : segments) ::unlink(file.c_str());
+    ::unlink(marker.c_str());
   }
 }
 
@@ -3930,6 +4101,96 @@ TEST(LogBackgroundWriter, StreamingSmallRecordsWakeAtMostOncePerWriteInterval) {
     ASSERT_EQ(record.header.dispatch_index, ++read);
   }
   EXPECT_EQ(read, index);
+  ::unlink(path.c_str());
+}
+
+// While small records stream into an active chunk without filling it and with
+// sync_interval an hour away, the background writer schedules each timed wait
+// within the default 10 ms write_interval and flushes the committed prefix
+// (REQ-OPS-31). Uses the before_timed_wait seam rather than a wall-clock
+// latency assertion so the fast lane stays deterministic on busy hosts.
+// REQ-OPS-31
+TEST(LogBackgroundWriter, StreamingWriteIntervalFlushesWithinBound) {
+  const auto path = TempPath("stream_write_interval");
+  std::uint64_t index = 0;
+  constexpr std::size_t kStreamingBatches = 5;
+  {
+    LogWriter::Options options{};
+    ASSERT_EQ(options.write_interval, std::chrono::milliseconds{10});
+    // 1 MiB chunk so streaming records never fill a chunk and trigger an early
+    // hand-off write; sync_interval is an hour away so only write_interval
+    // drives writes.
+    options.chunk_bytes = 1u << 20;
+    options.sync_interval = std::chrono::hours{1};
+
+    std::mutex wait_mutex;
+    std::vector<std::chrono::nanoseconds> timed_waits;
+    std::atomic<bool> saw_timed_wait{false};
+    options.before_timed_wait = [&](std::chrono::nanoseconds wait_duration) {
+      {
+        std::lock_guard lock{wait_mutex};
+        timed_waits.push_back(wait_duration);
+      }
+      saw_timed_wait.store(true, std::memory_order_release);
+    };
+    std::atomic<std::size_t> write_count{0};
+    std::atomic<std::size_t> timed_writes{0};
+    options.before_write = [&] {
+      write_count.fetch_add(1, std::memory_order_release);
+      if (saw_timed_wait.exchange(false, std::memory_order_acq_rel)) {
+        timed_writes.fetch_add(1, std::memory_order_release);
+      }
+    };
+
+    LogWriter writer{path, "stream_latency", options};
+    writer.start({}, {});
+    writer.flush();  // The writer thread creates the file.
+
+    const std::vector<std::byte> payload = MakePayload(16, 7);
+    const auto log_one = [&] {
+      Context context{};
+      context.dispatch_index = ++index;
+      writer.dispatch(context, payload);
+    };
+
+    // Prime last_write with one record that wakes the idle writer.
+    log_one();
+    ASSERT_TRUE(Eventually(
+        [&] { return write_count.load(std::memory_order_acquire) >= 1; }));
+
+    // Stream records faster than write_interval until kStreamingBatches
+    // timed write_interval waits have each been followed by a write.
+    ASSERT_TRUE(Eventually([&] {
+      log_one();
+      return timed_writes.load(std::memory_order_acquire) >= kStreamingBatches;
+    }));
+
+    {
+      std::lock_guard lock{wait_mutex};
+      ASSERT_GE(timed_waits.size(), kStreamingBatches)
+          << "expected streaming writes to schedule timed write_interval waits";
+      for (const auto wait_duration : timed_waits) {
+        EXPECT_GT(wait_duration, std::chrono::nanoseconds{0});
+        EXPECT_LE(wait_duration, options.write_interval)
+            << "timed wait exceeded write_interval: "
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   wait_duration)
+                   .count()
+            << " us";
+      }
+    }
+
+    writer.flush();
+    EXPECT_FALSE(writer.failed()) << writer.error();
+  }
+  LogReader reader{path};
+  LogReader::Record record{};
+  std::uint64_t read = 0;
+  while (reader.next(record)) {
+    ASSERT_EQ(record.header.dispatch_index, ++read);
+  }
+  EXPECT_EQ(read, index);
+  EXPECT_TRUE(reader.damage().clean());
   ::unlink(path.c_str());
 }
 

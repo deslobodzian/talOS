@@ -341,9 +341,11 @@ class SimulatedEventLoop
 
       now_ = std::max(now_, *deadline);
 
-      // Nothing but a prompt publication is due: the realtime loop's wake. A
-      // backlog the last drain left goes first, as the realtime loop drains
-      // it before it waits: a drain it was not woken for.
+      // Nothing but a prompt publication or a backlog is due: the realtime
+      // loop's backlog drain or wake. Preserve woken=true when a woken drain
+      // left the backlog or a prompt watcher is also due, so concurrent prompt
+      // watchers keep publish-time event_time while quiet watchers keep drain
+      // time.
       if (!timer || *timer > now_) {
         if (woken_at != now_) {
           woken_at = now_;
@@ -352,7 +354,9 @@ class SimulatedEventLoop
         if (++woken_drains > kMaxWokenDrainsPerInstant) {
           throw std::runtime_error(not_settling(now_));
         }
-        drain_messages(now_, /*woken=*/!backlog_);
+        const bool prompt_due = publication.has_value() && *publication <= now_;
+        drain_messages(now_,
+                       /*woken=*/!backlog_ || backlog_woken_ || prompt_due);
         continue;
       }
 
@@ -496,7 +500,9 @@ class SimulatedEventLoop
   bool drain_messages(MonotonicTime tick_deadline, bool woken = false) {
     ++drains_;
     backlog_ = false;
+    backlog_woken_ = false;
     bool capped = false;
+    bool prompt_capped = false;
     auto& sources = this->sources();
 
     for (std::size_t id = 0; id < sources.size(); ++id) {
@@ -526,10 +532,12 @@ class SimulatedEventLoop
         cursor.sequence = sequence + 1;
 
         const MonotonicTime published = cursor.channel->publish_time(sequence);
-        this->dispatch_message(
-            static_cast<std::uint16_t>(id),
-            woken && sources[id].prompt ? published : tick_deadline, now_,
-            sequence, dropped, sources[id].buffer, published);
+        const bool prompt =
+            options_.delivery == Delivery::ON_PUBLISH && sources[id].prompt;
+        this->dispatch_message(static_cast<std::uint16_t>(id),
+                               woken && prompt ? published : tick_deadline,
+                               now_, sequence, dropped, sources[id].buffer,
+                               published);
 
         if (!this->running()) {
           return false;
@@ -541,8 +549,14 @@ class SimulatedEventLoop
         capped = true;
         if (redrains(static_cast<std::uint16_t>(id))) {
           backlog_ = true;
+        } else if (options_.delivery == Delivery::ON_PUBLISH &&
+                   sources[id].prompt) {
+          prompt_capped = true;
         }
       }
+    }
+    if (backlog_) {
+      backlog_woken_ = woken || prompt_capped;
     }
     return capped;
   }
@@ -569,8 +583,10 @@ class SimulatedEventLoop
   bool started_{false};
   bool finished_{false};
   std::uint64_t drains_{0};
-  // The last drain left a backlog (see drain_messages).
+  // The last drain left a backlog (see drain_messages), and whether that
+  // backlog drain keeps woken=true for any concurrent prompt watcher.
   bool backlog_{false};
+  bool backlog_woken_{false};
 };
 
 }  // namespace talos::event

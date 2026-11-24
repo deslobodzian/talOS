@@ -273,9 +273,13 @@ class RealtimeEventLoop
       // publication wakes the loop for: drain again now rather than leave the
       // rest for the next timer, as a prompt watcher's failed arm does (see
       // drain_messages). Each drain stays capped, and due timers run between.
+      // Preserve woken=true when a woken drain left the backlog or a prompt
+      // watcher has unread messages, so concurrent prompt watchers keep
+      // publish-time event_time while quiet watchers keep drain time.
       if (backlog_) {
+        const bool woken = backlog_woken_ || has_unread_prompt();
         const MonotonicTime at = Poller::now();
-        drain_messages(at, at);
+        drain_messages(at, at, woken);
         continue;
       }
 
@@ -531,7 +535,9 @@ class RealtimeEventLoop
                       bool woken = false) {
     ++activity_.drains;
     backlog_ = false;
+    backlog_woken_ = false;
     bool capped = false;
+    bool prompt_capped = false;
     auto& sources = this->sources();
 
     // Registration order, which is the order the log records and replay
@@ -595,12 +601,29 @@ class RealtimeEventLoop
       if (!sources[id].latest_only && options_.max_messages_per_tick > 0 &&
           drained == options_.max_messages_per_tick) {
         capped = true;
-        if (!transport.prompt && options_.delivery != Delivery::POLL) {
+        if (transport.prompt) {
+          prompt_capped = true;
+        } else if (options_.delivery != Delivery::POLL) {
           backlog_ = true;
         }
       }
     }
+    if (backlog_) {
+      backlog_woken_ = woken || prompt_capped;
+    }
     return capped;
+  }
+
+  bool has_unread_prompt() const {
+    for (const std::uint16_t id : prompt_watchers_) {
+      const Transport& transport = transports_[id];
+      if (transport.queue && transport.reader_id &&
+          transport.queue->reader_sequence(*transport.reader_id) <
+              transport.queue->writer_sequence()) {
+        return true;
+      }
+    }
+    return false;
   }
 
   // Claims a reader slot again for a watcher whose slot was freed under it.
@@ -643,8 +666,10 @@ class RealtimeEventLoop
   // wake_wait_, which wake_loss() reads atomically from another thread.
   Activity activity_;
   // The last drain left a backlog the run drains again at once (see
-  // drain_messages).
+  // drain_messages), and whether that backlog drain keeps woken=true for any
+  // concurrent prompt watcher.
   bool backlog_{false};
+  bool backlog_woken_{false};
 };
 
 }  // namespace talos::event

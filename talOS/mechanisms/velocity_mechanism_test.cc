@@ -262,9 +262,9 @@ TEST_F(VelocityMechanismTest, AtSpeedDropsOnAVelocitySampleOlderThanTheBound) {
   EXPECT_TRUE(flywheel().at_speed());
 }
 
-// The velocity age bound follows [robot] status_hz (four status periods), not
-// a hardcoded 20 ms default: at 100 Hz, 40'000 us keeps at_speed and 40'001 us
-// drops it while still driving.
+// ReadinessAgeBound scales with [robot] status_hz: at status_hz = 100 (four
+// status periods = 40'000 us), a 40'000 us velocity sample keeps at_speed
+// while 40'001 us drops it while still driving.
 // REQ-DEV-22
 TEST(VelocityMechanismStatusRate, ReadinessAgeBoundFollowsConfiguredStatusHz) {
   auto sim = Sim::FromToml(R"(
@@ -291,30 +291,33 @@ can_id = 2
   hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
   sim.step(10ms);
 
-  const auto drive = [&](std::chrono::milliseconds duration) {
+  const auto drive = [&](double velocity_rps,
+                         std::chrono::milliseconds duration) {
     for (auto t = 0ms; t < duration; t += 5ms) {
       PublishTarget(sim, "shooter", "teleop",
-                    control::VelocityTarget{60.0, 0.0});
+                    control::VelocityTarget{velocity_rps, 0.0});
       sim.step(5ms);
     }
   };
 
-  hw.set_motor("shooter", "flywheel", 0.0, 60.0);
-  sim.step(5ms);
-  drive(20ms);
-  ASSERT_TRUE(shooter.flywheel.at_speed());
-
-  hw.set_motor("shooter", "flywheel", 0.0, 60.0, 0, 40'000);
-  drive(10ms);
-  ASSERT_TRUE(robot_enabled(sim.node("shooter")));
-  EXPECT_TRUE(shooter.flywheel.at_speed());
-  EXPECT_TRUE(shooter.flywheel.driving());
-
-  hw.set_motor("shooter", "flywheel", 0.0, 60.0, 0, 40'001);
-  drive(10ms);
-  ASSERT_TRUE(robot_enabled(sim.node("shooter")));
-  EXPECT_FALSE(shooter.flywheel.at_speed());
-  EXPECT_TRUE(shooter.flywheel.driving());
+  struct Row {
+    std::uint32_t velocity_age_us;
+    bool at_speed;
+  };
+  for (const Row& row : {Row{40'000, true}, Row{40'001, false}}) {
+    SCOPED_TRACE(row.velocity_age_us);
+    hw.set_motor("shooter", "flywheel", 0.0, 60.0);
+    sim.step(5ms);
+    drive(60.0, 20ms);
+    ASSERT_TRUE(shooter.flywheel.at_speed());
+    hw.set_motor("shooter", "flywheel", 0.0, 60.0, 0, row.velocity_age_us);
+    drive(60.0, 10ms);
+    ASSERT_TRUE(robot_enabled(sim.node("shooter")));
+    EXPECT_EQ(shooter.flywheel.at_speed(), row.at_speed);
+    EXPECT_TRUE(shooter.flywheel.driving());
+    EXPECT_EQ(hw.applied_motor("shooter", "flywheel").mode, Mode::kVelocity);
+    EXPECT_DOUBLE_EQ(hw.applied_motor("shooter", "flywheel").demand, 60.0);
+  }
 }
 
 // The velocity's age comes from the State, so at_speed does not wait for

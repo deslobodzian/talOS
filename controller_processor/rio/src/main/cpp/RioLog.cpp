@@ -806,6 +806,7 @@ std::string RioLog::Format(const LogEvent& e) {
           << (e.flag ? "sensor " : "motor ") << e.name << " (id=" << e.id
           << ", bus=" << e.bus << ", can_id=" << e.can_id << ")";
       break;
+    case LogKind::kCanBusStatus:
     case LogKind::kMessage:
     case LogKind::kCount:
       out << e.text;

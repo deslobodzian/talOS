@@ -1886,98 +1886,256 @@ TEST(RealtimeEventLoop, OnPublishWakesWhenAWriterTakesOverAPromptTopic) {
   EXPECT_LT(elapsed, Duration{5s});
 }
 
-// A timer that becomes due during consecutive post-timer backlog_ drains runs
-// between drains instead of being starved by an unbounded backlog loop.
+// A timer that becomes due during consecutive post-timer or post-wake backlog
+// drains runs between capped drains instead of being starved by an unbounded
+// backlog loop, across BEFORE_TIMERS at-drain, ON_PUBLISH at-drain, and
+// ON_PUBLISH waking delivery, and all remaining backlog drains finish without
+// sleeping for a far-future timer.
 // REQ-RT-02
 TEST(RealtimeEventLoop, DueTimerRunsBetweenConsecutivePostTimerBacklogDrains) {
-  constexpr std::size_t kSlots = 32;
-  constexpr std::size_t kCap = 8;
+  constexpr std::size_t kSlots = 64;
+  constexpr std::size_t kCap = 16;
   constexpr std::size_t kMaxPasses = (kSlots - 1) / kCap + 2;  // 5 passes
-  // Drain 1 (woken): 8 msgs; Drain 2 (first backlog_ drain): 8 msgs (arms
-  // due timer); Timer pre-timer drain: kMaxPasses * kCap (40 msgs); then the
-  // timer must run before continuing to drain remaining backlog messages.
-  constexpr std::size_t kExpectedAtTimer = 2 * kCap + kMaxPasses * kCap;
-  constexpr std::size_t kSafetyCap = kExpectedAtTimer + 64;
+  constexpr std::size_t kPostTimerMessages = 2 * kCap;         // 32 msgs
+
+  struct Case {
+    const char* name;
+    Delivery delivery;
+    bool prompt_data;
+    std::size_t arm_on_msg;
+    std::size_t expected_drains_at_timer;
+  };
+  const Case cases[] = {
+      {"before_timers", Delivery::BEFORE_TIMERS, false, kMaxPasses * kCap + 1,
+       2 * kMaxPasses + 1},
+      {"on_publish_at_drain", Delivery::ON_PUBLISH, false, kCap + 1,
+       kMaxPasses + 2},
+      {"on_publish_waking", Delivery::ON_PUBLISH, true, 1, kMaxPasses + 1},
+  };
 
   const std::string pid = std::to_string(::getpid());
-  const std::string wake_topic = "/tbtbw_" + pid;
-  const std::string quiet_topic = "/tbtbq_" + pid;
+  int index = 0;
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    const std::string suffix = std::to_string(index++);
+    const std::string data_topic = "/tbtbq_" + pid + "_" + suffix;
+    const std::string wake_topic = "/tbtbw_" + pid + "_" + suffix;
+    const std::size_t expected_at_timer = c.expected_drains_at_timer * kCap;
+    const std::size_t expected_total = expected_at_timer + kPostTimerMessages;
+    const std::size_t safety_cap = expected_total + 64;
 
-  RealtimeEventLoop<>::Options options = on_publish();
-  options.slots = kSlots;
-  options.max_messages_per_tick = kCap;
+    RealtimeEventLoop<>::Options options = on_publish();
+    options.slots = kSlots;
+    options.max_messages_per_tick = kCap;
+    options.delivery = c.delivery;
 
-  RealtimeEventLoop<> loop{options};
-  std::optional<RTMSQueue> quiet_pub;
-  std::uint16_t timer_id = 0;
+    RealtimeEventLoop<> loop{options};
+    std::optional<RTMSQueue> data_pub;
+    std::uint16_t mid_timer_id = 0;
 
-  bool timer_fired = false;
-  std::size_t delivered = 0;
-  std::size_t delivered_at_timer = 0;
-  std::uint64_t drains_at_timer = 0;
-  std::uint64_t drains_at_end = 0;
+    bool mid_timer_fired = false;
+    bool far_timer_fired = false;
+    std::size_t delivered = 0;
+    std::size_t delivered_at_timer = 0;
+    std::uint64_t drains_at_timer = 0;
 
-  auto on_quiet = [&](const Context& context) {
-    ++delivered;
-    // Arm the timer on the first message of the first post-wake backlog_
-    // drain (drain #2) so it is already due before drain #3 would start.
-    if (delivered == kCap + 1) {
-      loop.arm_timer(timer_id, context.now, Duration::zero());
+    auto on_data = [&](const Context& context) {
+      ++delivered;
+      if (delivered == c.arm_on_msg) {
+        loop.arm_timer(mid_timer_id, context.now, Duration::zero());
+      }
+      if (!mid_timer_fired && delivered < safety_cap) {
+        const EventsTest::SensorMessage next{
+            static_cast<std::int32_t>(delivered), 0.0F, 0.0F};
+        ASSERT_EQ(data_pub->write(std::as_bytes(
+                      std::span<const EventsTest::SensorMessage, 1>{&next, 1})),
+                  WriteResult::SUCCESS);
+      }
+      if (mid_timer_fired && delivered == expected_total) {
+        loop.exit();
+      }
+    };
+    auto on_mid_timer = [&](const Context&) {
+      mid_timer_fired = true;
+      delivered_at_timer = delivered;
+      drains_at_timer = loop.activity().drains;
+      if (delivered > expected_at_timer) {
+        loop.exit();
+      }
+    };
+    auto on_far_timer = [&](const Context&) {
+      far_timer_fired = true;
+      loop.exit();
+    };
+
+    const auto data_id =
+        register_sensor_watcher(loop, data_topic, make_thunk(&on_data));
+    if (c.delivery == Delivery::ON_PUBLISH) {
+      if (c.prompt_data) {
+        loop.set_prompt(data_id);
+      } else {
+        loop.set_prompt(register_sensor_watcher(loop, wake_topic));
+      }
     }
-    if (!timer_fired && delivered < kSafetyCap) {
-      const EventsTest::SensorMessage next{static_cast<std::int32_t>(delivered),
-                                           0.0F, 0.0F};
-      ASSERT_EQ(quiet_pub->write(std::as_bytes(
-                    std::span<const EventsTest::SensorMessage, 1>{&next, 1})),
+    if (c.delivery == Delivery::BEFORE_TIMERS) {
+      const auto start_id = loop.register_timer("start", Thunk{});
+      loop.arm_timer(start_id, loop.monotonic_now(), Duration::zero());
+    }
+    mid_timer_id =
+        loop.register_timer("due_mid_backlog", make_thunk(&on_mid_timer));
+    const auto far_id =
+        loop.register_timer("far_guard", make_thunk(&on_far_timer));
+    loop.arm_timer(far_id, loop.monotonic_now() + 10s, Duration::zero());
+
+    data_pub.emplace(data_topic, sizeof(EventsTest::SensorMessage),
+                     alignof(EventsTest::SensorMessage),
+                     talos::schema::Of<EventsTest::SensorMessage>(), kSlots,
+                     RTMSOptions{.publisher = true});
+    for (std::size_t i = 0; i < kPostTimerMessages; ++i) {
+      const EventsTest::SensorMessage seed{static_cast<std::int32_t>(i), 0.0F,
+                                           0.0F};
+      ASSERT_EQ(data_pub->write(std::as_bytes(
+                    std::span<const EventsTest::SensorMessage, 1>{&seed, 1})),
                 WriteResult::SUCCESS);
     }
-    if (timer_fired && delivered > delivered_at_timer) {
-      drains_at_end = loop.activity().drains;
+    std::optional<RTMSQueue> wake_pub;
+    if (c.delivery == Delivery::ON_PUBLISH && !c.prompt_data) {
+      wake_pub.emplace(wake_topic, sizeof(EventsTest::SensorMessage),
+                       alignof(EventsTest::SensorMessage),
+                       talos::schema::Of<EventsTest::SensorMessage>(), kSlots,
+                       RTMSOptions{.publisher = true});
+      const EventsTest::SensorMessage trigger{0, 0.0F, 0.0F};
+      ASSERT_EQ(
+          wake_pub->write(std::as_bytes(
+              std::span<const EventsTest::SensorMessage, 1>{&trigger, 1})),
+          WriteResult::SUCCESS);
+    }
+
+    loop.run_for(kHangBound);  // Bound only; exits at expected_total.
+
+    EXPECT_TRUE(mid_timer_fired);
+    EXPECT_FALSE(far_timer_fired);
+    EXPECT_EQ(delivered_at_timer, expected_at_timer)
+        << "due timer was starved across consecutive backlog drains";
+    EXPECT_EQ(drains_at_timer, c.expected_drains_at_timer);
+    EXPECT_EQ(delivered, expected_total);
+    EXPECT_EQ(loop.activity().drains, c.expected_drains_at_timer + 2);
+    EXPECT_EQ(loop.activity().wakeups, 0u);
+  }
+}
+
+// wake_backstop applies only while waiting on a prompt watcher under
+// ON_PUBLISH: BEFORE_TIMERS and ON_PUBLISH with only quiet watchers sleep
+// straight to their next timer without backstop wakeups or drains.
+// REQ-RT-02
+TEST(RealtimeEventLoop, BackstopDoesNotWakeBeforeTimersOrQuietOnlyOnPublish) {
+  const std::string pid = std::to_string(::getpid());
+  int index = 0;
+  for (const auto delivery : {Delivery::BEFORE_TIMERS, Delivery::ON_PUBLISH}) {
+    SCOPED_TRACE(static_cast<int>(delivery));
+    RealtimeEventLoop<>::Options options;
+    options.delivery = delivery;
+    options.wake_backstop = 20ms;
+    RealtimeEventLoop<> loop{options};
+    register_sensor_watcher(loop,
+                            "/tnbs_" + pid + "_" + std::to_string(index++));
+
+    bool fired = false;
+    auto on_timer = [&](const Context&) {
+      fired = true;
+      loop.exit();
+    };
+    const auto timer_id = loop.register_timer("tick", make_thunk(&on_timer));
+    loop.arm_timer(timer_id, loop.monotonic_now() + 100ms, Duration::zero());
+
+    loop.run_for(kHangBound);  // Bound only; timer exits at 100 ms.
+
+    EXPECT_TRUE(fired);
+    EXPECT_EQ(loop.activity().drains, 1u);
+    EXPECT_LE(loop.activity().wakeups, 2u);
+  }
+}
+
+// Under ON_PUBLISH, when a quiet sequence watcher's cap triggers an immediate
+// backlog drain alongside a concurrent prompt watcher's remaining backlog, the
+// prompt watcher keeps publish-time event_time (preserving latency()) while the
+// quiet watcher keeps drain time.
+// REQ-RT-19
+// REQ-RT-02
+TEST(RealtimeEventLoop,
+     QuietBacklogPreservesPublishEventTimeForConcurrentPromptBacklog) {
+  constexpr std::size_t kCap = 16;
+  constexpr std::size_t kMessages = 2 * kCap;
+  const std::string pid = std::to_string(::getpid());
+  const std::string quiet_topic = "/tbwq_" + pid;
+  const std::string prompt_topic = "/tbwp_" + pid;
+
+  RealtimeEventLoop<>::Options options = on_publish();
+  options.max_messages_per_tick = kCap;
+  RealtimeEventLoop<> loop{options};
+
+  std::vector<Context> quiet;
+  std::vector<Context> prompt;
+  auto maybe_exit = [&] {
+    if (quiet.size() == kMessages && prompt.size() == kMessages) {
       loop.exit();
     }
   };
-  auto on_timer = [&](const Context&) {
-    timer_fired = true;
-    delivered_at_timer = delivered;
-    drains_at_timer = loop.activity().drains;
+  auto on_quiet = [&](const Context& context) {
+    quiet.push_back(context);
+    maybe_exit();
+  };
+  auto on_prompt = [&](const Context& context) {
+    prompt.push_back(context);
+    maybe_exit();
   };
 
-  loop.set_prompt(register_sensor_watcher(loop, wake_topic));
   register_sensor_watcher(loop, quiet_topic, make_thunk(&on_quiet));
-  timer_id = loop.register_timer("due_mid_backlog", make_thunk(&on_timer));
+  const auto prompt_id =
+      register_sensor_watcher(loop, prompt_topic, make_thunk(&on_prompt));
+  loop.set_prompt(prompt_id);
 
-  quiet_pub.emplace(quiet_topic, sizeof(EventsTest::SensorMessage),
-                    alignof(EventsTest::SensorMessage),
-                    talos::schema::Of<EventsTest::SensorMessage>(), kSlots,
-                    RTMSOptions{.publisher = true});
-  // Seed enough quiet messages to fill drain #1 and drain #2 (each capped at
-  // kCap), plus one more so drain #2 leaves backlog_ = true.
-  for (std::size_t i = 0; i < 2 * kCap + 1; ++i) {
-    const EventsTest::SensorMessage seed{static_cast<std::int32_t>(i), 0.0F,
-                                         0.0F};
-    ASSERT_EQ(quiet_pub->write(std::as_bytes(
-                  std::span<const EventsTest::SensorMessage, 1>{&seed, 1})),
-              WriteResult::SUCCESS);
+  RTMSQueue quiet_pub{quiet_topic,
+                      sizeof(EventsTest::SensorMessage),
+                      alignof(EventsTest::SensorMessage),
+                      talos::schema::Of<EventsTest::SensorMessage>(),
+                      MAX_SLOTS,
+                      RTMSOptions{.publisher = true}};
+  RTMSQueue prompt_pub{prompt_topic,
+                       sizeof(EventsTest::SensorMessage),
+                       alignof(EventsTest::SensorMessage),
+                       talos::schema::Of<EventsTest::SensorMessage>(),
+                       MAX_SLOTS,
+                       RTMSOptions{.publisher = true}};
+
+  const MonotonicTime t0 = Poller::now();
+  const MonotonicTime published = t0 - 50ms;
+  for (std::size_t i = 0; i < kMessages; ++i) {
+    const EventsTest::SensorMessage msg{static_cast<std::int32_t>(i), 0.0F,
+                                        0.0F};
+    const auto bytes =
+        std::as_bytes(std::span<const EventsTest::SensorMessage, 1>{&msg, 1});
+    ASSERT_EQ(quiet_pub.write(bytes, published.nanos()), WriteResult::SUCCESS);
+    ASSERT_EQ(prompt_pub.write(bytes, published.nanos()), WriteResult::SUCCESS);
   }
-  RTMSQueue wake_pub{wake_topic,
-                     sizeof(EventsTest::SensorMessage),
-                     alignof(EventsTest::SensorMessage),
-                     talos::schema::Of<EventsTest::SensorMessage>(),
-                     kSlots,
-                     RTMSOptions{.publisher = true}};
-  const EventsTest::SensorMessage trigger{0, 0.0F, 0.0F};
-  ASSERT_EQ(wake_pub.write(std::as_bytes(
-                std::span<const EventsTest::SensorMessage, 1>{&trigger, 1})),
-            WriteResult::SUCCESS);
 
-  loop.run_for(kHangBound);  // Bound only; exits right after timer + next msg.
+  loop.run_for(kHangBound);  // Bound only; exits once all 32 of each drain.
 
-  EXPECT_TRUE(timer_fired);
-  EXPECT_EQ(delivered_at_timer, kExpectedAtTimer)
-      << "due timer was starved across consecutive backlog_ drains";
-  EXPECT_EQ(drains_at_timer, 2u + kMaxPasses);
-  EXPECT_GT(drains_at_end, drains_at_timer);
+  ASSERT_EQ(quiet.size(), kMessages);
+  ASSERT_EQ(prompt.size(), kMessages);
+  EXPECT_EQ(loop.activity().drains, 2u);
   EXPECT_EQ(loop.activity().wakeups, 0u);
+  for (std::size_t i = 0; i < kMessages; ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(prompt[i].publish_time, published);
+    EXPECT_EQ(prompt[i].event_time, published);
+    EXPECT_GE(prompt[i].latency(), 50ms);
+    EXPECT_EQ(quiet[i].publish_time, published);
+    EXPECT_GE(quiet[i].event_time, t0);
+    EXPECT_GE(quiet[i].now, quiet[i].event_time);
+  }
+  EXPECT_GE(loop.source_counters()[prompt_id].max_latency_ns.load(),
+            Duration{50ms}.count());
 }
 
 // Calling run/run_for/run_until from a second thread while the loop is blocked

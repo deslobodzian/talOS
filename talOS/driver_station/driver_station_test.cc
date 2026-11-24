@@ -100,6 +100,35 @@ TEST(DriverStationTest, FullyPopulatedEncodingReachesMaximumSize) {
   EXPECT_EQ(Encode(original, {buffer.data(), buffer.size() - 1}), 0u);
 }
 
+// REQ-DEV-05: a joystick carrying kMaxButtons (32) round-trips upper-range
+// buttons 13 (bit 12) and 32 (bit 31) intact across Encode/Decode.
+TEST(DriverStationTest, UpperRangeButtonsRoundTrip) {
+  constexpr uint32_t kButton13 = uint32_t{1} << 12;
+  constexpr uint32_t kButton32 = uint32_t{1} << 31;
+
+  DriverStationData original{};
+  original.sample_time_us = 20000;
+  original.mode_since_us = 20000;
+  original.fms.flags = kDsAttached | kEnabled | kTeleop;
+  auto& stick = original.joysticks[0];
+  stick.connected = true;
+  stick.axis_count = 4;
+  stick.button_count = kMaxButtons;
+  stick.buttons = kButton13 | kButton32;
+
+  std::array<uint8_t, kMaxEncodedSize> buffer{};
+  const std::size_t size = Encode(original, buffer);
+  ASSERT_GT(size, 0u);
+
+  DriverStationData decoded{};
+  ASSERT_TRUE(Decode({buffer.data(), size}, decoded));
+  EXPECT_EQ(decoded.joysticks[0].button_count, kMaxButtons);
+  EXPECT_EQ(decoded.joysticks[0].buttons, kButton13 | kButton32);
+  EXPECT_NE(decoded.joysticks[0].buttons & kButton13, 0u);
+  EXPECT_NE(decoded.joysticks[0].buttons & kButton32, 0u);
+  EXPECT_EQ(decoded.joysticks[0].buttons & ~(kButton13 | kButton32), 0u);
+}
+
 TEST(DriverStationTest, UnterminatedStringsTruncateInsteadOfFailing) {
   DriverStationData original{};
   std::memset(original.fms.game_specific_message, 'G', kMaxGameMessageLength);
