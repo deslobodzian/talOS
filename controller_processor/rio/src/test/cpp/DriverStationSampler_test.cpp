@@ -89,7 +89,7 @@ TEST(DriverStationSampler, EachListedTransitionStartsANewGeneration) {
 // one mode: the loop's socket is closed for SocketRetry's 100 ms (nothing is
 // sent), the mode is still observed every tick, and the first packet after
 // the socket reopens carries the generation the last one did. A closed socket
-// is not a mode change (bdf56ace reverted one that made it one).
+// is not a mode change (a873afbe reverted one that made it one).
 // REQ-SAFE-10
 TEST(DriverStationSampler, ASameModeCompanionLinkDropKeepsTheGeneration) {
   constexpr uint32_t kTeleopEnabled =

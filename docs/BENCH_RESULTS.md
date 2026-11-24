@@ -25,7 +25,7 @@ has 8 cores; the **Mac mini** is the deployment host (M4 Pro, 12 cores).
 ## 2026-11-22
 
 Mac mini (M4 Pro, 12 cores, macOS 26.3 / Darwin 25.3.0 arm64), commit
-`820a06d5`, no hardware attached (`TODO.md` `MAC-1`, `INC-3`, `DEPLOY-10`):
+`856514d9`, no hardware attached (`TODO.md` `MAC-1`, `INC-3`, `DEPLOY-10`):
 
 - **MAC-1: `tools/mac_qualify.sh` full build, suite, configs, and warm spawns.**
   - `bazel build //...`: PASS (41 s); `bazel test --test_output=errors //...`:
@@ -51,7 +51,7 @@ Mac mini (M4 Pro, 12 cores, macOS 26.3 / Darwin 25.3.0 arm64), commit
     --studio-http-port 0` stopped with `SIGTERM`: 5/5 exited 0 in **79.7–88.9 ms**
     (median **84.2 ms**), against explicit launchd `ExitTimeOut = 90` s.
 
-Linux workstation (8 cores), commit `820a06d5`, loaded (concurrent worker Bazel
+Linux workstation (8 cores), commit `856514d9`, loaded (concurrent worker Bazel
 builds running in sibling worktrees; `TODO.md` `TEST-24`):
 
 - **TEST-24: `//studio:drive_browser_test` 200/200 PASS on loaded Linux.**
@@ -61,7 +61,7 @@ builds running in sibling worktrees; `TODO.md` `TEST-24`):
     zero timeouts waiting for the Studio bridge's `listening` line.
 
 Mac mini (M4 Pro, 12 cores, macOS 26.3 / Darwin 25.3.0 arm64), commit
-`78ebe06a`, idle (`vm.loadavg` 1.39–1.93), no hardware attached (`TODO.md`
+`4e3dd3b0`, idle (`vm.loadavg` 1.39–1.93), no hardware attached (`TODO.md`
 `RT-22`, `CAM-1`):
 
 - **RT-22: Python control node GIL contention under macOS
@@ -98,17 +98,17 @@ Mac mini (M4 Pro, 12 cores, macOS 26.3 / Darwin 25.3.0 arm64), commit
     4 × 640×360 @ 60 fps: Metal 1.30 cores, `cpu` 1.20 cores (loses ~45% of
     visible tags at `min_tag_px = 12`).
 
-Linux workstation (8 cores, GCC 16.2.1, `libasan.so.8`), commits `78ebe06a` and
-`94cc8727`, no hardware attached (`TODO.md` `BENCH-3`, `CI-3`):
+Linux workstation (8 cores, GCC 16.2.1, `libasan.so.8`), commits `4e3dd3b0` and
+`6e14df58`, no hardware attached (`TODO.md` `BENCH-3`, `CI-3`):
 
 - **BENCH-3: RoboRIO `./gradlew phoenixTest -Pasan` clean with zero
-  suppressions (`78ebe06a`).**
+  suppressions (`4e3dd3b0`).**
   - `./gradlew phoenixTest -Pasan`: 106/106 debug + 106/106 release +
     `rioBuildStampTest` PASS (`BUILD SUCCESSFUL`). Direct runs under strict
     ASan + verbose LSan (`detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1`):
     106/106 PASS, 0 ASan errors, 0 LSan leaks, 0 vendor-sim/HAL suppressions.
     Canary leak and heap-use-after-free checks both triggered and failed cleanly.
-- **CI-3: Full `clang-tidy-18` sweep across all C++ test sources (`94cc8727`).**
+- **CI-3: Full `clang-tidy-18` sweep across all C++ test sources (`6e14df58`).**
   - All 135 in-graph C++ test files and 38 test-support/testdata/bench `.cc`
     files (173/173 TUs) passed `clang-tidy-18` with repo `.clang-tidy`
     (`WarningsAsErrors: '*'`, `--checks=-bugprone-unchecked-optional-access`):
@@ -116,12 +116,12 @@ Linux workstation (8 cores, GCC 16.2.1, `libasan.so.8`), commits `78ebe06a` and
 
 ## 2026-11-21
 
-Mac mini (M4 Pro, 12 cores, Darwin 25.3.0 arm64), commits `d942b0b8` and
-`6037f7ff`, no hardware attached, idle. Measurements for `TODO.md` `LOG-8`,
+Mac mini (M4 Pro, 12 cores, Darwin 25.3.0 arm64), commits `af8a57f5` and
+`4434381a`, no hardware attached, idle. Measurements for `TODO.md` `LOG-8`,
 `TRACE-1`, `TEST-10`, and `TEST-22`:
 
 - **LOG-8: enabled simulation time-cut log window stays within 8/7 of the
-  printed window (`REQ-OPS-32`).** At `d942b0b8`, 60 s enabled teleop physics
+  printed window (`REQ-OPS-32`).** At `af8a57f5`, 60 s enabled teleop physics
   simulation (`robot_physics_sim.toml` with `[robot] log_max_bytes = 33554432`,
   `--mode-schedule teleop:60`, active stick demand from t=2 s): printed
   `Event-log window 20331671 us` (`20.332 s`); all 6 logging members exited 0
@@ -131,19 +131,19 @@ Mac mini (M4 Pro, 12 cores, Darwin 25.3.0 arm64), commits `d942b0b8` and
   (`1.0597`), `gyro` `19.103 s` (`1.0643`), `motor` `18.938 s` (`1.0736`); worst
   ratio `1.0736 <= 8/7 (1.1429)`.
 - **TRACE-1: macOS death and idle-timeout checks pass on the Mac mini.** At
-  `d942b0b8`, `bazel test --test_output=errors //talOS/launcher:launcher_death_test //studio/bridge:client_timeout_test`
+  `af8a57f5`, `bazel test --test_output=errors //talOS/launcher:launcher_death_test //studio/bridge:client_timeout_test`
   passed (`launcher_death_test` 1.3 s, `client_timeout_test` 9.1 s). In Linux
-  CI run `44855147331` (`d942b0b8`), `//talOS/protocol:udp_address_change_test`
+  CI run `44855147331` (`af8a57f5`), `//talOS/protocol:udp_address_change_test`
   ran under `TALOS_REQUIRE_NETNS=1` and passed in 0.2 s (0 skips).
 - **TEST-10 & TEST-22: repeated macOS runs pass with 0 failures.** At
-  `6037f7ff`, `bazel test --nocache_test_results --runs_per_test=5` passed
+  `4434381a`, `bazel test --nocache_test_results --runs_per_test=5` passed
   `//talOS/launcher:launcher_test` (20/20 shard runs, max 51.2 s),
   `//talOS/launcher:supervision_test` (15/15 shard runs, max 71.9 s), and
   `//talOS/bridge:run_timing_test` (5/5 runs, max 0.1 s).
 
 ## 2026-11-20
 
-Mac mini (M4 Pro, 12 cores, Darwin 25.3.0 arm64), commit `1218376d`, no
+Mac mini (M4 Pro, 12 cores, Darwin 25.3.0 arm64), commit `c99ab38c`, no
 hardware attached. Three consecutive uncached full suites
 (`bazel test --nocache_test_results --test_output=errors //...`, 251 tests)
 each started immediately after driving 1-minute `vm.loadavg` to >= 9.0
@@ -165,7 +165,7 @@ each started immediately after driving 1-minute `vm.loadavg` to >= 9.0
     `//bench/main_processor:bundle_test` PASSED in 55.6 s (`install_check_test`
     26.8 s, `warm_up_test` 15.4 s); 251/251 tests passed.
 
-Mac mini (M4 Pro, 12 cores, Darwin 25.3.0 arm64), commit `0cebbd0d`, no
+Mac mini (M4 Pro, 12 cores, Darwin 25.3.0 arm64), commit `9f98bce0`, no
 hardware attached, idle (load 1.2). Measurements for `TODO.md` `SCALE-1`,
 `RT-7`, `STUDIO-2`, `MAC-2`, and `INC-3`:
 
@@ -216,7 +216,7 @@ hardware attached, idle (load 1.2). Measurements for `TODO.md` `SCALE-1`,
   Under `--disk-load 8` (10 kills): median 10.6 ms (range 10.1–40.5 ms; Python
   79.3–124.2 ms).
 
-Mac mini (M4 Pro, 12 cores, macOS arm64), commit `1e3bb1c8`, no hardware
+Mac mini (M4 Pro, 12 cores, macOS arm64), commit `a61254fb`, no hardware
 attached, idle. Verification of `TODO.md` STUDIO-1 macOS bridge listener and
 idle-timeout tests:
 
@@ -226,10 +226,10 @@ idle-timeout tests:
   in-use port fails on macOS; `client_timeout_test` 8.9 s, confirming an
   unresponsive client frees its slot within the 12–16 s idle-timeout window).
 
-Mac mini (M4 Pro, 12 cores, macOS arm64), commit `6dd79706`, no hardware
+Mac mini (M4 Pro, 12 cores, macOS arm64), commit `de55b715`, no hardware
 attached. Investigation of nightly `Bazel (tsan, macOS)` failures (`TODO.md`
-CI-13) and kept CI logs from Nightly runs `43877022665` (`6c701709`) and
-`44122679143` (`d702c99d`).
+CI-13) and kept CI logs from Nightly runs `43877022665` (`b70912f0`) and
+`44122679143` (`6684b37c`).
 
 - **CI-13: zero ThreadSanitizer race reports; mechanism is ~100x macOS TSan
   fork/exec kernel overhead.** Neither nightly run's logs contain any
@@ -255,9 +255,9 @@ CI-13) and kept CI logs from Nightly runs `43877022665` (`6c701709`) and
 
 ## 2026-11-17
 
-Bench, RoboRIO build c6c04a67 with companion 10.0.0.37, Mac mini (12 cores,
+Bench, RoboRIO build 6cbc1115 with companion 10.0.0.37, Mac mini (12 cores,
 Darwin 25.3.0, load 1.3 to 1.6, two users logged in) as main processor over
-Ethernet, bench bundle of c6c04a67 (`git_dirty = false`), launched over ssh,
+Ethernet, bench bundle of 6cbc1115 (`git_dirty = false`), launched over ssh,
 uncommissioned throughout. Driver Station on the Linux workstation, program
 NOT RECORDED, gamepad in slot 0. Sessions
 `~/talos-bench/logs/U/7798953721310323380` (300 s, no Studio) and
@@ -397,8 +397,8 @@ the head revision.
   204.3/362.7, 207.6/333.2; at 200, refresh 169.7/272.3, 167.9/288.9,
   170.6/293.4 and devices 206.7/385.2, 203.6/389.0, 210.5/330.5. The
   status rate changes the bus load, not the tick's cost.
-- **Studio from another build.** A dev Studio page built from 6a4bbd88
-  against session V's bridge (c6c04a67) showed every node stale; the
+- **Studio from another build.** A dev Studio page built from 183435f2
+  against session V's bridge (6cbc1115) showed every node stale; the
   bridge's `/system.json` listed all seven alive and it sent a
   `talos.system_graph.update` every 0.5 s (STUDIO-12).
 - **RT-28: the hole read from the kept log and the RoboRIO, the same
@@ -447,7 +447,7 @@ the head revision.
   The earlier timeouts at load about 9 were not reproduced.
 
 - **RT-22: a Python worker thread delays `update()`.** Mac mini, macOS
-  (Darwin 25.3), idle (load 1.25 to 1.75), talOS f8d6dcad, Python 3.11.14,
+  (Darwin 25.3), idle (load 1.25 to 1.75), talOS 9baf017a, Python 3.11.14,
   `sys.getswitchinterval()` 0.005 s. A scratch `talos_py_node` (not kept)
   owning no output, so an observer: timeshare, not the time-constraint
   policy of a control node. Live run, `--duration-s 32`, the first 2 s
@@ -472,10 +472,10 @@ the head revision.
 
 - **RIO-1: stale-FaultField flake, mechanism observed.** Mac mini, macOS
   (Darwin 25.3), desktop Phoenix simulation, load 0.5 to 1.5, talOS
-  6acdcf9f; one `StaleFaultFieldClearsLimitsAndKeepsFaults` per process.
+  f79a4f06; one `StaleFaultFieldClearsLimitsAndKeepsFaults` per process.
   Before the fix 8 of 40 Release and 2 of 20 Debug runs failed, every one
   at the boot row's wait (`fault_flags 0`, after the 10 s bound); at
-  841a0fc0, before the torque-current work, 1 of 20 Release. Instrumented
+  7ceb1bf4, before the torque-current work, 1 of 20 Release. Instrumented
   reads of the boot row's TalonFX: it read valid with BootDuringEnable
   from about 0.11 s after the backend was constructed until 0.51 to 0.53 s,
   then valid without it, whether driven at 2 V or neutral; the 30-read
@@ -486,7 +486,7 @@ the head revision.
   `--gtest_filter='PhoenixBackend*' --gtest_repeat=5` 125 of 125 in each.
 
 - **CI-1, CI-2, CI-9, CI-10, INC-6: first green nightly.** GitHub hosted
-  macOS runners, `main` at 95f4878e, Nightly run 43905118119 (started by
+  macOS runners, `main` at 02261885, Nightly run 43905118119 (started by
   hand): Bazel under AddressSanitizer, Bazel under ThreadSanitizer and the
   macOS soak (seed 1) all passed. The ThreadSanitizer and soak jobs passed
   on a rerun: on the first attempt no hosted runner picked them up
@@ -500,8 +500,8 @@ the head revision.
   construction in `PhoenixBackend::Configure`, and two thread leaks at
   exit, so the Gradle task fails.
 - **BENCH-11: disabled dry run on the Mac mini.** Bench, RoboRIO build
-  6acdcf9f with companion 10.0.0.37, Mac mini (12 cores) as main
-  processor over Ethernet, bundle of 6acdcf9f (`git_dirty = false`),
+  f79a4f06 with companion 10.0.0.37, Mac mini (12 cores) as main
+  processor over Ethernet, bundle of f79a4f06 (`git_dirty = false`),
   disabled, uncommissioned, no Driver Station attached, launched over
   ssh, 45 s, session 124490254188690328. Controller link up, 8995 States,
   `send_failures=0`; Realtime `full` on all six nodes and no realtime
@@ -513,19 +513,19 @@ the head revision.
 ## 2026-11-15
 
 - **BENCH-5: CAN bus status slots on the bench.** Bench, RoboRIO build
-  87ce6efa, disabled, 60 s; main processor revision NOT RECORDED. Not
+  9841e8dc, disabled, 60 s; main processor revision NOT RECORDED. Not
   acceptance evidence (BENCH-8). The bridge's slot table read `0 rio,
   1 Shooter`; slot 1 read OK at 0.18 utilization with every counter 0; slot 0
   (the RoboRIO's own bus, no devices) read OK at 0 with a transmit error count
   of 128 and one transmit-buffer-full; `alert_warning_can_bus_unread` stayed
-  false. The first deploy (before 87ce6efa) reported zero buses: the gateway
+  false. The first deploy (before 9841e8dc) reported zero buses: the gateway
   lost the count when an asynchronous configure committed, which no simulated
   backend could show.
 - **TEST-26: ring tests on ARM.** Mac mini (ARM), revision NOT RECORDED:
   `//talOS/rtms:ring_handoff_test` and `:ring_lap_test` passed 20 of 20. The
   mutation that removes the torn-read guard was seen failing only on x86-64.
 - **INC-7: headless Chromium gave no DevTools port.** Linux workstation,
-  `tools/prepush.sh` run of 7facd73f, several agents running, load about 8:
+  `tools/prepush.sh` run of 920b9c06, several agents running, load about 8:
   `//studio:drive_browser_test` failed in `setUpClass` with `TimeoutError:
   /usr/bin/chromium DevTools port: not within 60 s`; every session member
   exited 0; no `browser.log` was kept. Ten repeats with the browser required
@@ -542,7 +542,7 @@ were kept only in a scratch directory. The RoboRIO-side figures (its own log)
 do not depend on that; the State-interval and log-window figures do.
 
 - **LOG-2, LOG-8 (REQ-OPS-32): event-log window, 600 s bench session.** Bench,
-  RoboRIO build 261c190e, five devices on CANivore `Shooter`, disabled; Linux
+  RoboRIO build 7913dd6e, five devices on CANivore `Shooter`, disabled; Linux
   workstation as main processor, revision NOT RECORDED; `log_max_bytes =
   33554432`. The launcher printed `Event-log window 19483373 us` (19.48 s); the five
   nodes kept 19.2 to 19.3 s and the bridge 17.25 s, so the window over the
@@ -553,14 +553,14 @@ do not depend on that; the State-interval and log-window figures do.
   rotation.
 - **BENCH-3, RT-21 (REQ-RT-24): Driver Station read with no Driver Station.**
   Bench, no Driver Station attached, 3 to 100 min uptime; revision NOT
-  RECORDED. Before 7e46011e the loop called `HAL_RefreshDSData` every 5 ms, a
+  RECORDED. Before 5fdcc6e8 the loop called `HAL_RefreshDSData` every 5 ms, a
   blocking round trip to `FRC_NetCommDaemon` (`SCHED_OTHER`): `driver
   station` phase 0.70 to 0.88 ms mean, up to 13.5 ms, hundreds of overruns;
   about 0.12 ms with a Driver Station attached. With the `talos-ds` thread
-  making those calls (7e46011e, same bench): phase 9.2 to 9.7 µs mean, 38 to
+  making those calls (5fdcc6e8, same bench): phase 9.2 to 9.7 µs mean, 38 to
   63 µs max, no `loop timing` line, State interval max 5.34 ms over 23,999
   States.
-- **BENCH-4: swerve module devices read.** Bench, RoboRIO build 7920f947,
+- **BENCH-4: swerve module devices read.** Bench, RoboRIO build 9b1df254,
   disabled, uncommissioned, 30 s; Linux workstation as main processor,
   revision NOT RECORDED. All five devices on CANivore `Shooter` reported
   connected (Talon FX 1, 5, 6, CANcoder 3, Pigeon 2 id 0); the steer position
@@ -577,14 +577,14 @@ do not depend on that; the State-interval and log-window figures do.
 ## 2026-11-13
 
 - **BENCH-3: config persistence and State cadence.** Bench, RoboRIO build
-  30d9f76, disabled, uncommissioned; Linux workstation as main processor,
+  5e1e6f1, disabled, uncommissioned; Linux workstation as main processor,
   revision NOT RECORDED. Pushing a changed config and then the original
   rewrote `talos_config.bin` both times with no `[rio] loop timing` line and
   no rejected frame; the `[s.ms]` prefix shows on the companion-link console
   messages; a 60 s session delivered 12000 States (interval median 5.00 ms,
   p99 5.21, max 7.27).
 - **BENCH-3 (REQ-RT-22): RoboRIO address removed, first run.** Bench, RoboRIO
-  build 6cae6d0, disabled, uncommissioned; Linux workstation. `ip addr del` on
+  build 412e593, disabled, uncommissioned; Linux workstation. `ip addr del` on
   the RoboRIO's `eth0` for 6.07 s under a 45 s session lost the link for that
   time and reconnected 47 ms after the address returned, with no rejected
   frame and no bridge send failure. The RoboRIO printed neither `hardware
@@ -593,7 +593,7 @@ do not depend on that; the State-interval and log-window figures do.
   `2 overruns`, `max work 9419 us`, which none of the five tick phases (each
   under 0.3 ms) accounted for.
 - **BENCH-3 (REQ-RT-22): RoboRIO address removed, rerun.** Bench, the tree of
-  4473d5d, which the RoboRIO reports as build 65602fd; disabled,
+  2676c1b, which the RoboRIO reports as build 65602fd; disabled,
   uncommissioned; Linux workstation; address removed for 6.07 s under a 45 s
   session. The RoboRIO printed `send failed (errno 22); keeping the socket`
   and, after the address returned, `sending again: 1471 sends failed over
@@ -605,7 +605,7 @@ do not depend on that; the State-interval and log-window figures do.
   windows); `link` stayed under 0.31 ms. So the earlier 9.4 ms tick was time
   inside the Driver Station read (WPILib/HAL), not the socket.
 - **RT-12 (REQ-OPS-20): counters at the enable edge.** Mac mini, head
-  47f6ead, ten driven runs of `./sim.sh --sim-gateway --no-studio`, disabled
+  0c17071, ten driven runs of `./sim.sh --sim-gateway --no-studio`, disabled
   then teleop: `gateway_rejected_command_count` and `identity_rejected_count`
   stayed 0 and `timed_out_mask` stayed 0 within a second of the enable edge in
   10 of 10 (2026-11-11: 1 of 10 and 3 to 5 of 10). The intake's bit was
@@ -619,7 +619,7 @@ do not depend on that; the State-interval and log-window figures do.
   revision NOT RECORDED: 0 of 11 sessions (the set that had shown the alert 11
   of 11) ever showed the alert or a nonzero mask; no first request was
   refused; both counters stayed flat across each enable edge.
-- **CI-8: `tools/prepush.sh` on macOS.** Mac mini, wave 16, head 4a84ce36
+- **CI-8: `tools/prepush.sh` on macOS.** Mac mini, wave 16, head e727fcd3
   (before the review fixes): every step passed with no portability change
   (313 s with gradle and Studio skipped on a cold output base, 200 s with
   neither skipped; 815 `.d` files, no host header outside the SDK);
@@ -632,7 +632,7 @@ do not depend on that; the State-interval and log-window figures do.
   session from the source tree, revision NOT RECORDED: `studio/drive.html`
   served with its assets and the 13-widget 2026 layout; `/drive` 200.
 - **VIS-1: driver dashboard in a browser (wave 16).** Mac mini, the page as
-  pushed in 85dc2a78, headless Chrome at 1366x768, field config from an
+  pushed in d3f8463e, headless Chrome at 1366x768, field config from an
   installed bundle: `/drive`, its three hashed assets and `/drive/layout.json`
   served with the right cache headers; the page fit the screen in dark and
   light with status `OK Connected: telemetry current` and every widget showing
@@ -641,7 +641,7 @@ do not depend on that; the State-interval and log-window figures do.
   8.8 px. Chrome's own `--screenshot` captures before data arrives; the check
   needs the DevTools protocol and a real wait.
 - **VIS-1: driver dashboard in a browser (wave 19).** Mac mini, the page as
-  pushed in 9a3d36cd, Chrome at 1366x768, dark and light: SUBSYSTEMS 13 of 13
+  pushed in c0e6be16, Chrome at 1366x768, dark and light: SUBSYSTEMS 13 of 13
   rows visible in two columns and PRE-MATCH 6 of 6, as the fit model
   computed; smallest text 12 px; on load 12 of 13 widgets read STALE under
   CONNECTING for about 100 ms, then OK; a stopped session reads BRIDGE LINK
@@ -687,23 +687,23 @@ do not depend on that; the State-interval and log-window figures do.
   `NonCriticalDescribeTimeoutAllowsPeersToLaunch` 5 of 10 at four jobs), and
   `bundle_test` missed the 15 s probe deadline once on `pose_estimator` right
   after a build.
-- **MAC-2: suite at wave 14.** Mac mini, the head before c1668b8: build and
+- **MAC-2: suite at wave 14.** Mac mini, the head before 28d870b: build and
   212/212 fresh, gradle 54 tests, launcher stress 10/10 and 30/30 with the
   stub warm-up; `launcher_test` (then unsharded) took 54 to 58 s of its 60 s
   at ten parallel runs and timed out 9 of 10 (59.6 to 64.4 s) with bundle
   installs running beside it.
-- **MAC-2 (REQ-OPS-47): install warm-up.** Mac mini, head 47f6ead: a fresh
+- **MAC-2 (REQ-OPS-47): install warm-up.** Mac mini, head 0c17071: a fresh
   install's warm-up took 4.6 to 5.4 s idle and 30 to 38 s under the
   launcher-test load (bound 60 s per member, none reached); the first
   `--describe-only` after it took 0.4 to 0.5 s idle and 1.5 to 1.7 s under
   load, 14/14, against 17.4 s under load without the warm-up; the warm-up
   added no file to the bundle.
-- **TEST-9: sharded `launcher_test` on macOS.** Mac mini, head 47f6ead, ten
+- **TEST-9: sharded `launcher_test` on macOS.** Mac mini, head 0c17071, ten
   runs at default jobs: `launcher_test`'s four shards took 13.1 to 15.8, 19.4
   to 25.6, 24.9 to 27.5 and 17.5 to 24.2 s of the 60 s limit (the unsharded
   binary took 54 to 58 s), 40 of 40 passing.
 - **TEST-22: bridge test host check on macOS CI.** GitHub macOS runner, CI run
-  43375149698, head 47f6ead: `HardwareNodeTest.
+  43375149698, head 0c17071: `HardwareNodeTest.
   RunSendsHeartbeatsAndTheTimeoutNeutralOnItsOwn` failed its host check: "host
   unqualified: an ordinary thread's 1 ms sleep overran by 26411 us" against
   the 25000 µs it allows. First occurrence recorded.
@@ -720,9 +720,9 @@ do not depend on that; the State-interval and log-window figures do.
   take 12 to 14 ms because exposure gain lets sensor noise through as speckle
   the detector then examines.
 - **TEST-16: `accuracy_test` fusion check evaluated.** Linux workstation, load
-  0.8 to 1.9, after 0a98851: three runs kept 534 to 539 of 539 frames per
+  0.8 to 1.9, after 589dd8c: three runs kept 534 to 539 of 539 frames per
   camera; the check was evaluated and passed (fused 0.045 to 0.064 m against
-  0.094 to 0.095 m odometry). Before 0a98851 the camera node's single result
+  0.094 to 0.095 m odometry). Before 589dd8c the camera node's single result
   slot lost 5 to 7% of computed frames and the check was skipped on every
   workstation run.
 - **STUDIO-1: a client that never reads.** Mac mini loopback, revision NOT
@@ -730,16 +730,16 @@ do not depend on that; the State-interval and log-window figures do.
   held at 8 s, 3,295 holds by 12 s).
 - **CI-1, CI-2, CI-3: Linux CI legs.** GitHub CI on the pushed branch: the
   Linux sanitizer legs (asan, tsan) and the bindings diff were green in run
-  43184148264 (c725fd3); the Linux soak (seed 0) and match rehearsal were
+  43184148264 (51f067e); the Linux soak (seed 0) and match rehearsal were
   green in runs 43178185836 and 43184148264. Run 43178185836's first
   merge-base tidy surfaced nine findings in three files (`v4l2_source.h`, two
-  `studio/review` tests), fixed in 014beaa and c725fd3; run 43184148264 was
+  `studio/review` tests), fixed in 168352c and 51f067e; run 43184148264 was
   clean over the files it diffed.
 
 ## 2026-11-11
 
 - **MAC-1: full suite on the Mac mini.** `bazel test //...` 186 of 186 at
-  d53393e (149 s wall, warm cache).
+  f102348 (149 s wall, warm cache).
 - **LOG-2: log window before the time cut.** Bench, revision NOT RECORDED:
   kept spans 48.3 to 120.4 s, longest over shortest 2.49.
 - **RT-5: RoboRIO loop at default scheduling.** Bench, image
@@ -764,7 +764,7 @@ do not depend on that; the State-interval and log-window figures do.
   `SCHED_OTHER` thread including `can_psend` and `can_recv`, and the
   `SCHED_RR` threads.
 - **RT-5, RESET-2, RESET-3, RT-15: evening session, loop at `SCHED_FIFO` 10.**
-  Bench, RoboRIO build ba81a01, loop `SCHED_FIFO` 10, Kraken X44 on CANivore
+  Bench, RoboRIO build cdbac33, loop `SCHED_FIFO` 10, Kraken X44 on CANivore
   `Shooter`, firmware 26.3.0.0, disabled; Mac mini main processor, every node
   with its full realtime grant; main-processor revision NOT RECORDED.
   - RT-5: with no shell on the RoboRIO, 600 s had 0 overruns and 0 late ticks
@@ -885,7 +885,7 @@ this section.
   devices 57 µs, control 27 µs, health 23 µs mean.
 - **RIO-2: refresh phase on one bus.** Single-bus bench: refresh phase 147 µs
   mean, unchanged by the per-bus `RefreshAll`.
-- **RT-7: wake-socket descriptor peak.** Mac mini, 951c87f, disabled
+- **RT-7: wake-socket descriptor peak.** Mac mini, cae8387, disabled
   simulation: 11 of 256. Linux, enabled: 27.
 - **RT-19: Phoenix desktop-simulation lock.** Desktop simulation: a 200 ms
   hold of the `PhoenixTools_Sim` mutex stalled the RoboRIO loop 198 ms and
@@ -904,13 +904,13 @@ this section.
 - **STUDIO-2: recorded-session review.** By hand on a 20 s simulated session:
   438 channels, a snapshot in 7.7 ms, the picker listing the session in
   headless Chromium.
-- **STUDIO-4: large-message wait (derived, not measured, 62f29fa).** About
+- **STUDIO-4: large-message wait (derived, not measured, ef02539).** About
   16 s at 4 clients for a 64 KB message, about 55 min at 64 clients, no bound
   near the 64,000 B cap.
 - **DEPLOY-10 (REQ-OPS-48): one-interpreter bundle on Linux.** 749 to 407 MB
   (tar 781 to 424 MB, gzip 240 to 131 MB); a 20 s simulated run from an
   installed bundle exited 0 with all 14 members 0.
-- **TEST-9: launcher process tests, Linux against macOS.** c725fd3: Linux
+- **TEST-9: launcher process tests, Linux against macOS.** 51f067e: Linux
   `launcher_test` 4.2 s, `supervision_test` 3.6 s (largest of 3 shards); idle
   Mac mini `launcher_test` 20.0 s for 57 cases (35 s under load),
   `supervision_test` 20.8 s. On the Mac the first exec of a newly written
@@ -918,7 +918,7 @@ this section.
   `/bin/sh <stub>` 9 ms; about 100 fresh stubs per run is about 13 s of the
   20 s.
 - **TEST-10: launcher tests under load on macOS.** Mac mini (12 cores),
-  89ebbf1, `--runs_per_test=20` at full parallelism: `launcher_test` timed out
+  1724edc, `--runs_per_test=20` at full parallelism: `launcher_test` timed out
   20 of 20 at 75 s (after 30 to 40 of its 57 cases, 4 to 9 already failed);
   `supervision_test` failed 14 of 60 shard runs; `continuity_test` passed 20
   of 20 (3 of 20 failed before). Nearly every failure is a `--describe` probe
