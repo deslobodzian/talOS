@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -102,9 +103,10 @@ TEST_F(RollerTest, DrivesAtALiveLane) {
 // devices flush's (REQ-SAFE-02, proved in talOS/devices), not this
 // node's evidence.
 TEST_F(RollerTest, DisabledRobotGoesNeutral) {
-  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+  Teleop();
+  Hold(30.0, 40ms);
+  ASSERT_EQ(Applied(), Mode::kVelocity);
   hw.enable(false);
-  sim.step(10ms);
   Hold(30.0, 60ms);
   EXPECT_EQ(Request(), Mode::kNeutral);
   EXPECT_EQ(Applied(), Mode::kNeutral);
@@ -175,6 +177,7 @@ TEST_F(RollerTest, DisconnectedFeedbackGoesNeutral) {
   // the node's own feedback gate is what stops it.
   ASSERT_TRUE(talos::robot_enabled(sim.node("roller")));
   EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_EQ(Applied(), Mode::kNeutral);
   const State state = Latest();
   EXPECT_FALSE(state.connected());
   EXPECT_FALSE(state.enabled());
@@ -183,9 +186,19 @@ TEST_F(RollerTest, DisconnectedFeedbackGoesNeutral) {
 // REQ-SAFE-04
 TEST_F(RollerTest, NonFiniteDemandGoesNeutral) {
   Teleop();
-  Hold(std::numeric_limits<double>::quiet_NaN(), 40ms);
-  EXPECT_EQ(Request(), Mode::kNeutral);
-  EXPECT_FALSE(Latest().enabled());
+  for (const double bad : {std::numeric_limits<double>::quiet_NaN(),
+                           std::numeric_limits<double>::infinity(),
+                           -std::numeric_limits<double>::infinity()}) {
+    SCOPED_TRACE(bad);
+    Hold(30.0, 40ms);
+    ASSERT_EQ(Applied(), Mode::kVelocity);
+    Hold(bad, 40ms);
+    EXPECT_EQ(Request(), Mode::kNeutral);
+    EXPECT_EQ(Applied(), Mode::kNeutral);
+    const State state = Latest();
+    EXPECT_FALSE(state.enabled());
+    EXPECT_TRUE(std::isfinite(state.velocity_rps()));
+  }
 }
 
 // matrix: n/a 9 (the roller reads no parameters)

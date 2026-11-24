@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -63,6 +64,14 @@ struct SpecDeleter {
 };
 using SpecPtr = std::unique_ptr<mjSpec, SpecDeleter>;
 
+struct ScopedHook {
+  explicit ScopedHook(bool& active) : active_(active) { active_ = true; }
+  ~ScopedHook() { active_ = false; }
+  ScopedHook(const ScopedHook&) = delete;
+  ScopedHook& operator=(const ScopedHook&) = delete;
+  bool& active_;
+};
+
 // The `index`th group of `stride` entries of a MuJoCo array.
 template <typename T>
 T* At(T* array, int stride, int index) {
@@ -117,6 +126,7 @@ SpecPtr FlatCarpet() {
   SpecPtr spec(mj_makeSpec());
   if (!spec) Refuse("flat carpet: mj_makeSpec failed");
   mjsBody* world = mjs_findBody(spec.get(), "world");
+  if (world == nullptr) Refuse("flat carpet: no worldbody");
   // The field's centre, 651.22 x 317.69 in; a plane collides over its whole
   // extent, so its position and size are only rendering.
   constexpr double kCentreX = 651.22 * 0.0254 / 2.0;
@@ -134,6 +144,7 @@ SpecPtr FlatCarpet() {
   }};
   for (const Carpet& carpet : kCarpets) {
     mjsGeom* geom = mjs_addGeom(world, nullptr);
+    if (geom == nullptr) Refuse("flat carpet: mjs_addGeom failed");
     geom->type = mjGEOM_PLANE;
     geom->pos[0] = kCentreX;
     geom->pos[1] = kCentreY;
@@ -193,11 +204,27 @@ void CheckActuators(mjSpec* spec, const std::string& file,
     mjsActuator* actuator = mjs_asActuator(element);
     const std::string where =
         file + ": " + Describe(element, mjOBJ_ACTUATOR) + ": ";
+    if (actuator == nullptr) Refuse(where + "is not a valid actuator element");
     const std::string name = NameOf(element);
-    if (FindMotor(motors, name) == nullptr) {
+    const PlantMotor* motor = nullptr;
+    for (const PlantMotor& candidate : motors) {
+      if (candidate.name != name) continue;
+      if (motor != nullptr) {
+        Refuse(where + "matches more than one configured motor");
+      }
+      motor = &candidate;
+    }
+    if (motor == nullptr) {
       Refuse(where +
              "names no configured motor; every actuator binds the motor of "
              "its name");
+    }
+    if (!std::isfinite(motor->gear) || !(motor->gear > 0.0)) {
+      Refuse(where + "motor gear must be finite and positive");
+    }
+    if (!std::isfinite(motor->no_load_damping_nm_per_radps) ||
+        motor->no_load_damping_nm_per_radps < 0.0) {
+      Refuse(where + "motor no-load damping must be finite and non-negative");
     }
     if (actuator->type != mjACTUATOR_MOTOR) {
       Refuse(where + "is not a <motor>; a bound actuator is a plain <motor>");
@@ -226,8 +253,10 @@ void CheckActuators(mjSpec* spec, const std::string& file,
     const std::string behind =
         "; the force a bound actuator applies is the motor's law alone";
     if (actuator->trntype == mjTRN_JOINT) {
-      mjsElement* element = mjs_findElement(spec, mjOBJ_JOINT, target.c_str());
-      if (const mjsJoint* joint = element ? mjs_asJoint(element) : nullptr) {
+      mjsElement* target_element =
+          mjs_findElement(spec, mjOBJ_JOINT, target.c_str());
+      if (const mjsJoint* joint =
+              target_element ? mjs_asJoint(target_element) : nullptr) {
         if (joint->type != mjJNT_HINGE && joint->type != mjJNT_SLIDE) {
           Refuse(where + "drives joint '" + target +
                  "', which is neither a hinge nor a slide");
@@ -242,8 +271,10 @@ void CheckActuators(mjSpec* spec, const std::string& file,
         }
       }
     } else if (actuator->trntype == mjTRN_TENDON) {
-      mjsElement* element = mjs_findElement(spec, mjOBJ_TENDON, target.c_str());
-      if (const mjsTendon* tendon = element ? mjs_asTendon(element) : nullptr;
+      mjsElement* target_element =
+          mjs_findElement(spec, mjOBJ_TENDON, target.c_str());
+      if (const mjsTendon* tendon =
+              target_element ? mjs_asTendon(target_element) : nullptr;
           tendon != nullptr &&
           IsLimited(tendon->actfrclimited, tendon->actfrcrange)) {
         Refuse(where + "drives tendon '" + target +
@@ -362,9 +393,13 @@ void CheckNames(mjSpec* field, const std::string& field_file, mjSpec* robot,
 }
 
 std::string JointOrTendon(const mjModel* m, int actuator) {
+  if (actuator < 0 || actuator >= m->nactuator) return "joint ''";
   const int id = *At(m->actuator_trnid, 2, actuator);
   const bool tendon = m->actuator_trntype[actuator] == mjTRN_TENDON;
-  const char* name = mj_id2name(m, tendon ? mjOBJ_TENDON : mjOBJ_JOINT, id);
+  const char* name = nullptr;
+  if (id >= 0 && id < (tendon ? m->ntendon : m->njnt)) {
+    name = mj_id2name(m, tendon ? mjOBJ_TENDON : mjOBJ_JOINT, id);
+  }
   return std::string(tendon ? "tendon '" : "joint '") +
          (name == nullptr ? "" : name) + "'";
 }
@@ -382,6 +417,7 @@ int CountElements(mjSpec* spec, mjtObj type) {
 // The joint whose qpos block holds `address` (joints are numbered in qpos
 // order), or -1.
 int JointOfQpos(const mjModel* m, int address) {
+  if (address < 0 || address >= m->nq) return -1;
   int joint = -1;
   for (int j = 0; j < m->njnt && m->jnt_qposadr[j] <= address; ++j) {
     joint = j;
@@ -390,12 +426,13 @@ int JointOfQpos(const mjModel* m, int address) {
 }
 
 // MuJoCo's log handler before InstallMujocoProcessHandlers replaced it.
-mjfLogHandler previous_log_handler = nullptr;
+std::atomic<mjfLogHandler> previous_log_handler{nullptr};
 
 // Errors end the process naming the plant (MuJoCo requires an error handler
 // not to return); the warning every MakePlant raises by design is dropped;
 // everything else goes to MuJoCo's own handler, set to the console only.
 void GatewayLogHandler(const mjLogMessage* message) {
+  if (message == nullptr) return;
   if (message->level == mjLOG_ERROR) {
     std::fprintf(stderr, "mujoco plant: MuJoCo error%s%s: %s\n",
                  message->func != nullptr ? " in " : "",
@@ -409,7 +446,11 @@ void GatewayLogHandler(const mjLogMessage* message) {
           std::string_view::npos) {
     return;
   }
-  previous_log_handler(message);
+  if (const mjfLogHandler previous =
+          previous_log_handler.load(std::memory_order_acquire);
+      previous != nullptr) {
+    previous(message);
+  }
 }
 
 const char* WarningName(int warning) {
@@ -444,7 +485,9 @@ void InstallMujocoProcessHandlers() {
   config.logto_file = 0;
   mju_setLogConfig(config);
   const mjfLogHandler previous = mju_setLogHandler(GatewayLogHandler);
-  if (previous != GatewayLogHandler) previous_log_handler = previous;
+  if (previous != GatewayLogHandler) {
+    previous_log_handler.store(previous, std::memory_order_release);
+  }
 }
 
 void MujocoPlant::ModelDeleter::operator()(mjModel_* model) const {
@@ -462,6 +505,10 @@ std::unique_ptr<MujocoPlant> MakePlant(const PlantModel& model,
   const std::string field_file = model.field_xml.empty()
                                      ? std::string("the flat carpet")
                                      : model.field_xml;
+  if (!std::isfinite(model.start_x_m) || !std::isfinite(model.start_y_m) ||
+      !std::isfinite(model.start_yaw_rad)) {
+    Refuse(robot_file + ": start_pose coordinates and yaw must be finite");
+  }
   SpecPtr world =
       model.field_xml.empty() ? FlatCarpet() : Parse(model.field_xml, "field");
   SpecPtr robot = Parse(robot_file, "robot");
@@ -501,7 +548,12 @@ std::unique_ptr<MujocoPlant> MakePlant(const PlantModel& model,
   // H.4: the root body on a frame at the start pose; its own pos and quat
   // compose after the frame. A deep copy, so the robot spec can go.
   mjs_setDeepCopy(world.get(), 1);
-  mjsFrame* frame = mjs_addFrame(mjs_findBody(world.get(), "world"), nullptr);
+  mjsBody* world_body = mjs_findBody(world.get(), "world");
+  if (world_body == nullptr) Refuse(field_file + ": no worldbody");
+  mjsFrame* frame = mjs_addFrame(world_body, nullptr);
+  if (frame == nullptr) {
+    Refuse(robot_file + ": could not add start-pose frame on " + field_file);
+  }
   frame->pos[0] = model.start_x_m;
   frame->pos[1] = model.start_y_m;
   frame->pos[2] = 0.0;
@@ -539,6 +591,10 @@ std::unique_ptr<MujocoPlant> MakePlant(const PlantModel& model,
        element != nullptr; element = mjs_nextElement(world.get(), element)) {
     mjsActuator* actuator = mjs_asActuator(element);
     const PlantMotor* motor = FindMotor(motors, NameOf(element));
+    if (actuator == nullptr || motor == nullptr) {
+      Refuse(robot_file + ": " + Describe(element, mjOBJ_ACTUATOR) +
+             ": actuator has no matching configured motor after attach");
+    }
     const double gear = motor->gear;
     actuator->gaintype = mjGAIN_FIXED;
     actuator->biastype = mjBIAS_AFFINE;
@@ -565,6 +621,9 @@ std::unique_ptr<MujocoPlant> MakePlant(const PlantModel& model,
   }
   plant->root_body_ = mjs_getId(attached);
   world.reset();
+  if (plant->root_body_ <= 0 || plant->root_body_ >= plant->model_->nbody) {
+    Refuse(robot_file + ": compiled root body id is out of range");
+  }
   // No robot tree sleeps. MuJoCo keeps an actuated tree awake on its own
   // (compile resolves its policy to mjSLEEP_AUTO_NEVER), but not a robot
   // tree with no actuator (a passive mechanism, a model whose motors are all
@@ -577,7 +636,8 @@ std::unique_ptr<MujocoPlant> MakePlant(const PlantModel& model,
     mjModel* model_out = plant->model_.get();
     for (int body = 1; body < model_out->nbody; ++body) {
       const int tree = model_out->body_treeid[body];
-      if (model_out->body_rootid[body] == plant->root_body_ && tree >= 0) {
+      if (model_out->body_rootid[body] == plant->root_body_ && tree >= 0 &&
+          tree < model_out->ntree) {
         model_out->tree_sleep_policy[tree] = mjSLEEP_NEVER;
       }
     }
@@ -589,17 +649,37 @@ std::unique_ptr<MujocoPlant> MakePlant(const PlantModel& model,
     Refuse("compiling " + robot_file + ": mj_makeData failed (arena of " +
            std::to_string(kArenaBytes) + " bytes)");
   }
-  plant->step_us_ = static_cast<uint32_t>(std::llround(m->opt.timestep * 1e6));
+  if (!std::isfinite(m->opt.timestep) || !(m->opt.timestep > 0.0)) {
+    Refuse("compiling " + robot_file + ": compiled timestep is not positive");
+  }
+  const long long raw_step_us = std::llround(m->opt.timestep * 1e6);
+  if (raw_step_us <= 0 || raw_step_us % 2 != 0 ||
+      raw_step_us > std::numeric_limits<uint32_t>::max()) {
+    Refuse("compiling " + robot_file +
+           ": compiled timestep must be an even positive number of "
+           "microseconds");
+  }
+  plant->step_us_ = static_cast<uint32_t>(raw_step_us);
 
   for (MujocoPlant::Actuator& actuator : plant->actuators_) {
     actuator.id = mj_name2id(m, mjOBJ_ACTUATOR, actuator.motor.c_str());
+    if (actuator.id < 0 || actuator.id >= m->nactuator) {
+      Refuse(robot_file + ": compiled actuator '" + actuator.motor +
+             "' is missing or out of range");
+    }
     actuator.ctrl = m->actuator_ctrladr[actuator.id];
     actuator.output = m->actuator_outadr[actuator.id];
+    if (actuator.ctrl < 0 || actuator.ctrl >= m->nu || actuator.output < 0 ||
+        actuator.output >= m->nout) {
+      Refuse(robot_file + ": compiled actuator '" + actuator.motor +
+             "' has an out-of-range control or output index");
+    }
     actuator.target = JointOrTendon(m, actuator.id);
   }
   const int root = plant->root_body_;
-  plant->root_free_ = m->body_jntnum[root] > 0 &&
-                      m->jnt_type[m->body_jntadr[root]] == mjJNT_FREE;
+  const int root_jnt = m->body_jntadr[root];
+  plant->root_free_ = m->body_jntnum[root] > 0 && root_jnt >= 0 &&
+                      root_jnt < m->njnt && m->jnt_type[root_jnt] == mjJNT_FREE;
 
   mjData* d = plant->data_.get();
   mj_forward(m, d);
@@ -607,9 +687,13 @@ std::unique_ptr<MujocoPlant> MakePlant(const PlantModel& model,
   // 1/(moment·M⁻¹·moment) (as MuJoCo's dampratio uses; actuator_acc0 is
   // |M⁻¹·moment|, not an inertia): mechanism kg·m², armature included.
   const int nv = static_cast<int>(m->nv);
-  std::vector<mjtNum> moment(static_cast<std::size_t>(nv));
+  std::vector<mjtNum> moment(nv > 0 ? static_cast<std::size_t>(nv) : 0);
   std::vector<mjtNum> solved(moment.size());
   for (MujocoPlant::Actuator& actuator : plant->actuators_) {
+    if (nv <= 0) {
+      actuator.inertia_kg_m2 = std::numeric_limits<double>::quiet_NaN();
+      continue;
+    }
     const int out = actuator.output;
     mju_sparse2dense(moment.data(), d->actuator_moment, 1, nv,
                      d->moment_rownnz + out, d->moment_rowadr + out,
@@ -618,8 +702,9 @@ std::unique_ptr<MujocoPlant> MakePlant(const PlantModel& model,
     const double weight = mju_dot(moment.data(), solved.data(), nv);
     // No moment at the reference pose (a tendon across its sled's travel,
     // say): the inertia there is unknown, not zero.
-    actuator.inertia_kg_m2 =
-        weight > 0.0 ? 1.0 / weight : std::numeric_limits<double>::quiet_NaN();
+    actuator.inertia_kg_m2 = std::isfinite(weight) && weight > 0.0
+                                 ? 1.0 / weight
+                                 : std::numeric_limits<double>::quiet_NaN();
   }
   for (std::size_t w = 0; w < plant->warnings_.size(); ++w) {
     plant->warnings_[w] = d->warning[w].number;
@@ -645,6 +730,14 @@ bool MujocoPlant::Bind(std::span<const hardware::sim::PlantMotor> motors,
     error.message = std::move(message);
     return false;
   };
+  if (failed_) {
+    return refuse("", "bind_mujoco_plant",
+                  "the plant failed: " + std::string(failure()));
+  }
+  if (in_hook_) {
+    return refuse("", "bind_mujoco_plant",
+                  "reentrant Bind called from a world rule");
+  }
   if (owned.size() != motors.size()) {
     return refuse("", "bind_mujoco_plant",
                   "owned has " + std::to_string(owned.size()) +
@@ -657,7 +750,12 @@ bool MujocoPlant::Bind(std::span<const hardware::sim::PlantMotor> motors,
     const Actuator& actuator = actuators_[a];
     std::size_t index = motors.size();
     for (std::size_t i = 0; i < motors.size(); ++i) {
-      if (motors[i].name == actuator.motor) index = i;
+      if (motors[i].name != actuator.motor) continue;
+      if (index != motors.size()) {
+        return refuse(actuator.motor, "bind_mujoco_actuator",
+                      "more than one motor is named '" + actuator.motor + "'");
+      }
+      index = i;
     }
     if (index == motors.size()) {
       return refuse(actuator.motor, "bind_mujoco_actuator",
@@ -675,9 +773,19 @@ bool MujocoPlant::Bind(std::span<const hardware::sim::PlantMotor> motors,
                     "was compiled with (its damping G^2*b_m is compiled in); "
                     "restart the gateway with this config");
     }
-    if (!(motor.resistance_ohm > 0.0)) {
+    if (!std::isfinite(motor.resistance_ohm) || !(motor.resistance_ohm > 0.0)) {
       return refuse(actuator.motor, "bind_mujoco_actuator",
-                    "motor has no winding resistance");
+                    "motor winding resistance must be finite and positive");
+    }
+    if (!std::isfinite(motor.torque_constant_nm_per_a) ||
+        motor.torque_constant_nm_per_a < 0.0) {
+      return refuse(actuator.motor, "bind_mujoco_actuator",
+                    "motor torque constant must be finite and non-negative");
+    }
+    if (!std::isfinite(motor.back_emf_v_per_radps) ||
+        motor.back_emf_v_per_radps < 0.0) {
+      return refuse(actuator.motor, "bind_mujoco_actuator",
+                    "motor back-EMF constant must be finite and non-negative");
     }
     Bound entry;
     entry.motor = index;
@@ -694,12 +802,17 @@ bool MujocoPlant::Bind(std::span<const hardware::sim::PlantMotor> motors,
     const std::string sensor(input.sensor);
     const std::string device(input.input);
     const int id = mj_name2id(m, mjOBJ_SENSOR, sensor.c_str());
-    if (id < 0) {
+    if (id < 0 || id >= m->nsensor) {
       return refuse(device, "bind_world_input",
                     "the model has no sensor '" + sensor + "'");
     }
     Input entry;
     entry.address = m->sensor_adr[id];
+    if (entry.address < 0 || entry.address >= m->nsensordata ||
+        m->sensor_dim[id] < 1) {
+      return refuse(device, "bind_world_input",
+                    "sensor '" + sensor + "' has an out-of-range data address");
+    }
     if (m->sensor_type[id] == mjSENS_RANGEFINDER) {
       entry.rangefinder = true;
       entry.cutoff = m->sensor_cutoff[id];
@@ -708,11 +821,11 @@ bool MujocoPlant::Bind(std::span<const hardware::sim::PlantMotor> motors,
                       "rangefinder '" + sensor +
                           "' is not one ray from a site measuring dist");
       }
-      if (!(entry.cutoff > 0.0)) {
+      if (!std::isfinite(entry.cutoff) || !(entry.cutoff > 0.0)) {
         return refuse(device, "bind_world_input",
                       "rangefinder '" + sensor +
-                          "' has no cutoff; it reads closed while it sees a "
-                          "surface nearer than its cutoff");
+                          "' has no finite positive cutoff; it reads closed "
+                          "while it sees a surface nearer than its cutoff");
       }
     } else if (m->sensor_type[id] != mjSENS_TOUCH) {
       return refuse(device, "bind_world_input",
@@ -785,6 +898,10 @@ bool MujocoPlant::Bind(std::span<const hardware::sim::PlantMotor> motors,
 bool MujocoPlant::Step(int steps,
                        std::span<const hardware::sim::PlantDrive> drives) {
   if (failed_) return false;
+  if (in_hook_) {
+    Fail("reentrant Step from a world rule");
+    return false;
+  }
   mjModel* m = model_.get();
   mjData* d = data_.get();
   if (steps < 0 || drives.size() < rotors_.size()) {
@@ -794,6 +911,30 @@ bool MujocoPlant::Step(int steps,
     failed_ = true;
     return false;
   }
+
+  // Validate every bound motor's drive before writing into mjModel/mjData.
+  // -inf/+inf are the open torque limits; NaN, inverted bounds, min = +inf,
+  // max = -inf, and any non-finite voltage are refused.
+  for (const Bound& entry : bound_) {
+    const hardware::sim::PlantDrive& drive = drives[entry.motor];
+    const bool bad_volts = !std::isfinite(drive.volts);
+    const bool bad_bounds =
+        std::isnan(drive.min_torque_nm) || std::isnan(drive.max_torque_nm) ||
+        drive.min_torque_nm > drive.max_torque_nm ||
+        drive.min_torque_nm == std::numeric_limits<double>::infinity() ||
+        drive.max_torque_nm == -std::numeric_limits<double>::infinity();
+    if (bad_volts || bad_bounds) {
+      std::snprintf(
+          failure_.data(), failure_.size(),
+          "mujoco plant: invalid drive for actuator '%s' at plant time %.4f s "
+          "(volts=%g, torque=[%g, %g])",
+          entry.actuator->motor.c_str(), d->time, drive.volts,
+          drive.min_torque_nm, drive.max_torque_nm);
+      failed_ = true;
+      return false;
+    }
+  }
+  if (steps == 0) return true;
 
   // A: the torque law of PlantDrive, in mechanism units (actuator length is
   // mechanism radians, so rotor speed is G times its velocity):
@@ -837,11 +978,13 @@ bool MujocoPlant::Step(int steps,
     // A rule must not throw; one that does fails the plant like one that
     // returns false (no cost while none throws).
     try {
+      ScopedHook guard(in_hook_);
       for (WorldRules* rules : rules_) {
         if (!rules->AfterStep(*m, *d, steps_, match_input_)) {
           Fail(rules->failure());
           return false;
         }
+        if (failed_) return false;
       }
     } catch (const std::exception& error) {
       Fail(error.what());
@@ -850,8 +993,40 @@ bool MujocoPlant::Step(int steps,
       Fail("a world rule threw something that is not a std::exception");
       return false;
     }
+    // A rule may write qpos/qvel; check them immediately so non-finite or
+    // runaway values fail this step instead of leaking into rotor()/chassis().
+    mj_checkPos(m, d);
+    mj_checkVel(m, d);
+    for (const int warning : kFatalWarnings) {
+      if (d->warning[warning].number != warnings_[warning]) {
+        Fail(warning, d->warning[warning].lastinfo);
+        return false;
+      }
+    }
   }
   Refresh();
+  for (const Bound& entry : bound_) {
+    const hardware::sim::PlantRotor& r = rotors_[entry.motor];
+    if (!std::isfinite(r.position_rot) || !std::isfinite(r.velocity_rps)) {
+      std::snprintf(failure_.data(), failure_.size(),
+                    "mujoco plant: non-finite rotor state for actuator '%s' at "
+                    "plant time %.4f s",
+                    entry.actuator->motor.c_str(), d->time);
+      failed_ = true;
+      return false;
+    }
+  }
+  if (root_free_ &&
+      (!std::isfinite(chassis_.x_m) || !std::isfinite(chassis_.y_m) ||
+       !std::isfinite(chassis_.yaw_rad) || !std::isfinite(chassis_.vx_mps) ||
+       !std::isfinite(chassis_.vy_mps) ||
+       !std::isfinite(chassis_.omega_radps))) {
+    std::snprintf(failure_.data(), failure_.size(),
+                  "mujoco plant: non-finite chassis state at plant time %.4f s",
+                  d->time);
+    failed_ = true;
+    return false;
+  }
   for (std::size_t b = 0; b < bound_.size(); ++b) {
     const bool over = std::fabs(rotors_[bound_[b].motor].velocity_rps) >
                       hardware::Gateway::kMaxRotorRps;
@@ -875,13 +1050,23 @@ void MujocoPlant::Fail(int warning, int info) {
     }
   } else if (warning == mjWARN_BADQVEL || warning == mjWARN_BADQACC) {
     if (info >= 0 && info < m->nv) {
-      element = mj_id2name(m, mjOBJ_JOINT, m->dof_jntid[info]);
-      kind = "joint";
+      const int joint = m->dof_jntid[info];
+      if (joint >= 0 && joint < m->njnt) {
+        element = mj_id2name(m, mjOBJ_JOINT, joint);
+        kind = "joint";
+      }
     }
   } else if (warning == mjWARN_BADCTRL) {
     if (info >= 0 && info < m->nu) {
-      element = mj_id2name(m, mjOBJ_ACTUATOR, info);
-      kind = "actuator";
+      for (int a = 0; a < m->nactuator; ++a) {
+        const int start = m->actuator_ctrladr[a];
+        const int count = m->actuator_ctrlnum[a];
+        if (info >= start && info < start + count) {
+          element = mj_id2name(m, mjOBJ_ACTUATOR, a);
+          kind = "actuator";
+          break;
+        }
+      }
     }
   }
   const std::size_t text_info = info < 0 ? 0 : static_cast<std::size_t>(info);
@@ -899,9 +1084,11 @@ void MujocoPlant::Fail(int warning, int info) {
 }
 
 void MujocoPlant::Fail(std::string_view text) {
+  const char* ptr = text.empty() ? "" : text.data();
+  const int len = static_cast<int>(std::min(text.size(), failure_.size()));
   std::snprintf(failure_.data(), failure_.size(),
                 "mujoco world rule at plant time %.4f s: %.*s", data_->time,
-                static_cast<int>(text.size()), text.data());
+                len, ptr);
   failed_ = true;
 }
 
@@ -909,6 +1096,10 @@ void MujocoPlant::AddRules(WorldRules& rules) {
   if (failed_) {
     throw std::logic_error("MujocoPlant::AddRules on a failed plant: " +
                            std::string(failure()));
+  }
+  if (in_hook_) {
+    throw std::logic_error(
+        "MujocoPlant::AddRules called reentrantly from a world rule");
   }
   if (steps_ != 0) {
     throw std::logic_error(
@@ -922,7 +1113,10 @@ void MujocoPlant::AddRules(WorldRules& rules) {
   }
   mjModel* m = model_.get();
   mjData* d = data_.get();
-  rules.Attach(*m, *d);
+  {
+    ScopedHook guard(in_hook_);
+    rules.Attach(*m, *d);
+  }
   // What Attach placed is the world every reader and the next Attach see,
   // checked as mj_step checks it, so a bad placement is refused here, naming
   // the warning, not blamed on the first Step.
@@ -943,16 +1137,25 @@ void MujocoPlant::AddRules(WorldRules& rules) {
 }
 
 void MujocoPlant::SetMatchInput(const MatchInput& input) {
+  if (failed_) {
+    match_input_ = input;
+    return;
+  }
+  if (in_hook_) {
+    Fail("reentrant SetMatchInput from a world rule");
+    return;
+  }
   match_input_ = input;
-  if (failed_) return;
   // Each rule observes the input now, so what it reports follows the input
   // on a tick whose plant time rounds to no step.
   try {
+    ScopedHook guard(in_hook_);
     for (WorldRules* rules : rules_) {
       if (!rules->ObserveMatch(input)) {
         Fail(rules->failure());
         return;
       }
+      if (failed_) return;
     }
   } catch (const std::exception& error) {
     Fail(error.what());
@@ -1017,6 +1220,7 @@ bool MujocoPlant::input_closed(std::size_t input) const {
   if (input >= inputs_.size()) return false;
   const Input& entry = inputs_[input];
   const double value = data_->sensordata[entry.address];
+  if (!std::isfinite(value)) return false;
   return entry.rangefinder ? value >= 0.0 && value < entry.cutoff : value > 0.0;
 }
 

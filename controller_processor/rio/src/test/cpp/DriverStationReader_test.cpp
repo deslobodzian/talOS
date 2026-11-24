@@ -602,6 +602,68 @@ TEST(DriverStationReader, ProgramModeOfTreatsEStoppedAsDisabled) {
             ProgramMode::kTest);
 }
 
+// A detached control word (!kDsAttached) must always map to
+// ProgramMode::kDisabled even if kEnabled and mode bits are set (matching
+// Robot.cpp's gateway enable gate and talOS/devices DsModeOf, RULES.md 1).
+// REQ-SAFE-10
+TEST(DriverStationReader, ProgramModeOfRequiresDsAttached) {
+  using talos::rio::ProgramModeOf;
+  EXPECT_EQ(ProgramModeOf(ds::kEnabled | ds::kTeleop), ProgramMode::kDisabled);
+  EXPECT_EQ(ProgramModeOf(ds::kEnabled | ds::kAutonomous),
+            ProgramMode::kDisabled);
+  EXPECT_EQ(ProgramModeOf(ds::kEnabled | ds::kTest), ProgramMode::kDisabled);
+}
+
+// A zero staleness bound must fail closed to kNoDriverStation even when the
+// snapshot was refreshed at the exact tick timestamp.
+// REQ-SAFE-10, REQ-RT-24
+TEST(DriverStationReader, ZeroStaleBoundFailsClosedToNoDriverStation) {
+  auto gate = std::make_shared<Gate>();
+  const TestClock clock = MakeClock();
+  DriverStationReader reader{CallsThrough(gate), ClockThrough(clock), NoReport,
+                             kNeverAbandon};
+  reader.Start(0);
+  gate->SetSample(kA);
+  ASSERT_TRUE(gate->Step());
+  const ds::DriverStationData view = reader.Read(kT0, /*stale_us=*/0);
+  EXPECT_TRUE(view == kNoDriverStation) << Describe(view);
+  EXPECT_EQ(reader.refreshed_us(), 0u);
+}
+
+// SnapshotDriverStation clamps out-of-range finite joystick axes to [-1, 1]
+// and masks button bits past button_count so corrupted or stale HAL values
+// cannot emit unbounded setpoints or phantom button presses.
+// REQ-SAFE-10
+TEST(DriverStationReader,
+     SnapshotDriverStationClampsAxesAndMasksPhantomButtons) {
+  HAL_Initialize(500, 0);
+  struct ResetSim {
+    ~ResetSim() {
+      frc::sim::DriverStationSim::SetJoystickAxisCount(0, 0);
+      frc::sim::DriverStationSim::SetJoystickButtonCount(0, 0);
+      frc::sim::DriverStationSim::SetJoystickButtons(0, 0u);
+      frc::sim::DriverStationSim::NotifyNewData();
+    }
+  } reset_sim;
+
+  frc::sim::DriverStationSim::SetJoystickAxisCount(0, 2);
+  frc::sim::DriverStationSim::SetJoystickAxis(0, 0, 2.5);
+  frc::sim::DriverStationSim::SetJoystickAxis(0, 1, -3.25);
+  frc::sim::DriverStationSim::SetJoystickButtonCount(0, 3);
+  frc::sim::DriverStationSim::SetJoystickButtons(
+      0, (1u << 0) | (1u << 2) | (1u << 3) | (1u << 15) | (1u << 31));
+  frc::sim::DriverStationSim::NotifyNewData();
+
+  ds::DriverStationData snapshot{};
+  ds::SnapshotDriverStation(snapshot);
+  ASSERT_TRUE(snapshot.joysticks[0].connected);
+  ASSERT_EQ(snapshot.joysticks[0].axis_count, 2u);
+  EXPECT_FLOAT_EQ(snapshot.joysticks[0].axes[0], 1.0f);
+  EXPECT_FLOAT_EQ(snapshot.joysticks[0].axes[1], -1.0f);
+  EXPECT_EQ(snapshot.joysticks[0].button_count, 3u);
+  EXPECT_EQ(snapshot.joysticks[0].buttons, (1u << 0) | (1u << 2));
+}
+
 // SnapshotDriverStation sanitizes non-finite HAL axes/match_time and invalid
 // match types into safe finite defaults.
 // REQ-SAFE-10

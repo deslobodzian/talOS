@@ -85,7 +85,7 @@ function parseConfig(raw: unknown): FieldConfig {
       cameras: asBool(layersRaw.cameras, defaultConfig.layers.cameras),
       velocity: asBool(layersRaw.velocity, defaultConfig.layers.velocity)
     },
-    trailSeconds: Math.max(0.5, asNumber(obj.trailSeconds, defaultConfig.trailSeconds)),
+    trailSeconds: Math.min(3600, Math.max(0.5, asNumber(obj.trailSeconds, defaultConfig.trailSeconds))),
     follow: asBool(obj.follow, defaultConfig.follow)
   };
 }
@@ -116,25 +116,33 @@ function FieldPanel({config, setConfig}: PanelProps<FieldConfig>) {
   const recorded = useRecorded();
   const cursorNs = playback.cursor_ns;
 
+  const present = useMemo(() => new Set(dictionary.map(c => c.name)), [dictionary]);
   const poseTopic = recorded?.bounds.pose_topic;
   const estimate = useMemo(
       () => discoverEstimate(dictionary, poseTopic), [dictionary, poseTopic]);
   const cameras = useMemo(() => discoverCameras(dictionary), [dictionary]);
 
   const trailChannels = useMemo(
-      () => estimate ? [estimate.x, estimate.y, estimate.yaw] : [], [estimate]);
+      () => estimate ?
+          [estimate.x, estimate.y, estimate.yaw].filter(name => present.has(name)) :
+          [],
+      [estimate, present]);
   const trailSeries = useSeries(trailChannels, {seconds: config.trailSeconds});
 
-  const truthSeries = useSeries(
-      ['sim/state/pose/x_m', 'sim/state/pose/y_m', 'sim/state/pose/yaw_rad'],
-      {seconds: config.trailSeconds});
+  const truthChannels = useMemo(
+      () => ['sim/state/pose/x_m', 'sim/state/pose/y_m', 'sim/state/pose/yaw_rad']
+          .filter(name => present.has(name)),
+      [present]);
+  const truthSeries = useSeries(truthChannels, {seconds: config.trailSeconds});
 
-  const cameraChannels = useMemo(() => cameras.flatMap(cam => [
-    `${cam.name}/state/pose/x_m`, `${cam.name}/state/pose/y_m`,
-    `${cam.name}/state/pose/yaw_rad`, `${cam.name}/state/x_std_m`,
-    `${cam.name}/state/y_std_m`, `${cam.name}/state/valid`,
-    `${cam.name}/state/sample_time_ns`
-  ]), [cameras]);
+  const cameraChannels = useMemo(
+      () => cameras.flatMap(cam => [
+        `${cam.name}/state/pose/x_m`, `${cam.name}/state/pose/y_m`,
+        `${cam.name}/state/pose/yaw_rad`, `${cam.name}/state/x_std_m`,
+        `${cam.name}/state/y_std_m`, `${cam.name}/state/valid`,
+        `${cam.name}/state/sample_time_ns`
+      ]).filter(name => present.has(name)),
+      [cameras, present]);
   const cameraWindow = Math.max(2, config.trailSeconds);
   const cameraSeries = useSeries(cameraChannels, {seconds: cameraWindow});
 
@@ -188,9 +196,9 @@ function FieldPanel({config, setConfig}: PanelProps<FieldConfig>) {
       const px = column('pose/x_m'), py = column('pose/y_m'), yaw = column('pose/yaw_rad');
       const xs = column('x_std_m'), ys = column('y_std_m');
       const valid = column('valid'), sampleNs = column('sample_time_ns');
-      if (!px) return;
+      if (!px || !py || !valid) return;
       // Latest valid observation; older ones are at least as stale.
-      for (let j = px.length - 1; j >= 0; j--) {
+      for (let j = Math.min(px.length, py.length, valid.length) - 1; j >= 0; j--) {
         if (valid[j] !== 1) continue;
         if (!Number.isFinite(px[j]) || !Number.isFinite(py[j])) continue;
         const nowNs = Number(cursorNs);
@@ -287,7 +295,8 @@ function FieldPanel({config, setConfig}: PanelProps<FieldConfig>) {
   };
   const setTrailSeconds = (e: ChangeEvent<HTMLInputElement>) => {
     const v = Number(e.target.value);
-    if (Number.isFinite(v)) setConfig({...config, trailSeconds: Math.max(0.5, v)});
+    if (Number.isFinite(v))
+      setConfig({...config, trailSeconds: Math.min(3600, Math.max(0.5, v))});
   };
 
   const point = (p: PointM) => `${toPx(p.x)},${toPy(p.y)}`;
@@ -322,7 +331,7 @@ function FieldPanel({config, setConfig}: PanelProps<FieldConfig>) {
       </label>
       <label className="field-trail-seconds">
         Trail
-        <input type="number" min="0.5" step="0.5" value={config.trailSeconds}
+        <input type="number" min="0.5" max="3600" step="0.5" value={config.trailSeconds}
                onChange={setTrailSeconds}/>
         s
       </label>

@@ -16,12 +16,13 @@ for spatial. Include `talOS/geometry/lie.h`.
   Its rate stays `omega` for any `dt` (it never wraps past pi); only the linear
   part goes through `V(omega * dt)^-1`, which grows without bound near the
   nonzero multiples of 2 pi where no twist with that rate translates.
-  Nonpositive periods return the original velocities.
+  Nonpositive or non-finite periods return the original velocities.
 * `SO3::FromMatrixNormalized` projects noisy matrices onto proper rotations
-  using fixed-size SVD, including a determinant correction for reflections.
+  using fixed-size SVD, including a determinant correction for reflections
+  (non-finite inputs return `SO3::Identity()`).
   `RightJacobianInverse` is the closed-form inverse of the right Jacobian.
-* `SO3::Log` uses the skew part away from pi and reconstructs the axis by the
-  largest-diagonal method near pi.
+* `SO3::Log` uses the skew part away from pi and reconstructs the axis from the
+  symmetric part near pi.
 * `SE3::RightJacobianOfExp` is a 3rd-order BCH series (error O(|tau|^4)):
   accurate for small optimizer steps, not a large-angle formula. The
   rotation-only `SO3::RightJacobianOfExp` is exact closed form.

@@ -78,6 +78,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -230,25 +231,41 @@ inline AxisState StepAxis(const MotorModel& motor, const MechanismModel& mech,
                           const AxisState& state, double volts, bool powered,
                           double supply_v, double dt_s) {
   AxisState out = state;
-  if (dt_s <= 0.0) return out;
-  const double supply = std::max(0.0, supply_v);
-  const double effective_volts = std::clamp(volts, -supply, supply);
+  if (!std::isfinite(dt_s) || dt_s <= 0.0) return out;
+  const double supply =
+      std::isfinite(supply_v) && supply_v > 0.0 ? supply_v : 0.0;
+  const double effective_volts =
+      std::isfinite(volts) ? std::clamp(volts, -supply, supply) : 0.0;
   const double inertia_scale =
-      mech.inertia_kg_m2 > 0.0
+      std::isfinite(mech.inertia_kg_m2) && mech.inertia_kg_m2 > 0.0 &&
+              std::isfinite(motor.nominal_inertia_kg_m2) &&
+              motor.nominal_inertia_kg_m2 > 0.0
           ? mech.inertia_kg_m2 / motor.nominal_inertia_kg_m2
           : 1.0;
-  double tau = motor.time_constant_s * std::max(0.1, inertia_scale);
+  const double base_tau =
+      std::isfinite(motor.time_constant_s) && motor.time_constant_s > 0.0
+          ? motor.time_constant_s
+          : 0.02;
+  double tau = base_tau * std::max(0.1, inertia_scale);
   double target = 0.0;
   if (powered) {
-    const double bemf_slope = motor.free_speed_rps_at_12v > 0.0
+    const double bemf_slope = std::isfinite(motor.free_speed_rps_at_12v) &&
+                                      motor.free_speed_rps_at_12v > 0.0
                                   ? 12.0 / motor.free_speed_rps_at_12v
                                   : 0.0;
-    const double damping_v_per_rps =
-        bemf_slope + motor.viscous_friction_vs_per_rps;
+    const double viscous = std::isfinite(motor.viscous_friction_vs_per_rps) &&
+                                   motor.viscous_friction_vs_per_rps > 0.0
+                               ? motor.viscous_friction_vs_per_rps
+                               : 0.0;
+    const double damping_v_per_rps = bemf_slope + viscous;
     target =
         damping_v_per_rps > 0.0 ? effective_volts / damping_v_per_rps : 0.0;
+    const double static_v =
+        std::isfinite(motor.static_friction_v) && motor.static_friction_v > 0.0
+            ? motor.static_friction_v
+            : 0.0;
     if (std::abs(out.rotor_velocity_rps) < 1e-9 &&
-        std::abs(effective_volts) < motor.static_friction_v)
+        std::abs(effective_volts) < static_v)
       target = 0.0;
   } else {
     // Unpowered decay: brake shorts the motor (fast stop), coast lets the
@@ -284,31 +301,39 @@ inline double GravityVoltage(const Gains& gains, double mech_pos) {
 inline bool DriveVoltage(const MotorRequest& req, const MotorConfig& cfg,
                          double mech_pos, double mech_vel, double supply_v,
                          double& volts_out) {
+  if (req.mode == Mode::kNeutral || req.mode == Mode::kTorqueCurrent) {
+    return false;
+  }
+  if (!std::isfinite(req.demand) || !std::isfinite(req.feedforward_v) ||
+      !std::isfinite(mech_pos) || !std::isfinite(mech_vel) ||
+      !std::isfinite(supply_v)) {
+    return false;
+  }
   const double supply = std::max(0.0, supply_v);
-  const double ceiling =
-      std::min(cfg.max_voltage > 0.0 ? cfg.max_voltage : 12.0, supply);
-  const auto clamp = [](double v, double lim) {
-    return std::clamp(v, -lim, lim);
+  const double max_v = std::isfinite(cfg.max_voltage) && cfg.max_voltage > 0.0
+                           ? cfg.max_voltage
+                           : 12.0;
+  const double ceiling = std::min(max_v, supply);
+  const auto finish = [&](double raw) {
+    if (std::isnan(raw)) return false;
+    volts_out = std::clamp(raw, -ceiling, ceiling);
+    return true;
   };
   switch (req.mode) {
     case Mode::kNeutral:
+    case Mode::kTorqueCurrent:
       return false;
     case Mode::kDutyCycle:
-      volts_out = clamp(req.demand * supply, ceiling);
-      return true;
+      return finish(req.demand * supply);
     case Mode::kVoltage:
-      volts_out = clamp(req.demand, ceiling);
-      return true;
+      return finish(req.demand);
     case Mode::kVelocity: {
       const auto& gains = cfg.slots[req.slot < 3 ? req.slot : 0];
       const double error = req.demand - mech_vel;
-      volts_out =
-          clamp(req.feedforward_v + gains.p * error +
+      return finish(req.feedforward_v + gains.p * error +
                     gains.s * (req.demand >= 0.0 ? 1.0 : -1.0) *
                         (std::abs(req.demand) > 1e-9 ? 1.0 : 0.0) +
-                    gains.v * req.demand + GravityVoltage(gains, mech_pos),
-                ceiling);
-      return true;
+                    gains.v * req.demand + GravityVoltage(gains, mech_pos));
     }
     case Mode::kPosition:
     case Mode::kMotionMagic: {
@@ -318,14 +343,9 @@ inline bool DriveVoltage(const MotorRequest& req, const MotorConfig& cfg,
       const double error = cfg.continuous_wrap
                                ? std::remainder(req.demand - mech_pos, 1.0)
                                : (req.demand - mech_pos);
-      volts_out =
-          clamp(req.feedforward_v + gains.p * error - gains.d * mech_vel +
-                    GravityVoltage(gains, mech_pos),
-                ceiling);
-      return true;
+      return finish(req.feedforward_v + gains.p * error - gains.d * mech_vel +
+                    GravityVoltage(gains, mech_pos));
     }
-    case Mode::kTorqueCurrent:
-      return false;
   }
   return false;
 }
@@ -409,10 +429,24 @@ struct MechanismSpec {
 class PhysicsSimBackend final : public SimBackendBase {
  public:
   explicit PhysicsSimBackend(PhysicsOptions options = {}) : options_{options} {
+    if (!std::isfinite(options_.start_x_m)) options_.start_x_m = 0.0;
+    if (!std::isfinite(options_.start_y_m)) options_.start_y_m = 0.0;
+    if (!std::isfinite(options_.start_yaw_rad)) options_.start_yaw_rad = 0.0;
     if (!std::isfinite(options_.wheel_radius_m) ||
         options_.wheel_radius_m <= 0.0) {
       options_.wheel_radius_m = PhysicsOptions::kDefaultWheelRadiusM;
     }
+    if (!std::isfinite(options_.wheel_radius_error_frac)) {
+      options_.wheel_radius_error_frac = 0.0;
+    }
+    if (!std::isfinite(options_.wheel_slip_gain) ||
+        options_.wheel_slip_gain < 0.0) {
+      options_.wheel_slip_gain = 0.0;
+    }
+    if (!std::isfinite(options_.gyro_drift_radps)) {
+      options_.gyro_drift_radps = 0.0;
+    }
+    motor_to_sensor_.fill(-1);
   }
 
   const WorldState& truth() const { return truth_; }
@@ -536,6 +570,15 @@ class PhysicsSimBackend final : public SimBackendBase {
   // configuration never resets the plant's world.
   bool Configure(const Config& config) override {
     config_error_.reset();
+    if (config.motors.size() > kMaxMotors) {
+      config_error_ = ConfigError{
+          .device_name = "config",
+          .operation = "configure",
+          .message = "motor count " + std::to_string(config.motors.size()) +
+                     " exceeds kMaxMotors (" + std::to_string(kMaxMotors) +
+                     ")"};
+      return false;
+    }
     config_ = config;
     can_bus_count_ = CanBuses(config_).count;
     for (auto& m : config_.motors) {
@@ -554,6 +597,8 @@ class PhysicsSimBackend final : public SimBackendBase {
     commands_.fill(MotorRequest{});
     applied_volts_.fill(0.0);
     powered_.fill(false);
+    drives_.fill(PlantDrive{});
+    plant_amperes_.fill(0.0);
     frozen_.fill(false);
     held_.fill(MotorSample{});
     held_at_us_.fill(0);
@@ -591,7 +636,8 @@ class PhysicsSimBackend final : public SimBackendBase {
       held_[i].valid = true;
       if (m.feedback == Feedback::kRemoteCANcoder) {
         for (std::size_t s = 0; s < config.sensors.size(); ++s) {
-          if (config.sensors[s].id == m.feedback_sensor_id) {
+          if (config.sensors[s].id == m.feedback_sensor_id &&
+              config.sensors[s].kind == SensorKind::kCANcoder) {
             motor_to_sensor_[i] = static_cast<int>(s);
             break;
           }
@@ -603,6 +649,13 @@ class PhysicsSimBackend final : public SimBackendBase {
     return true;
   }
 
+  bool Apply(std::span<const MotorRequest> commands) override {
+    if (commands.size() > kMaxMotors) return false;
+    commands_.fill(MotorRequest{});
+    std::copy(commands.begin(), commands.end(), commands_.begin());
+    return true;
+  }
+
   // Without a plant, the models advance by the time since the last Read, at
   // most 50 ms. With one, by the plant time AdvancePlantTime steps, and every
   // motor and CAN sensor sample is as old as the plant lags the sample time;
@@ -610,17 +663,19 @@ class PhysicsSimBackend final : public SimBackendBase {
   bool Read(State& state) override {
     ReadSimulatedCanBus(state.health, can_bus_count_);
     double dt = 0.0;
-    int64_t delta = 0;
+    uint64_t delta_us = 0;
     if (previous_time_) {
-      delta = static_cast<int64_t>(state.sample_time_us - *previous_time_);
-      dt = delta > 0 ? static_cast<double>(delta) * 1e-6 : 0.0;
+      if (state.sample_time_us > *previous_time_) {
+        delta_us = state.sample_time_us - *previous_time_;
+      }
+      dt = static_cast<double>(delta_us) * 1e-6;
       if (dt > 0.05) dt = 0.05;
     }
     previous_time_ = state.sample_time_us;
     if (plant_ == nullptr) {
       StepModels(dt);
     } else {
-      AdvancePlantTime(std::max<int64_t>(delta, 0));
+      AdvancePlantTime(delta_us);
     }
     const uint32_t sample_age_us =
         plant_ != nullptr
@@ -664,7 +719,12 @@ class PhysicsSimBackend final : public SimBackendBase {
       // A bound motor's soft limits gate its output (SoftLimitBlocks); the
       // plant's joint is never moved.
       if (!owned_[i] && EnforceSoftLimits(m, out, i) && powered_[i]) {
-        applied_volts_[i] = LimitWindingVoltage(i, m, applied_volts_[i]);
+        if (commands_[i].mode == Mode::kTorqueCurrent && m.master_id == 0) {
+          applied_volts_[i] = LimitWindingVoltage(
+              i, m, TorqueCurrentVolts(i, m, commands_[i].demand));
+        } else {
+          applied_volts_[i] = LimitWindingVoltage(i, m, applied_volts_[i]);
+        }
         out.voltage = applied_volts_[i];
       }
       // After any limit stops the rotor: a motor held at it is stalled.
@@ -796,13 +856,15 @@ class PhysicsSimBackend final : public SimBackendBase {
   // to whole microseconds goes to AdvancePlantTime as a Read's interval does.
   void Step(double dt_s) {
     if (plant_ == nullptr) {
-      StepModels(dt_s);
+      if (!std::isfinite(dt_s) || dt_s < 0.0) return;
+      constexpr double kMaxManualStepS = 10.0;
+      StepModels(std::min(dt_s, kMaxManualStepS));
     } else {
       // Past the cap the time is dropped anyway; the bound keeps llround's
       // result in range.
       constexpr double kMaxStepS = 1e6;
       AdvancePlantTime(std::isfinite(dt_s) && dt_s > 0.0
-                           ? static_cast<int64_t>(
+                           ? static_cast<uint64_t>(
                                  std::llround(std::min(dt_s, kMaxStepS) * 1e6))
                            : 0);
     }
@@ -875,7 +937,8 @@ class PhysicsSimBackend final : public SimBackendBase {
     }
   }
   void SetSupplyVoltage(double volts) {
-    const double clamped = std::clamp(volts, 0.0, 16.0);
+    const double clamped =
+        std::isfinite(volts) ? std::clamp(volts, 0.0, 16.0) : 0.0;
     supply_voltage_override_ = clamped;
     supply_v_ = clamped;
     brownout_ = explicit_brownout_;
@@ -897,6 +960,8 @@ class PhysicsSimBackend final : public SimBackendBase {
     commands_.fill(MotorRequest{});
     applied_volts_.fill(0.0);
     powered_.fill(false);
+    drives_.fill(PlantDrive{});
+    plant_amperes_.fill(0.0);
     frozen_.fill(false);
     restoring_.fill(false);
     motor_connected_.fill(true);
@@ -1105,9 +1170,13 @@ class PhysicsSimBackend final : public SimBackendBase {
   // without teleporting or exceeding acceleration_rps2.
   double AdvanceProfile(Profile& p, const MotorConfig& cfg, double goal,
                         double dt) {
-    if (dt <= 0.0) return 0.0;
+    if (!std::isfinite(dt) || dt <= 0.0 || !std::isfinite(goal)) return 0.0;
     const double accel = cfg.acceleration_rps2;
     const double cruise = cfg.cruise_velocity_rps;
+    if (!std::isfinite(accel) || accel <= 0.0 || !std::isfinite(cruise) ||
+        cruise <= 0.0) {
+      return 0.0;
+    }
     const double previous_vel = p.profile_vel_rps;
     const double stop_pos =
         p.profile_pos_rot +
@@ -1232,7 +1301,8 @@ class PhysicsSimBackend final : public SimBackendBase {
   double FeedbackOffset(std::size_t i) const {
     const int sensor = motor_to_sensor_[i];
     if (sensor < 0) return 0.0;
-    return config_.sensors[sensor].offset_rot / SensorToMechanism(i);
+    const double offset = config_.sensors[sensor].offset_rot;
+    return std::isfinite(offset) ? offset / SensorToMechanism(i) : 0.0;
   }
 
   double MechPosition(std::size_t i) const {
@@ -1282,7 +1352,9 @@ class PhysicsSimBackend final : public SimBackendBase {
     const uint32_t step_us = plant_ != nullptr ? plant_->step_us() : 0;
     if (step_us == 0) return 0;
     const uint64_t period_us = config_.period_us;
-    return static_cast<uint32_t>(2 * ((period_us + step_us - 1) / step_us));
+    const uint64_t raw = 2 * ((period_us + step_us - 1) / step_us);
+    return static_cast<uint32_t>(
+        std::min<uint64_t>(raw, std::numeric_limits<int>::max()));
   }
 
   // Binds plant_ to config_ (Configure's last step): the motors it
@@ -1433,28 +1505,42 @@ class PhysicsSimBackend final : public SimBackendBase {
     }
   }
 
-  // Adds `delta_us` (>= 0) of sample time to the plant's clock and advances
+  // Adds `delta_us` of sample time to the plant's clock and advances
   // every model by the whole steps it rounds to (PlantTime).
-  void AdvancePlantTime(int64_t delta_us) {
+  void AdvancePlantTime(uint64_t delta_us) {
     // Not stepped while unbound (no Configure yet, or a refused one) or
     // after it failed.
     if (!plant_bound_ || plant_failed_) return;
-    const int64_t step_us = plant_->step_us();
-    const int64_t half_us = step_us / 2;
-    plant_acc_us_ += delta_us;  // plant_acc_us_ + half_us >= 0 here
-    const int64_t steps =
-        std::min<int64_t>((plant_acc_us_ + half_us) / step_us,
-                          static_cast<int64_t>(plant_time_.max_steps));
-    plant_acc_us_ -= steps * step_us;
-    if (plant_acc_us_ >= half_us) {  // time beyond the cap
-      const int64_t dropped = (plant_acc_us_ + half_us) / step_us;
-      plant_time_.dropped_us += static_cast<uint64_t>(dropped * step_us);
+    const uint64_t step_us = plant_->step_us();
+    const int64_t half_us = static_cast<int64_t>(step_us / 2);
+    // Shift plant_acc_us_ from [-half_us, half_us) into [0, step_us) so
+    // arbitrary delta_us values never trigger signed integer overflow.
+    const uint64_t acc = static_cast<uint64_t>(plant_acc_us_ + half_us);
+    const uint64_t q_delta = delta_us / step_us;
+    const uint64_t r_delta = delta_us % step_us;
+    const uint64_t sum_r = acc + r_delta;
+    const uint64_t total_steps = q_delta + sum_r / step_us;
+    const uint64_t steps =
+        std::min<uint64_t>(total_steps, plant_time_.max_steps);
+    const uint64_t dropped = total_steps - steps;
+    const auto add_sat = [](uint64_t a, uint64_t b) {
+      const uint64_t max_u64 = std::numeric_limits<uint64_t>::max();
+      return b > max_u64 - a ? max_u64 : a + b;
+    };
+    const auto mul_sat = [](uint64_t a, uint64_t b) {
+      const uint64_t max_u64 = std::numeric_limits<uint64_t>::max();
+      return b != 0 && a > max_u64 / b ? max_u64 : a * b;
+    };
+    if (dropped > 0) {
+      plant_time_.dropped_us =
+          add_sat(plant_time_.dropped_us, mul_sat(dropped, step_us));
       ++plant_time_.dropped_ticks;
-      plant_acc_us_ -= dropped * step_us;
     }
-    plant_time_.stepped_us += static_cast<uint64_t>(steps * step_us);
+    const uint64_t stepped_delta_us = mul_sat(steps, step_us);
+    plant_time_.stepped_us = add_sat(plant_time_.stepped_us, stepped_delta_us);
+    plant_acc_us_ = static_cast<int64_t>(sum_r % step_us) - half_us;
     plant_time_.lag_us = static_cast<int32_t>(plant_acc_us_);
-    StepModels(static_cast<double>(steps * step_us) * 1e-6,
+    StepModels(static_cast<double>(stepped_delta_us) * 1e-6,
                static_cast<int>(steps));
   }
 
@@ -1512,8 +1598,7 @@ class PhysicsSimBackend final : public SimBackendBase {
     const double amperes =
         std::clamp((d.volts - (d.back_emf ? ke_rad * omega : 0.0)) / r_ohm,
                    d.min_torque_nm / kt, d.max_torque_nm / kt);
-    const double ceiling = std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0,
-                                    std::max(0.0, supply_v));
+    const double ceiling = VoltageCeiling(m, supply_v);
     return {amperes,
             std::clamp(r_ohm * amperes + ke_rad * omega, -ceiling, ceiling)};
   }
@@ -1571,11 +1656,13 @@ class PhysicsSimBackend final : public SimBackendBase {
     const double dir = Direction(i);
     const double rps = axes_[i].rotor_velocity_rps;
     const double raw_volts = raw[i];
-    const double supply = std::max(0.0, supply_v);
-    const double ceiling =
-        std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0, supply);
+    const double supply =
+        std::isfinite(supply_v) && supply_v > 0.0 ? supply_v : 0.0;
+    const double ceiling = VoltageCeiling(m, supply);
     const double stator_nm =
-        m.stator_limit_a > 0.0 ? kt * m.stator_limit_a : kInf;
+        std::isfinite(m.stator_limit_a) && m.stator_limit_a > 0.0
+            ? kt * m.stator_limit_a
+            : kInf;
     bool supply_limited = false;
     const double limited_v =
         LimitWindingVoltageAt(i, m, raw_volts, supply, rps, &supply_limited);
@@ -1610,8 +1697,10 @@ class PhysicsSimBackend final : public SimBackendBase {
                                : std::clamp(dir * raw_volts, -ceiling, ceiling);
       return {volts, true, -stator_nm, stator_nm};
     }
-    const double peak_a =
-        std::max(0.0, std::min(m.max_torque_current_a, m.stator_limit_a));
+    if (!std::isfinite(commands_[i].demand)) {
+      return {0.0, m.brake, -kInf, kInf};
+    }
+    const double peak_a = PeakTorqueCurrent(m);
     const double amperes =
         dir * std::clamp(commands_[i].demand, -peak_a, peak_a);
     const double demand_nm = kt * amperes;
@@ -1643,7 +1732,10 @@ class PhysicsSimBackend final : public SimBackendBase {
   // where it is. Analytic motors are clamped instead (EnforceSoftLimits).
   bool SoftLimitBlocks(std::size_t i, double volts) const {
     const auto& m = config_.motors[i];
-    if (!owned_[i] || !m.soft_limits) return false;
+    if (!owned_[i] || !m.soft_limits || !std::isfinite(m.reverse_limit_rot) ||
+        !std::isfinite(m.forward_limit_rot)) {
+      return false;
+    }
     const double output =
         commands_[i].mode == Mode::kTorqueCurrent ? commands_[i].demand : volts;
     const double lo = std::min(m.reverse_limit_rot, m.forward_limit_rot);
@@ -1746,7 +1838,10 @@ class PhysicsSimBackend final : public SimBackendBase {
 
   bool EnforceSoftLimits(const MotorConfig& m, MotorSample& out,
                          std::size_t i) {
-    if (!m.soft_limits) return false;
+    if (!m.soft_limits || !std::isfinite(m.reverse_limit_rot) ||
+        !std::isfinite(m.forward_limit_rot)) {
+      return false;
+    }
     const double lo = std::min(m.reverse_limit_rot, m.forward_limit_rot);
     const double hi = std::max(m.reverse_limit_rot, m.forward_limit_rot);
     const double gear = Gear(i);
@@ -1767,12 +1862,15 @@ class PhysicsSimBackend final : public SimBackendBase {
   }
 
   // Output toward an asserted, enabled limit switch is held neutral; volts
-  // are in the motor's configured positive (forward) direction.
+  // are in the motor's configured positive (forward) direction (torque current
+  // is judged by its demand's sign, matching SoftLimitBlocks).
   bool LimitSwitchBlocks(std::size_t i, double volts) const {
     const auto& m = config_.motors[i];
-    return (volts > 0.0 && forward_pressed_[i] &&
+    const double output =
+        commands_[i].mode == Mode::kTorqueCurrent ? commands_[i].demand : volts;
+    return (output > 0.0 && forward_pressed_[i] &&
             m.forward_limit_switch != LimitSwitch::kDisabled) ||
-           (volts < 0.0 && reverse_pressed_[i] &&
+           (output < 0.0 && reverse_pressed_[i] &&
             m.reverse_limit_switch != LimitSwitch::kDisabled);
   }
 
@@ -1786,14 +1884,21 @@ class PhysicsSimBackend final : public SimBackendBase {
 
   // Motor i's last connected sample as PhoenixBackend reads a device whose
   // frames stopped then: its ages grow from it, its FaultField's limit and
-  // limiter bits clear at kFaultFieldMaxAgeUs (its fault bits stay; none is
-  // modelled here) and its temperature reads 0 at kTemperatureMaxAgeUs.
+  // limiter bits clear and its effort fields (voltage, stator current, supply
+  // current) zero at DiagnosticMaxAgeUs(config_.status_hz) (its fault bits
+  // stay; none is modelled here), and its temperature reads 0 at
+  // kTemperatureMaxAgeUs.
   MotorSample HeldSample(std::size_t i, uint64_t now_us) const {
     MotorSample out = held_[i];
     const uint32_t age_us = AgeUs(now_us, held_at_us_[i]);
     out.position_age_us = age_us;
     out.velocity_age_us = age_us;
-    if (age_us >= kFaultFieldMaxAgeUs) out.fault_flags &= ~kMotorNotFaultFlags;
+    if (age_us >= DiagnosticMaxAgeUs(config_.status_hz)) {
+      out.fault_flags &= ~kMotorNotFaultFlags;
+      out.voltage = 0.0;
+      out.stator_current_a = 0.0;
+      out.supply_current_a = 0.0;
+    }
     if (age_us >= kTemperatureMaxAgeUs) out.temperature_c = 0;
     return out;
   }
@@ -1854,6 +1959,26 @@ class PhysicsSimBackend final : public SimBackendBase {
     return chassis_dynamics_.mass_kg > 0.0 && !modules_.empty();
   }
 
+  static double VoltageCeiling(const MotorConfig& m, double supply_v) {
+    const double supply =
+        std::isfinite(supply_v) && supply_v > 0.0 ? supply_v : 0.0;
+    const double max_v = std::isfinite(m.max_voltage) && m.max_voltage > 0.0
+                             ? m.max_voltage
+                             : 12.0;
+    return std::min(max_v, supply);
+  }
+
+  static double PeakTorqueCurrent(const MotorConfig& m) {
+    if (!std::isfinite(m.max_torque_current_a) ||
+        m.max_torque_current_a <= 0.0) {
+      return 0.0;
+    }
+    if (std::isfinite(m.stator_limit_a) && m.stator_limit_a > 0.0) {
+      return std::min(m.max_torque_current_a, m.stator_limit_a);
+    }
+    return m.max_torque_current_a;
+  }
+
   // Effective winding voltage in motor i's configured direction at an explicit
   // bus voltage and physical rotor velocity. `supply_limited`, when given, is
   // set when supply_limit_a bound (after the stator band).
@@ -1861,21 +1986,23 @@ class PhysicsSimBackend final : public SimBackendBase {
                                double volts, double supply_v,
                                double rotor_velocity_rps,
                                bool* supply_limited = nullptr) const {
+    if (!std::isfinite(volts) || !std::isfinite(rotor_velocity_rps)) return 0.0;
     const MotorModel motor = MotorModelFor(m.motor_type.value);
     const double dir = Direction(i);
-    const double supply = std::max(0.0, supply_v);
-    const double ceiling =
-        std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0, supply);
+    const double supply =
+        std::isfinite(supply_v) && supply_v > 0.0 ? supply_v : 0.0;
+    const double ceiling = VoltageCeiling(m, supply);
     double rotor_volts = std::clamp(dir * volts, -ceiling, ceiling);
     const double back_emf_v = motor.back_emf_v_per_rps() * rotor_velocity_rps;
     const double resistance_ohm = motor.resistance_ohm();
-    if (m.stator_limit_a > 0.0) {
+    if (std::isfinite(m.stator_limit_a) && m.stator_limit_a > 0.0) {
       const double max_drop_v = m.stator_limit_a * resistance_ohm;
       rotor_volts = std::clamp(rotor_volts, back_emf_v - max_drop_v,
                                back_emf_v + max_drop_v);
       rotor_volts = std::clamp(rotor_volts, -ceiling, ceiling);
     }
-    if (m.supply_limit_a > 0.0 && supply > 0.0) {
+    if (std::isfinite(m.supply_limit_a) && m.supply_limit_a > 0.0 &&
+        supply > 0.0) {
       const double max_power_drop = m.supply_limit_a * supply * resistance_ohm;
       const double draw_drop = rotor_volts * (rotor_volts - back_emf_v);
       if (draw_drop > max_power_drop) {
@@ -1966,14 +2093,14 @@ class PhysicsSimBackend final : public SimBackendBase {
   double TorqueCurrentVoltsAt(std::size_t i, const MotorConfig& m,
                               double amperes, double supply_v,
                               double rotor_velocity_rps) const {
+    if (!std::isfinite(amperes) || !std::isfinite(rotor_velocity_rps)) {
+      return 0.0;
+    }
     const MotorModel motor = MotorModelFor(m.motor_type.value);
-    const double peak_a =
-        std::max(0.0, std::min(m.max_torque_current_a, m.stator_limit_a));
+    const double peak_a = PeakTorqueCurrent(m);
     const double current_a = std::clamp(amperes, -peak_a, peak_a);
     const double back_emf_v = motor.back_emf_v_per_rps() * rotor_velocity_rps;
-    const double supply = std::max(0.0, supply_v);
-    const double ceiling =
-        std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0, supply);
+    const double ceiling = VoltageCeiling(m, supply_v);
     return std::clamp(
         current_a * motor.resistance_ohm() + Direction(i) * back_emf_v,
         -ceiling, ceiling);
@@ -2029,24 +2156,26 @@ class PhysicsSimBackend final : public SimBackendBase {
         const auto& gains = m.slots[req.slot < 3 ? req.slot : 0];
         const double velocity = profile.profile_vel_rps;
         const double sign = velocity > 0.0 ? 1.0 : velocity < 0.0 ? -1.0 : 0.0;
-        const double ceiling =
-            std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0, supply);
+        const double ceiling = VoltageCeiling(m, supply);
         const double pos_error =
             m.continuous_wrap
                 ? std::remainder(profile.profile_pos_rot - mech_pos, 1.0)
                 : (profile.profile_pos_rot - mech_pos);
-        volts =
-            std::clamp(req.feedforward_v + gains.p * pos_error +
-                           gains.v * velocity + gains.a * profile_accel[i] +
-                           gains.s * sign + gains.d * (velocity - mech_vel) +
-                           GravityVoltage(gains, mech_pos),
-                       -ceiling, ceiling);
-        want_power = FeedbackValid(i);
+        const double raw_v = req.feedforward_v + gains.p * pos_error +
+                             gains.v * velocity + gains.a * profile_accel[i] +
+                             gains.s * sign + gains.d * (velocity - mech_vel) +
+                             GravityVoltage(gains, mech_pos);
+        if (!std::isnan(raw_v)) {
+          volts = std::clamp(raw_v, -ceiling, ceiling);
+          want_power = FeedbackValid(i);
+        }
       } else if (req.mode == Mode::kTorqueCurrent) {
-        // Powered at any demand: 0 A is zero torque, not neutral.
-        volts = TorqueCurrentVoltsAt(i, m, req.demand, supply,
-                                     axes_[i].rotor_velocity_rps);
-        want_power = FeedbackValid(i);
+        if (std::isfinite(req.demand)) {
+          // Powered at any finite demand: 0 A is zero torque, not neutral.
+          volts = TorqueCurrentVoltsAt(i, m, req.demand, supply,
+                                       axes_[i].rotor_velocity_rps);
+          want_power = FeedbackValid(i);
+        }
       } else {
         want_power = FeedbackValid(i) &&
                      DriveVoltage(req, m, mech_pos, mech_vel, supply, volts);
@@ -2159,6 +2288,7 @@ class PhysicsSimBackend final : public SimBackendBase {
     const BoundMechanism& spec = bound_mechanisms_[root];
     const double gear = Gear(root);
     const double j_rotor = spec.inertia_kg_m2 / (gear * gear);
+    if (!std::isfinite(j_rotor) || j_rotor <= 0.0) return;
     const double b_ext = spec.viscous_damping_nm_per_radps / (gear * gear);
     const double tau_static = spec.static_friction_nm / gear;
 
@@ -2247,8 +2377,7 @@ class PhysicsSimBackend final : public SimBackendBase {
             continue;
           }
 
-          const double ceiling =
-              std::min(mk.max_voltage > 0.0 ? mk.max_voltage : 12.0, supply);
+          const double ceiling = VoltageCeiling(mk, supply);
           const double dir_k = Direction(k);
           const bool is_tc =
               (k == root && commands_[k].mode == Mode::kTorqueCurrent);
@@ -2270,10 +2399,11 @@ class PhysicsSimBackend final : public SimBackendBase {
               std::clamp(dir_k * cmd_v_cfg, -ceiling, ceiling);
           bool current_limited = false;
           if (is_tc) {
-            const double peak_a = std::max(
-                0.0, std::min(mk.max_torque_current_a, mk.stator_limit_a));
+            const double peak_a = PeakTorqueCurrent(mk);
             const double i_req =
-                std::clamp(commands_[k].demand, -peak_a, peak_a);
+                std::isfinite(commands_[k].demand)
+                    ? std::clamp(commands_[k].demand, -peak_a, peak_a)
+                    : 0.0;
             if (std::abs(i_req) > 1e-12) {
               v_ceil_rotor = dir_k * (i_req > 0.0 ? ceiling : -ceiling);
               current_limited = std::abs(v_lim_rotor - v_ceil_rotor) > 1e-9;
@@ -2442,7 +2572,7 @@ class PhysicsSimBackend final : public SimBackendBase {
   // the plant integrates the bound motors and its chassis in place of the
   // models here.
   void StepModels(double dt_s, int plant_steps = 0) {
-    if (dt_s < 0.0) return;
+    if (!std::isfinite(dt_s) || dt_s < 0.0) return;
 
     // Advance Motion Magic profiles once per tick before battery sag iteration
     // (profile kinematics are independent of supply voltage).
@@ -2452,8 +2582,10 @@ class PhysicsSimBackend final : public SimBackendBase {
       const auto& m = config_.motors[i];
       if (m.master_id != 0) continue;
       const auto& req = commands_[i];
-      if (req.mode == Mode::kMotionMagic && m.cruise_velocity_rps > 0.0 &&
-          m.acceleration_rps2 > 0.0) {
+      if (req.mode == Mode::kMotionMagic && std::isfinite(req.demand) &&
+          std::isfinite(req.feedforward_v) &&
+          std::isfinite(m.cruise_velocity_rps) && m.cruise_velocity_rps > 0.0 &&
+          std::isfinite(m.acceleration_rps2) && m.acceleration_rps2 > 0.0) {
         const double gear = Gear(i);
         const double mech_pos = MechPosition(i);
         const double mech_vel =
@@ -2590,7 +2722,7 @@ class PhysicsSimBackend final : public SimBackendBase {
   // Coupled 2D rigid-body swerve chassis + wheel friction-circle dynamics.
   void StepChassisDynamic(const std::array<double, kMaxMotors>& raw_volts,
                           double dt_s) {
-    if (dt_s <= 0.0 || modules_.empty()) return;
+    if (!std::isfinite(dt_s) || dt_s <= 0.0 || modules_.empty()) return;
     constexpr double kGravityMps2 = 9.80665;
     constexpr double kDefaultWheelInertiaKgM2 = 0.004;
     constexpr int kSubSteps = 10;
@@ -2690,8 +2822,7 @@ class PhysicsSimBackend final : public SimBackendBase {
         double w_ceil_wheel = std::numeric_limits<double>::infinity();
 
         if (powered_[d]) {
-          const double ceiling =
-              std::min(md.max_voltage > 0.0 ? md.max_voltage : 12.0, supply);
+          const double ceiling = VoltageCeiling(md, supply);
           const bool is_tc = (commands_[d].mode == Mode::kTorqueCurrent);
           const double cmd_v =
               is_tc ? TorqueCurrentVoltsAt(d, md, commands_[d].demand, supply,
@@ -2706,10 +2837,11 @@ class PhysicsSimBackend final : public SimBackendBase {
 
           double v_ceil_rotor = std::clamp(dir_d * cmd_v, -ceiling, ceiling);
           if (is_tc) {
-            const double peak_a = std::max(
-                0.0, std::min(md.max_torque_current_a, md.stator_limit_a));
+            const double peak_a = PeakTorqueCurrent(md);
             const double i_req =
-                std::clamp(commands_[d].demand, -peak_a, peak_a);
+                std::isfinite(commands_[d].demand)
+                    ? std::clamp(commands_[d].demand, -peak_a, peak_a)
+                    : 0.0;
             v_ceil_rotor = dir_d * (i_req > 0.0   ? ceiling
                                     : i_req < 0.0 ? -ceiling
                                                   : 0.0);
@@ -2904,7 +3036,7 @@ class PhysicsSimBackend final : public SimBackendBase {
   }
 
   void StepChassis(double dt_s) {
-    if (dt_s <= 0.0) return;
+    if (!std::isfinite(dt_s) || dt_s <= 0.0) return;
     double sum_x = 0.0;
     double sum_y = 0.0;
     double sum_vx = 0.0;
@@ -2919,8 +3051,9 @@ class PhysicsSimBackend final : public SimBackendBase {
       const double acceleration =
           (surface_speed - module.previous_surface_speed_mps) / dt_s;
       module.previous_surface_speed_mps = surface_speed;
-      const double slip = std::min(
-          1.0, options_.wheel_slip_gain * std::abs(acceleration) / 9.80665);
+      const double slip = std::clamp(
+          options_.wheel_slip_gain * std::abs(acceleration) / 9.80665, 0.0,
+          1.0);
       const double speed = surface_speed * (1.0 - slip);
       const double angle = MechPosition(module.steer) * kTau;
       const double vx = speed * std::cos(angle);

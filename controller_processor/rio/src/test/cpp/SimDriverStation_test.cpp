@@ -312,6 +312,64 @@ TEST_F(SimDriverStationTest, NamesTheConfiguredAlliance) {
   ::unsetenv("TALOS_SIM_DS");
 }
 
+// Malformed TALOS_SIM_DS (e.g. "false" or "") must throw std::invalid_argument
+// rather than silently enabling the simulated robot, and malformed or negative
+// TALOS_SIM_DS_DISABLE_AFTER_MS must be refused instead of parsed via atoi().
+// REQ-DEV-06
+TEST_F(SimDriverStationTest,
+       SettingsFromEnvironmentRejectsMalformedModeAndDisableAfter) {
+  struct ResetSimEnv {
+    ~ResetSimEnv() {
+      ::unsetenv("TALOS_SIM_DS");
+      ::unsetenv("TALOS_SIM_DS_SCHEDULE");
+      ::unsetenv("TALOS_SIM_DS_DISABLE_AFTER_MS");
+      ::unsetenv("TALOS_SIM_DS_ALLIANCE");
+      ::unsetenv("TALOS_SIM_JOYSTICK_SCHEDULE");
+    }
+  } reset_env;
+
+  ::unsetenv("TALOS_SIM_DS_SCHEDULE");
+  ::unsetenv("TALOS_SIM_DS_DISABLE_AFTER_MS");
+  ::unsetenv("TALOS_SIM_DS_ALLIANCE");
+  ::unsetenv("TALOS_SIM_JOYSTICK_SCHEDULE");
+
+  ::setenv("TALOS_SIM_DS", "1", 1);
+  const auto enabled = SimDriverStation::SettingsFromEnvironment();
+  EXPECT_TRUE(enabled.active);
+  EXPECT_TRUE(enabled.enabled);
+  EXPECT_FALSE(enabled.enable_when_configured);
+
+  ::setenv("TALOS_SIM_DS", "0", 1);
+  const auto disabled = SimDriverStation::SettingsFromEnvironment();
+  EXPECT_TRUE(disabled.active);
+  EXPECT_FALSE(disabled.enabled);
+
+  ::setenv("TALOS_SIM_DS", "auto", 1);
+  ::setenv("TALOS_SIM_DS_DISABLE_AFTER_MS", "1500", 1);
+  const auto automatic = SimDriverStation::SettingsFromEnvironment();
+  EXPECT_TRUE(automatic.active);
+  EXPECT_TRUE(automatic.enable_when_configured);
+  ASSERT_TRUE(automatic.disable_after.has_value());
+  EXPECT_EQ(*automatic.disable_after, std::chrono::milliseconds{1500});
+
+  ::unsetenv("TALOS_SIM_DS_DISABLE_AFTER_MS");
+  for (const char* bad_mode : {"", "false", "true", "2", "AUTO"}) {
+    ::setenv("TALOS_SIM_DS", bad_mode, 1);
+    EXPECT_THROW(SimDriverStation::SettingsFromEnvironment(),
+                 std::invalid_argument)
+        << "mode='" << bad_mode << "'";
+  }
+
+  ::setenv("TALOS_SIM_DS", "1", 1);
+  for (const char* bad_after :
+       {"", "-1", "+10", " 10", "abc", "10ms", "99999999999999999999"}) {
+    ::setenv("TALOS_SIM_DS_DISABLE_AFTER_MS", bad_after, 1);
+    EXPECT_THROW(SimDriverStation::SettingsFromEnvironment(),
+                 std::invalid_argument)
+        << "disable_after='" << bad_after << "'";
+  }
+}
+
 }  // namespace
 
 #endif  // __FRC_ROBORIO__

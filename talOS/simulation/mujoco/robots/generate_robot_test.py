@@ -110,6 +110,39 @@ class RefusalTest(unittest.TestCase):
          _set(["robot", "mass_kg"], 5.0), "robot.mass_kg"),
         ("a welded root with swerve", "swerve_robot",
          _set(["robot", "root"], "welded"), "swerve"),
+        ("hood start at exit end", "shooter_rig",
+         _set(["flywheel", "hood_start_deg"], 30.0),
+         "flywheel.hood_start_deg"),
+        ("hood start past exit end", "shooter_rig",
+         _set(["flywheel", "hood_start_deg"], 45.0),
+         "flywheel.hood_start_deg"),
+        ("hopper wall below floor front", "shooter_rig",
+         lambda p: p["hopper"].update(
+             floor_front_m=0.80, floor_slope_deg=40.0, wall_top_m=0.70),
+         "hopper.wall_top_m"),
+        ("belly clearance at chassis box top", "shooter_rig",
+         _set(["frame", "belly_clearance_m"], 0.30),
+         "frame.belly_clearance_m"),
+        ("non-finite mass", "shooter_rig",
+         _set(["robot", "mass_kg"], math.nan), "robot.mass_kg"),
+        ("negative motor gear", "shooter_rig",
+         _set(["motors", "flywheel", "gear"], -1.0), "motors.flywheel.gear"),
+        ("rotor armature overflow", "shooter_rig",
+         _set(["motors", "flywheel", "gear"], 1e200), "motors.flywheel"),
+        ("preload underground below hopper floor", "shooter_rig",
+         _set(["preload", "positions_m", 0], [0.05, 0.0, -0.5]),
+         "preload.positions_m[0]"),
+        ("XML non-character in name", "shooter_rig",
+         _set(["beam_breaks", 0, "name"], "beam\ufffe"),
+         "beam_breaks[0].name"),
+        ("hopper too narrow for feeder roller", "shooter_rig",
+         lambda p: (
+             p["game_piece"].update(radius_m=0.002),
+             p["bumpers"].update(bottom_m=0.001),
+             p["hopper"].update(width_m=0.01),
+             p["feeder"].update(compression_m=0.001),
+             p["flywheel"].update(compression_m=0.001),
+         ), "hopper.width_m"),
     ]
 
     # REQ-DEV-41: a parameter file the generator cannot honour is refused,
@@ -140,6 +173,47 @@ class NameTest(unittest.TestCase):
             ["shooter-Left &1", "roller"])
         self.assertIn("intakeBeam",
                       [r.get("name") for r in model.iter("rangefinder")])
+
+    def test_source_name_with_comment_metacharacters_emits_valid_xml(self):
+        params = copy.deepcopy(example("shooter_rig"))
+        text = generate_robot.generate(params, "robot--v2-->evil\n.toml")
+        header, body = text.split("\n", 1)
+        self.assertTrue(header.startswith("<!-- "))
+        self.assertTrue(header.endswith(" -->"))
+        self.assertNotIn("--", header[4:-3])
+        model = ET.fromstring(text)
+        self.assertEqual(model.tag, "mujoco")
+        self.assertEqual(ET.fromstring(body).tag, "mujoco")
+
+    def test_tiny_positives_and_huge_beam_direction_stay_positive_finite(self):
+        params = copy.deepcopy(example("shooter_rig"))
+        params["flywheel"]["efficiency"] = 1e-13
+        params["beam_breaks"][0]["direction"] = [1.5e308, 1.5e308, 0.0]
+        params["beam_breaks"][0]["cutoff_m"] = 1e-13
+        model = ET.fromstring(generate_robot.generate(params, "x.toml"))
+        numerics = {n.get("name"): n.get("data")
+                    for n in model.iter("numeric")}
+        efficiency, _ = map(float, numerics["flywheel_shooter"].split())
+        self.assertGreater(efficiency, 0.0)
+        ranges = {r.get("name"): float(r.get("cutoff"))
+                  for r in model.iter("rangefinder")}
+        self.assertGreater(ranges["intake_beam"], 0.0)
+        sites = {s.get("name"): s for s in model.iter("site")}
+        zaxis = tuple(map(float, sites["intake_beam"].get("zaxis").split()))
+        self.assertAlmostEqual(math.hypot(*zaxis), 1.0, places=5)
+
+        tiny_piece = copy.deepcopy(example("shooter_rig"))
+        tiny_piece.pop("preload", None)
+        tiny_piece["game_piece"]["radius_m"] = 1e-13
+        tiny_piece["bumpers"]["bottom_m"] = 0.0
+        tiny_piece["feeder"]["compression_m"] = 0.0
+        tiny_piece["flywheel"]["compression_m"] = 0.0
+        tiny_model = ET.fromstring(generate_robot.generate(tiny_piece, "y.toml"))
+        tiny_sites = {s.get("name"): s for s in tiny_model.iter("site")}
+        inlet_half = tuple(
+            map(float, tiny_sites["flywheel_inlet"].get("size").split())
+        )
+        self.assertTrue(all(v > 0.0 for v in inlet_half), inlet_half)
 
 
 class ContractTest(unittest.TestCase):
@@ -227,6 +301,22 @@ class OutputTest(unittest.TestCase):
                                       "robot.xml")])
         self.assertEqual(status, 1)
         self.assertEqual(len(err.getvalue().splitlines()), 1)
+
+    def test_check_reports_non_utf8_model_as_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parameters = os.path.join(tmp, "robot_params.toml")
+            model = os.path.join(tmp, "robot.xml")
+            shutil.copyfile(
+                os.path.join(EXAMPLES, "shooter_rig.toml"), parameters)
+            with open(model, "wb") as f:
+                f.write(b"\xff\xfe\x00not-utf8")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                status = generate_robot.main([
+                    "--check", "--parameters", parameters, "--out", model])
+            self.assertEqual(status, 1)
+            self.assertIn("UTF-8", err.getvalue())
+            self.assertIn("generate_robot -- --parameters", err.getvalue())
 
 
 if __name__ == "__main__":

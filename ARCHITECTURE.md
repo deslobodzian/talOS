@@ -208,7 +208,7 @@ for that instant. A shorter gap, such as a late or missed tick, keeps its
 last demand. Whatever the bridge does, the RoboRIO neutralizes it within
 `command_timeout_us` of the State its last request was built from (plus
 the RoboRIO loop's lateness; if that loop stalls, its
-[watchdog](talOS/hardware/README.md) acts two loop periods and one 5 ms
+[watchdog](talOS/hardware/README.md#roborio) acts two loop periods and one 5 ms
 poll later), but by invalidating every output: the merged command carries the oldest observation
 of any owner still merged. Because an actuator owner's `period_us` is at most
 `command_timeout_us / 4` (below), its owner timeout is half the timeout, so
@@ -322,7 +322,7 @@ drain at the publication's instant.
 Off-simulation the loop thread runs realtime, best effort, in one of three
 tiers the process picks itself: the bridge above control nodes (a node whose
 own subsystem owns a motor, digital or PWM output, or that writes a target
-lane) above observers (every other node). Linux gives each tier its own
+lane) above observers (every other node, including `studio_bridge`). Linux gives each tier its own
 `SCHED_FIFO` priority below PREEMPT_RT's interrupt threads; macOS runs the
 bridge and control nodes under the Mach time-constraint policy, which has no
 priority among them, and observers timeshare below it. The loop's
@@ -330,8 +330,8 @@ shared-memory rings and stack are prefaulted and locked; Linux also locks
 all other memory (`mlockall`), while macOS only prefaults the talOS code
 (`talOS/process`; the priorities, what is locked on each OS and
 `TALOS_REALTIME`'s override are in the node development guide's realtime
-scheduling paragraph). Helper threads, such as camera capture
-and AprilTag detection, run below every loop thread
+scheduling paragraph). Helper threads, such as camera capture, AprilTag
+detection and registry reporting, run below every loop thread
 (`ConfigureBackgroundThread`).
 
 Messages become visible when the consumer drains its topics, but `age()` and
@@ -418,6 +418,8 @@ configuration/robot.toml        [robot] period, timeouts, controller address
                                 [robot.targets] target lanes per Driver Station mode
                                 [studio] viewer bridge; dashboard = "dashboard.toml", the driver
                                 dashboard's layout (talOS/telemetry/README.md)
+                                [simulation] optional simulation settings ([simulation.start_pose],
+                                [simulation.mujoco])
                                 [[subsystems]] name + path, one per subsystem
 configuration/subsystems/*.toml [subsystem] name, node = "//...:node", period_us,
                                 custom keys (node.param), [motors.*] and other devices,

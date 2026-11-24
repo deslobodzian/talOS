@@ -21,13 +21,54 @@ import unittest
 import urllib.error
 import urllib.request
 
+from _posixshmem import shm_unlink
 from python.runfiles import runfiles
 
-# Bounds only a hang, inside Bazel's 60 s timeout for a small test: the
-# launcher declares the bridge up 1 s after it spawned it, a few seconds
-# into a session on an idle host.
-HANG_S = 40
+# Bounds only a hang, kept inside Bazel's 60 s timeout for a small test so
+# failure artifacts are always preserved: the launcher declares the bridge up
+# 1 s after spawning it, and manifest.json records http_port at the same time.
+HANG_S = 30
+MANIFEST_POLL_S = 5
+HTTP_TIMEOUT_S = 10
 STOP_WAIT_S = 10
+
+# talOS/introspection/registry.h kRegistryPath.
+REGISTRY_TOPIC = "/talos_registry.6"
+
+
+def _shm_name(topic, namespace):
+    """Matches talos::ShmObjectName (talOS/memory/shared_memory_ptr.h)."""
+    mapped = "/" + topic.lstrip("/").replace("/", ".")
+    value = 0xCBF29CE484222325
+    for byte in namespace.encode() + b"\0" + mapped.encode():
+        value = ((value ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"/~{value:016x}"
+
+
+def _unlink_registry(namespace):
+    """Best-effort unlink of the isolated test namespace's registry segment."""
+    if not namespace:
+        return
+    try:
+        shm_unlink(_shm_name(REGISTRY_TOPIC, namespace))
+    except OSError:
+        pass
+
+
+def _valid_http_port(value):
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and 1 <= value <= 65535)
+
+
+def _read_member_logs(sessions_dir, filename):
+    chunks = []
+    for path in sorted(glob.glob(os.path.join(sessions_dir, "*", filename))):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                chunks.append(f.read())
+        except OSError:
+            pass
+    return "".join(chunks)
 
 
 def free_ports():
@@ -145,39 +186,62 @@ class StudioBridgeInSession(unittest.TestCase):
             out = os.path.join(tmp, "sessions")
             os.makedirs(out)
             launch_output = []
+            ports_used = []
             try:
-                self.check_session(out, launch_output)
+                self.check_session(tmp, out, launch_output, ports_used)
             except BaseException as error:
                 kept = preserve_failure_artifacts(
                     "".join(launch_output), out)
                 if isinstance(error, AssertionError):
-                    # The bridge's own output, which the launcher does not
-                    # echo: a port another process took first reads there, not
-                    # in the launch's lines (talOS docs/TESTING.md §6.4).
-                    logs = glob.glob(
-                        os.path.join(out, "*", "studio_bridge.log"))
-                    text = "".join(
-                        open(log, encoding="utf-8", errors="replace").read()
-                        for log in logs)
+                    # The members' own output, which the launcher does not
+                    # echo: a released UDP port another process took first
+                    # reads there, not in the launch's lines
+                    # (talOS docs/TESTING.md §6.4).
+                    studio_log = _read_member_logs(out, "studio_bridge.log")
+                    extra = []
+                    if ports_used:
+                        gw_port, br_port = ports_used[-1]
+                        extra.append(
+                            f"reserved UDP ports: gateway={gw_port}, "
+                            f"bridge={br_port} (released before launch)")
+                    for member, marker in (
+                        ("sim_gateway.log", "cannot open simulation socket"),
+                        ("hardware_node.log",
+                         "failed to open hardware node network/ipc resources"),
+                    ):
+                        content = _read_member_logs(out, member)
+                        if marker in content:
+                            extra.append(f"--- {member} ---\n{content}")
+                    extra_text = ("\n" + "\n".join(extra)) if extra else ""
                     note = f"\nartifacts preserved: {kept}" if kept else ""
                     raise AssertionError(
-                        f"{error}\n--- studio_bridge.log ---\n"
-                        f"{text or '(none written)'}{note}") from None
+                        f"{error}{extra_text}\n--- studio_bridge.log ---\n"
+                        f"{studio_log or '(none written)'}{note}") from None
                 if kept:
                     print(f"studio_test: failure artifacts preserved: {kept}",
                           file=sys.stderr)
                 raise
+            finally:
+                _unlink_registry(tmp)
 
-    def check_session(self, out, output):
-        sim = runfiles.Create().Rlocation("_main/sim")
+    def check_session(self, namespace, out, output, ports_used):
+        rf = runfiles.Create()
+        sim = rf.Rlocation("_main/sim")
+        self.assertTrue(sim and os.path.isfile(sim),
+                        f"_main/sim not found in runfiles ({sim!r})")
         gateway, bridge = free_ports()
+        ports_used.append((gateway, bridge))
+        # Isolate shared memory from any ambient TALOS_SHM_NAMESPACE or
+        # missing TEST_TMPDIR so the session never touches production SHM.
+        env = dict(os.environ, TALOS_SHM_NAMESPACE=namespace)
         launch = subprocess.Popen(
             [sim, "--start-studio-bridge", "--studio-http-port", "0",
              "--output-dir", out, "--remote", "127.0.0.1",
              "--remote-port", str(gateway), "--local-port", str(bridge),
              "--duration-s", str(HANG_S)],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            stderr=subprocess.STDOUT, text=True, env=env,
+            start_new_session=True)
         up = threading.Event()
 
         def read():
@@ -195,9 +259,9 @@ class StudioBridgeInSession(unittest.TestCase):
                     with open(path, encoding="utf-8") as f:
                         nodes = {n["name"]: n for n in json.load(f)["nodes"]}
                     port = nodes.get("studio_bridge", {}).get("http_port")
-                    if isinstance(port, int) and port > 0:
+                    if _valid_http_port(port):
                         return port
-                except (OSError, json.JSONDecodeError, KeyError):
+                except (OSError, json.JSONDecodeError, KeyError, TypeError):
                     pass
             return None
 
@@ -212,7 +276,7 @@ class StudioBridgeInSession(unittest.TestCase):
             studio = read_http_port()
             if studio is None:
                 wait = threading.Event()
-                for _ in range(HANG_S * 20):
+                for _ in range(MANIFEST_POLL_S * 20):
                     studio = read_http_port()
                     if studio is not None or launch.poll() is not None:
                         break
@@ -220,9 +284,12 @@ class StudioBridgeInSession(unittest.TestCase):
             self.assertIsNotNone(
                 studio,
                 f"manifest.json did not record studio_bridge http_port:\n{log}")
+            # Bypass any ambient HTTP(S)_PROXY for loopback requests.
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}))
             try:
-                with urllib.request.urlopen(f"http://127.0.0.1:{studio}/drive",
-                                            timeout=HANG_S) as answer:
+                with opener.open(f"http://127.0.0.1:{studio}/drive",
+                                 timeout=HTTP_TIMEOUT_S) as answer:
                     status, body = answer.status, answer.read().decode()
             except urllib.error.HTTPError as error:
                 status, body = error.code, error.read().decode()
@@ -235,7 +302,10 @@ class StudioBridgeInSession(unittest.TestCase):
             # fails here too) and the talOS checkout to build in; when
             # TALOS_REQUIRE_STUDIO_PAGES=1 is set (as in CI), unbuilt pages
             # fail the test instead.
-            webroot = runfiles.Create().Rlocation("_main/studio_webroot")
+            webroot = rf.Rlocation("_main/studio_webroot")
+            self.assertTrue(
+                webroot and os.path.isdir(webroot),
+                f"_main/studio_webroot not found in runfiles ({webroot!r})")
             built = not os.path.exists(os.path.join(webroot, "NOT_BUILT.txt"))
             require_pages = os.environ.get(
                 "TALOS_REQUIRE_STUDIO_PAGES", "").strip() not in ("", "0")
@@ -268,15 +338,30 @@ class StudioBridgeInSession(unittest.TestCase):
                 self.assertIsNotNone(checkout, body)
                 self.assertTrue(os.path.isfile(os.path.join(
                     checkout[1], "studio", "bridge", "webroot.bzl")), body)
-            launch.send_signal(signal.SIGINT)
-            self.assertEqual(launch.wait(timeout=STOP_WAIT_S), 0,
-                             "".join(output))
+            if launch.poll() is None:
+                try:
+                    launch.send_signal(signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+            returncode = launch.wait(timeout=STOP_WAIT_S)
+            reader.join(timeout=STOP_WAIT_S)
+            self.assertEqual(returncode, 0, "".join(output))
         finally:
             if launch.poll() is None:
-                os.killpg(launch.pid, signal.SIGKILL)
-                launch.wait()
+                try:
+                    os.killpg(launch.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    launch.wait(timeout=STOP_WAIT_S)
+                except subprocess.TimeoutExpired:
+                    pass
             reader.join(timeout=STOP_WAIT_S)
-            launch.stdout.close()
+            if not reader.is_alive():
+                try:
+                    launch.stdout.close()
+                except OSError:
+                    pass
         manifests = glob.glob(os.path.join(out, "*", "manifest.json"))
         self.assertEqual(len(manifests), 1, manifests)
         with open(manifests[0], encoding="utf-8") as f:

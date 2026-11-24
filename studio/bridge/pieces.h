@@ -40,6 +40,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -47,11 +48,14 @@
 
 #include "sim/sim_generated.h"
 #include "studio/bridge/telemetry.h"
+#include "talOS/telemetry/wire.h"
 
 namespace studio {
 
 // sim.GamePieces's arrays (MujocoGatewayExtension's kMaxGamePieces).
 inline constexpr std::uint32_t kMaxPieces = 640;
+static_assert(kMaxPieces <= std::numeric_limits<std::uint16_t>::max(),
+              "piece indices and record counts must fit u16");
 static_assert(sizeof(::sim::GamePieces) == 16 + kMaxPieces * 13);
 
 inline constexpr std::string_view kPiecesMagic = "PCS1";
@@ -136,7 +140,7 @@ inline bool IngestPieces(PiecesState& state, const ::sim::GamePieces& message) {
                            : 0;
   }
   state.count = count;
-  state.radius_m = radius;
+  state.radius_m = radius == 0.0F ? 0.0F : radius;
   state.sample_time_ns = message.sample_time_ns();
   state.has = true;
   ++state.generation;
@@ -178,7 +182,15 @@ class PiecesFeed {
   // most a keyframe of state.count pieces, so at most the allowance's cap,
   // which the allowance always comes to cover.
   std::size_t Owed(const PiecesState& state) {
-    if (!state.has || (has_ && generation_ == state.generation)) return 0;
+    if (!state.has) {
+      has_ = false;
+      prepared_ = false;
+      return 0;
+    }
+    if (state.count > kMaxPieces || !std::isfinite(state.radius_m) ||
+        state.radius_m < 0.0F || (has_ && generation_ == state.generation)) {
+      return 0;
+    }
     if (!prepared_ || prepared_generation_ != state.generation) {
       Prepare(state);
     }
@@ -201,11 +213,21 @@ class PiecesFeed {
             Afford&& afford, Send&& send) {
     wait_ns_ = kNeverNs;
     const std::size_t framed = Owed(state);
-    if (framed == 0) return false;
+    if (framed == 0 || framed > kPiecesAllowanceBytes) return false;
+    if (!std::isfinite(client_rate) || client_rate <= 0.0) return false;
     const double rate = kPiecesShare * client_rate;
+    if (!std::isfinite(rate) || rate <= 0.0) return false;
     if (!Allowance(framed, rate, now_ns)) {
-      wait_ns_ = static_cast<std::int64_t>(
-          std::ceil((static_cast<double>(framed) - tokens_) / rate * 1e9));
+      const double wait =
+          std::ceil((static_cast<double>(framed) - tokens_) / rate * 1e9);
+      if (std::isfinite(wait) && wait >= 0.0 &&
+          wait < static_cast<double>(kNeverNs)) {
+        const auto wait_i64 =
+            std::max<std::int64_t>(1, static_cast<std::int64_t>(wait));
+        if (now_ns <= 0 || wait_i64 <= kNeverNs - now_ns) {
+          wait_ns_ = wait_i64;
+        }
+      }
       return false;
     }
     if (!afford(framed)) return false;
@@ -217,14 +239,22 @@ class PiecesFeed {
     }
     tokens_ -= static_cast<double>(framed);
     for (const std::size_t i : changed_) {
-      in_play_[i] = state.in_play[i];
+      in_play_[i] = state.in_play[i] != 0 ? std::uint8_t{1} : std::uint8_t{0};
       for (std::size_t axis = 0; axis < 3; ++axis) {
         mm_[3 * i + axis] = state.mm[3 * i + axis];
       }
     }
+    if (keyframe_) {
+      for (std::size_t i = state.count; i < kMaxPieces; ++i) {
+        in_play_[i] = 0;
+        mm_[3 * i] = 0;
+        mm_[3 * i + 1] = 0;
+        mm_[3 * i + 2] = 0;
+      }
+    }
     has_ = true;
     count_ = state.count;
-    radius_m_ = state.radius_m;
+    radius_m_ = state.radius_m == 0.0F ? 0.0F : state.radius_m;
     generation_ = state.generation;
     prepared_ = false;
     return true;
@@ -239,10 +269,14 @@ class PiecesFeed {
 
  private:
   void Prepare(const PiecesState& state) {
-    keyframe_ = !has_ || count_ != state.count || radius_m_ != state.radius_m;
+    const float radius = state.radius_m == 0.0F ? 0.0F : state.radius_m;
+    const std::size_t count = std::min<std::size_t>(state.count, kMaxPieces);
+    keyframe_ = !has_ || count_ != state.count || radius_m_ != radius;
     changed_.clear();
-    for (std::size_t i = 0; i < state.count; ++i) {
-      if (keyframe_ || in_play_[i] != state.in_play[i] ||
+    for (std::size_t i = 0; i < count; ++i) {
+      const std::uint8_t in_play =
+          state.in_play[i] != 0 ? std::uint8_t{1} : std::uint8_t{0};
+      if (keyframe_ || in_play_[i] != in_play ||
           mm_[3 * i] != state.mm[3 * i] ||
           mm_[3 * i + 1] != state.mm[3 * i + 1] ||
           mm_[3 * i + 2] != state.mm[3 * i + 2]) {
@@ -257,9 +291,12 @@ class PiecesFeed {
   // fit now.
   bool Allowance(std::size_t bytes, double rate, std::int64_t now_ns) {
     if (started_ && now_ns > updated_ns_) {
-      tokens_ = std::min(
-          static_cast<double>(kPiecesAllowanceBytes),
-          tokens_ + static_cast<double>(now_ns - updated_ns_) * 1e-9 * rate);
+      const double dt_ns =
+          (updated_ns_ >= 0 || now_ns <= kNeverNs + updated_ns_)
+              ? static_cast<double>(now_ns - updated_ns_)
+              : static_cast<double>(now_ns) - static_cast<double>(updated_ns_);
+      tokens_ = std::min(static_cast<double>(kPiecesAllowanceBytes),
+                         tokens_ + dt_ns * 1e-9 * rate);
     }
     if (!started_ || now_ns > updated_ns_) updated_ns_ = now_ns;
     started_ = true;
@@ -276,7 +313,8 @@ class PiecesFeed {
     out[5] = 0;
     detail::PutU16(out + 6, static_cast<std::uint16_t>(changed_.size()));
     detail::PutU32(out + 8, state.count);
-    detail::PutU32(out + 12, std::bit_cast<std::uint32_t>(state.radius_m));
+    const float radius = state.radius_m == 0.0F ? 0.0F : state.radius_m;
+    detail::PutU32(out + 12, std::bit_cast<std::uint32_t>(radius));
     detail::PutU64(out + 16, state.sample_time_ns);
     char* record = out + kPiecesHeaderBytes;
     for (const std::size_t i : changed_) {

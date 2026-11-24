@@ -10,12 +10,14 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -59,6 +61,8 @@ T Read(std::string_view bytes, std::size_t at) {
 Decoded Decode(std::string_view bytes) {
   Decoded out;
   EXPECT_EQ(bytes.substr(0, 4), "PCS1");
+  EXPECT_EQ(static_cast<unsigned char>(bytes[4]) & ~kPiecesKeyframe, 0u);
+  EXPECT_EQ(static_cast<unsigned char>(bytes[5]), 0u);
   out.keyframe = (bytes[4] & 1) != 0;
   const auto records = Read<std::uint16_t>(bytes, 6);
   out.count = Read<std::uint32_t>(bytes, 8);
@@ -67,6 +71,8 @@ Decoded Decode(std::string_view bytes) {
   EXPECT_EQ(bytes.size(), 24u + 16u * records);
   for (std::size_t r = 0; r < records; ++r) {
     const std::size_t at = 24 + 16 * r;
+    EXPECT_EQ(static_cast<unsigned char>(bytes[at + 2]) & ~kPieceInPlay, 0u);
+    EXPECT_EQ(static_cast<unsigned char>(bytes[at + 3]), 0u);
     out.records[Read<std::uint16_t>(bytes, at)] = {
         .in_play = (bytes[at + 2] & 1) != 0,
         .x_mm = static_cast<std::int32_t>(Read<std::uint32_t>(bytes, at + 4)),
@@ -639,6 +645,234 @@ TEST(PumpPieces, AnUpdateWaitsAtMostOneMessageForThePieces) {
   EXPECT_LE(beside - alone,
             static_cast<std::int64_t>(static_cast<double>(owed) / kRate * 1e9) +
                 5'000'000);
+}
+
+// REQ-DEV-43: -0.0F radius canonicalizes to +0.0F on the wire, non-finite and
+// negative-overflow inputs are refused without mutating state, and a zero-piece
+// message clears the client via a 24-byte keyframe with zeroed padding.
+TEST(IngestPieces, CanonicalizesNegativeZeroRadiusAndRejectsNonFiniteEdges) {
+  PiecesState state;
+  ::sim::GamePieces neg_zero = Message(1, 10);
+  neg_zero.mutate_radius_m(-0.0F);
+  ASSERT_TRUE(IngestPieces(state, neg_zero));
+  EXPECT_EQ(std::bit_cast<std::uint32_t>(state.radius_m), 0u);
+
+  PiecesFeed feed;
+  std::vector<std::string> sent;
+  const auto pump = [&](std::int64_t now) {
+    return feed.Pump(
+        state, now, kAmpleRate, [](std::size_t) { return true; },
+        [&](std::string_view bytes) {
+          sent.emplace_back(bytes);
+          return true;
+        });
+  };
+  ASSERT_TRUE(pump(0));
+  EXPECT_EQ(Read<std::uint32_t>(sent.back(), 12), 0u)
+      << "wire radius must not carry -0.0F sign bit";
+  const Decoded key = Decode(sent.back());
+  EXPECT_TRUE(key.keyframe);
+  EXPECT_EQ(key.count, 1u);
+
+  const std::uint64_t generation = state.generation;
+  ::sim::GamePieces inf_radius = Message(1, 11);
+  inf_radius.mutate_radius_m(std::numeric_limits<float>::infinity());
+  ::sim::GamePieces neg_inf_coord = Message(1, 12);
+  neg_inf_coord.mutable_x_m()->Mutate(0,
+                                      -std::numeric_limits<float>::infinity());
+  ::sim::GamePieces nan_coord = Message(1, 13);
+  nan_coord.mutable_y_m()->Mutate(0, std::numeric_limits<float>::quiet_NaN());
+  ::sim::GamePieces neg_far = Message(1, 14);
+  neg_far.mutable_z_m()->Mutate(0, -2.2e6F);
+  for (const ::sim::GamePieces* refused :
+       {&inf_radius, &neg_inf_coord, &nan_coord, &neg_far}) {
+    EXPECT_FALSE(IngestPieces(state, *refused)) << refused->sample_time_ns();
+  }
+  EXPECT_EQ(state.generation, generation);
+  EXPECT_EQ(state.sample_time_ns, 10u);
+
+  ::sim::GamePieces empty = Message(0, 15);
+  empty.mutate_radius_m(0.0F);
+  ASSERT_TRUE(IngestPieces(state, empty));
+  ASSERT_TRUE(pump(1'000'000'000));
+  const Decoded cleared = Decode(sent.back());
+  EXPECT_TRUE(cleared.keyframe);
+  EXPECT_EQ(cleared.count, 0u);
+  EXPECT_TRUE(cleared.records.empty());
+  EXPECT_EQ(sent.back().size(), kPiecesHeaderBytes);
+}
+
+// REQ-DEV-43: PiecesFeed refuses out-of-range or non-finite PiecesState without
+// out-of-bounds access, clears stale tail entries on shrink, and resends a
+// keyframe after PiecesState is reset even if generation restarts at 1.
+TEST(PiecesFeed, RejectsInvalidStateAndClearsStaleTailAndResetState) {
+  PiecesFeed feed;
+  std::vector<std::string> sent;
+  const auto yes = [](std::size_t) { return true; };
+  const auto record = [&](std::string_view bytes) {
+    sent.emplace_back(bytes);
+    return true;
+  };
+
+  const auto expect_refused = [&](const PiecesState& invalid) {
+    EXPECT_EQ(feed.Owed(invalid), 0u);
+    EXPECT_FALSE(feed.Pump(invalid, 0, kAmpleRate, yes, record));
+    EXPECT_EQ(feed.wait_ns(), kNeverNs);
+  };
+  expect_refused(PiecesState{.has = true,
+                             .count = kMaxPieces + 1,
+                             .radius_m = 0.075F,
+                             .generation = 1});
+  expect_refused(
+      PiecesState{.has = true,
+                  .count = 1,
+                  .radius_m = std::numeric_limits<float>::quiet_NaN(),
+                  .generation = 2});
+  expect_refused(PiecesState{.has = true,
+                             .count = 1,
+                             .radius_m = std::numeric_limits<float>::infinity(),
+                             .generation = 3});
+  expect_refused(PiecesState{
+      .has = true, .count = 1, .radius_m = -0.01F, .generation = 4});
+  EXPECT_TRUE(sent.empty());
+
+  PiecesState state;
+  ASSERT_TRUE(IngestPieces(state, Message(4, 100)));
+  ASSERT_TRUE(feed.Pump(state, 0, kAmpleRate, yes, record));
+  EXPECT_EQ(Decode(sent.back()).records.size(), 4u);
+
+  ASSERT_TRUE(IngestPieces(state, Message(1, 200)));
+  ASSERT_TRUE(feed.Pump(state, 1'000'000'000, kAmpleRate, yes, record));
+  EXPECT_TRUE(Decode(sent.back()).keyframe);
+  EXPECT_EQ(Decode(sent.back()).count, 1u);
+
+  // Resetting PiecesState clears feed's cached generation so a fresh session
+  // starting at generation 1 sends a new keyframe instead of aliasing.
+  state = PiecesState{};
+  EXPECT_EQ(feed.Owed(state), 0u);
+  ASSERT_TRUE(IngestPieces(state, Message(2, 300)));
+  ASSERT_EQ(state.generation, 1u);
+  ASSERT_TRUE(feed.Pump(state, 2'000'000'000, kAmpleRate, yes, record));
+  const Decoded fresh = Decode(sent.back());
+  EXPECT_TRUE(fresh.keyframe);
+  EXPECT_EQ(fresh.count, 2u);
+  EXPECT_EQ(fresh.records.size(), 2u);
+}
+
+// REQ-DEV-43: non-positive, non-finite, or overflowing wait rates never divide
+// by zero, corrupt the allowance, or overflow int64 wait deadlines.
+TEST(PiecesFeed, NonPositiveNonFiniteAndTinyRatesNeverOverflowOrSpin) {
+  PiecesState state;
+  ::sim::GamePieces message = Message(640, 1);
+  ASSERT_TRUE(IngestPieces(state, message));
+  PiecesFeed feed;
+  std::size_t sends = 0;
+  const auto yes = [](std::size_t) { return true; };
+  const auto count_send = [&](std::string_view) {
+    ++sends;
+    return true;
+  };
+
+  for (const double bad_rate :
+       {0.0, -100.0, std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity()}) {
+    EXPECT_FALSE(feed.Pump(state, 0, bad_rate, yes, count_send));
+    EXPECT_EQ(feed.wait_ns(), kNeverNs);
+  }
+  EXPECT_EQ(sends, 0u);
+
+  // Allowance stayed intact: a valid rate still sends the full keyframe.
+  ASSERT_TRUE(feed.Pump(state, 0, 28000.0, yes, count_send));
+  EXPECT_EQ(sends, 1u);
+
+  // Deplete allowance (just spent 10,274 B) and request a tiny rate whose wait
+  // exceeds INT64_MAX ns.
+  Move(message, 0, 0.1F);
+  ASSERT_TRUE(IngestPieces(state, message));
+  EXPECT_FALSE(feed.Pump(state, 1'000, 1e-12, yes, count_send));
+  EXPECT_EQ(feed.wait_ns(), kNeverNs);
+
+  // A timestamp near kNeverNs where now_ns + wait_ns would overflow signed
+  // int64 also reports kNeverNs instead of overflowing WakeSchedule::Deferred.
+  PiecesFeed feed_near_max;
+  PiecesState near_state;
+  ::sim::GamePieces near_msg = Message(640, 1);
+  ASSERT_TRUE(IngestPieces(near_state, near_msg));
+  ASSERT_TRUE(
+      feed_near_max.Pump(near_state, kNeverNs - 100, 28000.0, yes, count_send));
+  Move(near_msg, 0, 0.1F);
+  ASSERT_TRUE(IngestPieces(near_state, near_msg));
+  EXPECT_FALSE(
+      feed_near_max.Pump(near_state, kNeverNs - 50, 28000.0, yes, count_send));
+  EXPECT_EQ(feed_near_max.wait_ns(), kNeverNs);
+}
+
+// REQ-DEV-43, REQ-OPS-35: AffordProgrammerSend refuses size_t overflow in
+// framed_bytes + own_room, EgressPlan/BridgeEgress gate invalid or zero rates
+// without UB, and duplicate DriveSlots::Admit preserves slot invariants.
+TEST(AffordProgrammerSend, GuardsOverflowInvalidRatesAndDuplicateDriveSlots) {
+  SharedReservation<int> reservation;
+  ClientRotation<int> rotation;
+  rotation.Add(1);
+  BridgeEgress egress(EgressPlan::Of(4, 0, 0));
+  WakeSchedule schedule;
+  EgressBudget own;
+  std::uint64_t held = 0;
+
+  constexpr std::size_t kUpdate = 2'000;
+  constexpr std::size_t kWrapRoom =
+      std::numeric_limits<std::size_t>::max() - kUpdate + 1;
+  schedule.BeginPass();
+  EXPECT_FALSE(AffordProgrammerSend(
+      reservation, egress, schedule, 1, own, kUpdate, kWrapRoom,
+      ClientFeeds::Feed::kTelemetry, 0, false, held));
+  EXPECT_EQ(schedule.retry_ns, kNeverNs);
+
+  EXPECT_THROW((void)EgressPlan::Of(4, 1, 0), std::invalid_argument);
+
+  // Default EgressPlan has 0 B/s drive rate; BridgeEgress must refuse with
+  // wait_ns == kNeverNs instead of dividing by zero.
+  BridgeEgress default_egress;
+  EgressBudget drive_own;
+  std::int64_t wait_ns = 0;
+  EXPECT_FALSE(default_egress.Affordable(drive_own, true, 100, 0, wait_ns));
+  EXPECT_EQ(wait_ns, kNeverNs);
+
+  // Invalid programmer/shared rates never reserve the shared bucket.
+  EgressPlan bad_plan;
+  bad_plan.programmer_bytes_per_s = 0.0;
+  bad_plan.programmer_client_bytes_per_s = 28000.0;
+  BridgeEgress zero_shared(bad_plan);
+  reservation.Pass(rotation, 0, [&](int client) {
+    return AffordProgrammerSend(reservation, zero_shared, schedule, client, own,
+                                100, 0, ClientFeeds::Feed::kTelemetry, 0, false,
+                                held);
+  });
+  reservation.Pass(rotation, kSharedReserveDelayNs + 1, [&](int client) {
+    return AffordProgrammerSend(reservation, zero_shared, schedule, client, own,
+                                100, 0, ClientFeeds::Feed::kTelemetry,
+                                kSharedReserveDelayNs + 1, false, held);
+  });
+  EXPECT_FALSE(reservation.reserved().has_value());
+
+  // Duplicate DriveSlots::Admit refreshes recency without duplicating slots.
+  DriveSlots<char> slots(2);
+  const auto a1 = slots.Admit('a');
+  const EgressBudget* a_budget = slots.Budget('a');
+  ASSERT_NE(a_budget, nullptr);
+  EXPECT_FALSE(slots.Admit('b').evicted.has_value());
+  const auto a2 = slots.Admit('a');
+  EXPECT_EQ(a2.slot, a1.slot);
+  EXPECT_FALSE(a2.evicted.has_value());
+  EXPECT_EQ(slots.Budget('a'), a_budget);
+  EXPECT_EQ(slots.clients(), (std::vector<char>{'b', 'a'}));
+  // Next admit evicts 'b' (now oldest), and Remove/Admit stay consistent.
+  EXPECT_EQ(slots.Admit('c').evicted, 'b');
+  slots.Remove('a');
+  EXPECT_EQ(slots.Budget('a'), nullptr);
+  EXPECT_FALSE(slots.Admit('d').evicted.has_value());
+  EXPECT_EQ(slots.clients(), (std::vector<char>{'c', 'd'}));
 }
 
 }  // namespace

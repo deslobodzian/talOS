@@ -82,7 +82,8 @@ class GatewayExtension {
   // the registry row, so it must not depend on the config or Configure: the
   // launcher refuses a run whose endpoints differ from its --describe probe.
   // --describe calls no other hook. The program exits 1, --describe included,
-  // when an entry's name repeats /sim/state's or another entry's, or when
+  // when an entry's name is empty, exceeds event::MAX_SOURCE_NAME, repeats
+  // /sim/state's or another entry's, has a kind other than SENDER, or when
   // /sim/state and the entries exceed a registry row's
   // introspect::kMaxSourcesPerNode (64), so at most 63 entries. Throw: exit 1.
   virtual event::Manifest Topics() const { return {}; }

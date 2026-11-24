@@ -93,7 +93,7 @@ class SE3 {
            (a2 * a) / Scalar(24);
   }
 
-  // Lie algebra hat: (w, v) -> [[w]^, v; 0, 0] (6x6 adjoint form).
+  // Lie algebra adjoint hat: (w, v) -> [[w]^, 0; [v]^, [w]^] (6x6 adjoint).
   static Matrix6 Hat(const Vector6& tau) {
     const Matrix3 w_hat = SO3<Scalar>::Hat(tau.template head<3>());
     const Matrix3 v_hat = SO3<Scalar>::Hat(tau.template tail<3>());
@@ -105,48 +105,17 @@ class SE3 {
   }
 
   // The V matrix of Exp (also useful to callers integrating velocity).
+  // Equals SO3::RightJacobianOfExp(-w).
   static Matrix3 LeftV(const Vector3& w) {
-    const Scalar theta_sq = w.squaredNorm();
-    const Scalar theta = std::sqrt(theta_sq);
-    const Matrix3 w_hat = SO3<Scalar>::Hat(w);
-    const Matrix3 w_hat_sq = w_hat * w_hat;
-    Scalar a, b;
-    if (theta_sq < TaylorThreshold()) {
-      a = Scalar(0.5) * (Scalar(1) - theta_sq / Scalar(12));
-      b = Scalar(1) / Scalar(6) * (Scalar(1) - theta_sq / Scalar(20));
-    } else {
-      a = (Scalar(1) - std::cos(theta)) / theta_sq;
-      b = (theta - std::sin(theta)) / (theta_sq * theta);
-    }
-    return Matrix3::Identity() + a * w_hat + b * w_hat_sq;
+    return SO3<Scalar>::RightJacobianOfExp(-w);
   }
 
-  // Inverse of V, closed form. Series c -> 1/12 + theta^2/720 + theta^4/30240.
+  // Inverse of V, closed form. Equals SO3::RightJacobianInverse(-w).
   static Matrix3 LeftVInverse(const Vector3& w) {
-    const Scalar theta_sq = w.squaredNorm();
-    const Scalar theta = std::sqrt(theta_sq);
-    const Matrix3 w_hat = SO3<Scalar>::Hat(w);
-    const Matrix3 w_hat_sq = w_hat * w_hat;
-    Scalar c;
-    if (theta_sq < TaylorThreshold()) {
-      c = Scalar(1) / Scalar(12) + theta_sq / Scalar(720) +
-          theta_sq * theta_sq / Scalar(30240);
-    } else {
-      const Scalar half = theta / Scalar(2);
-      const Scalar tan_half = std::tan(half);
-      const Scalar cot_term =
-          std::isinf(tan_half) ? Scalar(0) : half / tan_half;
-      c = (Scalar(1) - cot_term) / theta_sq;
-    }
-    return Matrix3::Identity() - w_hat / Scalar(2) + c * w_hat_sq;
+    return SO3<Scalar>::RightJacobianInverse(-w);
   }
 
  private:
-  static Scalar TaylorThreshold() {
-    using std::sqrt;
-    return sqrt(Eigen::NumTraits<Scalar>::epsilon());
-  }
-
   SO3<Scalar> r_;
   Vector3 t_;
 };

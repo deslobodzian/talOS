@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -196,6 +197,7 @@ can_id = 2
   hold(40ms);
   ASSERT_TRUE(talos::robot_enabled(sim.node("wrist")));
   EXPECT_EQ(hw.motor_request("wrist", "wrist_motor").mode, Mode::kNeutral);
+  EXPECT_EQ(hw.applied_motor("wrist", "wrist_motor").mode, Mode::kNeutral);
   const auto state = sim.latest<Wrist::State>(topics::kState);
   ASSERT_TRUE(state.has_value());
   EXPECT_FALSE(state->connected());
@@ -205,9 +207,19 @@ can_id = 2
 // REQ-SAFE-04
 TEST_F(WristTest, NonFiniteDemandGoesNeutral) {
   Teleop();
-  Hold(std::numeric_limits<double>::quiet_NaN(), 40ms);
-  EXPECT_EQ(Request(), Mode::kNeutral);
-  EXPECT_FALSE(Latest().enabled());
+  for (const double bad : {std::numeric_limits<double>::quiet_NaN(),
+                           std::numeric_limits<double>::infinity(),
+                           -std::numeric_limits<double>::infinity()}) {
+    SCOPED_TRACE(bad);
+    Hold(30.0, 40ms);
+    ASSERT_EQ(Applied(), Mode::kVelocity);
+    Hold(bad, 40ms);
+    EXPECT_EQ(Request(), Mode::kNeutral);
+    EXPECT_EQ(Applied(), Mode::kNeutral);
+    const State state = Latest();
+    EXPECT_FALSE(state.enabled());
+    EXPECT_TRUE(std::isfinite(state.velocity_rps()));
+  }
 }
 
 // matrix: n/a 9 (the wrist reads no parameters)

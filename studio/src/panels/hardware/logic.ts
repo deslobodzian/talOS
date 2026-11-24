@@ -18,19 +18,21 @@ export type Band = {start: number; end: number};
 // 0, which is the honest "not moving".
 export function counterRate(
     times: ArrayLike<number>, values: ArrayLike<number>): number|null {
+  const n = Math.min(times.length, values.length);
   let first = -1;
   let last = -1;
   let dv = 0;
-  for (let i = 0; i < values.length; i++) {
-    if (!Number.isFinite(values[i])) continue;
+  for (let i = 0; i < n; i++) {
+    if (!Number.isFinite(times[i]) || !Number.isFinite(values[i])) continue;
     if (first < 0) first = i;
     else if (values[i] > values[last]) dv += values[i] - values[last];
     last = i;
   }
   if (first < 0 || last <= first) return null;
   const dt = times[last] - times[first];
-  if (!(dt > 0)) return null;
-  return dv / dt;
+  if (!Number.isFinite(dt) || !(dt > 0)) return null;
+  const rate = dv / dt;
+  return Number.isFinite(rate) ? rate : null;
 }
 
 // One bit of a bitmask channel over time.
@@ -49,7 +51,7 @@ export type BitHistory = {
 export function bitHistory(
     times: ArrayLike<number>, mask: ArrayLike<number>,
     bits = 32): BitHistory[] {
-  const n = Math.min(32, Math.max(0, bits));
+  const n = Number.isFinite(bits) ? Math.min(32, Math.max(0, Math.trunc(bits))) : 0;
   const out: BitHistory[] = [];
   for (let b = 0; b < n; b++) {
     const bit = 1 << b;
@@ -70,7 +72,7 @@ export function bitHistory(
       }
       if (on && !prev) {
         setCount++;
-        lastSetAt = times[i];
+        if (i < times.length && Number.isFinite(times[i])) lastSetAt = times[i];
       }
       prev = on;
     }
@@ -84,18 +86,23 @@ export function bitHistory(
 export function flagBands(
     times: ArrayLike<number>, flag: ArrayLike<number>): Band[] {
   const out: Band[] = [];
+  const n = Math.min(times.length, flag.length);
   let start: number|null = null;
-  for (let i = 0; i < flag.length; i++) {
+  let lastFiniteTime: number|null = null;
+  for (let i = 0; i < n; i++) {
+    const t = times[i];
+    if (!Number.isFinite(t)) continue;
+    lastFiniteTime = t;
     const on = Number.isFinite(flag[i]) && flag[i] !== 0;
     if (on && start === null) {
-      start = times[i];
+      start = t;
     } else if (!on && start !== null) {
-      out.push({start, end: times[i]});
+      out.push({start, end: t});
       start = null;
     }
   }
-  if (start !== null && flag.length > 0)
-    out.push({start, end: times[flag.length - 1]});
+  if (start !== null && lastFiniteTime !== null)
+    out.push({start, end: lastFiniteTime});
   return out;
 }
 
@@ -137,8 +144,10 @@ export function canBusLines(
     const state = series.values[`${CAN}${index}/read_state`];
     const values = new Float64Array(n).fill(NaN);
     if (frac && state) {
-      for (let i = 0; i < n; i++)
-        if (canBusReadState(state[i]) === 'ok') values[i] = frac[i];
+      const len = Math.min(n, frac.length, state.length);
+      for (let i = 0; i < len; i++)
+        if (canBusReadState(state[i]) === 'ok' && Number.isFinite(frac[i]))
+          values[i] = frac[i];
     }
     out.push({index, name: canBusLabel(index, busNames), values});
   }

@@ -134,8 +134,8 @@ cc_library(
 # Six shards, so each has its own timeout under --config=tsan: gtest gives
 # case i, in run order (the file's TESTs, then its TEST_P instances), to
 # shard i % 6, which puts each two-scenario case (RunsAreBitIdentical,
-# TheSeedMatters) beside one cheap case. A case added above them moves
-# every later one.
+# TheSeedMatters) beside one cheap case and keeps the TEST_P instances off
+# those shards. A case added above them moves every later one.
 cc_test(
     name = "rules_test",
     size = "small",

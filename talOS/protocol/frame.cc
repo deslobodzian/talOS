@@ -39,7 +39,7 @@ std::size_t EncodeFrame(FrameType type, uint16_t flags, uint64_t sequence,
   }
 
   if (payload_size > 0) {
-    std::memcpy(out + kFrameHeaderSize, payload, payload_size);
+    std::memmove(out + kFrameHeaderSize, payload, payload_size);
   }
 
   return EncodeFrameInPlace(type, flags, sequence, monotonic_time_us,

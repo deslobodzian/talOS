@@ -34,6 +34,11 @@ test('counterRate measures a counter over its samples', () => {
   assert.equal(counterRate([0, 2, 5, 10], [10, 20, 2, 12]), 2);
   // NaN samples are skipped, not treated as zero.
   assert.equal(counterRate([0, 1, NaN, 5], [0, NaN, 4, 5]), 1);
+  // Leading NaN timestamps and mismatched lengths are skipped cleanly; overflow
+  // returns null rather than Infinity.
+  assert.equal(counterRate([NaN, 1, 5], [0, 2, 10]), 2);
+  assert.equal(counterRate([0, 2], [0, 4, 100]), 2);
+  assert.equal(counterRate([0, 1e-308], [0, 1e308]), null);
 });
 
 test('bitHistory reports the last set edge and current state per bit', () => {
@@ -63,6 +68,13 @@ test('bitHistory distinguishes absent masks from measured clear bits', () => {
     assert.deepEqual(bits.map(b => b.set), [null, null]);
   }
   assert.deepEqual(bitHistory([0], [0], 2).map(b => b.set), [false, false]);
+  // Non-finite bit counts yield empty; non-finite/missing timestamps never leak
+  // NaN or undefined into lastSetAt.
+  assert.deepEqual(bitHistory([0, 1], [0, 1], NaN), []);
+  assert.deepEqual(bitHistory([0, NaN], [0, 1], 1),
+                   [{bit: 0, set: true, lastSetAt: null, setCount: 1}]);
+  assert.deepEqual(bitHistory([0], [0, 1], 1),
+                   [{bit: 0, set: true, lastSetAt: null, setCount: 1}]);
 });
 
 test('flagBands groups contiguous 1 runs and skips NaN', () => {
@@ -71,6 +83,10 @@ test('flagBands groups contiguous 1 runs and skips NaN', () => {
   assert.deepEqual(flagBands([0, 1, 2, 3], [1, NaN, 1, 1]),
                    [{start: 0, end: 1}, {start: 2, end: 3}]);
   assert.deepEqual(flagBands([0, 1], [0, 0]), []);
+  // Non-finite timestamps and mismatched array lengths never emit NaN/undefined.
+  assert.deepEqual(flagBands([0, NaN, 2, NaN], [0, 1, 1, 0]),
+                   [{start: 2, end: 2}]);
+  assert.deepEqual(flagBands([0, 1], [1, 1, 1]), [{start: 0, end: 1}]);
 });
 
 test('decimateMinMax collapses 12k samples to O(width) spans and keeps a spike', () => {
@@ -129,6 +145,9 @@ test('an unread CAN bus has no utilization, in the chart or the model', () => {
   assert.deepEqual(Array.from(lines[0].values), [0.2, NaN, 0.3]);
   assert.ok(Array.from(lines[1].values).every(v => Number.isNaN(v)),
             `the unread bus is drawn at ${Array.from(lines[1].values)}`);
+  // Non-finite utilization on an OK read becomes a gap rather than Infinity.
+  const infLines = canBusLines(1, canBusSeries([{state: [1, 1, 1], frac: [0.1, Infinity, 0.3]}]));
+  assert.ok(Number.isNaN(infLines[0].values[1]));
 
   const B = 'hw/status/can_buses/';
   const buses = canBuses({

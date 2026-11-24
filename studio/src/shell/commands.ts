@@ -101,12 +101,25 @@ export function presetCommands(presets: readonly PresetRef[],
   }));
 }
 
+function parseDecimalBigInt(value: string): bigint|null {
+  if (!/^-?\d+$/.test(value)) return null;
+  try {
+    return BigInt(value);
+  } catch {
+    return null;
+  }
+}
+
 // How far back an event is from the playback cursor, for the event command
 // hint. Empty when there is no cursor to measure against.
 export function relativeEventTime(eventNs: string,
                                   cursorNs: string|null|undefined): string {
   if (cursorNs == null) return '';
-  const delta = Number(BigInt(cursorNs) - BigInt(eventNs));
+  const cursor = parseDecimalBigInt(cursorNs);
+  const event = parseDecimalBigInt(eventNs);
+  if (cursor === null || event === null) return '';
+  const delta = Number(cursor - event);
+  if (!Number.isFinite(delta)) return '';
   if (delta < 0) return '+' + duration(-delta);
   if (delta === 0) return 'now';
   return duration(delta) + ' ago';
@@ -118,8 +131,14 @@ export function eventCommands(events: readonly RobotEvent[],
                               cursorNs?: string|null,
                               limit = 50): Command[] {
   return [...events]
-      .sort((a, b) => (BigInt(a.t_ns) < BigInt(b.t_ns) ? 1 :
-                      BigInt(a.t_ns) > BigInt(b.t_ns) ? -1 : 0))
+      .sort((a, b) => {
+        const ta = parseDecimalBigInt(a.t_ns);
+        const tb = parseDecimalBigInt(b.t_ns);
+        if (ta === null && tb === null) return 0;
+        if (ta === null) return 1;
+        if (tb === null) return -1;
+        return ta < tb ? 1 : ta > tb ? -1 : 0;
+      })
       .slice(0, limit)
       .map(event => ({
         id: `event:${event.id}`,

@@ -8,8 +8,13 @@ load("@rules_python//python:defs.bzl", "py_test")
 
 _GENERATOR_SCRIPT = Label("//talOS/simulation/mujoco/robots:generate_robot.py")
 
-def _workspace_path(file):
+def _workspace_path(file, caller_repo, attr_name):
     label = native.package_relative_label(file)
+    if label.repo_name != caller_repo:
+        fail(
+            "robot_model_sync_test: %s (%r) must be a file in this repository" %
+            (attr_name, file),
+        )
     return (label.package + "/" + label.name) if label.package else label.name
 
 def robot_model_sync_test(name, parameters, model, **kwargs):
@@ -27,6 +32,7 @@ def robot_model_sync_test(name, parameters, model, **kwargs):
         calling package.
       **kwargs: passed to py_test.
     """
+    caller_repo = native.package_relative_label(name).repo_name
     py_test(
         name = name,
         size = kwargs.pop("size", "small"),
@@ -34,10 +40,8 @@ def robot_model_sync_test(name, parameters, model, **kwargs):
         main = _GENERATOR_SCRIPT,
         args = [
             "--check",
-            "--parameters",
-            _workspace_path(parameters),
-            "--out",
-            _workspace_path(model),
+            "--parameters=" + _workspace_path(parameters, caller_repo, "parameters"),
+            "--out=" + _workspace_path(model, caller_repo, "model"),
             # The canonical name; the test finds what the main repository
             # calls it in its runfiles' repository mapping.
             "--talos-repository=" + _GENERATOR_SCRIPT.repo_name,

@@ -275,6 +275,9 @@ TEST(PipelineTest, RejectsInvalidTypedSettings) {
   auto config = Config();
   config.backend_name = "invalid";
   ExpectInvalid(config, "backend");
+  config = Config();
+  config.gpu_init_timeout = std::chrono::milliseconds(-1);
+  ExpectInvalid(config, "gpu_init_timeout");
 }
 
 TEST(PipelineTest, AutoFallbackHonorsSettingsAndForcedMetalRejectsThem) {
@@ -447,6 +450,82 @@ TEST(PipelineTest, CpuBackendHandlesOddWidthYuyvInvalidFormatAndOversizedDims) {
                           &dummy_byte, static_cast<size_t>(over_int_max));
   ASSERT_TRUE(huge_stride.holds_image());
   EXPECT_FALSE(backend.Execute(huge_stride).success);
+}
+
+TEST(PipelineTest, DeferredGpuInitCatchesNonStdExceptionAndCancelsOnDestroy) {
+  const auto frame = TagFrame();
+  // A non-std::exception from the background GPU factory must never terminate
+  // the process: "metal" throws std::invalid_argument and "auto" stays on CPU.
+  {
+    auto config = Config();
+    config.backend_name = "metal";
+    config.deferred_gpu_init = true;
+    config.gpu_backend_factory = [](const apriltag::DetectorOptions&)
+        -> std::shared_ptr<ComputeBackend> { throw 42; };
+    EXPECT_THROW(AprilTagPipeline{config}, std::invalid_argument);
+  }
+  {
+    auto threw = std::make_shared<std::promise<void>>();
+    std::future<void> threw_future = threw->get_future();
+    auto config = Config();
+    config.backend_name = "auto";
+    config.deferred_gpu_init = true;
+    config.gpu_backend_factory = [threw](const apriltag::DetectorOptions&)
+        -> std::shared_ptr<ComputeBackend> {
+      threw->set_value();
+      throw 42;
+    };
+    AprilTagPipeline pipeline(config);
+    ASSERT_EQ(threw_future.wait_for(std::chrono::seconds(10)),
+              std::future_status::ready);
+    const auto result = pipeline.ProcessFrame(frame);
+    ASSERT_TRUE(result.success) << result.error_message;
+    EXPECT_EQ(result.backend, "cpu");
+  }
+  // Destroying a pipeline while background GPU init is still blocked must not
+  // block destruction or leak the created backend once the gate opens.
+  auto gate = std::make_shared<Gate>();
+  auto finished = std::make_shared<std::promise<void>>();
+  std::future<void> finished_future = finished->get_future();
+  {
+    auto config = Config();
+    config.backend_name = "auto";
+    config.deferred_gpu_init = true;
+    config.gpu_backend_factory = [gate,
+                                  finished](const apriltag::DetectorOptions&) {
+      auto gpu = std::make_shared<SlowGpuBackend>(gate);
+      finished->set_value();
+      return gpu;
+    };
+    AprilTagPipeline pipeline(config);
+    EXPECT_EQ(pipeline.backend_name(), "cpu");
+  }
+  gate->Open();
+  ASSERT_EQ(finished_future.wait_for(std::chrono::seconds(10)),
+            std::future_status::ready);
+}
+
+TEST(PipelineTest, NaNDecisionMarginAndNegativeHammingGetExactRejectReasons) {
+  auto backend = std::make_shared<DecodeQualityBackend>();
+  const auto config = Config();
+  AprilTagPipeline pipeline(config, backend);
+  const auto frame = TagFrame();
+
+  backend->hamming = 0;
+  backend->margin = std::numeric_limits<float>::quiet_NaN();
+  auto result = pipeline.ProcessFrame(frame);
+  ASSERT_TRUE(result.success);
+  ASSERT_EQ(result.detections.size(), 1u);
+  EXPECT_FALSE(result.detections.front().valid);
+  EXPECT_EQ(result.detections.front().reject_reason, "decision_margin");
+
+  backend->hamming = -1;
+  backend->margin = 100.0f;
+  result = pipeline.ProcessFrame(frame);
+  ASSERT_TRUE(result.success);
+  ASSERT_EQ(result.detections.size(), 1u);
+  EXPECT_FALSE(result.detections.front().valid);
+  EXPECT_EQ(result.detections.front().reject_reason, "hamming");
 }
 
 }  // namespace

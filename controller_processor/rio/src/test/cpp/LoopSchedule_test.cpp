@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -62,6 +63,16 @@ TEST(LoopSchedule, AnOverrunYieldsThenRestartsThePeriod) {
   const uint64_t resumed = kStartUs + 11'500 + kOverrunSleepUs;
   EXPECT_EQ(starts[1], resumed) << "the tick after an 11.5 ms overrun";
   EXPECT_EQ(starts[2], resumed + kPeriodUs) << "the period counts from it";
+}
+
+// Near UINT64_MAX, an overrun must saturate rather than wrap into the past
+// (which would make a SCHED_FIFO loop skip its yield and spin).
+// REQ-SAFE-25
+TEST(LoopSchedule, OverrunNearMaxTimestampSaturatesInsteadOfWrapping) {
+  constexpr uint64_t kMax = std::numeric_limits<uint64_t>::max();
+  EXPECT_EQ(NextWakeUs(kMax - 2 * kOverrunSleepUs, kMax - 1), kMax);
+  EXPECT_EQ(NextWakeUs(kMax - 2 * kOverrunSleepUs, kMax), kMax);
+  EXPECT_EQ(NextWakeUs(kMax, kMax), kMax);
 }
 
 }  // namespace

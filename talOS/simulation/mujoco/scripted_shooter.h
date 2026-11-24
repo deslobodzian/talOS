@@ -49,8 +49,10 @@ class ScriptedShooters final : public WorldRules {
 
   explicit ScriptedShooters(std::vector<Shooter> shooters);
 
-  // Sizes the per-body state; refuses an exit inside its own inlet at the
-  // current pose (every launch would launch again).
+  // Resets per-run state (`shots()`, last-launch tracking) and sizes the
+  // per-body state; refuses out-of-range indices, non-positive/non-finite
+  // parameters, or an exit inside its own inlet at the current pose (every
+  // launch would launch again).
   void Attach(const mjModel_& model, mjData_& data) override;
   bool AfterStep(mjModel_& model, mjData_& data, uint64_t step,
                  const MatchInput& input) override;
@@ -73,6 +75,13 @@ class ScriptedShooters final : public WorldRules {
     double beta{};      // I/(m r^2), I the mean principal inertia
   };
 
+  // Whether and in which step a body was last launched, so step 0 is distinct
+  // from never launched.
+  struct LaunchMark {
+    bool launched{false};
+    uint64_t step{};
+  };
+
   // The last body a shooter launched (its bodies_ index; -1: none yet) and
   // the step it launched in.
   struct Last {
@@ -88,8 +97,8 @@ class ScriptedShooters final : public WorldRules {
 
   std::vector<Shooter> shooters_;
   std::vector<Body> bodies_;
-  std::vector<uint64_t> launched_step_;  // by bodies_ entry; 0: never
-  std::vector<Last> last_;               // by shooters_ entry
+  std::vector<LaunchMark> launched_;  // by bodies_ entry
+  std::vector<Last> last_;            // by shooters_ entry
   uint64_t shots_{};
 };
 
@@ -97,11 +106,11 @@ class ScriptedShooters final : public WorldRules {
 // actuator carries any part of the contract. Throws std::invalid_argument,
 // naming the motor and the element, for a partial or malformed contract: a
 // missing site or numeric, a numeric without two values, an efficiency
-// outside (0, 1] or a contact radius that is not positive, an inlet that is
-// not a box, a flywheel that is not a hinge (a slide or a tendon) or whose
-// actuator's gear is not positive, a site off
-// the flywheel's robot tree, and a `*_inlet` site or `*_shooter` numeric
-// whose motor no actuator is.
+// outside (0, 1] or a contact radius that is not positive and finite, an inlet
+// that is not a box, a flywheel that is not a hinge (a slide or a tendon),
+// whose inertia is not positive and finite, or whose actuator's gear is not
+// positive and finite, a site off the flywheel's robot tree, and a `*_inlet`
+// site or `*_shooter` numeric whose motor no actuator is.
 std::unique_ptr<WorldRules> MakeScriptedShooters(const mjModel_& model);
 
 }  // namespace talos::simulation::mujoco

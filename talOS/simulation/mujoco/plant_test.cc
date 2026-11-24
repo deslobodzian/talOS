@@ -1051,5 +1051,242 @@ TEST(MujocoProcessHandlersDeathTest, EngineErrorExitsOneNamingThePlant) {
       ::testing::ExitedWithCode(1), "mujoco plant.*probe arena overflow");
 }
 
+// REQ-DEV-37: MakePlant refuses non-finite start poses and invalid or
+// duplicate motor parameters before compiling.
+TEST(MakePlant, RefusesNonFiniteStartPoseAndInvalidMotorParameters) {
+  constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  const std::vector<PlantMotor> valid_motors = {Motor("arm")};
+  for (const PlantModel& pose :
+       {PlantModel{.start_x_m = kNaN}, PlantModel{.start_y_m = kInf},
+        PlantModel{.start_yaw_rad = -kInf}}) {
+    EXPECT_THROW(Make("bad_pose", HingeRobot(0.01), valid_motors, pose),
+                 std::invalid_argument);
+  }
+  const std::vector<std::vector<PlantMotor>> bad_motors = {
+      {Motor("arm", 0.0)},
+      {Motor("arm", -2.0)},
+      {Motor("arm", kNaN)},
+      {Motor("arm", kInf)},
+      {PlantMotor{"arm", 1.0, kKt, kKe, kR, -1e-4}},
+      {PlantMotor{"arm", 1.0, kKt, kKe, kR, kNaN}},
+      {PlantMotor{"arm", 1.0, kKt, kKe, kR, kInf}},
+      {Motor("arm", 1.0), Motor("arm", 1.0)},
+  };
+  for (const auto& motors : bad_motors) {
+    EXPECT_THROW(Make("bad_motor", HingeRobot(0.01), motors),
+                 std::invalid_argument);
+  }
+}
+
+// REQ-DEV-37: Bind refuses non-finite/non-positive resistance, negative or
+// non-finite k_t/k_e, duplicate motor names, and a failed plant.
+TEST(MujocoPlant, BindRefusesInvalidWindingConstantsDuplicatesAndFailedPlant) {
+  constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  const std::vector<PlantMotor> compiled = {Motor("arm", 5.0)};
+  auto plant = Make("bind_winding", HingeRobot(0.01), compiled);
+  const std::vector<std::vector<PlantMotor>> cases = {
+      {PlantMotor{"arm", 5.0, kKt, kKe, 0.0, kBm}},
+      {PlantMotor{"arm", 5.0, kKt, kKe, -0.1, kBm}},
+      {PlantMotor{"arm", 5.0, kKt, kKe, kNaN, kBm}},
+      {PlantMotor{"arm", 5.0, kKt, kKe, kInf, kBm}},
+      {PlantMotor{"arm", 5.0, -0.01, kKe, kR, kBm}},
+      {PlantMotor{"arm", 5.0, kNaN, kKe, kR, kBm}},
+      {PlantMotor{"arm", 5.0, kInf, kKe, kR, kBm}},
+      {PlantMotor{"arm", 5.0, kKt, -0.01, kR, kBm}},
+      {PlantMotor{"arm", 5.0, kKt, kNaN, kR, kBm}},
+      {PlantMotor{"arm", 5.0, kKt, kInf, kR, kBm}},
+      {Motor("arm", 5.0), Motor("arm", 5.0)},
+  };
+  for (const auto& motors : cases) {
+    std::unique_ptr<bool[]> flags(new bool[motors.size() + 1]());
+    ConfigError error;
+    EXPECT_FALSE(plant->Bind(
+        motors, {}, std::span<bool>(flags.get(), motors.size()), error));
+    EXPECT_EQ(error.device_name, "arm");
+    EXPECT_FALSE(error.message.empty());
+  }
+  // Fail the plant, then verify Bind refuses it.
+  EXPECT_FALSE(plant->Step(-1, {}));
+  bool owned = false;
+  ConfigError error;
+  EXPECT_FALSE(plant->Bind(compiled, {}, std::span(&owned, 1), error));
+  EXPECT_FALSE(error.message.empty());
+}
+
+// REQ-DEV-37: Step refuses non-finite voltages, NaN torque limits, inverted
+// torque bounds, and degenerate infinite bounds without mutating ctrl, even
+// when steps == 0.
+TEST(MujocoPlant, StepRefusesNonFiniteAndInvertedDrivesWithoutMutatingState) {
+  constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  struct Case {
+    const char* what;
+    int steps;
+    PlantDrive drive;
+  };
+  const std::vector<Case> cases = {
+      {"NaN volts (0 steps)", 0, {.volts = kNaN}},
+      {"NaN volts (1 step)", 1, {.volts = kNaN}},
+      {"+Inf volts", 1, {.volts = kInf}},
+      {"-Inf volts", 1, {.volts = -kInf}},
+      {"NaN min torque", 1, {.volts = 1.0, .min_torque_nm = kNaN}},
+      {"NaN max torque", 1, {.volts = 1.0, .max_torque_nm = kNaN}},
+      {"inverted bounds",
+       1,
+       {.volts = 1.0, .min_torque_nm = 2.0, .max_torque_nm = -2.0}},
+      {"min +Inf", 1, {.volts = 1.0, .min_torque_nm = kInf}},
+      {"max -Inf", 1, {.volts = 1.0, .max_torque_nm = -kInf}},
+  };
+  const std::vector<PlantMotor> motors = {Motor("arm")};
+  const PlantDrive valid{.volts = 3.0};
+  for (const Case& row : cases) {
+    SCOPED_TRACE(row.what);
+    auto plant = Make("bad_drive", HingeRobot(0.01), motors);
+    Bind(*plant, motors);
+    ASSERT_TRUE(plant->Step(1, std::span(&valid, 1)));
+    ASSERT_EQ(plant->data()->ctrl[0], 3.0);
+    EXPECT_FALSE(plant->Step(row.steps, std::span(&row.drive, 1)));
+    EXPECT_FALSE(plant->failure().empty());
+    EXPECT_EQ(plant->data()->ctrl[0], 3.0);
+    EXPECT_FALSE(plant->Step(1, std::span(&valid, 1)));
+  }
+}
+
+// REQ-DEV-37: a WorldRules::AfterStep that writes NaN or Inf into qpos or qvel
+// fails that Step immediately rather than leaking non-finite rotor state.
+TEST(MujocoPlant, RuleWritingNonFiniteStateFailsThatStep) {
+  class CorruptingRule final : public WorldRules {
+   public:
+    explicit CorruptingRule(bool corrupt_vel) : corrupt_vel_(corrupt_vel) {}
+    void Attach(const mjModel& /*model*/, mjData& /*data*/) override {}
+    bool AfterStep(mjModel& /*model*/, mjData& data, uint64_t /*step*/,
+                   const MatchInput& /*input*/) override {
+      if (corrupt_vel_) {
+        data.qvel[0] = std::numeric_limits<double>::infinity();
+      } else {
+        data.qpos[0] = std::numeric_limits<double>::quiet_NaN();
+      }
+      return true;
+    }
+    std::string_view failure() const override { return {}; }
+
+   private:
+    bool corrupt_vel_;
+  };
+  const std::vector<PlantMotor> motors = {Motor("arm")};
+  const PlantDrive drive{.volts = 0.0};
+  for (const bool corrupt_vel : {false, true}) {
+    SCOPED_TRACE(corrupt_vel ? "qvel" : "qpos");
+    auto plant = Make("corrupt_rule", HingeRobot(0.01), motors);
+    Bind(*plant, motors);
+    CorruptingRule rule(corrupt_vel);
+    plant->AddRules(rule);
+    EXPECT_FALSE(plant->Step(1, std::span(&drive, 1)));
+    EXPECT_NE(plant->failure().find(corrupt_vel ? "BADQVEL" : "BADQPOS"),
+              std::string_view::npos)
+        << plant->failure();
+    EXPECT_NE(plant->failure().find("arm_joint"), std::string_view::npos)
+        << plant->failure();
+  }
+}
+
+// REQ-DEV-37: reentrant calls into MujocoPlant from WorldRules hooks fail
+// closed without corrupting rule iteration or state.
+TEST(MujocoPlant, ReentrantRuleHookFailsClosed) {
+  class DummyRule final : public WorldRules {
+   public:
+    void Attach(const mjModel& /*model*/, mjData& /*data*/) override {}
+    bool AfterStep(mjModel& /*model*/, mjData& /*data*/, uint64_t /*step*/,
+                   const MatchInput& /*input*/) override {
+      return true;
+    }
+    std::string_view failure() const override { return {}; }
+  };
+  class ReentrantRule final : public WorldRules {
+   public:
+    enum class Kind { kStep, kMatchInput, kAddInObserve };
+    ReentrantRule(MujocoPlant& plant, Kind kind, WorldRules& extra)
+        : plant_(plant), kind_(kind), extra_(extra) {}
+    void Attach(const mjModel& /*model*/, mjData& /*data*/) override {}
+    bool ObserveMatch(const MatchInput& /*input*/) override {
+      if (kind_ == Kind::kAddInObserve) plant_.AddRules(extra_);
+      return true;
+    }
+    bool AfterStep(mjModel& /*model*/, mjData& /*data*/, uint64_t /*step*/,
+                   const MatchInput& input) override {
+      if (kind_ == Kind::kStep) {
+        const PlantDrive drive{};
+        EXPECT_FALSE(plant_.Step(1, std::span(&drive, 1)));
+      } else if (kind_ == Kind::kMatchInput) {
+        plant_.SetMatchInput(input);
+      }
+      return true;
+    }
+    std::string_view failure() const override { return {}; }
+
+   private:
+    MujocoPlant& plant_;
+    Kind kind_;
+    WorldRules& extra_;
+  };
+  const std::vector<PlantMotor> motors = {Motor("arm")};
+  const PlantDrive drive{};
+  for (const auto kind :
+       {ReentrantRule::Kind::kStep, ReentrantRule::Kind::kMatchInput,
+        ReentrantRule::Kind::kAddInObserve}) {
+    auto plant = Make("reentrant", HingeRobot(0.01), motors);
+    Bind(*plant, motors);
+    DummyRule extra;
+    ReentrantRule rule(*plant, kind, extra);
+    plant->AddRules(rule);
+    if (kind == ReentrantRule::Kind::kAddInObserve) {
+      plant->SetMatchInput({});
+      EXPECT_FALSE(plant->Step(1, std::span(&drive, 1)));
+    } else {
+      EXPECT_FALSE(plant->Step(1, std::span(&drive, 1)));
+    }
+    EXPECT_NE(plant->failure().find("reentrant"), std::string_view::npos)
+        << plant->failure();
+  }
+}
+
+// REQ-DEV-37: non-finite sensor data (NaN or +Inf) never falsely closes a
+// touch input.
+TEST(MujocoPlant, TouchInputIgnoresNonFiniteSensorData) {
+  class InjectSensor final : public WorldRules {
+   public:
+    explicit InjectSensor(double value) : value_(value) {}
+    void Attach(const mjModel& /*model*/, mjData& /*data*/) override {}
+    bool AfterStep(mjModel& /*model*/, mjData& data, uint64_t /*step*/,
+                   const MatchInput& /*input*/) override {
+      data.sensordata[0] = value_;
+      return true;
+    }
+    std::string_view failure() const override { return {}; }
+
+   private:
+    double value_;
+  };
+  const std::string robot = R"(<mujoco><compiler angle="radian"/><worldbody>
+  <body name="base" pos="0 0 0.5">
+    <inertial pos="0 0 0" mass="1" diaginertia="0.1 0.1 0.1"/>
+    <site name="zone" type="sphere" size="0.08"/>
+  </body>
+</worldbody>
+<sensor><touch name="bumper" site="zone"/></sensor></mujoco>)";
+  for (const double bad : {std::numeric_limits<double>::quiet_NaN(),
+                           std::numeric_limits<double>::infinity()}) {
+    auto plant = Make("touch_nonfinite", robot, {});
+    const std::vector<PlantInput> inputs = {{"bumper", "bumper"}};
+    Bind(*plant, {}, inputs);
+    InjectSensor rule(bad);
+    plant->AddRules(rule);
+    ASSERT_TRUE(plant->Step(1, {}));
+    EXPECT_FALSE(plant->input_closed(0));
+  }
+}
+
 }  // namespace
 }  // namespace talos::simulation::mujoco

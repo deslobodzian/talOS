@@ -6,12 +6,15 @@
 #include <hal/DriverStationTypes.h>
 #include <hal/simulation/DriverStationData.h>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -52,6 +55,28 @@ std::string TimeOf(SimDriverStation::Clock::time_point now) {
                          .count());
 }
 
+std::chrono::milliseconds ParseNonNegativeMs(const char* raw,
+                                             const char* variable) {
+  if (raw == nullptr || raw[0] < '0' || raw[0] > '9') {
+    throw std::invalid_argument(std::string{variable} +
+                                " must be a non-negative integer, got '" +
+                                (raw != nullptr ? raw : "") + "'");
+  }
+  errno = 0;
+  char* end = nullptr;
+  const long long parsed = std::strtoll(raw, &end, 10);
+  // 1e9 s matches schedule.h's kMaxSeconds and keeps steady_clock addition far
+  // from signed overflow.
+  constexpr long long kMaxMs = 1'000'000'000'000LL;
+  if (errno == ERANGE || end == raw || *end != '\0' || parsed < 0 ||
+      parsed > kMaxMs) {
+    throw std::invalid_argument(std::string{variable} +
+                                " must be a non-negative integer, got '" + raw +
+                                "'");
+  }
+  return std::chrono::milliseconds{parsed};
+}
+
 }  // namespace
 
 SimDriverStation::Settings SimDriverStation::SettingsFromEnvironment() {
@@ -75,11 +100,17 @@ SimDriverStation::Settings SimDriverStation::SettingsFromEnvironment() {
       // The push requires disabled operation, so this waits for its
       // acknowledgement, not for a configuration restored from disk.
       settings.enable_when_configured = true;
+    } else if (mode == "1") {
+      settings.enabled = true;
+    } else if (mode == "0") {
+      settings.enabled = false;
     } else {
-      settings.enabled = mode != "0";
+      throw std::invalid_argument("TALOS_SIM_DS must be 0, 1 or auto, got '" +
+                                  std::string{mode} + "'");
     }
     if (after != nullptr) {
-      settings.disable_after = std::chrono::milliseconds{std::atoi(after)};
+      settings.disable_after =
+          ParseNonNegativeMs(after, "TALOS_SIM_DS_DISABLE_AFTER_MS");
     }
   }
   // Otherwise leave the Driver Station to the GUI or to a real one.

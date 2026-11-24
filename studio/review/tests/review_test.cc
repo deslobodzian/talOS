@@ -1,6 +1,7 @@
 #include "studio/review/review.h"
 
 #include <gtest/gtest.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -19,6 +20,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <span>
@@ -3868,6 +3870,927 @@ TEST_F(ReviewTest, DeclaredAndManifestServeWithoutOpeningOrEvictingSessions) {
   std::filesystem::remove_all(foreign_fmt);
   std::filesystem::remove_all(not_a_session);
   for (const std::string& dir : lru_dirs) std::filesystem::remove_all(dir);
+}
+
+// Guards REQ-OPS-41, REQ-OPS-42 hardware channel discovery:
+//   (a) <1 s session adding motor 2 + PWM 41 + DO 3 at t=20 ms discovers all
+//       new devices (skipping null gateway_build_id) and matches log_dump;
+//   (b) mid-second transient motor 7 appearing only at t=0.5 s is discovered
+//       and read by ReadSeries;
+//   (c) reader MESSAGE at t=0 (motor 1 + bogus 99) before writer SEND at
+//       t=10 ms (motors 1 & 2) resets to canonical SEND (motor 2 present,
+//       motor 99 absent);
+//   (d) /hw/state rotating > kMaxTopicChannels (2,048) across motor IDs fails
+//       with HTTP 422 while sibling s1 stays 200.
+// REQ-OPS-41, REQ-OPS-42
+TEST_F(ReviewTest,
+       HardwareChannelDiscoveryTracksLateDevicesCanonicalStreamAndCap) {
+  namespace hw = talos::hardware;
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::EventKind;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+  using P = talos::Descriptor<hw::Packet>;
+
+  const auto make_hw_reg = [](SourceKind kind) {
+    talos::event::Registration reg;
+    reg.id = 1;
+    reg.kind = kind;
+    reg.name = "/hw/state";
+    reg.message_bytes = sizeof(hw::Packet);
+    reg.schema = {std::string{P::kName}, P::kHash, {}};
+    return reg;
+  };
+  const auto encode_state = [](const hw::State& s) {
+    hw::Packet pkt{};
+    pkt.size = static_cast<std::uint32_t>(hw::Encode(s, pkt.data));
+    EXPECT_GT(pkt.size, 0u);
+    return pkt;
+  };
+  const auto has_channel = [](const json& doc, std::string_view name) {
+    for (const auto& ch : doc["channels"]) {
+      if (ch["name"] == name) return true;
+    }
+    return false;
+  };
+
+  // (a) <1 s session adding motor 2 + PWM 41 + DO 3 at t=20 ms (revision == 0
+  //     so gateway_build_id prints null and must not pollute channels).
+  {
+    const std::string dir = Library() + "/hw_late_devices";
+    std::filesystem::create_directories(dir);
+    {
+      tlog::LogWriter writer{dir + "/hardware_node.tlog", "hardware_node",
+                             tlog::LogWriterOptions{16384, 1, false}, 1};
+      writer.start({make_hw_reg(SourceKind::SENDER)},
+                   MonotonicTime::from_nanos(kStartNs));
+
+      hw::State s0{};
+      s0.build.revision = 0;
+      s0.motor_count = 1;
+      s0.motors[0].id = 1;
+      s0.motors[0].valid = true;
+      s0.motors[0].velocity_rps = 1.5;
+      const hw::Packet p0 = encode_state(s0);
+
+      hw::State s1 = s0;
+      s1.motor_count = 2;
+      s1.motors[1].id = 2;
+      s1.motors[1].valid = true;
+      s1.motors[1].velocity_rps = 7.25;
+      s1.pwm_output_count = 1;
+      s1.pwm_outputs[0] = {41, true, 0.75};
+      s1.digital_output_count = 1;
+      s1.digital_outputs[0] = {3, true, true};
+      const hw::Packet p1 = encode_state(s1);
+
+      Context ctx{};
+      ctx.dispatch_index = 1;
+      ctx.event_time = ctx.now = MonotonicTime::from_nanos(kStartNs);
+      writer.send(ctx, 1, std::as_bytes(std::span{&p0, 1}), 0, 1);
+
+      ctx.dispatch_index = 2;
+      ctx.event_time = ctx.now = MonotonicTime::from_nanos(kStartNs + 20 * kMs);
+      writer.send(ctx, 1, std::as_bytes(std::span{&p1, 1}), 0, 2);
+      writer.flush();
+      ASSERT_FALSE(writer.failed()) << writer.error();
+    }
+
+    const auto dumped = LogDump(dir);
+    ASSERT_EQ(dumped.size(), 2u);
+    const double dumped_vel =
+        dumped[1]["hardware"]["motors"][1]["velocity_rps"].get<double>();
+
+    Review review{Library(), 1u << 20};
+    const Response ch_resp =
+        review.Get("/review/hw_late_devices/channels.json", "");
+    ASSERT_EQ(ch_resp.status, 200) << ch_resp.body;
+    const json ch_doc = json::parse(ch_resp.body);
+    EXPECT_TRUE(has_channel(ch_doc, "hw/state/motors/1/velocity_rps"));
+    EXPECT_TRUE(has_channel(ch_doc, "hw/state/motors/2/velocity_rps"));
+    EXPECT_TRUE(has_channel(ch_doc, "hw/state/pwm_outputs/41/output"));
+    EXPECT_TRUE(has_channel(ch_doc, "hw/state/digital_outputs/3/value"));
+    EXPECT_FALSE(has_channel(ch_doc, "hw/state/gateway_build_id"));
+
+    const Response snap_resp =
+        review.Get("/review/hw_late_devices/snapshot",
+                   "t_ns=" + std::to_string(kStartNs + 20 * kMs));
+    ASSERT_EQ(snap_resp.status, 200) << snap_resp.body;
+    const json snap = json::parse(snap_resp.body)["channels"];
+    ASSERT_TRUE(snap.contains("hw/state/motors/2/velocity_rps"));
+    EXPECT_EQ(snap["hw/state/motors/2/velocity_rps"]["value"].get<double>(),
+              dumped_vel);
+    EXPECT_EQ(snap["hw/state/pwm_outputs/41/output"]["value"].get<double>(),
+              0.75);
+    EXPECT_EQ(snap["hw/state/digital_outputs/3/value"]["value"].get<double>(),
+              1.0);
+    std::filesystem::remove_all(dir);
+  }
+
+  // (b) Mid-second transient motor 7 appearing only at t=0.5 s.
+  {
+    const std::string dir = Library() + "/hw_transient_motor";
+    std::filesystem::create_directories(dir);
+    {
+      tlog::LogWriter writer{dir + "/hardware_node.tlog", "hardware_node",
+                             tlog::LogWriterOptions{16384, 1, false}, 1};
+      writer.start({make_hw_reg(SourceKind::SENDER)},
+                   MonotonicTime::from_nanos(kStartNs));
+
+      hw::State base{};
+      base.motor_count = 1;
+      base.motors[0].id = 1;
+      base.motors[0].valid = true;
+      hw::State with_7 = base;
+      with_7.motor_count = 2;
+      with_7.motors[1].id = 7;
+      with_7.motors[1].valid = true;
+      with_7.motors[1].velocity_rps = 12.5;
+      const hw::Packet p_base = encode_state(base);
+      const hw::Packet p_with_7 = encode_state(with_7);
+
+      Context ctx{};
+      ctx.dispatch_index = 1;
+      ctx.event_time = ctx.now = MonotonicTime::from_nanos(kStartNs);
+      writer.send(ctx, 1, std::as_bytes(std::span{&p_base, 1}), 0, 1);
+      ctx.dispatch_index = 2;
+      ctx.event_time = ctx.now =
+          MonotonicTime::from_nanos(kStartNs + 500 * kMs);
+      writer.send(ctx, 1, std::as_bytes(std::span{&p_with_7, 1}), 0, 2);
+      ctx.dispatch_index = 3;
+      ctx.event_time = ctx.now =
+          MonotonicTime::from_nanos(kStartNs + 600 * kMs);
+      writer.send(ctx, 1, std::as_bytes(std::span{&p_base, 1}), 0, 3);
+      writer.flush();
+      ASSERT_FALSE(writer.failed()) << writer.error();
+    }
+
+    const auto session = Session::Open(dir);
+    const auto ref = session->Find("hw/state/motors/7/velocity_rps");
+    ASSERT_TRUE(ref.has_value());
+    const auto series = session->ReadSeries(std::span{&*ref, 1}, kStartNs,
+                                            kStartNs + kSecond, 1);
+    EXPECT_EQ(series[0].count[0], 1u);
+    EXPECT_EQ(series[0].last[0], 12.5);
+    std::filesystem::remove_all(dir);
+  }
+
+  // (c) Reader MESSAGE at t=0 (motor 1 + bogus 99) before writer SEND at
+  //     t=10 ms (motors 1 & 2) -> motor 2 present, motor 99 absent.
+  {
+    const std::string dir = Library() + "/hw_canon_reset";
+    std::filesystem::create_directories(dir);
+    {
+      tlog::LogWriter reader{dir + "/alpha.tlog", "alpha",
+                             tlog::LogWriterOptions{16384, 1, false}, 1};
+      reader.start({make_hw_reg(SourceKind::WATCHER)},
+                   MonotonicTime::from_nanos(kStartNs));
+      hw::State bogus{};
+      bogus.motor_count = 2;
+      bogus.motors[0].id = 1;
+      bogus.motors[0].valid = true;
+      bogus.motors[1].id = 99;
+      bogus.motors[1].valid = true;
+      const hw::Packet p_bogus = encode_state(bogus);
+      Context ctx{};
+      ctx.kind = EventKind::MESSAGE;
+      ctx.source_id = 1;
+      ctx.dispatch_index = 1;
+      ctx.sequence = 1;
+      ctx.event_time = ctx.now = ctx.publish_time =
+          MonotonicTime::from_nanos(kStartNs);
+      reader.dispatch(ctx, std::as_bytes(std::span{&p_bogus, 1}));
+      reader.flush();
+      ASSERT_FALSE(reader.failed()) << reader.error();
+    }
+    {
+      tlog::LogWriter writer{dir + "/hardware_node.tlog", "hardware_node",
+                             tlog::LogWriterOptions{16384, 1, false}, 1};
+      writer.start({make_hw_reg(SourceKind::SENDER)},
+                   MonotonicTime::from_nanos(kStartNs));
+      hw::State real{};
+      real.motor_count = 2;
+      real.motors[0].id = 1;
+      real.motors[0].valid = true;
+      real.motors[1].id = 2;
+      real.motors[1].valid = true;
+      const hw::Packet p_real = encode_state(real);
+      Context ctx{};
+      ctx.dispatch_index = 1;
+      ctx.event_time = ctx.now = MonotonicTime::from_nanos(kStartNs + 10 * kMs);
+      writer.send(ctx, 1, std::as_bytes(std::span{&p_real, 1}), 0, 1);
+      writer.flush();
+      ASSERT_FALSE(writer.failed()) << writer.error();
+    }
+
+    Review review{Library(), 1u << 20};
+    const Response resp =
+        review.Get("/review/hw_canon_reset/channels.json", "");
+    ASSERT_EQ(resp.status, 200) << resp.body;
+    const json ch_doc = json::parse(resp.body);
+    EXPECT_TRUE(has_channel(ch_doc, "hw/state/motors/1/velocity_rps"));
+    EXPECT_TRUE(has_channel(ch_doc, "hw/state/motors/2/velocity_rps"));
+    EXPECT_FALSE(has_channel(ch_doc, "hw/state/motors/99/velocity_rps"));
+    std::filesystem::remove_all(dir);
+  }
+
+  // (d) /hw/state rotating > kMaxTopicChannels (2,048) across motor IDs -> 422
+  //     while s1 stays 200.
+  {
+    const std::string dir = Library() + "/hw_topic_cap";
+    std::filesystem::create_directories(dir);
+    {
+      tlog::LogWriter writer{dir + "/hardware_node.tlog", "hardware_node",
+                             tlog::LogWriterOptions{65536, 1, false}, 1};
+      writer.start({make_hw_reg(SourceKind::SENDER)},
+                   MonotonicTime::from_nanos(kStartNs));
+      // Each motor adds 13 channels; 170 distinct motor IDs > 2,048 channels.
+      for (std::uint16_t id = 1; id <= 170; ++id) {
+        hw::State s{};
+        s.motor_count = 1;
+        s.motors[0].id = id;
+        s.motors[0].valid = true;
+        const hw::Packet pkt = encode_state(s);
+        Context ctx{};
+        ctx.dispatch_index = id;
+        ctx.event_time = ctx.now =
+            MonotonicTime::from_nanos(kStartNs + std::int64_t{id} * kMs);
+        writer.send(ctx, 1, std::as_bytes(std::span{&pkt, 1}), 0, id);
+      }
+      writer.flush();
+      ASSERT_FALSE(writer.failed()) << writer.error();
+    }
+
+    Review review{Library(), 1u << 20};
+    EXPECT_EQ(review.Get("/review/hw_topic_cap/channels.json", "").status, 422);
+    EXPECT_EQ(review.Get("/review/s1/bounds.json", "").status, 200);
+    std::filesystem::remove_all(dir);
+  }
+}
+
+// Guards REQ-OPS-42 session-wide channel metadata byte cap: a session within
+// kMaxSessionChannels (9,000 <= 16,384) whose channel metadata exceeds
+// kMaxSessionChannelBytes (8 MiB) fails with HTTP 422 while s1 stays 200.
+// REQ-OPS-42
+TEST_F(ReviewTest,
+       SessionChannelByteCapRefusesOversizedMetadataAndPreservesSiblings) {
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+
+  const std::string dir = Library() + "/over_channel_bytes";
+  std::filesystem::create_directories(dir);
+  constexpr std::size_t kTopics = 9;
+  constexpr std::uint16_t kFields = 1000;
+  // 9 x 1,000 x ~1,012 B = ~9.1 MiB > kMaxSessionChannelBytes (8 MiB).
+  const std::string bfbs = ManyBoolsSchema(
+      "review_test.WideNames", std::string(1000, 'a') + "_", kFields);
+  std::vector<talos::event::Registration> regs;
+  regs.reserve(kTopics);
+  for (std::size_t t = 0; t < kTopics; ++t) {
+    talos::event::Registration reg;
+    reg.id = static_cast<std::uint16_t>(t + 1);
+    reg.kind = SourceKind::SENDER;
+    reg.name = "/w" + std::to_string(t) + "/state";
+    reg.message_bytes = kFields;
+    reg.schema = {"review_test.WideNames", 900 + t, bfbs};
+    regs.push_back(std::move(reg));
+  }
+  {
+    tlog::LogWriter writer{dir + "/wide.tlog", "wide",
+                           tlog::LogWriterOptions{65536, 1, false}, 1};
+    writer.start(regs, MonotonicTime::from_nanos(kStartNs));
+    const std::vector<std::byte> payload(kFields, std::byte{1});
+    for (std::size_t t = 0; t < kTopics; ++t) {
+      Context ctx{};
+      ctx.dispatch_index = t + 1;
+      ctx.event_time = ctx.now = MonotonicTime::from_nanos(kStartNs);
+      writer.send(ctx, static_cast<std::uint16_t>(t + 1), payload, 0, t + 1);
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+
+  Review review{Library(), 1u << 20};
+  EXPECT_EQ(review.Get("/review/over_channel_bytes/channels.json", "").status,
+            422);
+  EXPECT_EQ(review.Get("/review/s1/bounds.json", "").status, 200);
+  std::filesystem::remove_all(dir);
+}
+
+// Guards REQ-OPS-42 on ReadManifestRuns: oversized node names/reasons are
+// truncated UTF-8-safely to kMaxRunStringBytes, runs are kept incrementally in
+// a bounded max-heap of size kMaxTimelineRuns preserving the earliest runs,
+// timeline.json stays <= 2 MiB, and runs_dropped saturates at UINT64_MAX.
+// REQ-OPS-42
+TEST_F(ReviewTest, ManifestRunsBoundMemoryTruncateStringsAndSaturateDropped) {
+  const std::string dir = Library() + "/manifest_runs_cap";
+  testing::WriteFixtureSession(dir);
+  // 127 ASCII 'a' + 3-byte UTF-8 '€' ("\xE2\x82\xAC") + padding to 1 MiB.
+  // Truncating to kMaxRunStringBytes (128) must drop the split '€' -> 127 B.
+  std::string huge_name(kMaxRunStringBytes - 1, 'a');
+  huge_name += "\xE2\x82\xAC";
+  huge_name.append((std::size_t{1} << 20) - huge_name.size(), 'z');
+
+  std::string long_reason(kMaxRunStringBytes - 2, 'r');
+  long_reason += "\xE2\x82\xAC";  // 3 bytes starting at 126 -> cut to 126
+  long_reason.append(64, 'x');
+
+  const std::int64_t base_wall = testing::kStartWallNs;
+  {
+    std::ofstream out{dir + "/manifest.json", std::ios::binary};
+    out << "{\n  \"session_id\": " << testing::kSessionId
+        << ",\n  \"simulation\": true,\n  \"nodes\": [\n"
+        << "    {\"name\": \"" << huge_name
+        << "\", \"runs_dropped\": " << std::numeric_limits<std::int64_t>::max()
+        << ", \"runs\": [\n";
+    // Emit 5,000 runs in descending start order so the heap must evict later
+    // runs and keep the earliest ones.
+    constexpr int kRunCount = 5000;
+    for (int i = kRunCount - 1; i >= 0; --i) {
+      if (i != kRunCount - 1) out << ",\n";
+      const std::int64_t s = base_wall + std::int64_t{i + 10} * kMs;
+      out << "{\"start_wall_ns\":" << s << ",\"end_wall_ns\":" << (s + kMs)
+          << ",\"reason\":\"" << (i == 0 ? long_reason : "crash") << "\"}";
+    }
+    out << "\n    ]},\n"
+        << "    {\"name\": \"early_node\", \"runs_dropped\": "
+        << std::numeric_limits<std::int64_t>::max() << ", \"runs\": [\n"
+        << "{\"start_wall_ns\":" << (base_wall + kMs)
+        << ",\"end_wall_ns\":" << (base_wall + 2 * kMs)
+        << ",\"reason\":\"stop\"}\n    ]}\n  ]\n}\n";
+  }
+
+  Review review{Library(), 1u << 20};
+  const Response resp =
+      review.Get("/review/manifest_runs_cap/timeline.json", "");
+  ASSERT_EQ(resp.status, 200) << resp.body;
+  EXPECT_LE(resp.body.size(), std::size_t{2} << 20);
+  const json tl = json::parse(resp.body);
+  ASSERT_EQ(tl["runs"].size(), kMaxTimelineRuns);
+  EXPECT_EQ(tl["runs_dropped"].get<std::uint64_t>(),
+            std::numeric_limits<std::uint64_t>::max());
+  // Earliest run is from early_node at +1 ms, second is huge_name at +10 ms.
+  EXPECT_EQ(tl["runs"][0]["node"], "early_node");
+  const std::string trunc_node = tl["runs"][1]["node"];
+  const std::string trunc_reason = tl["runs"][1]["reason"];
+  EXPECT_EQ(trunc_node.size(), kMaxRunStringBytes - 1);
+  EXPECT_EQ(trunc_node, std::string(kMaxRunStringBytes - 1, 'a'));
+  EXPECT_EQ(trunc_reason.size(), kMaxRunStringBytes - 2);
+  EXPECT_EQ(trunc_reason, std::string(kMaxRunStringBytes - 2, 'r'));
+  std::filesystem::remove_all(dir);
+}
+
+// Guards REQ-OPS-41, REQ-OPS-42, REQ-SAFE-35 session directory confinement:
+//   (a) regular manifest.json + symlink .tlog -> 422 without leaking outside;
+//   (b) regular manifest.json + FIFO .tlog -> 422 immediately without blocking;
+//   (c) regular .tlog + symlink manifest.json (foreign protocol 999) -> 200
+//       with hardware decoded;
+//   (d) regular .tlog + symlink extra.tlog -> 200 without external topic;
+//   (e) non-sim sessions with FIFO or symlink session_class -> sessions.json
+//       returns 200 immediately with "class": "unknown".
+// REQ-OPS-41, REQ-OPS-42, REQ-SAFE-35
+TEST_F(ReviewTest,
+       SessionConfinementRejectsSymlinkAndFifoLogsManifestAndClass) {
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+  using D = talos::Descriptor<review_test::Shot>;
+
+  const std::string outside_dir = Directory() + "/outside_confinement";
+  std::filesystem::create_directories(outside_dir);
+  const std::string outside_tlog = outside_dir + "/leaked.tlog";
+  {
+    talos::event::Registration reg;
+    reg.id = 1;
+    reg.kind = SourceKind::SENDER;
+    reg.name = "/leaked/state";
+    reg.message_bytes = sizeof(review_test::Shot);
+    reg.schema = {std::string{D::kName}, D::kHash,
+                  std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                              D::kBfbs.size()}};
+    tlog::LogWriter writer{outside_tlog, "leaked",
+                           tlog::LogWriterOptions{8192, 1, false},
+                           testing::kSessionId};
+    writer.start({reg}, MonotonicTime::from_nanos(kStartNs));
+    const review_test::Shot shot{42.0, 1, review_test::Mode::IDLE, true, 1};
+    Context ctx{};
+    ctx.dispatch_index = 1;
+    ctx.event_time = ctx.now = MonotonicTime::from_nanos(kStartNs);
+    writer.send(ctx, 1, std::as_bytes(std::span{&shot, 1}), 0, 1);
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+  const std::string outside_manifest = outside_dir + "/foreign_manifest.json";
+  std::ofstream{outside_manifest}
+      << "{\n  \"session_id\": " << testing::kSessionId
+      << ",\n  \"hardware_protocol_version\": 999,\n  \"nodes\": []\n}\n";
+  const std::string outside_class = outside_dir + "/outside_class";
+  std::ofstream{outside_class} << "match 0\n";
+
+  // (a) Regular manifest.json + symlink .tlog -> 422.
+  const std::string sym_tlog_dir = Library() + "/confine_sym_tlog";
+  std::filesystem::create_directories(sym_tlog_dir);
+  std::ofstream{sym_tlog_dir + "/manifest.json"} << "{\"nodes\":[]}\n";
+  std::filesystem::create_symlink(outside_tlog, sym_tlog_dir + "/leaked.tlog");
+
+  // (b) Regular manifest.json + mkfifo .tlog -> 422 immediately.
+  const std::string fifo_tlog_dir = Library() + "/confine_fifo_tlog";
+  std::filesystem::create_directories(fifo_tlog_dir);
+  std::ofstream{fifo_tlog_dir + "/manifest.json"} << "{\"nodes\":[]}\n";
+  ASSERT_EQ(mkfifo((fifo_tlog_dir + "/hang.tlog").c_str(), 0600), 0);
+
+  // (c) Regular .tlog + symlink manifest.json (protocol 999) -> 200, decoded.
+  const std::string sym_manifest_dir = Library() + "/confine_sym_manifest";
+  testing::WriteFixtureSession(sym_manifest_dir);
+  std::filesystem::remove(sym_manifest_dir + "/manifest.json");
+  std::filesystem::create_symlink(outside_manifest,
+                                  sym_manifest_dir + "/manifest.json");
+
+  // (d) Regular .tlog + symlink extra.tlog -> 200 without /leaked/state.
+  const std::string extra_tlog_dir = Library() + "/confine_extra_tlog";
+  testing::WriteFixtureSession(extra_tlog_dir);
+  std::filesystem::create_symlink(outside_tlog, extra_tlog_dir + "/extra.tlog");
+
+  // (e) Non-sim sessions with FIFO and symlink session_class -> "unknown".
+  const std::string fifo_class_dir = Library() + "/confine_fifo_class";
+  std::filesystem::create_directories(fifo_class_dir);
+  std::ofstream{fifo_class_dir + "/manifest.json"}
+      << "{\"session_id\":1,\"simulation\":false,\"nodes\":[]}\n";
+  ASSERT_EQ(mkfifo((fifo_class_dir + "/" +
+                    std::string{talos::launcher::kSessionClassFile})
+                       .c_str(),
+                   0600),
+            0);
+
+  const std::string sym_class_dir = Library() + "/confine_sym_class";
+  std::filesystem::create_directories(sym_class_dir);
+  std::ofstream{sym_class_dir + "/manifest.json"}
+      << "{\"session_id\":2,\"simulation\":false,\"nodes\":[]}\n";
+  std::filesystem::create_symlink(
+      outside_class,
+      sym_class_dir + "/" + std::string{talos::launcher::kSessionClassFile});
+
+  {
+    Review review{Library(), 1u << 20};
+    EXPECT_EQ(review.Get("/review/confine_sym_tlog/bounds.json", "").status,
+              422);
+    EXPECT_EQ(review.Get("/review/confine_fifo_tlog/bounds.json", "").status,
+              422);
+
+    const Response sm_bounds =
+        review.Get("/review/confine_sym_manifest/bounds.json", "");
+    ASSERT_EQ(sm_bounds.status, 200) << sm_bounds.body;
+    EXPECT_TRUE(json::parse(sm_bounds.body)["hardware_not_decoded"].is_null());
+
+    const Response ex_ch =
+        review.Get("/review/confine_extra_tlog/channels.json", "");
+    ASSERT_EQ(ex_ch.status, 200) << ex_ch.body;
+    for (const auto& ch : json::parse(ex_ch.body)["channels"]) {
+      const std::string name = ch["name"];
+      EXPECT_FALSE(name.starts_with("leaked/")) << name;
+    }
+
+    const Response list_resp = review.Get("/review/sessions.json", "");
+    ASSERT_EQ(list_resp.status, 200) << list_resp.body;
+    bool saw_fifo_class = false;
+    bool saw_sym_class = false;
+    for (const auto& entry : json::parse(list_resp.body)) {
+      if (entry["id"] == "confine_fifo_class") {
+        saw_fifo_class = true;
+        EXPECT_EQ(entry["class"], "unknown");
+      } else if (entry["id"] == "confine_sym_class") {
+        saw_sym_class = true;
+        EXPECT_EQ(entry["class"], "unknown");
+      }
+    }
+    EXPECT_TRUE(saw_fifo_class);
+    EXPECT_TRUE(saw_sym_class);
+  }
+
+  std::filesystem::remove_all(sym_tlog_dir);
+  std::filesystem::remove_all(fifo_tlog_dir);
+  std::filesystem::remove_all(sym_manifest_dir);
+  std::filesystem::remove_all(extra_tlog_dir);
+  std::filesystem::remove_all(fifo_class_dir);
+  std::filesystem::remove_all(sym_class_dir);
+  std::filesystem::remove_all(outside_dir);
+}
+
+// Guards REQ-OPS-41, REQ-OPS-42 canonical stream selection for Driver Station
+// mode_streams: a non-canonical receiver flapping modes beside a canonical
+// sender (and receiver-only lexicographic path tie-break across restarts)
+// yields exact timeline.json modes and modes_dropped.
+// REQ-OPS-41, REQ-OPS-42
+TEST_F(ReviewTest, TimelineModesFollowCanonicalStreamAndSkipNonCanonical) {
+  namespace ds = talos::driver_station;
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::EventKind;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+  using P = talos::Descriptor<talos::hardware::Packet>;
+
+  const auto make_ds_reg = [](SourceKind kind) {
+    talos::event::Registration reg;
+    reg.id = 2;
+    reg.kind = kind;
+    reg.name = "/hw/state/driver_station";
+    reg.message_bytes = sizeof(talos::hardware::Packet);
+    reg.schema = {std::string{P::kName}, P::kHash, {}};
+    return reg;
+  };
+  const auto encode_ds = [](std::uint32_t flags) {
+    ds::DriverStationData data{};
+    data.fms.flags = flags;
+    talos::hardware::Packet pkt{};
+    pkt.size = static_cast<std::uint32_t>(ds::Encode(data, pkt.data));
+    EXPECT_GT(pkt.size, 0u);
+    return pkt;
+  };
+  const auto write_ds_messages =
+      [&](const std::string& path, const std::string& proc,
+          const std::vector<std::pair<std::int64_t, std::uint32_t>>& samples) {
+        tlog::LogWriter writer{path, proc,
+                               tlog::LogWriterOptions{16384, 1, false}, 1};
+        writer.start({make_ds_reg(SourceKind::WATCHER)},
+                     MonotonicTime::from_nanos(kStartNs));
+        std::uint64_t seq = 0;
+        for (const auto& [offset_ms, flags] : samples) {
+          const talos::hardware::Packet pkt = encode_ds(flags);
+          Context ctx{};
+          ctx.kind = EventKind::MESSAGE;
+          ctx.source_id = 2;
+          ctx.dispatch_index = ++seq;
+          ctx.sequence = seq;
+          ctx.event_time = ctx.now = ctx.publish_time =
+              MonotonicTime::from_nanos(kStartNs + offset_ms * kMs);
+          writer.dispatch(ctx, std::as_bytes(std::span{&pkt, 1}));
+        }
+        writer.flush();
+        ASSERT_FALSE(writer.failed()) << writer.error();
+      };
+
+  // Subcase 1: SEND beats flapping MESSAGE receiver.
+  {
+    const std::string dir = Library() + "/modes_canon_sender";
+    std::filesystem::create_directories(dir);
+    write_ds_messages(
+        dir + "/alpha.tlog", "alpha",
+        {{0, ds::kDsAttached | ds::kEnabled | ds::kAutonomous},
+         {100, ds::kDsAttached | ds::kEnabled | ds::kTest},
+         {200, ds::kDsAttached | ds::kEStop},
+         {800, ds::kDsAttached | ds::kEnabled | ds::kAutonomous}});
+    {
+      tlog::LogWriter writer{dir + "/hardware_node.tlog", "hardware_node",
+                             tlog::LogWriterOptions{16384, 1, false}, 1};
+      writer.start({make_ds_reg(SourceKind::SENDER)},
+                   MonotonicTime::from_nanos(kStartNs));
+      const talos::hardware::Packet pkt =
+          encode_ds(ds::kDsAttached | ds::kEnabled | ds::kTeleop);
+      Context ctx{};
+      ctx.dispatch_index = 1;
+      ctx.event_time = ctx.now =
+          MonotonicTime::from_nanos(kStartNs + 500 * kMs);
+      writer.send(ctx, 2, std::as_bytes(std::span{&pkt, 1}), 0, 1);
+      writer.flush();
+      ASSERT_FALSE(writer.failed()) << writer.error();
+    }
+    Review review{Library(), 1u << 20};
+    const Response resp =
+        review.Get("/review/modes_canon_sender/timeline.json", "");
+    std::filesystem::remove_all(dir);
+    ASSERT_EQ(resp.status, 200) << resp.body;
+    const json tl = json::parse(resp.body);
+    EXPECT_EQ(tl["modes_dropped"], 0);
+    ASSERT_EQ(tl["modes"].size(), 1u);
+    EXPECT_EQ(tl["modes"][0]["mode"], "teleop");
+    EXPECT_EQ(tl["modes"][0]["start_ns"], std::to_string(kStartNs + 500 * kMs));
+  }
+
+  // Subcase 2: Receiver-only path tie-break preserves alpha across restart.
+  {
+    const std::string dir = Library() + "/modes_canon_receiver";
+    std::filesystem::create_directories(dir);
+    write_ds_messages(dir + "/beta.tlog", "beta",
+                      {{0, ds::kDsAttached | ds::kEStop},
+                       {400, ds::kDsAttached | ds::kEnabled | ds::kTest}});
+    write_ds_messages(
+        dir + "/alpha.tlog", "alpha",
+        {{200, ds::kDsAttached | ds::kEnabled | ds::kAutonomous}});
+    write_ds_messages(dir + "/alpha.restart1.tlog", "alpha",
+                      {{800, ds::kDsAttached | ds::kEnabled | ds::kTeleop}});
+    Review review{Library(), 1u << 20};
+    const Response resp =
+        review.Get("/review/modes_canon_receiver/timeline.json", "");
+    std::filesystem::remove_all(dir);
+    ASSERT_EQ(resp.status, 200) << resp.body;
+    const json tl = json::parse(resp.body);
+    EXPECT_EQ(tl["modes_dropped"], 0);
+    ASSERT_EQ(tl["modes"].size(), 2u);
+    EXPECT_EQ(tl["modes"][0]["mode"], "auto");
+    EXPECT_EQ(tl["modes"][1]["mode"], "teleop");
+  }
+}
+
+// Guards REQ-OPS-42 overflow_bits geometric growth, post-merge compaction, and
+// the kMaxSessionOverflowBytes (8 MiB) session-wide ceiling (-> HTTP 422 while
+// sibling s1 stays 200).
+// REQ-OPS-42
+TEST_F(ReviewTest, OverflowBitmapGeometricGrowthCompactionAndSessionCap) {
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+
+  const std::string bfbs = ManyBoolsSchema("review_test.OneBool", "b", 1);
+  const auto make_reg = [&](std::uint16_t id) {
+    talos::event::Registration reg;
+    reg.id = id;
+    reg.kind = SourceKind::SENDER;
+    reg.name = "/ov" + std::to_string(id) + "/state";
+    reg.message_bytes = 1;
+    reg.schema = {"review_test.OneBool", 777, bfbs};
+    return reg;
+  };
+
+  // Subcase 1: 130 overflow sources grow 1 -> 2 -> 4 words/cp during Open()
+  // and compact post-merge to 3 words/cp with exact reads.
+  {
+    const std::string dir = Library() + "/overflow_compact";
+    std::filesystem::create_directories(dir);
+    constexpr std::uint16_t kFirstId = 64;
+    constexpr std::uint16_t kCount = 130;
+    std::vector<talos::event::Registration> regs;
+    regs.reserve(kCount);
+    for (std::uint16_t i = 0; i < kCount; ++i) {
+      regs.push_back(make_reg(static_cast<std::uint16_t>(kFirstId + i)));
+    }
+    {
+      tlog::LogWriter writer{dir + "/compact.tlog", "compact",
+                             tlog::LogWriterOptions{65536, 1, false}, 1};
+      writer.start(regs, MonotonicTime::from_nanos(kStartNs));
+      const std::array<std::byte, 1> one{std::byte{1}};
+      std::uint64_t seq = 0;
+      for (std::uint16_t i = 0; i < kCount; ++i) {
+        Context ctx{};
+        ctx.dispatch_index = ++seq;
+        ctx.event_time = ctx.now = MonotonicTime::from_nanos(
+            kStartNs + std::int64_t{i % 10} * kSecond);
+        writer.send(ctx, static_cast<std::uint16_t>(kFirstId + i), one, 0, seq);
+      }
+      writer.flush();
+      ASSERT_FALSE(writer.failed()) << writer.error();
+    }
+    const auto session = Session::Open(dir);
+    ASSERT_EQ(session->files().size(), 1u);
+    EXPECT_EQ(session->files()[0].overflow_source_ids.size(), kCount);
+    EXPECT_EQ(session->files()[0].overflow_words_per_cp, 3u);
+    const auto last_ref = session->Find(
+        "ov" + std::to_string(kFirstId + kCount - 1) + "/state/b0");
+    ASSERT_TRUE(last_ref.has_value());
+    const auto series = session->ReadSeries(std::span{&*last_ref, 1}, kStartNs,
+                                            kStartNs + 10 * kSecond, 1);
+    EXPECT_EQ(series[0].count[0], 1u);
+    std::filesystem::remove_all(dir);
+  }
+
+  // Subcase 2: 257 files x 32 KiB overflow_bits (> kMaxSessionOverflowBytes =
+  // 8 MiB) fails with HTTP 422 while sibling s1 stays 200.
+  struct rlimit rl {};
+  bool raised_limit = false;
+  struct rlimit old_rl {};
+  if (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < 320) {
+    old_rl = rl;
+    rl.rlim_cur = std::min<rlim_t>(rl.rlim_max, 512);
+    if (rl.rlim_cur >= 320 && ::setrlimit(RLIMIT_NOFILE, &rl) == 0) {
+      raised_limit = true;
+    }
+  }
+  if (rl.rlim_cur >= 320) {
+    const std::string dir = Library() + "/overflow_session_cap";
+    std::filesystem::create_directories(dir);
+    constexpr std::uint16_t kFirstId = 64;
+    constexpr std::uint16_t kSources = 129;  // 4 words/cp during Open()
+    constexpr std::size_t kFiles =
+        (kMaxSessionOverflowBytes / kMaxOverflowBytesPerFile) + 1;
+    constexpr std::int64_t kCheckpoints = static_cast<std::int64_t>(
+        kMaxOverflowBytesPerFile / (kMaxOverflowWordsPerCheckpoint * 8));
+    std::vector<talos::event::Registration> regs;
+    regs.reserve(kSources);
+    for (std::uint16_t i = 0; i < kSources; ++i) {
+      regs.push_back(make_reg(static_cast<std::uint16_t>(kFirstId + i)));
+    }
+    const std::array<std::byte, 1> one{std::byte{1}};
+    for (std::size_t f = 0; f < kFiles; ++f) {
+      const std::string proc = "p" + std::to_string(f);
+      tlog::LogWriter writer{dir + "/" + proc + ".tlog", proc,
+                             tlog::LogWriterOptions{65536, 1, false}, 1};
+      writer.start(regs, MonotonicTime::from_nanos(kStartNs));
+      std::uint64_t seq = 0;
+      for (std::uint16_t i = 0; i < kSources; ++i) {
+        Context ctx{};
+        ctx.dispatch_index = ++seq;
+        ctx.event_time = ctx.now = MonotonicTime::from_nanos(kStartNs);
+        writer.send(ctx, static_cast<std::uint16_t>(kFirstId + i), one, 0, seq);
+      }
+      for (std::int64_t s = 1; s < kCheckpoints; ++s) {
+        Context ctx{};
+        ctx.dispatch_index = ++seq;
+        ctx.event_time = ctx.now =
+            MonotonicTime::from_nanos(kStartNs + s * kSecond);
+        writer.send(ctx, kFirstId, one, 0, seq);
+      }
+      writer.flush();
+      ASSERT_FALSE(writer.failed()) << writer.error();
+    }
+
+    Review review{Library(), 1u << 20};
+    const Response resp =
+        review.Get("/review/overflow_session_cap/bounds.json", "");
+    EXPECT_EQ(resp.status, 422) << resp.body;
+    EXPECT_NE(resp.body.find("overflow"), std::string::npos) << resp.body;
+    EXPECT_EQ(review.Get("/review/s1/bounds.json", "").status, 200);
+    std::filesystem::remove_all(dir);
+  }
+  if (raised_limit) {
+    (void)::setrlimit(RLIMIT_NOFILE, &old_rl);
+  }
+}
+
+// Guards REQ-OPS-41, REQ-OPS-42 timestamp edge cases:
+//   - Session::Snapshot returns a record published at INT64_MIN;
+//   - Session::Snapshot breaks equal publish_ns ties across two files in favor
+//     of the later file (matching ReadSeries);
+//   - Extreme FileHeader timestamps (INT64_MAX, -1000) and manifest.json
+//     UINT64_MAX fields clamp without signed overflow UB or negative wrap.
+// REQ-OPS-41, REQ-OPS-42
+TEST_F(ReviewTest,
+       SnapshotHandlesInt64MinAndTieBreakAndClampsExtremeTimestamps) {
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+  using D = talos::Descriptor<review_test::Shot>;
+
+  const auto make_shot_reg = [] {
+    talos::event::Registration reg;
+    reg.id = 1;
+    reg.kind = SourceKind::SENDER;
+    reg.name = "/shooter/state";
+    reg.message_bytes = sizeof(review_test::Shot);
+    reg.schema = {std::string{D::kName}, D::kHash,
+                  std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                              D::kBfbs.size()}};
+    return reg;
+  };
+
+  // Subcase 1: publish_time_ns == INT64_MIN returned by Snapshot(INT64_MIN).
+  {
+    const std::string dir = Library() + "/snap_int64_min";
+    std::filesystem::create_directories(dir);
+    {
+      tlog::LogWriter writer{dir + "/shooter.tlog", "shooter",
+                             tlog::LogWriterOptions{8192, 1, false}, 1};
+      writer.start({make_shot_reg()}, MonotonicTime::from_nanos(kStartNs));
+      const review_test::Shot shot{3.25, 7, review_test::Mode::IDLE, true, 1};
+      Context ctx{};
+      ctx.dispatch_index = 1;
+      ctx.event_time = MonotonicTime::from_nanos(kStartNs);
+      ctx.now = MonotonicTime::min();
+      writer.send(ctx, 1, std::as_bytes(std::span{&shot, 1}), 0, 1);
+      writer.flush();
+      ASSERT_FALSE(writer.failed()) << writer.error();
+    }
+    const auto session = Session::Open(dir);
+    const auto snap =
+        session->Snapshot(std::numeric_limits<std::int64_t>::min());
+    const auto ref = session->Find("shooter/state/position_m");
+    ASSERT_TRUE(ref.has_value());
+    const auto it =
+        std::find_if(snap.begin(), snap.end(), [&](const Sample& s) {
+          return s.channel.topic == ref->topic &&
+                 s.channel.channel == ref->channel;
+        });
+    ASSERT_NE(it, snap.end());
+    EXPECT_EQ(it->sample_ns, std::numeric_limits<std::int64_t>::min());
+    EXPECT_EQ(ValueOf(session->channel(*ref).kind, it->raw), 3.25);
+    std::filesystem::remove_all(dir);
+  }
+
+  // Subcase 2: Equal publish_ns across two files -> later file wins (matches
+  // ReadSeries).
+  {
+    const std::string dir = Library() + "/snap_tie_break";
+    std::filesystem::create_directories(dir);
+    const std::int64_t pub_ns = kStartNs + 100 * kMs;
+    struct FileCase {
+      const char* name;
+      double val;
+      std::int64_t ev_ns;
+    };
+    for (const FileCase& fc : {
+             FileCase{"shooter.tlog", 1.5, kStartNs},
+             FileCase{"shooter.restart1.tlog", 2.5, kStartNs + kSecond},
+         }) {
+      tlog::LogWriter writer{dir + "/" + fc.name, "shooter",
+                             tlog::LogWriterOptions{8192, 1, false}, 1};
+      writer.start({make_shot_reg()}, MonotonicTime::from_nanos(fc.ev_ns));
+      const review_test::Shot shot{fc.val, 1, review_test::Mode::IDLE, true, 1};
+      Context ctx{};
+      ctx.dispatch_index = 1;
+      ctx.event_time = MonotonicTime::from_nanos(fc.ev_ns);
+      ctx.now = MonotonicTime::from_nanos(pub_ns);
+      writer.send(ctx, 1, std::as_bytes(std::span{&shot, 1}), 0, 1);
+      writer.flush();
+      ASSERT_FALSE(writer.failed()) << writer.error();
+    }
+    const auto session = Session::Open(dir);
+    const auto ref = session->Find("shooter/state/position_m");
+    ASSERT_TRUE(ref.has_value());
+    const auto series =
+        session->ReadSeries(std::span{&*ref, 1}, pub_ns, pub_ns + kMs, 1);
+    ASSERT_EQ(series[0].count[0], 2u);
+    const auto snap = session->Snapshot(pub_ns);
+    const auto it =
+        std::find_if(snap.begin(), snap.end(), [&](const Sample& s) {
+          return s.channel.topic == ref->topic &&
+                 s.channel.channel == ref->channel;
+        });
+    ASSERT_NE(it, snap.end());
+    EXPECT_EQ(ValueOf(session->channel(*ref).kind, it->raw), series[0].last[0]);
+    EXPECT_EQ(ValueOf(session->channel(*ref).kind, it->raw), 2.5);
+    std::filesystem::remove_all(dir);
+  }
+
+  // Subcase 3: Extreme FileHeader timestamps + UINT64_MAX manifest fields clamp
+  // cleanly without signed overflow UB or negative wrap.
+  {
+    const std::string dir = Library() + "/extreme_timestamps";
+    std::filesystem::create_directories(dir);
+    {
+      tlog::LogWriter writer{dir + "/shooter.tlog", "shooter",
+                             tlog::LogWriterOptions{8192, 1, false}, 1};
+      writer.start({make_shot_reg()}, MonotonicTime::from_nanos(-1000));
+      const review_test::Shot shot{1.0, 1, review_test::Mode::IDLE, true, 1};
+      Context ctx{};
+      ctx.dispatch_index = 1;
+      ctx.event_time = ctx.now = MonotonicTime::from_nanos(kStartNs);
+      writer.send(ctx, 1, std::as_bytes(std::span{&shot, 1}), 0, 1);
+      writer.flush();
+      ASSERT_FALSE(writer.failed()) << writer.error();
+    }
+    {
+      std::fstream f{dir + "/shooter.tlog",
+                     std::ios::in | std::ios::out | std::ios::binary};
+      const std::int64_t wall = std::numeric_limits<std::int64_t>::max();
+      f.seekp(offsetof(tlog::FileHeader, start_wall_ns));
+      f.write(reinterpret_cast<const char*>(&wall), sizeof wall);
+      ASSERT_TRUE(f.good());
+    }
+    {
+      const std::uint64_t umax = std::numeric_limits<std::uint64_t>::max();
+      std::ofstream{dir + "/manifest.json"}
+          << "{\n  \"session_id\": 1,\n  \"simulation\": true,\n"
+          << "  \"start_wall_ns\": " << umax << ",\n"
+          << "  \"end_wall_ns\": " << umax << ",\n"
+          << "  \"nodes\": [{\"name\": \"shooter\", \"runs_dropped\": " << umax
+          << ", \"runs\": [{\"start_wall_ns\": 1, \"end_wall_ns\": 10, "
+             "\"reason\": \"stop\"}]}]\n}\n";
+    }
+
+    Review review{Library(), 1u << 20};
+    const Response list_resp = review.Get("/review/sessions.json", "");
+    ASSERT_EQ(list_resp.status, 200) << list_resp.body;
+    bool found = false;
+    for (const auto& entry : json::parse(list_resp.body)) {
+      if (entry["id"] == "extreme_timestamps") {
+        found = true;
+        EXPECT_EQ(entry["start_wall_ns"], "0");
+        EXPECT_EQ(entry["end_wall_ns"], "0");
+      }
+    }
+    EXPECT_TRUE(found);
+
+    const Response bounds_resp =
+        review.Get("/review/extreme_timestamps/bounds.json", "");
+    ASSERT_EQ(bounds_resp.status, 200) << bounds_resp.body;
+    EXPECT_EQ(json::parse(bounds_resp.body)["origin_wall_ns"],
+              std::to_string(std::numeric_limits<std::int64_t>::max()));
+
+    const Response tl_resp =
+        review.Get("/review/extreme_timestamps/timeline.json", "");
+    ASSERT_EQ(tl_resp.status, 200) << tl_resp.body;
+    const json tl = json::parse(tl_resp.body);
+    EXPECT_EQ(tl["runs_dropped"], 0);
+    ASSERT_EQ(tl["runs"].size(), 1u);
+    EXPECT_EQ(tl["runs"][0]["start_ns"], "0");
+    EXPECT_EQ(tl["runs"][0]["end_ns"], "0");
+    std::filesystem::remove_all(dir);
+  }
 }
 
 }  // namespace

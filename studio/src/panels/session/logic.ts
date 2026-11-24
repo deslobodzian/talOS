@@ -89,7 +89,7 @@ export function loopRate(
   const timers = node.sources.filter(s => s.kind === 'TIMER');
   const candidates = timers.length ? timers : node.sources;
   const measured = candidates.map(s => rates[rateKey(node.name, s.id)])
-                        .filter((r): r is number => r !== undefined);
+                        .filter((r): r is number => r !== undefined && Number.isFinite(r));
   return measured.length ? Math.max(...measured) : null;
 }
 

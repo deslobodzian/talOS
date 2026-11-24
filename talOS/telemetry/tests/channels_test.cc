@@ -12,6 +12,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "flatbuffers/flatbuffers.h"
@@ -572,6 +573,260 @@ TEST(TelemetryChannels, NonIntegerFieldsIgnoreEnumTypeIndex) {
   EXPECT_EQ(channels[3].name, "demo/status/mode");
   EXPECT_EQ(channels[3].unit, "");
   EXPECT_EQ(channels[3].labels, (std::vector<std::string>{"OFF", "ON"}));
+}
+
+// REQ-OPS-42: FlattenOptions::max_metadata_bytes bounds cumulative channel
+// metadata bytes (names, units, enum labels, and per-channel/per-label storage)
+// during recursive flattening, stopping cleanly with a clear error when
+// exceeded while allowing schemas within budget.
+TEST(TelemetryChannels, MetadataByteBudgetBoundsFlattening) {
+  const auto total_metadata_bytes = [](const std::vector<Channel>& channels) {
+    std::size_t total = 0;
+    for (const Channel& ch : channels) total += ChannelMetadataBytes(ch);
+    return total;
+  };
+
+  // 1. Exact boundary on a real schema.
+  {
+    const schema::Identity identity = schema::Of<schema_test::Mixed>();
+    const std::vector<Channel> baseline =
+        FlattenTopic("/demo/state", identity.name, identity.bfbs);
+    ASSERT_FALSE(baseline.empty());
+    const std::size_t exact = total_metadata_bytes(baseline);
+
+    FlattenOptions at_budget;
+    at_budget.max_metadata_bytes = exact;
+    const std::vector<Channel> allowed =
+        FlattenTopic("/demo/state", identity.name, identity.bfbs, at_budget);
+    ASSERT_EQ(allowed.size(), baseline.size());
+    for (std::size_t i = 0; i < baseline.size(); ++i) {
+      EXPECT_EQ(allowed[i].name, baseline[i].name);
+    }
+
+    FlattenOptions under_budget;
+    under_budget.max_metadata_bytes = exact - 1;
+    try {
+      (void)FlattenTopic("/demo/state", identity.name, identity.bfbs,
+                         under_budget);
+      ADD_FAILURE() << "accepted schema past max_metadata_bytes";
+    } catch (const std::invalid_argument& error) {
+      const std::string msg = error.what();
+      EXPECT_NE(msg.find("/demo/state"), std::string::npos) << msg;
+      EXPECT_NE(msg.find("metadata"), std::string::npos) << msg;
+    }
+  }
+
+  // 2. Deeply nested structs with long field names stop cleanly when cumulative
+  // metadata exceeds max_metadata_bytes, even when truncate is true.
+  {
+    flatbuffers::FlatBufferBuilder fbb;
+    constexpr std::uint16_t kLeafCount = 8;
+    constexpr std::int32_t kLeafBytes =
+        static_cast<std::int32_t>(kLeafCount * sizeof(double));
+    const std::string long_segment(128, 'a');
+    std::vector<flatbuffers::Offset<reflection::Object>> objects;
+    for (std::int32_t i = 0; i < 4; ++i) {
+      const flatbuffers::Offset<reflection::Type> ftype =
+          i < 3 ? reflection::CreateType(fbb, reflection::BaseType::Obj,
+                                         reflection::BaseType::None, i + 1, 0,
+                                         1, 0)
+                : reflection::CreateType(fbb, reflection::BaseType::Array,
+                                         reflection::BaseType::Double, -1,
+                                         kLeafCount, 8, 8);
+      const std::string fname = i < 3 ? long_segment : long_segment + "_m";
+      std::vector<flatbuffers::Offset<reflection::Field>> fields{
+          reflection::CreateFieldDirect(fbb, fname.c_str(), ftype, 0, 0)};
+      char obj_name[32];
+      std::snprintf(obj_name, sizeof obj_name, "t.n%02d", i);
+      objects.push_back(reflection::CreateObjectDirect(fbb, obj_name, &fields,
+                                                       true, 8, kLeafBytes));
+    }
+    std::vector<flatbuffers::Offset<reflection::Enum>> enums;
+    reflection::FinishSchemaBuffer(
+        fbb, reflection::CreateSchemaDirect(fbb, &objects, &enums));
+    const std::string bfbs{
+        reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
+
+    const std::vector<Channel> baseline =
+        FlattenTopic("/nested/state", "t.n00", bfbs);
+    ASSERT_EQ(baseline.size(), kLeafCount);
+    const std::size_t exact = total_metadata_bytes(baseline);
+    ASSERT_GT(exact, 4096u);
+
+    FlattenOptions at_budget;
+    at_budget.max_metadata_bytes = exact;
+    EXPECT_EQ(FlattenTopic("/nested/state", "t.n00", bfbs, at_budget).size(),
+              kLeafCount);
+
+    for (const bool truncate : {false, true}) {
+      FlattenOptions over_budget;
+      over_budget.max_metadata_bytes = 2048;
+      over_budget.truncate = truncate;
+      try {
+        (void)FlattenTopic("/nested/state", "t.n00", bfbs, over_budget);
+        ADD_FAILURE() << "accepted nested schema past max_metadata_bytes";
+      } catch (const std::invalid_argument& error) {
+        const std::string msg = error.what();
+        EXPECT_NE(msg.find("/nested/state"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("metadata"), std::string::npos) << msg;
+      }
+    }
+  }
+
+  // 3. Enum label storage and label text count against max_metadata_bytes.
+  {
+    flatbuffers::FlatBufferBuilder fbb;
+    const auto ftype =
+        reflection::CreateType(fbb, reflection::BaseType::UByte,
+                               reflection::BaseType::None, 0, 0, 1, 0);
+    std::vector<flatbuffers::Offset<reflection::Field>> fields{
+        reflection::CreateFieldDirect(fbb, "mode", ftype, 0, 0)};
+    std::vector<flatbuffers::Offset<reflection::Object>> objects{
+        reflection::CreateObjectDirect(fbb, "t.EnumStruct", &fields, true, 1,
+                                       1)};
+    std::vector<flatbuffers::Offset<reflection::EnumVal>> vals;
+    vals.reserve(64);
+    for (std::int64_t v = 0; v < 64; ++v) {
+      const std::string label =
+          "v" + std::to_string(v) + "_" + std::string(60, 'x');
+      vals.push_back(reflection::CreateEnumValDirect(fbb, label.c_str(), v));
+    }
+    const auto enum_type =
+        reflection::CreateType(fbb, reflection::BaseType::UByte,
+                               reflection::BaseType::None, -1, 0, 1, 0);
+    std::vector<flatbuffers::Offset<reflection::Enum>> enums{
+        reflection::CreateEnumDirect(fbb, "t.BigEnum", &vals, false,
+                                     enum_type)};
+    reflection::FinishSchemaBuffer(
+        fbb, reflection::CreateSchemaDirect(fbb, &objects, &enums));
+    const std::string bfbs{
+        reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
+
+    const std::vector<Channel> baseline =
+        FlattenTopic("/enum/state", "t.EnumStruct", bfbs);
+    ASSERT_EQ(baseline.size(), 1u);
+    ASSERT_EQ(baseline[0].labels.size(), 64u);
+    const std::size_t exact = total_metadata_bytes(baseline);
+
+    FlattenOptions at_budget;
+    at_budget.max_metadata_bytes = exact;
+    EXPECT_EQ(
+        FlattenTopic("/enum/state", "t.EnumStruct", bfbs, at_budget).size(),
+        1u);
+
+    FlattenOptions under_budget;
+    under_budget.max_metadata_bytes = exact - 1;
+    try {
+      (void)FlattenTopic("/enum/state", "t.EnumStruct", bfbs, under_budget);
+      ADD_FAILURE() << "accepted enum schema past max_metadata_bytes";
+    } catch (const std::invalid_argument& error) {
+      const std::string msg = error.what();
+      EXPECT_NE(msg.find("/enum/state"), std::string::npos) << msg;
+      EXPECT_NE(msg.find("metadata"), std::string::npos) << msg;
+    }
+  }
+
+  // 4. Default kMaxTopicMetadataBytes stops adversarial expansion in both
+  // FlattenTopic and EnvelopeChannels even when channel/element/depth counts
+  // are well below their caps.
+  {
+    flatbuffers::FlatBufferBuilder fbb;
+    constexpr std::uint16_t kCount = 600;
+    const std::string huge_field = std::string(4096, 'x') + "_m";
+    const auto ftype =
+        reflection::CreateType(fbb, reflection::BaseType::Array,
+                               reflection::BaseType::Double, -1, kCount, 8, 8);
+    std::vector<flatbuffers::Offset<reflection::Field>> fields{
+        reflection::CreateFieldDirect(fbb, huge_field.c_str(), ftype, 0, 0)};
+    std::vector<flatbuffers::Offset<reflection::Object>> objects{
+        reflection::CreateObjectDirect(
+            fbb, "t.HugeMeta", &fields, true, 8,
+            static_cast<std::int32_t>(kCount * sizeof(double)))};
+    std::vector<flatbuffers::Offset<reflection::Enum>> enums;
+    reflection::FinishSchemaBuffer(
+        fbb, reflection::CreateSchemaDirect(fbb, &objects, &enums));
+    const std::string bfbs{
+        reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
+
+    try {
+      (void)FlattenTopic("/huge/state", "t.HugeMeta", bfbs);
+      ADD_FAILURE() << "FlattenTopic accepted schema past default metadata cap";
+    } catch (const std::invalid_argument& error) {
+      const std::string msg = error.what();
+      EXPECT_NE(msg.find("/huge/state"), std::string::npos) << msg;
+      EXPECT_NE(msg.find("metadata"), std::string::npos) << msg;
+    }
+
+    try {
+      (void)EnvelopeChannels("/huge/target/teleop", "t.HugeMeta", bfbs);
+      ADD_FAILURE()
+          << "EnvelopeChannels accepted schema past default metadata cap";
+    } catch (const std::invalid_argument& error) {
+      const std::string msg = error.what();
+      EXPECT_NE(msg.find("/huge/target/teleop"), std::string::npos) << msg;
+      EXPECT_NE(msg.find("metadata"), std::string::npos) << msg;
+    }
+  }
+}
+
+// REQ-OPS-42: empty or malformed topic and field names (slashes, embedded NULs)
+// are refused cleanly rather than emitting corrupt channel paths.
+TEST(TelemetryChannels, EmptyOrMalformedTopicAndFieldNamesAreRefused) {
+  const schema::Identity identity = schema::Of<schema_test::Mixed>();
+  const std::array<std::string_view, 6> bad_topics = {
+      "",
+      "/",
+      "//demo/state",
+      "/demo/state/",
+      "/demo//state",
+      std::string_view{"/demo\0/state", 12},
+  };
+  for (const std::string_view bad_topic : bad_topics) {
+    EXPECT_THROW((void)FlattenTopic(bad_topic, identity.name, identity.bfbs),
+                 std::invalid_argument);
+    EXPECT_THROW(
+        (void)EnvelopeChannels(bad_topic, identity.name, identity.bfbs),
+        std::invalid_argument);
+  }
+
+  const std::array<std::string_view, 3> bad_fields = {
+      "",
+      "bad/name",
+      std::string_view{"bad\0name", 8},
+  };
+  for (const std::string_view bad_field : bad_fields) {
+    flatbuffers::FlatBufferBuilder fbb;
+    const auto ftype =
+        reflection::CreateType(fbb, reflection::BaseType::Double,
+                               reflection::BaseType::None, -1, 0, 8, 0);
+    const auto fname = fbb.CreateString(bad_field.data(), bad_field.size());
+    std::vector<flatbuffers::Offset<reflection::Field>> fields{
+        reflection::CreateField(fbb, fname, ftype, 0, 0)};
+    std::vector<flatbuffers::Offset<reflection::Object>> objects{
+        reflection::CreateObjectDirect(fbb, "t.BadField", &fields, true, 8, 8)};
+    std::vector<flatbuffers::Offset<reflection::Enum>> enums;
+    reflection::FinishSchemaBuffer(
+        fbb, reflection::CreateSchemaDirect(fbb, &objects, &enums));
+    const std::string bfbs{
+        reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
+
+    try {
+      (void)FlattenTopic("/crafted/state", "t.BadField", bfbs);
+      ADD_FAILURE() << "FlattenTopic accepted malformed field name";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string{error.what()}.find("/crafted/state"),
+                std::string::npos)
+          << error.what();
+    }
+    try {
+      (void)EnvelopeChannels("/crafted/target/teleop", "t.BadField", bfbs);
+      ADD_FAILURE() << "EnvelopeChannels accepted malformed field name";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string{error.what()}.find("/crafted/target/teleop"),
+                std::string::npos)
+          << error.what();
+    }
+  }
 }
 
 }  // namespace
