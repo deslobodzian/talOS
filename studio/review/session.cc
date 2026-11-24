@@ -1,5 +1,9 @@
 #include "studio/review/session.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -10,6 +14,7 @@
 #include <map>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 
 #include "nlohmann/json.hpp"
@@ -18,7 +23,6 @@
 #include "talOS/configuration/config_parser.h"
 #include "talOS/events/log/format.h"
 #include "talOS/events/log/log_reader.h"
-#include "talOS/launcher/log_inputs.h"
 #include "talOS/launcher/log_merge.h"
 #include "talOS/schema/identity.h"
 #include "talOS/schema/unit_suffix.h"
@@ -52,6 +56,31 @@ bool IsValueRecord(const tlog::RecordHeader& header) {
          tlog::IsAcceptedSend(header);
 }
 
+void SaturatingAdd(std::uint64_t& dst, std::uint64_t add) noexcept {
+  constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+  dst = add > kMax - dst ? kMax : dst + add;
+}
+
+std::int64_t ClampedSubI64(std::int64_t a, std::int64_t b,
+                           std::int64_t min_val) noexcept {
+  const __int128 diff = static_cast<__int128>(a) - static_cast<__int128>(b);
+  constexpr __int128 kMax = std::numeric_limits<std::int64_t>::max();
+  if (diff < static_cast<__int128>(min_val)) return min_val;
+  if (diff > kMax) return std::numeric_limits<std::int64_t>::max();
+  return static_cast<std::int64_t>(diff);
+}
+
+// Truncates `text` to at most `max_bytes` bytes without splitting a multi-byte
+// UTF-8 sequence.
+std::string TruncateUtf8(std::string_view text, std::size_t max_bytes) {
+  if (text.size() <= max_bytes) return std::string{text};
+  std::size_t len = max_bytes;
+  while (len > 0 && (static_cast<unsigned char>(text[len]) & 0xC0u) == 0x80u) {
+    --len;
+  }
+  return std::string{text.substr(0, len)};
+}
+
 struct RawAlertInterval {
   std::int64_t start_ns{0};
   std::int64_t end_ns{0};
@@ -71,6 +100,155 @@ struct AlertStream {
   std::int64_t last_publish_ns{std::numeric_limits<std::int64_t>::min()};
 };
 
+struct ModeStream {
+  std::vector<ModeInterval> intervals;
+  std::uint64_t dropped{0};
+  std::int64_t last_publish_ns{std::numeric_limits<std::int64_t>::min()};
+  ModeKind last_mode{ModeKind::kDisabled};
+  bool last_fms{false};
+  bool closed_last{false};
+};
+
+// Single canonical stream tracked during Open(): SEND beats MESSAGE; lowest
+// file index wins among SENDs, lexicographically smallest path wins among
+// MESSAGEs (matching post-scan topic selection).
+struct CanonicalStream {
+  std::optional<std::size_t> file;
+  bool is_send{false};
+};
+
+enum class StreamAction : std::uint8_t {
+  kSkip,
+  kContinue,
+  kReset,
+};
+
+StreamAction SelectCanonicalStream(CanonicalStream& stream,
+                                   const std::vector<LogFile>& files,
+                                   std::size_t file, bool is_send) {
+  const LogFile& log_file = files[file];
+  if (!stream.file.has_value()) {
+    stream.file = file;
+    stream.is_send = is_send;
+    return StreamAction::kReset;
+  }
+  const std::size_t cur_file = *stream.file;
+  const LogFile& cur = files[cur_file];
+  if (stream.is_send) {
+    if (!is_send) return StreamAction::kSkip;
+    if (log_file.process == cur.process) {
+      if (file < cur_file) stream.file = file;
+      return StreamAction::kContinue;
+    }
+    if (file < cur_file) {
+      stream.file = file;
+      return StreamAction::kReset;
+    }
+    return StreamAction::kSkip;
+  }
+  if (is_send) {
+    stream.file = file;
+    stream.is_send = true;
+    return StreamAction::kReset;
+  }
+  if (log_file.process == cur.process) {
+    if (log_file.path < cur.path) stream.file = file;
+    return StreamAction::kContinue;
+  }
+  if (log_file.path < cur.path) {
+    stream.file = file;
+    return StreamAction::kReset;
+  }
+  return StreamAction::kSkip;
+}
+
+constexpr std::uint32_t HardwareDeviceKey(std::uint8_t tag,
+                                          std::uint16_t id) noexcept {
+  return (static_cast<std::uint32_t>(tag) << 16) | id;
+}
+
+template <typename Array>
+bool AnyUnseenDevice(const std::unordered_set<std::uint32_t>& seen,
+                     std::uint8_t tag, const Array& items, std::size_t count) {
+  const std::size_t n = std::min(count, items.size());
+  for (std::size_t i = 0; i < n; ++i) {
+    if (!seen.contains(HardwareDeviceKey(tag, items[i].id))) return true;
+  }
+  return false;
+}
+
+template <typename Array>
+void RecordDevices(std::unordered_set<std::uint32_t>& seen, std::uint8_t tag,
+                   const Array& items, std::size_t count) {
+  const std::size_t n = std::min(count, items.size());
+  for (std::size_t i = 0; i < n; ++i) {
+    seen.insert(HardwareDeviceKey(tag, items[i].id));
+  }
+}
+
+bool HasUnseenHardwareDevice(HardwareRecord kind,
+                             const talos::launcher::HardwarePacket& packet,
+                             const std::unordered_set<std::uint32_t>& seen) {
+  if (kind == HardwareRecord::kState) {
+    const auto& s = packet.state;
+    return AnyUnseenDevice(seen, 0, s.motors, s.motor_count) ||
+           AnyUnseenDevice(seen, 1, s.sensors, s.sensor_count) ||
+           AnyUnseenDevice(seen, 2, s.digital_inputs, s.digital_input_count) ||
+           AnyUnseenDevice(seen, 3, s.digital_outputs,
+                           s.digital_output_count) ||
+           AnyUnseenDevice(seen, 4, s.analog_inputs, s.analog_input_count) ||
+           AnyUnseenDevice(seen, 5, s.encoders, s.encoder_count) ||
+           AnyUnseenDevice(seen, 6, s.pwm_outputs, s.pwm_output_count);
+  }
+  if (kind == HardwareRecord::kCommand) {
+    const auto& c = packet.command;
+    return AnyUnseenDevice(seen, 0, c.motors, c.count) ||
+           AnyUnseenDevice(seen, 3, c.digital_outputs,
+                           c.digital_output_count) ||
+           AnyUnseenDevice(seen, 6, c.pwm_outputs, c.pwm_output_count);
+  }
+  return false;
+}
+
+void RecordHardwareDevices(HardwareRecord kind,
+                           const talos::launcher::HardwarePacket& packet,
+                           std::unordered_set<std::uint32_t>& seen) {
+  if (kind == HardwareRecord::kState) {
+    const auto& s = packet.state;
+    RecordDevices(seen, 0, s.motors, s.motor_count);
+    RecordDevices(seen, 1, s.sensors, s.sensor_count);
+    RecordDevices(seen, 2, s.digital_inputs, s.digital_input_count);
+    RecordDevices(seen, 3, s.digital_outputs, s.digital_output_count);
+    RecordDevices(seen, 4, s.analog_inputs, s.analog_input_count);
+    RecordDevices(seen, 5, s.encoders, s.encoder_count);
+    RecordDevices(seen, 6, s.pwm_outputs, s.pwm_output_count);
+  } else if (kind == HardwareRecord::kCommand) {
+    const auto& c = packet.command;
+    RecordDevices(seen, 0, c.motors, c.count);
+    RecordDevices(seen, 3, c.digital_outputs, c.digital_output_count);
+    RecordDevices(seen, 6, c.pwm_outputs, c.pwm_output_count);
+  }
+}
+
+std::size_t ChannelMetadataBytes(const Channel& channel) {
+  std::size_t bytes = channel.name.size() + channel.unit.size();
+  for (const std::string& label : channel.labels) {
+    bytes += label.size();
+  }
+  return bytes;
+}
+
+std::size_t HardwareChannelBytes(std::string_view name, ChannelKind kind) {
+  std::size_t bytes = name.size();
+  if (kind != Talos::Telemetry::ChannelKind_Bool) {
+    const std::size_t slash = name.rfind('/');
+    const std::string_view leaf =
+        slash == std::string_view::npos ? name : name.substr(slash + 1);
+    bytes += talos::schema::unit_for_field(leaf).size();
+  }
+  return bytes;
+}
+
 // A topic as the index pass learns it.
 struct TopicBuild {
   std::string name;
@@ -80,64 +258,19 @@ struct TopicBuild {
   std::vector<Channel> channels;  // struct topics
   // Indices into `channels` whose alert level is not None.
   std::vector<std::uint32_t> alert_channels;
-  // Single canonical alert stream tracked during Open(): SEND beats MESSAGE;
-  // lowest file index wins among SENDs, lexicographically smallest path wins
-  // among MESSAGEs (matching the post-scan topic selection below, assuming
-  // launcher log naming where each process's files arrive in file-index order
-  // and distinct processes' log paths do not interleave lexicographically).
-  std::optional<std::size_t> alert_file;
-  bool alert_is_send{false};
+  CanonicalStream alert_stream_canon;
   AlertStream alert_stream;
-  // Hardware topics: every channel name seen, with its kind.
+  CanonicalStream mode_stream_canon;
+  ModeStream mode_stream;
+  // Hardware topics: every channel name seen on the canonical stream, with its
+  // kind.
+  CanonicalStream hardware_stream;
   std::map<std::string, ChannelKind> hardware_channels;
-  std::int64_t decoded_second{std::numeric_limits<std::int64_t>::min()};
+  std::size_t hardware_channel_bytes{0};
+  bool hardware_initialized{false};
+  std::unordered_set<std::uint32_t> seen_hardware_devices;
+  std::unordered_set<std::string> pending_null_channels;
 };
-
-bool SelectCanonicalAlertStream(TopicBuild& topic,
-                                const std::vector<LogFile>& files,
-                                std::size_t file, bool is_send) {
-  const LogFile& log_file = files[file];
-  if (!topic.alert_file.has_value()) {
-    topic.alert_file = file;
-    topic.alert_is_send = is_send;
-    topic.alert_stream.channels.resize(topic.alert_channels.size());
-    return true;
-  }
-  const std::size_t cur_file = *topic.alert_file;
-  const LogFile& cur = files[cur_file];
-  if (topic.alert_is_send) {
-    if (!is_send) return false;
-    if (log_file.process == cur.process) {
-      if (file < cur_file) topic.alert_file = file;
-      return true;
-    }
-    if (file < cur_file) {
-      topic.alert_file = file;
-      topic.alert_stream = AlertStream{};
-      topic.alert_stream.channels.resize(topic.alert_channels.size());
-      return true;
-    }
-    return false;
-  }
-  if (is_send) {
-    topic.alert_file = file;
-    topic.alert_is_send = true;
-    topic.alert_stream = AlertStream{};
-    topic.alert_stream.channels.resize(topic.alert_channels.size());
-    return true;
-  }
-  if (log_file.process == cur.process) {
-    if (log_file.path < cur.path) topic.alert_file = file;
-    return true;
-  }
-  if (log_file.path < cur.path) {
-    topic.alert_file = file;
-    topic.alert_stream = AlertStream{};
-    topic.alert_stream.channels.resize(topic.alert_channels.size());
-    return true;
-  }
-  return false;
-}
 
 constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{4} << 20;
 constexpr std::uintmax_t kMaxConfigBytes = std::uintmax_t{1} << 20;
@@ -267,20 +400,17 @@ ModeKind ModeFromDriverStation(
   return ModeKind::kDisabled;
 }
 
-struct ModeStream {
-  std::vector<ModeInterval> intervals;
-  std::uint64_t dropped{0};
-  std::int64_t last_publish_ns{std::numeric_limits<std::int64_t>::min()};
-  ModeKind last_mode{ModeKind::kDisabled};
-  bool last_fms{false};
-  bool closed_last{false};
-};
-
 bool ReadManifestInt(const nlohmann::json& object, std::string_view key,
                      std::int64_t& out) {
   const auto it = object.find(key);
   if (it == object.end()) return false;
   if (it->is_number_integer()) {
+    if (it->is_number_unsigned() &&
+        it->get<std::uint64_t>() >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::int64_t>::max())) {
+      return false;
+    }
     out = it->get<std::int64_t>();
     return true;
   }
@@ -294,14 +424,19 @@ bool ReadManifestInt(const nlohmann::json& object, std::string_view key,
   return false;
 }
 
-void ReadManifestRuns(const fs::path& manifest_path,
+bool RunLess(const RunInterval& a, const RunInterval& b) {
+  const std::int64_t a_end =
+      a.end_ns.value_or(std::numeric_limits<std::int64_t>::max());
+  const std::int64_t b_end =
+      b.end_ns.value_or(std::numeric_limits<std::int64_t>::max());
+  return std::tie(a.start_ns, a.node, a_end, a.reason) <
+         std::tie(b.start_ns, b.node, b_end, b.reason);
+}
+
+void ReadManifestRuns(const nlohmann::json& manifest,
                       std::int64_t origin_wall_ns,
                       std::vector<RunInterval>& runs,
                       std::uint64_t& runs_dropped) {
-  const auto content = ReadBoundedRegularFile(manifest_path, kMaxManifestBytes);
-  if (!content) return;
-  const auto manifest = nlohmann::json::parse(*content, nullptr,
-                                              /*allow_exceptions=*/false);
   if (!manifest.is_object()) return;
   const auto nodes = manifest.find("nodes");
   if (nodes == manifest.end() || !nodes->is_array()) return;
@@ -309,11 +444,12 @@ void ReadManifestRuns(const fs::path& manifest_path,
     if (!node.is_object()) continue;
     const auto name_it = node.find("name");
     if (name_it == node.end() || !name_it->is_string()) continue;
-    const std::string& node_name = name_it->get_ref<const std::string&>();
+    const std::string node_name = TruncateUtf8(
+        name_it->get_ref<const std::string&>(), kMaxRunStringBytes);
     std::int64_t node_dropped = 0;
     if (ReadManifestInt(node, "runs_dropped", node_dropped) &&
         node_dropped > 0) {
-      runs_dropped += static_cast<std::uint64_t>(node_dropped);
+      SaturatingAdd(runs_dropped, static_cast<std::uint64_t>(node_dropped));
     }
     const auto node_runs = node.find("runs");
     if (node_runs == node.end() || !node_runs->is_array()) continue;
@@ -328,30 +464,107 @@ void ReadManifestRuns(const fs::path& manifest_path,
       if (reason_it == run.end() || !reason_it->is_string()) continue;
       std::int64_t end_wall_ns = 0;
       (void)ReadManifestInt(run, "end_wall_ns", end_wall_ns);
-      std::int64_t start_ns = start_wall_ns - origin_wall_ns;
-      if (start_ns < 0) start_ns = 0;
+      const std::int64_t start_ns =
+          ClampedSubI64(start_wall_ns, origin_wall_ns, 0);
       std::optional<std::int64_t> end_ns;
       if (end_wall_ns > 0) {
-        end_ns = std::max(start_ns, end_wall_ns - origin_wall_ns);
+        end_ns =
+            std::max(start_ns, ClampedSubI64(end_wall_ns, origin_wall_ns, 0));
       }
-      runs.push_back({node_name, start_ns, end_ns,
-                      reason_it->get_ref<const std::string&>()});
+      RunInterval item{node_name, start_ns, end_ns,
+                       TruncateUtf8(reason_it->get_ref<const std::string&>(),
+                                    kMaxRunStringBytes)};
+      if (runs.size() < kMaxTimelineRuns) {
+        runs.push_back(std::move(item));
+        if (runs.size() == kMaxTimelineRuns) {
+          std::make_heap(runs.begin(), runs.end(), RunLess);
+        }
+      } else {
+        SaturatingAdd(runs_dropped, 1);
+        if (RunLess(item, runs.front())) {
+          std::pop_heap(runs.begin(), runs.end(), RunLess);
+          runs.back() = std::move(item);
+          std::push_heap(runs.begin(), runs.end(), RunLess);
+        }
+      }
     }
   }
-  std::sort(runs.begin(), runs.end(),
-            [](const RunInterval& a, const RunInterval& b) {
-              const std::int64_t a_end =
-                  a.end_ns.value_or(std::numeric_limits<std::int64_t>::max());
-              const std::int64_t b_end =
-                  b.end_ns.value_or(std::numeric_limits<std::int64_t>::max());
-              return std::tie(a.start_ns, a.node, a_end, a.reason) <
-                     std::tie(b.start_ns, b.node, b_end, b.reason);
-            });
-  if (runs.size() > kMaxTimelineRuns) {
-    runs_dropped += runs.size() - kMaxTimelineRuns;
-    runs.resize(kMaxTimelineRuns);
-  }
+  std::sort(runs.begin(), runs.end(), RunLess);
   runs.shrink_to_fit();
+}
+
+// Lists regular, non-symlink `.tlog` files directly inside non-symlink `dir`,
+// verified with O_NOFOLLOW | O_NONBLOCK and fstat(S_ISREG) so symlinks and
+// FIFOs never escape confinement or hang Session::Open (REQ-OPS-41, REQ-OPS-42,
+// REQ-SAFE-35).
+std::vector<std::string> SessionLogFiles(const fs::path& dir) {
+  std::error_code ec;
+  const fs::file_status dir_st = fs::symlink_status(dir, ec);
+  if (ec || fs::is_symlink(dir_st) || !fs::is_directory(dir_st)) {
+    return {};
+  }
+  std::vector<std::string> paths;
+  for (fs::directory_iterator it{dir, ec};
+       !ec && it != fs::directory_iterator{}; it.increment(ec)) {
+    if (it->path().extension() != ".tlog") continue;
+    std::error_code entry_ec;
+    const fs::file_status st = it->symlink_status(entry_ec);
+    if (entry_ec || fs::is_symlink(st) || !fs::is_regular_file(st)) continue;
+    const int fd = ::open(it->path().c_str(),
+                          O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) continue;
+    struct stat sb {};
+    const bool regular = (::fstat(fd, &sb) == 0) && S_ISREG(sb.st_mode);
+    ::close(fd);
+    if (!regular) continue;
+    paths.push_back(it->path().string());
+  }
+  std::sort(paths.begin(), paths.end());
+  return paths;
+}
+
+constexpr std::int64_t kBridgeStatusSearchNs = 1'000'000'000;
+constexpr std::string_view kHardwareStatusTopic = "/hw/status";
+
+// The protocol_version_id of the first /hw/status SEND in `path` within its
+// first second of records, matching hardware_record.cc's
+// RecordedProtocolVersion without scanning the directory again.
+std::optional<std::uint16_t> FirstBridgeStatusVersion(const std::string& path) {
+  try {
+    tlog::WindowedLogReader reader{path};
+    std::optional<std::uint16_t> id;
+    std::optional<talos::launcher::ProtocolVersionField> version_field;
+    for (const auto& source : reader.manifest()) {
+      if (source.kind == talos::event::SourceKind::SENDER &&
+          source.name == kHardwareStatusTopic) {
+        version_field = talos::launcher::ResolveProtocolVersionField(
+            source.schema.bfbs, source.schema.name, source.message_bytes);
+        if (version_field) id = source.id;
+        break;
+      }
+    }
+    if (!id || !version_field) return std::nullopt;
+    tlog::LogReader::Record record;
+    std::optional<std::int64_t> first_ns;
+    while (reader.next(record)) {
+      if (!first_ns) first_ns = record.header.event_time_ns;
+      if (record.header.event_time_ns > *first_ns &&
+          static_cast<std::uint64_t>(record.header.event_time_ns) -
+                  static_cast<std::uint64_t>(*first_ns) >
+              static_cast<std::uint64_t>(kBridgeStatusSearchNs)) {
+        return std::nullopt;
+      }
+      if (record.header.source_id != *id ||
+          record.header.kind != static_cast<std::uint16_t>(EventKind::SEND)) {
+        continue;
+      }
+      return talos::launcher::ReadProtocolVersion(*version_field,
+                                                  record.payload);
+    }
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+  return std::nullopt;
 }
 
 // A log file as the index pass learns it: per source id, its topic (-1 for
@@ -370,7 +583,8 @@ constexpr std::size_t kMaxOverflowWordsPerFile =
     kMaxOverflowBytesPerFile / sizeof(std::uint64_t);
 
 void RecordOverflowSource(LogFile& log_file, FileBuild& build,
-                          std::size_t cp_idx, std::uint16_t source_id) {
+                          std::size_t cp_idx, std::uint16_t source_id,
+                          std::size_t& session_overflow_bytes) {
   const auto it = build.overflow_bit.find(source_id);
   std::size_t bit_idx = 0;
   if (it == build.overflow_bit.end()) {
@@ -383,9 +597,9 @@ void RecordOverflowSource(LogFile& log_file, FileBuild& build,
     if (needed_words > log_file.overflow_words_per_cp) {
       const std::size_t old_words = log_file.overflow_words_per_cp;
       const std::size_t new_words =
-          old_words == 0
-              ? 1
-              : std::min(kMaxOverflowWordsPerCheckpoint, old_words * 2);
+          std::min(kMaxOverflowWordsPerCheckpoint,
+                   std::max(needed_words,
+                            old_words == 0 ? std::size_t{1} : old_words * 2));
       const std::size_t old_cps =
           old_words == 0 ? 0 : log_file.overflow_bits.size() / old_words;
       const std::size_t target_cps = std::max(old_cps, cp_idx + 1);
@@ -393,7 +607,18 @@ void RecordOverflowSource(LogFile& log_file, FileBuild& build,
         log_file.overflow_capped = true;
         return;
       }
-      std::vector<std::uint64_t> grown(target_cps * new_words, 0);
+      const std::size_t target_words = target_cps * new_words;
+      const std::size_t old_bytes =
+          log_file.overflow_bits.size() * sizeof(std::uint64_t);
+      const std::size_t new_bytes = target_words * sizeof(std::uint64_t);
+      if (new_bytes > old_bytes &&
+          new_bytes - old_bytes >
+              kMaxSessionOverflowBytes - session_overflow_bytes) {
+        throw std::runtime_error("session exceeds overflow bitmap cap (" +
+                                 std::to_string(kMaxSessionOverflowBytes) +
+                                 " bytes)");
+      }
+      std::vector<std::uint64_t> grown(target_words, 0);
       for (std::size_t c = 0; c < old_cps; ++c) {
         for (std::size_t w = 0; w < old_words; ++w) {
           grown[c * new_words + w] = log_file.overflow_bits[c * old_words + w];
@@ -401,6 +626,9 @@ void RecordOverflowSource(LogFile& log_file, FileBuild& build,
       }
       log_file.overflow_bits = std::move(grown);
       log_file.overflow_words_per_cp = new_words;
+      if (new_bytes > old_bytes) {
+        session_overflow_bytes += new_bytes - old_bytes;
+      }
     } else if (cp_idx + 1 >
                kMaxOverflowWordsPerFile / log_file.overflow_words_per_cp) {
       log_file.overflow_capped = true;
@@ -420,12 +648,20 @@ void RecordOverflowSource(LogFile& log_file, FileBuild& build,
   const std::size_t required_size =
       (cp_idx + 1) * log_file.overflow_words_per_cp;
   if (log_file.overflow_bits.size() < required_size) {
+    const std::size_t delta_bytes =
+        (required_size - log_file.overflow_bits.size()) * sizeof(std::uint64_t);
+    if (delta_bytes > kMaxSessionOverflowBytes - session_overflow_bytes) {
+      throw std::runtime_error("session exceeds overflow bitmap cap (" +
+                               std::to_string(kMaxSessionOverflowBytes) +
+                               " bytes)");
+    }
     if (log_file.overflow_bits.capacity() < required_size) {
       const std::size_t doubled = log_file.overflow_bits.capacity() * 2;
       log_file.overflow_bits.reserve(
           std::min(kMaxOverflowWordsPerFile, std::max(required_size, doubled)));
     }
     log_file.overflow_bits.resize(required_size, 0);
+    session_overflow_bytes += delta_bytes;
   }
   log_file.overflow_bits[cp_idx * log_file.overflow_words_per_cp +
                          (bit_idx / 64)] |=
@@ -436,11 +672,13 @@ class Indexer {
  public:
   std::vector<TopicBuild> topics;
   std::size_t total_channels{0};
+  std::size_t total_channel_bytes{0};
 
   // The topic `source` carries, created on first sight; -1 for one that
   // holds no channel review reads, or whose schema disagrees with the one
   // the topic was first seen with. Throws std::runtime_error when adding
-  // the topic would exceed kMaxSessionChannels across the session.
+  // the topic would exceed kMaxSessionChannels or kMaxSessionChannelBytes
+  // across the session.
   std::int32_t Resolve(const talos::event::Registration& source,
                        const std::string& path) {
     const auto& schema = source.schema;
@@ -496,7 +734,19 @@ class Indexer {
                                  std::to_string(kMaxSessionChannels) +
                                  ") at topic " + source.name);
       }
+      std::size_t topic_bytes = 0;
+      for (const Channel& ch : topic.channels) {
+        const std::size_t ch_bytes = ChannelMetadataBytes(ch);
+        if (ch_bytes >
+            kMaxSessionChannelBytes - total_channel_bytes - topic_bytes) {
+          throw std::runtime_error("session exceeds channel byte cap (" +
+                                   std::to_string(kMaxSessionChannelBytes) +
+                                   ") at topic " + source.name);
+        }
+        topic_bytes += ch_bytes;
+      }
       total_channels += topic.channels.size();
+      total_channel_bytes += topic_bytes;
       for (std::uint32_t c = 0; c < topic.channels.size(); ++c) {
         if (topic.channels[c].alert != Talos::Telemetry::AlertLevel_None) {
           topic.alert_channels.push_back(c);
@@ -567,25 +817,55 @@ double ValueOf(ChannelKind kind, std::uint64_t raw) {
 }
 
 std::unique_ptr<Session> Session::Open(const fs::path& dir) {
-  const std::vector<std::string> paths =
-      talos::launcher::LogInputFiles({dir.string()});
-  if (paths.empty() || !fs::is_directory(dir)) {
+  const std::vector<std::string> paths = SessionLogFiles(dir);
+  if (paths.empty()) {
     throw std::runtime_error("no .tlog files in " + dir.string());
   }
+  std::optional<nlohmann::json> manifest;
+  if (const auto manifest_text =
+          ReadBoundedRegularFile(dir / "manifest.json", kMaxManifestBytes)) {
+    auto parsed = nlohmann::json::parse(*manifest_text, nullptr,
+                                        /*allow_exceptions=*/false);
+    if (parsed.is_object()) manifest = std::move(parsed);
+  }
+  talos::launcher::RecordedProtocol recorded;
+  if (manifest) {
+    const auto ver_it = manifest->find("hardware_protocol_version");
+    if (ver_it != manifest->end() && ver_it->is_number_integer()) {
+      if (ver_it->is_number_unsigned()) {
+        const auto ver = ver_it->get<std::uint64_t>();
+        if (ver >= 1 && ver <= 0xFFFFu) {
+          recorded.manifest = static_cast<std::uint16_t>(ver);
+        }
+      } else {
+        const auto ver = ver_it->get<std::int64_t>();
+        if (ver >= 1 && ver <= 0xFFFF) {
+          recorded.manifest = static_cast<std::uint16_t>(ver);
+        }
+      }
+    }
+  }
+  for (const std::string& log_path : paths) {
+    const auto version = FirstBridgeStatusVersion(log_path);
+    if (version && std::find(recorded.bridge.begin(), recorded.bridge.end(),
+                             *version) == recorded.bridge.end()) {
+      recorded.bridge.push_back(*version);
+    }
+  }
+  if (const std::string line = recorded.Disagreement(); !line.empty()) {
+    std::cerr << "studio_review: " << dir.string() << ": " << line << '\n';
+  }
+  talos::launcher::HardwareProtocolCheck protocol{std::move(recorded)};
+
   std::unique_ptr<Session> session{new Session};
   Indexer indexer;
   std::vector<FileBuild> builds;
   std::unordered_map<const talos::launcher::MergedLog*, std::size_t> file_of;
   const talos::launcher::MergedLog* last_log = nullptr;
   std::size_t file = 0;
+  std::size_t session_overflow_bytes = 0;
   bool any = false;
   std::vector<HardwareSample> samples;
-  std::map<std::pair<std::string, bool>, ModeStream> mode_streams;
-  auto recorded = talos::launcher::RecordedProtocolVersion({dir.string()});
-  if (const std::string line = recorded.Disagreement(); !line.empty()) {
-    std::cerr << "studio_review: " << dir.string() << ": " << line << '\n';
-  }
-  talos::launcher::HardwareProtocolCheck protocol{std::move(recorded)};
 
   const auto visit = [&](const talos::launcher::MergedRecord& r) {
     const auto* merged = r.log.get();
@@ -647,80 +927,148 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
     if (build.topic[id] == kUnresolved) {
       build.topic[id] = indexer.Resolve(*r.source, merged->path);
     }
+    const talos::launcher::HardwarePacket* decoded_hw = nullptr;
     if (const auto kind = talos::launcher::HardwareRecordOf(
             r.source->name, r.source->schema.name);
         kind != HardwareRecord::kNone) {
-      protocol.Add(kind, r.source->name,
-                   r.header.kind != static_cast<std::uint16_t>(EventKind::SEND),
-                   r.payload);
+      decoded_hw = protocol.Add(
+          kind, r.source->name,
+          r.header.kind != static_cast<std::uint16_t>(EventKind::SEND),
+          r.payload);
     }
     if (build.topic[id] < 0) return true;
     log_file.checkpoints[cp_idx].sources |= SourceBit(id);
     if (id >= 63) {
-      RecordOverflowSource(log_file, build, cp_idx, id);
+      RecordOverflowSource(log_file, build, cp_idx, id, session_overflow_bytes);
     }
     const bool is_send =
         r.header.kind == static_cast<std::uint16_t>(EventKind::SEND);
     build.kinds[id] |= is_send ? 1 : 2;
     const auto topic_idx = static_cast<std::size_t>(build.topic[id]);
     TopicBuild& topic = indexer.topics[topic_idx];
-    // A hardware topic's channels are what its packets hold: learned from
-    // its first packet in each second. Never decode foreign-protocol hardware
-    // or Driver Station packets (REQ-OPS-51).
+    // A hardware topic's channels are what its canonical stream's packets
+    // hold: re-flattened only on first packet, while any previously-null
+    // channel is still pending, or when an unseen device id appears. Never
+    // decode foreign-protocol hardware or Driver Station packets (REQ-OPS-51).
     if (topic.decoder == Decoder::kHardware) {
-      if (!protocol.foreign() && topic.decoded_second != second) {
-        topic.decoded_second = second;
-        FlattenHardware(topic.name, topic.hardware, r.payload, samples);
-        for (const HardwareSample& sample : samples) {
-          if (!sample.null &&
-              topic.hardware_channels.emplace(sample.name, sample.kind)
-                  .second) {
-            if (indexer.total_channels >= kMaxSessionChannels) {
-              throw std::runtime_error("session exceeds channel cap (" +
-                                       std::to_string(kMaxSessionChannels) +
-                                       ") at topic " + topic.name);
+      if (!protocol.foreign()) {
+        const StreamAction action = SelectCanonicalStream(
+            topic.hardware_stream, session->files_, file, is_send);
+        if (action != StreamAction::kSkip) {
+          if (action == StreamAction::kReset) {
+            indexer.total_channels -= topic.hardware_channels.size();
+            indexer.total_channel_bytes -= topic.hardware_channel_bytes;
+            topic.hardware_channels.clear();
+            topic.hardware_channel_bytes = 0;
+            topic.seen_hardware_devices.clear();
+            topic.pending_null_channels.clear();
+            topic.hardware_initialized = false;
+          }
+          const bool needs_flatten =
+              !topic.hardware_initialized ||
+              !topic.pending_null_channels.empty() || decoded_hw == nullptr ||
+              HasUnseenHardwareDevice(topic.hardware, *decoded_hw,
+                                      topic.seen_hardware_devices);
+          if (needs_flatten) {
+            FlattenHardware(topic.name, topic.hardware, r.payload, samples);
+            if (!samples.empty()) {
+              topic.hardware_initialized = true;
+              if (decoded_hw != nullptr) {
+                RecordHardwareDevices(topic.hardware, *decoded_hw,
+                                      topic.seen_hardware_devices);
+              }
+              for (const HardwareSample& sample : samples) {
+                if (sample.null) {
+                  if (!topic.hardware_channels.contains(sample.name) &&
+                      topic.pending_null_channels.size() <
+                          talos::telemetry::kMaxTopicChannels) {
+                    topic.pending_null_channels.insert(sample.name);
+                  }
+                  continue;
+                }
+                topic.pending_null_channels.erase(sample.name);
+                if (topic.hardware_channels.contains(sample.name)) continue;
+                const std::size_t ch_bytes =
+                    HardwareChannelBytes(sample.name, sample.kind);
+                if (topic.hardware_channels.size() >=
+                    talos::telemetry::kMaxTopicChannels) {
+                  throw std::runtime_error(
+                      "topic " + topic.name + " exceeds channel cap (" +
+                      std::to_string(talos::telemetry::kMaxTopicChannels) +
+                      ")");
+                }
+                if (indexer.total_channels >= kMaxSessionChannels) {
+                  throw std::runtime_error("session exceeds channel cap (" +
+                                           std::to_string(kMaxSessionChannels) +
+                                           ") at topic " + topic.name);
+                }
+                if (ch_bytes >
+                    kMaxSessionChannelBytes - indexer.total_channel_bytes) {
+                  throw std::runtime_error(
+                      "session exceeds channel byte cap (" +
+                      std::to_string(kMaxSessionChannelBytes) + ") at topic " +
+                      topic.name);
+                }
+                topic.hardware_channels.emplace(sample.name, sample.kind);
+                topic.hardware_channel_bytes += ch_bytes;
+                ++indexer.total_channels;
+                indexer.total_channel_bytes += ch_bytes;
+              }
             }
-            ++indexer.total_channels;
           }
         }
       }
     } else if (topic.decoder == Decoder::kDriverStation) {
       if (!protocol.foreign()) {
-        std::array<std::uint64_t, talos::telemetry::kDriverStationChannelCount>
-            values{};
-        if (talos::telemetry::ReadDriverStation(r.payload, values)) {
-          const std::int64_t publish_ns = r.header.publish_time_ns;
-          ModeStream& stream = mode_streams[{log_file.process, is_send}];
-          if (publish_ns >= stream.last_publish_ns) {
-            stream.last_publish_ns = publish_ns;
-            const ModeKind mode = ModeFromDriverStation(values);
-            const bool fms = values[6] != 0;
-            if (stream.intervals.empty()) {
-              stream.intervals.push_back({publish_ns, publish_ns, mode, fms});
-              stream.last_mode = mode;
-              stream.last_fms = fms;
-            } else if (mode != stream.last_mode || fms != stream.last_fms) {
-              if (!stream.closed_last) {
-                stream.intervals.back().end_ns = publish_ns;
-                if (stream.intervals.size() < kMaxTimelineModes) {
-                  stream.intervals.push_back(
-                      {publish_ns, publish_ns, mode, fms});
+        const StreamAction action = SelectCanonicalStream(
+            topic.mode_stream_canon, session->files_, file, is_send);
+        if (action != StreamAction::kSkip) {
+          if (action == StreamAction::kReset) {
+            topic.mode_stream = ModeStream{};
+          }
+          std::array<std::uint64_t,
+                     talos::telemetry::kDriverStationChannelCount>
+              values{};
+          if (talos::telemetry::ReadDriverStation(r.payload, values)) {
+            const std::int64_t publish_ns = r.header.publish_time_ns;
+            ModeStream& stream = topic.mode_stream;
+            if (publish_ns >= stream.last_publish_ns) {
+              stream.last_publish_ns = publish_ns;
+              const ModeKind mode = ModeFromDriverStation(values);
+              const bool fms = values[6] != 0;
+              if (stream.intervals.empty()) {
+                stream.intervals.push_back({publish_ns, publish_ns, mode, fms});
+                stream.last_mode = mode;
+                stream.last_fms = fms;
+              } else if (mode != stream.last_mode || fms != stream.last_fms) {
+                if (!stream.closed_last) {
+                  stream.intervals.back().end_ns = publish_ns;
+                  if (stream.intervals.size() < kMaxTimelineModes) {
+                    stream.intervals.push_back(
+                        {publish_ns, publish_ns, mode, fms});
+                  } else {
+                    stream.closed_last = true;
+                    SaturatingAdd(stream.dropped, 1);
+                  }
                 } else {
-                  stream.closed_last = true;
-                  ++stream.dropped;
+                  SaturatingAdd(stream.dropped, 1);
                 }
-              } else {
-                ++stream.dropped;
+                stream.last_mode = mode;
+                stream.last_fms = fms;
               }
-              stream.last_mode = mode;
-              stream.last_fms = fms;
             }
           }
         }
       }
     } else if (topic.decoder == Decoder::kStruct &&
                !topic.alert_channels.empty()) {
-      if (SelectCanonicalAlertStream(topic, session->files_, file, is_send)) {
+      const StreamAction action = SelectCanonicalStream(
+          topic.alert_stream_canon, session->files_, file, is_send);
+      if (action != StreamAction::kSkip) {
+        if (action == StreamAction::kReset) {
+          topic.alert_stream = AlertStream{};
+          topic.alert_stream.channels.resize(topic.alert_channels.size());
+        }
         const std::int64_t publish_ns = r.header.publish_time_ns;
         AlertStream& stream = topic.alert_stream;
         if (publish_ns >= stream.last_publish_ns) {
@@ -742,7 +1090,7 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
               if (st.intervals.size() < kMaxTimelineAlerts) {
                 st.intervals.push_back({st.start_ns, publish_ns});
               } else {
-                ++st.dropped;
+                SaturatingAdd(st.dropped, 1);
               }
             }
           }
@@ -757,6 +1105,21 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
   }
   if (!any) throw std::runtime_error("no records in " + dir.string());
   for (LogFile& log_file : session->files_) {
+    const std::size_t used_words =
+        (log_file.overflow_source_ids.size() + 63) / 64;
+    if (used_words > 0 && used_words < log_file.overflow_words_per_cp) {
+      const std::size_t old_words = log_file.overflow_words_per_cp;
+      const std::size_t cps = log_file.overflow_bits.size() / old_words;
+      std::vector<std::uint64_t> compact(cps * used_words, 0);
+      for (std::size_t c = 0; c < cps; ++c) {
+        for (std::size_t w = 0; w < used_words; ++w) {
+          compact[c * used_words + w] =
+              log_file.overflow_bits[c * old_words + w];
+        }
+      }
+      log_file.overflow_bits = std::move(compact);
+      log_file.overflow_words_per_cp = used_words;
+    }
     log_file.overflow_bits.shrink_to_fit();
     log_file.overflow_source_ids.shrink_to_fit();
   }
@@ -806,11 +1169,13 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
     topic.hardware = build.hardware;
     topic.kind = sender ? EventKind::SEND : EventKind::MESSAGE;
     topic.process = session->files_[sender ? *sender : *receiver].process;
+    const std::uint8_t want_kind = sender ? 1 : 2;
     for (std::size_t f = 0; f < builds.size(); ++f) {
       if (session->files_[f].process != topic.process) continue;
       const FileBuild& file_build = builds[f];
       for (std::size_t id = 0; id < file_build.topic.size(); ++id) {
-        if (file_build.topic[id] == static_cast<std::int32_t>(t)) {
+        if (file_build.topic[id] == static_cast<std::int32_t>(t) &&
+            (file_build.kinds[id] & want_kind) != 0) {
           topic.sources.push_back({f, static_cast<std::uint16_t>(id)});
         }
       }
@@ -877,21 +1242,28 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
     const Topic& topic = session->topics_[t];
     const bool is_send = topic.kind == EventKind::SEND;
     if (!protocol.foreign() && topic.decoder == Decoder::kDriverStation) {
-      const auto it = mode_streams.find({topic.process, is_send});
-      if (it != mode_streams.end()) {
-        session->modes_ = std::move(it->second.intervals);
-        session->modes_dropped_ = it->second.dropped;
-        if (!session->modes_.empty() && !it->second.closed_last) {
+      const std::size_t build_idx = sorted_build_index[t];
+      TopicBuild& build = indexer.topics[build_idx];
+      if (build.mode_stream_canon.file.has_value() &&
+          build.mode_stream_canon.is_send == is_send &&
+          session->files_[*build.mode_stream_canon.file].process ==
+              topic.process) {
+        session->modes_ = std::move(build.mode_stream.intervals);
+        session->modes_dropped_ = build.mode_stream.dropped;
+        if (!session->modes_.empty() && !build.mode_stream.closed_last) {
           session->modes_.back().end_ns =
               std::max(session->modes_.back().start_ns, session->end_ns_);
         }
         session->modes_.shrink_to_fit();
+        build.mode_stream = ModeStream{};
       }
     } else if (topic.decoder == Decoder::kStruct) {
       const std::size_t build_idx = sorted_build_index[t];
       TopicBuild& build = indexer.topics[build_idx];
-      if (build.alert_file.has_value() && build.alert_is_send == is_send &&
-          session->files_[*build.alert_file].process == topic.process) {
+      if (build.alert_stream_canon.file.has_value() &&
+          build.alert_stream_canon.is_send == is_send &&
+          session->files_[*build.alert_stream_canon.file].process ==
+              topic.process) {
         AlertStream& stream = build.alert_stream;
         const auto& alert_channels = build.alert_channels;
         for (std::size_t i = 0; i < alert_channels.size(); ++i) {
@@ -909,14 +1281,14 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
                   st.start_ns, std::max(st.start_ns, session->end_ns_), ref,
                   /*active_at_end=*/true));
             } else {
-              ++st.dropped;
+              SaturatingAdd(st.dropped, 1);
             }
           }
-          session->alerts_dropped_ += st.dropped;
+          SaturatingAdd(session->alerts_dropped_, st.dropped);
           if (combined_alerts.size() > kMaxTimelineAlerts) {
             sort_alerts();
-            session->alerts_dropped_ +=
-                combined_alerts.size() - kMaxTimelineAlerts;
+            SaturatingAdd(session->alerts_dropped_,
+                          combined_alerts.size() - kMaxTimelineAlerts);
             combined_alerts.resize(kMaxTimelineAlerts);
           }
         }
@@ -938,20 +1310,20 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
     }
   }
   if (origin) {
-    session->origin_wall_ns_ = origin->second - origin->first;
+    session->origin_wall_ns_ =
+        ClampedSubI64(origin->second, origin->first,
+                      std::numeric_limits<std::int64_t>::min());
   }
-  ReadManifestRuns(dir / "manifest.json", session->origin_wall_ns_,
-                   session->runs_, session->runs_dropped_);
-  std::error_code manifest_ec;
-  const fs::file_status manifest_st =
-      fs::symlink_status(dir / "manifest.json", manifest_ec);
-  if (!manifest_ec && !fs::is_symlink(manifest_st) &&
-      fs::is_regular_file(manifest_st)) {
-    const std::string config_path =
-        talos::launcher::SessionConfigPath("", {dir.string()});
-    if (!config_path.empty()) {
-      if (auto pose = ReadPoseTopicFromConfig(dir, config_path)) {
-        session->pose_topic_ = std::move(*pose);
+  if (manifest) {
+    ReadManifestRuns(*manifest, session->origin_wall_ns_, session->runs_,
+                     session->runs_dropped_);
+    const auto cfg_it = manifest->find("config_path");
+    if (cfg_it != manifest->end() && cfg_it->is_string()) {
+      const std::string& cfg = cfg_it->get_ref<const std::string&>();
+      if (!cfg.empty()) {
+        if (auto pose = ReadPoseTopicFromConfig(dir, cfg)) {
+          session->pose_topic_ = std::move(*pose);
+        }
       }
     }
   }
@@ -1204,6 +1576,7 @@ std::vector<Sample> Session::Snapshot(std::int64_t t_ns, ReadStats* stats,
   if (max_channels == 0 || topics_.empty()) return {};
   struct Latest {
     std::int64_t publish_ns{std::numeric_limits<std::int64_t>::min()};
+    std::size_t file_index{0};
     std::vector<std::uint64_t> raw;
     std::vector<std::uint8_t> present;
   };
@@ -1373,9 +1746,13 @@ std::vector<Sample> Session::Snapshot(std::int64_t t_ns, ReadStats* stats,
       }
     }
     for (Item& item : items) {
-      if (item.topic < topic_cutoff && !item.found.raw.empty() &&
-          item.found.publish_ns > latest[item.topic].publish_ns) {
-        latest[item.topic] = std::move(item.found);
+      if (item.topic >= topic_cutoff || item.found.raw.empty()) continue;
+      Latest& cur = latest[item.topic];
+      if (cur.raw.empty() || item.found.publish_ns > cur.publish_ns ||
+          (item.found.publish_ns == cur.publish_ns &&
+           file_index >= cur.file_index)) {
+        item.found.file_index = file_index;
+        cur = std::move(item.found);
       }
     }
   }

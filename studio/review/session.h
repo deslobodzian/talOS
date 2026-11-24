@@ -117,29 +117,35 @@ static_assert(sizeof(Gap) == 48, "REQ-OPS-42: 48 B per GAP record");
 inline constexpr std::size_t kMaxTimelineModes = 4096;
 inline constexpr std::size_t kMaxTimelineAlerts = 4096;
 inline constexpr std::size_t kMaxTimelineRuns = 4096;
+// Maximum UTF-8 byte length kept for each RunInterval's node name and reason
+// read from manifest.json (REQ-OPS-42; 5x NAMING.md's 24 B node name cap).
+inline constexpr std::size_t kMaxRunStringBytes = 128;
 
-// Fixed ceiling on total channels across all topics in one open session
-// (REQ-OPS-42): well above live telemetry's 2048-channel dictionary cap and
-// kMaxSnapshotChannels (8192), while bounding per-session heap and
-// /channels.json size even for crafted multi-topic logs. A session exceeding
-// this cap is refused in Session::Open (HTTP 422 for that session only).
+// Fixed ceilings on total channels and channel metadata bytes (name + unit +
+// labels) across all topics in one open session (REQ-OPS-42): well above live
+// telemetry's 2048-channel dictionary cap and kMaxSnapshotChannels (8192),
+// while bounding per-session heap and /channels.json size even for crafted
+// multi-topic logs. A session exceeding either cap is refused in Session::Open
+// (HTTP 422 for that session only).
 inline constexpr std::size_t kMaxSessionChannels = 16384;
+inline constexpr std::size_t kMaxSessionChannelBytes = std::size_t{8} << 20;
 
 // Fixed ceiling on channels returned by one Session::Snapshot (REQ-OPS-42):
 // well above live telemetry's 2048-channel dictionary cap, while bounding
 // snapshot memory even for a crafted session with huge channel counts.
 inline constexpr std::size_t kMaxSnapshotChannels = 8192;
 
-// Fixed ceilings on one LogFile's out-of-line presence bitset for source ids
-// >= 63 (REQ-OPS-42): at most kMaxOverflowSources distinct sources (4 words =
-// 32 B/checkpoint) and at most kMaxOverflowBytesPerFile bytes (32 KiB) per
-// file. Past either ceiling, reads fall back conservatively to
-// Checkpoint::sources bit 63 (which flags any source_id >= 63 present in that
-// second), keeping reads exact with bounded heap.
+// Fixed ceilings on LogFile out-of-line presence bitsets for source ids >= 63
+// (REQ-OPS-42): at most kMaxOverflowSources distinct sources (4 words = 32
+// B/checkpoint) and at most kMaxOverflowBytesPerFile bytes (32 KiB) per file
+// (falling back conservatively to Checkpoint::sources bit 63 past either
+// per-file ceiling), and at most kMaxSessionOverflowBytes (8 MiB) across all
+// files in one session (refusing the session in Session::Open with HTTP 422).
 inline constexpr std::size_t kMaxOverflowWordsPerCheckpoint = 4;
 inline constexpr std::size_t kMaxOverflowSources =
     kMaxOverflowWordsPerCheckpoint * 64;
 inline constexpr std::size_t kMaxOverflowBytesPerFile = std::size_t{32} << 10;
+inline constexpr std::size_t kMaxSessionOverflowBytes = std::size_t{8} << 20;
 
 enum class ModeKind : std::uint8_t {
   kDisabled,
