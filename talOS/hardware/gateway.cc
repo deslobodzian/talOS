@@ -606,6 +606,11 @@ void Gateway::Tick(uint64_t now, bool enabled) {
   // before any mask, ended here so PollResets applies nothing more.
   healthy_ = configured_ && JudgeFeedbackAge() && read;
   read_us_ = clock_ != nullptr ? std::max(now, clock_()) : now;
+  // Advance sample_time_us to read_us_ so the emitted State timestamp matches
+  // the post-Read instant at which feedback was sampled and command expiry is
+  // evaluated (avoiding a State that shows kCommandActive cleared at a
+  // sample_time_us earlier than command_expiry_us).
+  state_.sample_time_us = read_us_;
   ExpireCommand(read_us_);
   // Total loss starts a new epoch whether or not a command is in force: a
   // request built from a State before it must never drive after it.
