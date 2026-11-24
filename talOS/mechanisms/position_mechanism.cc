@@ -404,13 +404,16 @@ bool PositionMechanism::home(Time now) {
   bool still_counts = slow;
   if (homing_ == Homing::kStall) {
     // A stop is stillness under load once this push has had the chance to
-    // move the mechanism: it has travelled homing_min_travel_rot since the
-    // push began, or the push has lasted homing_min_push_us (a mechanism
-    // that starts slowly is not yet at its stop). Motion from an earlier,
-    // interrupted push does not count.
-    const bool moved =
-        push_since_.has_value() &&
-        std::abs(position_rot_ - push_start_rot_) >= homing_min_travel_rot_;
+    // move the mechanism: it has travelled homing_min_travel_rot in
+    // homing_v_'s direction (toward home_rot_) since the push began, or the
+    // push has lasted homing_min_push_us (a mechanism that starts slowly is
+    // not yet at its stop). Motion from an earlier, interrupted push, or
+    // backdrive opposite to homing_v_, does not count.
+    const double travel_toward_home_rot = homing_v_ < 0.0
+                                              ? push_start_rot_ - position_rot_
+                                              : position_rot_ - push_start_rot_;
+    const bool moved = push_since_.has_value() &&
+                       travel_toward_home_rot >= homing_min_travel_rot_;
     still_counts =
         slow && std::abs(motor_.current()) >= homing_stall_current_a_ &&
         (moved ||
@@ -512,6 +515,14 @@ void PositionMechanism::drive_goal(Request request, double request_rot,
   phase_ = at_goal_debounce_state_.update(near, now) ? PositionPhase::kAtGoal
                                                      : PositionPhase::kMoving;
   if (near) {
+    // Refresh the move timer while in tolerance so move_timeout_us measures
+    // continuous time spent away from goal, not cumulative time since the goal
+    // was first commanded (which would immediately fault on a single
+    // perturbation tick after holding longer than move_timeout_us). Note that
+    // a mechanism oscillating repeatedly across the tolerance_rot_ boundary
+    // refreshes goal_since_ on each in-tolerance tick and will not trip
+    // kMoveTimeout.
+    goal_since_ = now;
     stall_debounce_.reset();
     return;
   }

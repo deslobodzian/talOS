@@ -488,6 +488,7 @@ py_test(
         "session_report_test.py",
     ],
     data = [
+        ":log_dump",
         ":session_report",
         ":session_report_fixture",
         ":target_lane_probe",
