@@ -957,6 +957,30 @@ class PhysicsSimBackend final : public SimBackendBase {
                                                : 0.0;
   }
 
+  // The motors Configure hands ExternalPlant::Bind for `config`, in config
+  // order: each motor's name, gear (rotor_to_sensor_ratio *
+  // sensor_to_mechanism_ratio, each 1 when not positive and finite) and the
+  // winding constants of its motor_type. A program building a plant before
+  // attaching it reads them here. The names are views into `config`, valid
+  // while it lives unchanged. Configure passes its configuration after
+  // SetLocalMotorTypes has applied the local motor types, so a program
+  // passes its own parse of the robot config.
+  [[nodiscard]] static std::vector<PlantMotor> PlantMotors(
+      const Config& config) {
+    std::vector<PlantMotor> motors;
+    motors.reserve(config.motors.size());
+    for (const MotorConfig& m : config.motors) {
+      const MotorModel model = MotorModelFor(m.motor_type.value);
+      motors.push_back({m.name.view(), GearOf(m),
+                        model.torque_constant_nm_per_a(),
+                        model.back_emf_v_per_radps(), model.resistance_ohm(),
+                        model.no_load_damping_nm_per_radps()});
+    }
+    return motors;
+  }
+  // The names would view into a temporary.
+  static std::vector<PlantMotor> PlantMotors(const Config&& config) = delete;
+
   // The external plant (sim_plant.h), bound at the next Configure; nullptr
   // detaches it. Not owned: it must outlive this backend's use of it. It
   // survives every Configure, and its clock (plant_time()) restarts here.
@@ -1216,20 +1240,29 @@ class PhysicsSimBackend final : public SimBackendBase {
            FeedbackOffset(i);
   }
 
-  double RotorToSensor(std::size_t i) const {
-    const double ratio = config_.motors[i].rotor_to_sensor_ratio;
+  static double RotorToSensorOf(const MotorConfig& m) {
+    const double ratio = m.rotor_to_sensor_ratio;
     return std::isfinite(ratio) && ratio > 0.0 ? ratio : 1.0;
+  }
+  static double SensorToMechanismOf(const MotorConfig& m) {
+    const double ratio = m.sensor_to_mechanism_ratio;
+    return std::isfinite(ratio) && ratio > 0.0 ? ratio : 1.0;
+  }
+  // Rotor rotations per mechanism rotation.
+  static double GearOf(const MotorConfig& m) {
+    const double gear = RotorToSensorOf(m) * SensorToMechanismOf(m);
+    return std::isfinite(gear) && gear > 0.0 ? gear : 1.0;
+  }
+
+  double RotorToSensor(std::size_t i) const {
+    return RotorToSensorOf(config_.motors[i]);
   }
 
   double SensorToMechanism(std::size_t i) const {
-    const double ratio = config_.motors[i].sensor_to_mechanism_ratio;
-    return std::isfinite(ratio) && ratio > 0.0 ? ratio : 1.0;
+    return SensorToMechanismOf(config_.motors[i]);
   }
 
-  double Gear(std::size_t i) const {
-    const double gear = RotorToSensor(i) * SensorToMechanism(i);
-    return std::isfinite(gear) && gear > 0.0 ? gear : 1.0;
-  }
+  double Gear(std::size_t i) const { return GearOf(config_.motors[i]); }
 
   int MotorIndex(uint16_t id) const {
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
@@ -1248,7 +1281,8 @@ class PhysicsSimBackend final : public SimBackendBase {
   uint32_t PlantMaxSteps() const {
     const uint32_t step_us = plant_ != nullptr ? plant_->step_us() : 0;
     if (step_us == 0) return 0;
-    return 2 * ((config_.period_us + step_us - 1) / step_us);
+    const uint64_t period_us = config_.period_us;
+    return static_cast<uint32_t>(2 * ((period_us + step_us - 1) / step_us));
   }
 
   // Binds plant_ to config_ (Configure's last step): the motors it
@@ -1285,17 +1319,7 @@ class PhysicsSimBackend final : public SimBackendBase {
                       std::to_string(step_us)});
     }
     const std::size_t n = config_.motors.size();
-    std::array<PlantMotor, kMaxMotors> motors{};
-    for (std::size_t i = 0; i < n; ++i) {
-      const MotorModel model =
-          MotorModelFor(config_.motors[i].motor_type.value);
-      motors[i] = {config_.motors[i].name.view(),
-                   Gear(i),
-                   model.torque_constant_nm_per_a(),
-                   model.back_emf_v_per_radps(),
-                   model.resistance_ohm(),
-                   model.no_load_damping_nm_per_radps()};
-    }
+    const std::vector<PlantMotor> motors = PlantMotors(config_);
     std::vector<PlantInput> inputs;
     inputs.reserve(world_inputs_.size());
     bound_world_inputs_.reserve(world_inputs_.size());
@@ -1309,8 +1333,8 @@ class PhysicsSimBackend final : public SimBackendBase {
     }
     ConfigError error;
     std::array<bool, kMaxMotors> owned{};
-    if (!plant_->Bind(std::span<const PlantMotor>(motors.data(), n), inputs,
-                      std::span<bool>(owned.data(), n), error)) {
+    if (!plant_->Bind(motors, inputs, std::span<bool>(owned.data(), n),
+                      error)) {
       return RefusePlant(std::move(error));
     }
     owned_ = owned;
@@ -1442,7 +1466,8 @@ class PhysicsSimBackend final : public SimBackendBase {
   bool StepPlant(int steps, const std::array<double, kMaxMotors>& raw_volts) {
     const std::size_t n = config_.motors.size();
     for (std::size_t i = 0; i < n; ++i) {
-      drives_[i] = owned_[i] ? DriveFor(i, raw_volts[i]) : PlantDrive{};
+      drives_[i] = owned_[i] ? DriveFor(i, raw_volts, powered_, supply_v_)
+                             : PlantDrive{};
     }
     if (!plant_->Step(steps, std::span<const PlantDrive>(drives_.data(), n))) {
       plant_failed_ = true;
@@ -1453,19 +1478,52 @@ class PhysicsSimBackend final : public SimBackendBase {
     SyncFromPlant();
     for (std::size_t i = 0; i < n; ++i) {
       if (!owned_[i] || !powered_[i]) continue;
-      const MotorModel motor =
-          MotorModelFor(config_.motors[i].motor_type.value);
-      const double r_ohm = motor.resistance_ohm();
-      const double kt = motor.torque_constant_nm_per_a();
-      const double ke_rad = motor.back_emf_v_per_radps();
-      const double omega = axes_[i].rotor_velocity_rps * kTau;
-      const PlantDrive& d = drives_[i];
-      const double amperes =
-          std::clamp((d.volts - (d.back_emf ? ke_rad * omega : 0.0)) / r_ohm,
-                     d.min_torque_nm / kt, d.max_torque_nm / kt);
-      applied_volts_[i] = Direction(i) * (r_ohm * amperes + ke_rad * omega);
+      const PlantCurrent carried =
+          PlantCurrentAt(i, drives_[i], axes_[i].rotor_velocity_rps, supply_v_);
+      plant_amperes_[i] = carried.amperes;
+      applied_volts_[i] = Direction(i) * carried.volts;
     }
     return true;
+  }
+
+  // What a bound motor's drive carries at rotor speed `rps`, in its physical
+  // rotor frame: the plant law's current I (sim_plant.h), and the output
+  // voltage of a controller held within its ceiling (max_voltage or
+  // `supply_v`, whichever is lower). Within the drive's bounds that voltage
+  // is the winding's, R * I + k_e * w; where a bound caps the current below
+  // what the winding passes at the ceiling (regeneration beyond the ceiling
+  // plus stator_limit_a * R), the controller is at its ceiling, and the
+  // voltage is the ceiling. The stator current is |I|; the supply current is
+  // the output power over the bus, V * I / supply_v, at most supply_limit_a
+  // (PlantSupplyCurrent), so all three agree with the torque k_t * I the
+  // plant applied.
+  struct PlantCurrent {
+    double amperes;
+    double volts;
+  };
+  PlantCurrent PlantCurrentAt(std::size_t i, const PlantDrive& d, double rps,
+                              double supply_v) const {
+    const auto& m = config_.motors[i];
+    const MotorModel motor = MotorModelFor(m.motor_type.value);
+    const double r_ohm = motor.resistance_ohm();
+    const double kt = motor.torque_constant_nm_per_a();
+    const double ke_rad = motor.back_emf_v_per_radps();
+    const double omega = rps * kTau;
+    const double amperes =
+        std::clamp((d.volts - (d.back_emf ? ke_rad * omega : 0.0)) / r_ohm,
+                   d.min_torque_nm / kt, d.max_torque_nm / kt);
+    const double ceiling = std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0,
+                                    std::max(0.0, supply_v));
+    return {amperes,
+            std::clamp(r_ohm * amperes + ke_rad * omega, -ceiling, ceiling)};
+  }
+
+  double PlantSupplyCurrent(const MotorConfig& m, const PlantCurrent& carried,
+                            double supply_v) const {
+    if (supply_v <= 0.0) return 0.0;
+    const double current_a = carried.volts * carried.amperes / supply_v;
+    return m.supply_limit_a > 0.0 ? std::min(m.supply_limit_a, current_a)
+                                  : current_a;
   }
 
   // The drive a bound motor's winding gets over the next plant Step, in its
@@ -1473,8 +1531,18 @@ class PhysicsSimBackend final : public SimBackendBase {
   // supply_v_ and the tick-start speed w0). Its regime is the one
   // LimitWindingVoltageAt and TorqueCurrentVoltsAt are in at w0:
   //   - unpowered: a shorted winding under brake, an open one under coast;
-  //   - a voltage mode (a follower included, fed its master's applied volts
-  //     at its own speed): the command clamped to the voltage ceiling;
+  //   - a voltage mode: the command clamped to the voltage ceiling;
+  //   - a follower: at its own tick-start speed it carries exactly the
+  //     current the analytic model gives it there (its master's applied
+  //     volts through its own stator band and supply limit). When its
+  //     master's drive, turned into the follower's rotor direction and given
+  //     the follower's own stator limit (none when it has none), carries that
+  //     same current there, the follower takes it, and so follows its
+  //     master's regime at every step, as on a shared shaft StepRigidBodyShaft
+  //     feeds a follower its master's limited volts recomputed at every
+  //     segment. Otherwise (a follower on another shaft, or its own supply
+  //     limit binding) it holds its master's applied volts for the tick
+  //     within its own limits;
   //   - torque current I: the ceiling in I's direction, with I as the bound
   //     on that side (0 A: the ceiling in the rotor's direction, no torque
   //     unless it overspeeds the ceiling); while the rotor is back-driven
@@ -1491,15 +1559,19 @@ class PhysicsSimBackend final : public SimBackendBase {
   // The ceiling is max_voltage or the solved supply, whichever is lower, so
   // the cap also applies when a sagging battery lowers it below back-EMF.
   // At other speeds within the tick the regime stays the one chosen at w0.
-  PlantDrive DriveFor(std::size_t i, double raw_volts) const {
+  // `raw` and `powered` are ResolveCommandsAtSupply's at `supply_v`.
+  PlantDrive DriveFor(std::size_t i, const std::array<double, kMaxMotors>& raw,
+                      const std::array<bool, kMaxMotors>& powered,
+                      double supply_v) const {
     constexpr double kInf = std::numeric_limits<double>::infinity();
     const auto& m = config_.motors[i];
-    if (!powered_[i]) return {0.0, m.brake, -kInf, kInf};
+    if (!powered[i]) return {0.0, m.brake, -kInf, kInf};
     const MotorModel motor = MotorModelFor(m.motor_type.value);
     const double kt = motor.torque_constant_nm_per_a();
     const double dir = Direction(i);
     const double rps = axes_[i].rotor_velocity_rps;
-    const double supply = std::max(0.0, supply_v_);
+    const double raw_volts = raw[i];
+    const double supply = std::max(0.0, supply_v);
     const double ceiling =
         std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0, supply);
     const double stator_nm =
@@ -1507,6 +1579,31 @@ class PhysicsSimBackend final : public SimBackendBase {
     bool supply_limited = false;
     const double limited_v =
         LimitWindingVoltageAt(i, m, raw_volts, supply, rps, &supply_limited);
+    if (const int lead = m.master_id != 0 ? MotorIndex(m.master_id) : -1;
+        lead >= 0 && powered[lead]) {
+      const PlantDrive held{
+          supply_limited ? dir * limited_v
+                         : std::clamp(dir * raw_volts, -ceiling, ceiling),
+          true, -stator_nm, stator_nm};
+      if (supply_limited) return held;
+      // Physical rotor volts: the follower's are Direction(i) times its raw
+      // (its master's applied volts, reversed if opposed), the master's
+      // Direction(lead) times them. A master with a follower is in a voltage
+      // mode (config refuses torque current on one), so its drive's bounds
+      // are only its own stator limit, which the follower does not take.
+      const double k = dir * (m.oppose_master ? -1.0 : 1.0) * Direction(lead);
+      const PlantDrive mirrored{
+          std::clamp(k * DriveFor(lead, raw, powered, supply_v).volts, -ceiling,
+                     ceiling),
+          true, -stator_nm, stator_nm};
+      const double held_a = PlantCurrentAt(i, held, rps, supply_v).amperes;
+      const double mirrored_a =
+          PlantCurrentAt(i, mirrored, rps, supply_v).amperes;
+      return std::abs(mirrored_a - held_a) <=
+                     1e-9 * std::max(1.0, std::abs(held_a))
+                 ? mirrored
+                 : held;
+    }
     if (m.master_id != 0 || commands_[i].mode != Mode::kTorqueCurrent) {
       const double volts = supply_limited
                                ? dir * limited_v
@@ -1832,7 +1929,9 @@ class PhysicsSimBackend final : public SimBackendBase {
   // stator_limit_a stays visible rather than hidden. At 12 V stall it equals
   // stall current; at 12 V free speed it equals free current; 0 while
   // unpowered.
+  // A powered bound motor reports what its drive carried (PlantCurrentAt).
   double StatorCurrent(std::size_t i, const MotorConfig& m) const {
+    if (owned_[i] && powered_[i]) return std::abs(plant_amperes_[i]);
     return std::abs(SignedStatorCurrent(i, m));
   }
 
@@ -1856,6 +1955,10 @@ class PhysicsSimBackend final : public SimBackendBase {
   // regen), while negative regen stays signed, matching Phoenix 6. 0 when
   // unpowered or supply_v_ <= 0.
   double SupplyCurrent(std::size_t i, const MotorConfig& m) const {
+    if (owned_[i] && powered_[i]) {
+      return PlantSupplyCurrent(
+          m, {plant_amperes_[i], Direction(i) * applied_volts_[i]}, supply_v_);
+    }
     return SupplyCurrentAt(i, m, applied_volts_[i], powered_[i], supply_v_,
                            axes_[i].rotor_velocity_rps);
   }
@@ -1982,6 +2085,15 @@ class PhysicsSimBackend final : public SimBackendBase {
     }
     double total_supply_a = 0.0;
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+      if (owned_[i] && powered_out[i]) {
+        // What the plant's drive carries at the tick-start speed.
+        total_supply_a += PlantSupplyCurrent(
+            config_.motors[i],
+            PlantCurrentAt(i, DriveFor(i, raw_volts_out, powered_out, supply),
+                           axes_[i].rotor_velocity_rps, supply),
+            supply);
+        continue;
+      }
       total_supply_a +=
           SupplyCurrentAt(i, config_.motors[i], applied_volts_out[i],
                           powered_out[i], supply, axes_[i].rotor_velocity_rps);
@@ -2938,6 +3050,8 @@ class PhysicsSimBackend final : public SimBackendBase {
   // The motors the plant binds (Configure), and their last drives.
   std::array<bool, kMaxMotors> owned_{};
   std::array<PlantDrive, kMaxMotors> drives_{};
+  // Each powered bound motor's current over the last Step, rotor frame.
+  std::array<double, kMaxMotors> plant_amperes_{};
   // SetWorldInputs, and those of them config_ names, in the plant's input
   // order.
   struct BoundWorldInput {
