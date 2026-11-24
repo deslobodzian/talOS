@@ -99,13 +99,50 @@ export function discoverSubsystems(channels: ChannelInfo[], graph: SystemGraph|n
 
 export type EstimateChannels = {
   x: string; y: string; yaw: string; vx: string|null; vy: string|null;
+  valid: string;
 };
 
-// The estimate pose (and, when present, velocity) channels. The estimator
-// publishes the estimated pose; discover it by its accepted-observation
-// counter rather than by name. Falls back to the old `/pose/x_m` suffix rule
-// for recordings whose estimator predates that shape (the demo).
-export function discoverEstimate(dictionary: ChannelInfo[]): EstimateChannels|null {
+// Resolves Pose2d (and optional velocity) channels under a configured
+// `[studio] pose_topic` (e.g. `/alt_odom/state`), or null when absent.
+export function discoverPoseTopic(
+    dictionary: ChannelInfo[], poseTopic?: string): EstimateChannels|null {
+  if (!poseTopic) return null;
+  const base = poseTopic.replace(/^\/+/, '').replace(/\/+$/, '');
+  if (!base) return null;
+  const names = new Set(dictionary.map(c => c.name));
+  const prefix = `${base}/`;
+  const valid = `${prefix}valid`;
+  const preferred = `${prefix}pose/x_m`;
+  const candidates = names.has(preferred) ?
+      [preferred] :
+      dictionary.filter(c => c.name.startsWith(prefix) && c.name.endsWith('/x_m'))
+          .map(c => c.name);
+  for (const x of candidates) {
+    const stem = x.slice(0, -'x_m'.length);
+    const y = `${stem}y_m`, yaw = `${stem}yaw_rad`;
+    if (names.has(y) && names.has(yaw)) {
+      const vx = `${prefix}velocity/vx_mps`;
+      const vy = `${prefix}velocity/vy_mps`;
+      return {
+        x, y, yaw,
+        vx: names.has(vx) ? vx : null,
+        vy: names.has(vy) ? vy : null,
+        valid
+      };
+    }
+  }
+  return null;
+}
+
+// The estimate pose (and, when present, velocity) channels. Prefers a
+// configured `[studio] pose_topic` when present; otherwise discovers the
+// estimator by its accepted-observation counter rather than by name, falling
+// back to the old `/pose/x_m` suffix rule for recordings whose estimator
+// predates that shape (the demo).
+export function discoverEstimate(dictionary: ChannelInfo[],
+                                 poseTopic?: string): EstimateChannels|null {
+  const configured = discoverPoseTopic(dictionary, poseTopic);
+  if (configured) return configured;
   const names = new Set(dictionary.map(c => c.name));
   for (const est of discoverEstimators(dictionary)) {
     const x = `${est.name}/state/pose/x_m`;
@@ -117,7 +154,8 @@ export function discoverEstimate(dictionary: ChannelInfo[]): EstimateChannels|nu
       y: `${est.name}/state/pose/y_m`,
       yaw: `${est.name}/state/pose/yaw_rad`,
       vx: names.has(vx) ? vx : null,
-      vy: names.has(vy) ? vy : null
+      vy: names.has(vy) ? vy : null,
+      valid: `${est.name}/state/valid`
     };
   }
   const x = dictionary.find(c => c.name.endsWith('/pose/x_m'));
@@ -125,6 +163,7 @@ export function discoverEstimate(dictionary: ChannelInfo[]): EstimateChannels|nu
   const prefix = x.name.slice(0, -'pose/x_m'.length);
   return {
     x: x.name, y: prefix + 'pose/y_m', yaw: prefix + 'pose/yaw_rad',
-    vx: null, vy: null
+    vx: null, vy: null,
+    valid: `${prefix}valid`
   };
 }

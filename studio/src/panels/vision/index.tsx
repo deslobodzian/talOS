@@ -179,7 +179,7 @@ function VisionPanel() {
 
       return {
         name: c.name,
-        healthy: healthyRaw === undefined ? null : healthyRaw !== 0,
+        healthy: healthyRaw === undefined || !Number.isFinite(healthyRaw) ? null : healthyRaw !== 0,
         fps: fpsFromPeriod(periodUs),
         latencyMs: latencyUs === null ? null : latencyUs / 1000,
         visibleTags: read(status('visible_tag_count')),
@@ -202,7 +202,8 @@ function VisionPanel() {
       null;
   const estPct = acceptancePct(estAccepted, estRejected);
   const estValidRaw = estimator ? ch[channel(estimator.name, 'state/valid')] : undefined;
-  const estValid = estValidRaw === undefined ? null : estValidRaw !== 0;
+  const estValid =
+      estValidRaw === undefined || !Number.isFinite(estValidRaw) ? null : estValidRaw !== 0;
 
   // Chart lines: per camera, x/y observation error against the reference
   // (x solid, y dashed), sharing each camera's observation times.
