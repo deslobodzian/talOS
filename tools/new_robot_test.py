@@ -664,6 +664,36 @@ class RobotRepositoryTest(unittest.TestCase):
             self.assertEqual(os.listdir(used), ["notes.txt"])
 
     # REQ-DEV-23
+    def test_refuses_symlink_target_before_write(self):
+        # A symlink at target_dir (dangling or pointing to an empty directory)
+        # must be refused by plan_repository (including --dry-run) and
+        # write_repository rather than failing os.rename with ENOTDIR.
+        with tempfile.TemporaryDirectory() as tmp:
+            talos, _ = fake_talos(tmp)
+            empty_dir = os.path.join(tmp, "empty_dir")
+            os.makedirs(empty_dir)
+            link_to_empty = os.path.join(tmp, "link_to_empty")
+            os.symlink(empty_dir, link_to_empty)
+            dangling = os.path.join(tmp, "dangling")
+            os.symlink(os.path.join(tmp, "nowhere"), dangling)
+
+            for label, target in (
+                ("dangling", dangling),
+                ("link_to_empty", link_to_empty),
+                ("link_to_empty_slash", link_to_empty + os.sep),
+            ):
+                with self.subTest(case=label):
+                    with self.assertRaisesRegex(new_subsystem.Refused,
+                                                "symbolic link"):
+                        new_robot.plan_repository(talos, target, "my_robot")
+
+            with self.assertRaisesRegex(new_subsystem.Refused,
+                                        "symbolic link"):
+                new_robot.write_repository(link_to_empty, [])
+            self.assertTrue(os.path.islink(link_to_empty))
+            self.assertEqual(os.listdir(empty_dir), [])
+
+    # REQ-DEV-23
     def test_a_fixture_the_template_does_not_match_refuses_the_copy(self):
         # The template is the fixture: a file it does not place, a place
         # the fixture lost, or a line a substitution no longer finds stops
