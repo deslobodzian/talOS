@@ -252,10 +252,10 @@ class Source final : public CameraSource {
         mode.fps <= 0 || mode.fps > 1000000) {
       return false;
     }
-    std::lock_guard lifecycle(lifecycle_mutex_);
-    if (!JoinExitedWorkerLocked()) {
+    if (!JoinExitedWorkersOutsideLocks()) {
       return false;
     }
+    std::lock_guard lifecycle(lifecycle_mutex_);
     std::lock_guard lock(state_mutex_);
     if (running_.load(std::memory_order_acquire) || worker_.joinable() ||
         !retired_workers_.empty()) {
@@ -269,10 +269,10 @@ class Source final : public CameraSource {
     return controls_;
   }
   bool SetControls(const CameraControls& controls) override {
-    std::lock_guard lifecycle(lifecycle_mutex_);
-    if (!JoinExitedWorkerLocked()) {
+    if (!JoinExitedWorkersOutsideLocks()) {
       return false;
     }
+    std::lock_guard lifecycle(lifecycle_mutex_);
     std::lock_guard lock(state_mutex_);
     if (running_.load(std::memory_order_acquire) || worker_.joinable() ||
         !retired_workers_.empty()) {
@@ -299,17 +299,32 @@ class Source final : public CameraSource {
   bool controls_applied() const override { return controls_applied_; }
   bool Start() override {
     std::unique_lock lifecycle(lifecycle_mutex_);
-    if (running_.load(std::memory_order_acquire)) {
-      return true;
-    }
-    if (StopLocked()) {
-      lifecycle.unlock();
-      ReportConnection(ConnectionState::kError,
-                       device_id() + ": cannot restart inside frame callback");
-      return false;
+    for (;;) {
+      if (running_.load(std::memory_order_acquire)) {
+        return true;
+      }
+      std::vector<std::jthread> to_join;
+      bool on_self_capture = false;
+      DetachWorkersLocked(to_join, &on_self_capture);
+      if (!to_join.empty()) {
+        lifecycle.unlock();
+        JoinThreads(to_join);
+        lifecycle.lock();
+        continue;
+      }
+      if (on_self_capture) {
+        lifecycle.unlock();
+        ReportConnection(
+            ConnectionState::kError,
+            device_id() + ": cannot restart inside frame callback");
+        return false;
+      }
+      ReleaseDevice();
+      break;
     }
     auto fail = [&](const char* step, int error) {
-      StopLocked();
+      running_.store(false, std::memory_order_release);
+      ReleaseDevice();
       std::string message = device_id() + ": " + step;
       if (error != 0) message += std::string(": ") + std::strerror(error);
       lifecycle.unlock();
@@ -460,39 +475,63 @@ class Source final : public CameraSource {
     return true;
   }
   void Stop() override {
-    std::lock_guard lifecycle(lifecycle_mutex_);
-    StopLocked();
+    for (;;) {
+      std::vector<std::jthread> to_join;
+      bool on_self_capture = false;
+      {
+        std::lock_guard lifecycle(lifecycle_mutex_);
+        DetachWorkersLocked(to_join, &on_self_capture);
+        running_.store(false, std::memory_order_release);
+        if (to_join.empty()) {
+          if (!on_self_capture) {
+            ReleaseDevice();
+          }
+          return;
+        }
+      }
+      JoinThreads(to_join);
+      std::lock_guard lifecycle(lifecycle_mutex_);
+      if (!running_.load(std::memory_order_acquire)) {
+        std::vector<std::jthread> remaining;
+        bool still_self = false;
+        DetachWorkersLocked(remaining, &still_self);
+        if (remaining.empty()) {
+          if (!still_self) {
+            ReleaseDevice();
+          }
+          return;
+        }
+        // Another worker appeared before we finished teardown; join it next.
+        continue;
+      }
+      return;
+    }
   }
 
  private:
-  bool StopLocked() {
-    std::vector<std::jthread> to_join;
-    bool on_self_capture = false;
-    {
-      std::lock_guard lock(state_mutex_);
-      const auto self = std::this_thread::get_id();
-      if (worker_.joinable()) {
-        worker_.request_stop();
-        if (worker_.get_id() == self) {
-          retired_workers_.push_back(std::move(worker_));
-        } else {
-          to_join.push_back(std::move(worker_));
-        }
-      }
-      ReapRetiredLocked(to_join);
-      for (const auto& t : retired_workers_) {
-        if (t.joinable() && t.get_id() == self) {
-          on_self_capture = capture_active_.load(std::memory_order_acquire);
-          break;
-        }
+  void DetachWorkersLocked(std::vector<std::jthread>& to_join,
+                           bool* on_self_capture) {
+    std::lock_guard lock(state_mutex_);
+    const auto self = std::this_thread::get_id();
+    if (worker_.joinable()) {
+      worker_.request_stop();
+      if (worker_.get_id() == self) {
+        retired_workers_.push_back(std::move(worker_));
+      } else {
+        to_join.push_back(std::move(worker_));
       }
     }
-    JoinThreads(to_join);
-    running_.store(false, std::memory_order_release);
-    if (!on_self_capture) {
-      ReleaseDevice();
+    ReapRetiredLocked(to_join);
+    bool self_active = false;
+    for (const auto& t : retired_workers_) {
+      if (t.joinable() && t.get_id() == self) {
+        self_active = capture_active_.load(std::memory_order_acquire);
+        break;
+      }
     }
-    return on_self_capture;
+    if (on_self_capture != nullptr) {
+      *on_self_capture = self_active;
+    }
   }
   void ReapRetiredLocked(std::vector<std::jthread>& to_join) {
     const auto self = std::this_thread::get_id();
@@ -510,25 +549,30 @@ class Source final : public CameraSource {
       }
     }
   }
-  bool JoinExitedWorkerLocked() {
-    std::vector<std::jthread> to_join;
-    {
-      std::lock_guard lock(state_mutex_);
-      if (running_.load(std::memory_order_acquire)) {
-        return false;
-      }
-      const auto self = std::this_thread::get_id();
-      if (worker_.joinable()) {
-        if (worker_.get_id() == self) {
-          retired_workers_.push_back(std::move(worker_));
-        } else {
-          to_join.push_back(std::move(worker_));
+  bool JoinExitedWorkersOutsideLocks() {
+    for (;;) {
+      std::vector<std::jthread> to_join;
+      {
+        std::lock_guard lifecycle(lifecycle_mutex_);
+        std::lock_guard lock(state_mutex_);
+        if (running_.load(std::memory_order_acquire)) {
+          return false;
         }
+        const auto self = std::this_thread::get_id();
+        if (worker_.joinable()) {
+          if (worker_.get_id() == self) {
+            retired_workers_.push_back(std::move(worker_));
+          } else {
+            to_join.push_back(std::move(worker_));
+          }
+        }
+        ReapRetiredLocked(to_join);
       }
-      ReapRetiredLocked(to_join);
+      if (to_join.empty()) {
+        return !running_.load(std::memory_order_acquire);
+      }
+      JoinThreads(to_join);
     }
-    JoinThreads(to_join);
-    return !running_.load(std::memory_order_acquire);
   }
   void ReleaseDevice() {
     std::lock_guard lock(device_mutex_);

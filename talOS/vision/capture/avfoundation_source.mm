@@ -130,9 +130,10 @@ class Source final : public CameraSource {
     std::unique_lock<std::mutex> lifecycle(lifecycle_mutex_);
     if (running_.load(std::memory_order_acquire)) return true;
     auto fail = [&](ConnectionState state, const std::string& message) {
-      StopLocked();
+      DetachedSession detached = DetachSessionLocked();
       const std::string full = device_id() + ": " + message;
       lifecycle.unlock();
+      TeardownDetached(detached);
       NotifyConnection(state, full);
       return false;
     };
@@ -264,8 +265,9 @@ class Source final : public CameraSource {
       output_.videoSettings =
           @{(id)kCVPixelBufferPixelFormatTypeKey : @(requested)};
       delegate_ = [[TalosCaptureDelegate alloc] init];
-      delegate_->callback = [this](CMSampleBufferRef sample) {
-        Receive(sample);
+      AVCaptureSession* session = session_;
+      delegate_->callback = [this, session](CMSampleBufferRef sample) {
+        Receive(sample, session);
       };
       // Frame delivery runs at the QoS that
       // talos::process::ConfigureBackgroundThread gives camera workers,
@@ -296,34 +298,57 @@ class Source final : public CameraSource {
     return true;
   }
   void Stop() override {
-    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
-    StopLocked();
+    DetachedSession detached;
+    {
+      std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
+      detached = DetachSessionLocked();
+    }
+    TeardownDetached(detached);
   }
 
   uint64_t dropped_frames() const override { return dropped_frames_.load(); }
 
  private:
-  void StopLocked() {
+  struct DetachedSession {
+    AVCaptureSession* session = nil;
+    AVCaptureVideoDataOutput* output = nil;
+    TalosCaptureDelegate* delegate = nil;
+    dispatch_queue_t dispatch = nullptr;
+  };
+  DetachedSession DetachSessionLocked() {
     running_.store(false, std::memory_order_release);
     connected_.store(false, std::memory_order_release);
+    DetachedSession detached;
+    detached.session = session_;
+    detached.output = output_;
+    detached.delegate = delegate_;
+    detached.dispatch = dispatch_;
+    session_ = nil;
+    output_ = nil;
+    delegate_ = nil;
+    dispatch_ = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(device_mutex_);
+      device_ = nil;
+    }
+    return detached;
+  }
+  void TeardownDetached(DetachedSession& detached) {
     @autoreleasepool {
-      [session_ stopRunning];
-      [output_ setSampleBufferDelegate:nil queue:nullptr];
+      [detached.session stopRunning];
+      [detached.output setSampleBufferDelegate:nil queue:nullptr];
       const bool on_dispatch_queue =
-          dispatch_ && dispatch_get_specific(&kDispatchQueueKey) == this;
-      if (dispatch_ && !on_dispatch_queue) {
-        dispatch_sync(dispatch_, ^{
+          detached.dispatch &&
+          dispatch_get_specific(&kDispatchQueueKey) == this;
+      if (detached.dispatch && !on_dispatch_queue) {
+        dispatch_sync(detached.dispatch, ^{
                       });
       }
-      if (delegate_) delegate_->callback = {};
-      delegate_ = nil;
-      output_ = nil;
-      session_ = nil;
-      {
-        std::lock_guard<std::mutex> lock(device_mutex_);
-        device_ = nil;
-      }
-      dispatch_ = nullptr;
+      if (detached.delegate) detached.delegate->callback = {};
+      detached.delegate = nil;
+      detached.output = nil;
+      detached.session = nil;
+      detached.dispatch = nullptr;
     }
   }
   void NotifyConnection(ConnectionState state, const std::string& message) {
@@ -339,7 +364,7 @@ class Source final : public CameraSource {
     const char* desc = error.localizedDescription.UTF8String;
     return desc ? std::string(desc) : std::string("unknown error");
   }
-  void Receive(CMSampleBufferRef sample) {
+  void Receive(CMSampleBufferRef sample, AVCaptureSession* session) {
     if (!running_.load(std::memory_order_acquire)) return;
     CVPixelBufferRef pixels = CMSampleBufferGetImageBuffer(sample);
     if (!pixels ||
@@ -376,9 +401,9 @@ class Source final : public CameraSource {
         CMTIME_IS_NUMERIC(pts) ? CMTimeGetSeconds(pts) * 1e9 : 0);
     frame.set_timestamp_kind(TimestampKind::kDelivery);
     frame.set_mapping_quality(TimestampMappingQuality::kEstimated);
-    if (session_.synchronizationClock && CMTIME_IS_NUMERIC(pts)) {
+    if (session.synchronizationClock && CMTIME_IS_NUMERIC(pts)) {
       const CMTime hostPTS = CMSyncConvertTime(
-          pts, session_.synchronizationClock, CMClockGetHostTimeClock());
+          pts, session.synchronizationClock, CMClockGetHostTimeClock());
       const double age = CMTimeGetSeconds(
           CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), hostPTS));
       if (std::isfinite(age) && age >= 0 && age < 5) {
