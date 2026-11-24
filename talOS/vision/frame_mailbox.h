@@ -46,6 +46,8 @@ class FrameMailbox {
 
   // Allocates `bytes` of capacity per slot. Call before the producer starts.
   void Reserve(size_t bytes) {
+    std::lock_guard lock(mutex_);
+    reserved_bytes_ = bytes;
     for (auto& slot : slots_) slot.storage->reserve(bytes);
   }
 
@@ -58,6 +60,21 @@ class FrameMailbox {
     }
     // filling_ is written only by this thread, under the lock below.
     Slot& slot = slots_[filling_];
+    // Detach storage if a consumer retained a shallow copy or Share() of a
+    // previously taken frame past its next TakeNewest(), so reusing this slot
+    // never mutates or reallocates memory backing another live Frame.
+    if (slot.storage.use_count() > 2) {
+      slot.storage = std::make_shared<std::vector<uint8_t>>();
+      if (reserved_bytes_ > 0) {
+        slot.storage->reserve(reserved_bytes_);
+      }
+      slot.frame = Frame(0, 0, 0, talos::event::MonotonicTime::from_nanos(0), 0,
+                         0, 0, PixelFormat::kGray8, slot.storage);
+    } else {
+      // Pairs with the release decrement of any external shared_ptr copy that
+      // just dropped before use_count() returned 2.
+      std::atomic_thread_fence(std::memory_order_acquire);
+    }
     const size_t bytes = frame.size();
     slot.storage->resize(bytes);
     std::memcpy(slot.storage->data(), frame.data(), bytes);
@@ -84,9 +101,10 @@ class FrameMailbox {
   }
 
   // Consumer: the newest frame published since the last take, or nullptr.
-  // The frame stays valid and unchanged until this consumer's next
-  // TakeNewest(); do not keep a copy past that (copies share the slot), Clone
-  // it instead.
+  // The returned pointer stays valid and unchanged until this consumer's next
+  // TakeNewest(). For zero-allocation steady state, do not retain copies past
+  // the next TakeNewest() (Clone() instead); retaining a shallow copy forces
+  // the producer to detach a fresh slot buffer rather than corrupting it.
   const Frame* TakeNewest() {
     std::lock_guard lock(mutex_);
     if (!ready_fresh_) return nullptr;
@@ -127,6 +145,7 @@ class FrameMailbox {
   size_t filling_ = 0;
   size_t ready_ = 1;
   size_t processing_ = 2;
+  size_t reserved_bytes_ = 0;
   bool ready_fresh_ = false;
   std::atomic<uint64_t> dropped_{0};
 };
