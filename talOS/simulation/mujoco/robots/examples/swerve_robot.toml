@@ -1,0 +1,181 @@
+# A swerve robot with an intake, a hopper with a gate feeder and a flywheel
+# (README.md). Device names and gear ratios are a 2026 robot's config's,
+# but for the feeder's motor;
+# every other number is an estimate (EST) unless marked. A starting point:
+# copy it beside a robot's config and change it to the robot.
+
+[robot]
+name = "swerve_robot"
+root = "free"
+mass_kg = 60.0  # EST: whole robot with bumpers and battery
+
+[game_piece]
+radius_m = 0.07506  # the 2026 FUEL (fields/rebuilt_2026/README.md)
+
+[frame]
+length_m = 0.6985  # 27.5 in: a 110 in frame perimeter, square
+width_m = 0.6985
+belly_clearance_m = 0.035  # EST
+rail_height_m = 0.0508  # EST: 2 in tube
+rail_width_m = 0.0254  # EST: 1 in tube
+
+[bumpers]
+bottom_m = 0.0635  # EST: 2.5 in, below the FUEL's equator
+height_m = 0.127  # EST: 5 in
+thickness_m = 0.085  # EST
+
+# One table per motor: gear is the config's rotor_to_sensor_ratio x
+# sensor_to_mechanism_ratio; rotor_inertia_kg_m2 is an EST for a Kraken X60.
+[motors.front_left_drive]
+gear = 6.75
+rotor_inertia_kg_m2 = 1.0e-4
+
+[motors.front_left_steer]
+gear = 12.8
+rotor_inertia_kg_m2 = 1.0e-4
+
+[motors.front_right_drive]
+gear = 6.75
+rotor_inertia_kg_m2 = 1.0e-4
+
+[motors.front_right_steer]
+gear = 12.8
+rotor_inertia_kg_m2 = 1.0e-4
+
+[motors.back_left_drive]
+gear = 6.75
+rotor_inertia_kg_m2 = 1.0e-4
+
+[motors.back_left_steer]
+gear = 12.8
+rotor_inertia_kg_m2 = 1.0e-4
+
+[motors.back_right_drive]
+gear = 6.75
+rotor_inertia_kg_m2 = 1.0e-4
+
+[motors.back_right_steer]
+gear = 12.8
+rotor_inertia_kg_m2 = 1.0e-4
+
+[motors.roller]
+gear = 1.0
+rotor_inertia_kg_m2 = 1.0e-4
+
+# EST: the hopper's gate (README.md); not in the 2026 robot's config, which
+# feeds by reversing its intake roller.
+[motors.feeder]
+gear = 1.0
+rotor_inertia_kg_m2 = 1.0e-4
+
+[motors.flywheel]
+gear = 1.0
+rotor_inertia_kg_m2 = 1.0e-4
+
+[swerve]
+wheel_radius_m = 0.0508  # 2 in
+wheel_mass_kg = 0.25  # EST
+module_mass_kg = 1.5  # EST: a module without its wheel
+
+[[swerve.modules]]
+name = "front_left"
+x_m = 0.30
+y_m = 0.30
+drive_motor = "front_left_drive"
+steer_motor = "front_left_steer"
+
+[[swerve.modules]]
+name = "front_right"
+x_m = 0.30
+y_m = -0.30
+drive_motor = "front_right_drive"
+steer_motor = "front_right_steer"
+
+[[swerve.modules]]
+name = "back_left"
+x_m = -0.30
+y_m = 0.30
+drive_motor = "back_left_drive"
+steer_motor = "back_left_steer"
+
+[[swerve.modules]]
+name = "back_right"
+x_m = -0.30
+y_m = -0.30
+drive_motor = "back_right_drive"
+steer_motor = "back_right_steer"
+
+[intake]
+motor = "roller"
+roller_count = 3
+roller_radius_m = 0.0254
+roller_mass_kg = 0.3
+roller_first_fraction = 0.25
+roller_last_fraction = 0.7
+ramp_angle_deg = 45.0
+lip_height_m = 0.012
+top_above_bumper_m = 0.03
+width_m = 0.56
+compression_m = 0.02
+
+# 0.52 m walls, and the flywheel below, keep the robot under a TRENCH's arm
+# (0.565 m). The floor's front is 5 cm below the intake's bridge, so a piece
+# thrown forward by braking meets the step's face.
+[hopper]
+width_m = 0.56
+step_m = 0.05
+floor_slope_deg = 12.0
+wall_top_m = 0.52
+
+# The gate has its own motor. A gate belted to the intake's roller (the
+# generator's `ratio`, as a robot that feeds by reversing its intake would
+# be) turns backward while the intake collects, pushes the waiting pieces
+# forward and blocks the intake.
+[feeder]
+motor = "feeder"
+x_m = -0.12
+roller_radius_m = 0.0254
+roller_mass_kg = 0.3
+compression_m = 0.01
+
+[flywheel]
+motor = "flywheel"
+radius_m = 0.0508
+width_m = 0.12
+mass_kg = 0.8
+inertia_kg_m2 = 0.0025
+axle_x_m = -0.336
+axle_z_m = 0.43
+compression_m = 0.02
+hood_start_deg = -20.0
+exit_elevation_deg = 60.0
+exit_offset_m = 0.15
+efficiency = 0.5
+
+# Across the throat behind the ramp's top, at a FUEL centre's height.
+[[beam_breaks]]
+name = "intake_beam"
+position_m = [0.41925, -0.28, 0.29556]
+direction = [0.0, 1.0, 0.0]
+cutoff_m = 0.54
+
+# Across the pocket behind the feeder, at a FUEL centre's height.
+[[beam_breaks]]
+name = "beam_break"
+position_m = [-0.21776, -0.27, 0.15]
+direction = [0.0, 1.0, 0.0]
+cutoff_m = 0.54
+
+# Eight FUEL in the hopper: two rows of three on the floor in front of the
+# feeder, two more resting on them, each 5 mm or more clear of what it meets.
+[preload]
+positions_m = [
+  [-0.015, -0.16, 0.181],
+  [-0.015, 0.0, 0.181],
+  [-0.015, 0.16, 0.181],
+  [0.145, -0.16, 0.215],
+  [0.145, 0.0, 0.215],
+  [0.145, 0.16, 0.215],
+  [0.065, -0.08, 0.324],
+  [0.065, 0.08, 0.324],
+]
