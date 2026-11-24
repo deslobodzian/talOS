@@ -199,6 +199,61 @@ TEST(CanBusHealth, AFailedReadReadsFailedAndIsCounted) {
       << "a new configuration kept the previous one's failures";
 }
 
+// Multiple failed reads before Poll() observes the spell (for example after a
+// try-lock miss or delayed poll), or a failed read that ages to STALE before
+// Poll() runs, must all be counted in spell_failures on both kFailing and
+// kRecovered rather than losing earlier failures in the spell.
+// REQ-OPS-20
+TEST(CanBusHealth, SpellFailuresCountAllFailuresBeforePollAndAcrossStale) {
+  CanBusHealth health;
+  health.Configure(Devices({"rio"}, {}), false);
+  Loop loop{health};
+
+  // Start healthy so the bus has an established OK baseline.
+  health.SampleNext(kStartUs, [](std::string_view) { return Ok(0.2); });
+  loop.Poll(kStartUs + kLoopPeriodUs);
+  ASSERT_EQ(health.Slot(0).read_state, CanBusReadState::kOk);
+  ASSERT_TRUE(loop.changes.empty());
+
+  // Two failed reads before Poll() runs, then recovery: both failures count.
+  const CanBusHealth::Sample failed{false, 0.0, 0, 0, 0, 0, "CANBusNotFound"};
+  health.SampleNext(kStartUs + kPeriodUs,
+                    [&](std::string_view) { return failed; });
+  health.SampleNext(kStartUs + 2 * kPeriodUs,
+                    [&](std::string_view) { return failed; });
+  loop.Poll(kStartUs + 2 * kPeriodUs + kLoopPeriodUs);
+  ASSERT_EQ(loop.changes.size(), 1u);
+  EXPECT_EQ(loop.changes[0].event, Event::kFailing);
+  EXPECT_FALSE(loop.changes[0].stale);
+  EXPECT_EQ(loop.changes[0].spell_failures, 2u);
+
+  health.SampleNext(kStartUs + 3 * kPeriodUs,
+                    [](std::string_view) { return Ok(0.3); });
+  loop.Poll(kStartUs + 3 * kPeriodUs + kLoopPeriodUs);
+  ASSERT_EQ(loop.changes.size(), 2u);
+  EXPECT_EQ(loop.changes[1].event, Event::kRecovered);
+  EXPECT_EQ(loop.changes[1].spell_failures, 2u);
+
+  // A failed read that ages to STALE before Poll() runs still counts its
+  // failure in the new spell (and does not recount the earlier spell's two).
+  const uint64_t fail_time = kStartUs + 4 * kPeriodUs;
+  health.SampleNext(fail_time, [&](std::string_view) { return failed; });
+  loop.Poll(fail_time + health.StaleUs());
+  EXPECT_EQ(health.Slot(0).read_state, CanBusReadState::kStale);
+  ASSERT_EQ(loop.changes.size(), 3u);
+  EXPECT_EQ(loop.changes[2].event, Event::kFailing);
+  EXPECT_TRUE(loop.changes[2].stale);
+  EXPECT_EQ(loop.changes[2].spell_failures, 1u);
+
+  const uint64_t recover_time = fail_time + health.StaleUs() + kPeriodUs;
+  health.SampleNext(recover_time, [](std::string_view) { return Ok(0.4); });
+  loop.Poll(recover_time + kLoopPeriodUs);
+  ASSERT_EQ(loop.changes.size(), 4u);
+  EXPECT_EQ(loop.changes[3].event, Event::kRecovered);
+  EXPECT_EQ(loop.changes[3].spell_failures, 1u);
+  EXPECT_EQ(health.Slot(0).read_failure_count, 3u);
+}
+
 // A vendor call that never returns, or a sampler starved of the CPU, leaves
 // the last read published. It reads current only until it is three of its
 // bus's own sampling periods old on the loop's clock (two buses: 600 ms),

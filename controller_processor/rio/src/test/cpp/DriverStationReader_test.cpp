@@ -14,6 +14,7 @@
 #include <hal/simulation/DriverStationData.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -30,6 +31,7 @@
 
 #ifdef __linux__
 #include <pthread.h>
+#include <sched.h>
 #endif
 
 namespace {
@@ -636,6 +638,78 @@ TEST(DriverStationReader, SnapshotDriverStationSanitizesNonFiniteHalFields) {
   EXPECT_FLOAT_EQ(snapshot.joysticks[0].axes[0], 0.0f);
   EXPECT_TRUE(std::isfinite(snapshot.joysticks[0].axes[1]));
   EXPECT_FLOAT_EQ(snapshot.joysticks[0].axes[1], 0.0f);
+}
+
+// Robot.cpp starts the talos-ds helper at SCHED_FIFO priority 5 (below the
+// loop thread's priority 10 and above default-scheduled threads, REQ-RT-24)
+// with SCHED_RESET_ON_FORK so forked children do not inherit realtime
+// scheduling. On Linux, Start(5) attempts SCHED_FIFO | SCHED_RESET_ON_FORK at
+// priority 5 and reports the outcome: when granted, the helper runs under
+// SCHED_FIFO | SCHED_RESET_ON_FORK at priority 5 and logs that policy and
+// priority; when unprivileged (EPERM), the refusal log names priority 5 and
+// errno EPERM, and the reader still serves snapshots.
+// REQ-RT-24
+TEST(DriverStationReader, StartRequestsRealtimePriorityAndReportsOutcome) {
+  constexpr int kPriority = 5;
+  auto gate = std::make_shared<Gate>();
+  const TestClock clock = MakeClock();
+
+  std::mutex report_mutex;
+  std::vector<std::string> reports;
+#ifdef __linux__
+  int observed_policy = -1;
+  int observed_priority = -1;
+#endif
+  DriverStationReader::Calls calls = CallsThrough(gate);
+#ifdef __linux__
+  calls.refresh = [gate, &report_mutex, &observed_policy,
+                   &observed_priority](ds::DriverStationData& out) {
+    {
+      const std::lock_guard lock{report_mutex};
+      if (observed_policy < 0) {
+        observed_policy = sched_getscheduler(0);
+        sched_param param{};
+        if (sched_getparam(0, &param) == 0) {
+          observed_priority = param.sched_priority;
+        }
+      }
+    }
+    gate->Refresh(out);
+  };
+#endif
+
+  DriverStationReader reader{std::move(calls), ClockThrough(clock),
+                             [&](std::string_view line) {
+                               const std::lock_guard lock{report_mutex};
+                               reports.emplace_back(line);
+                             },
+                             kNeverAbandon};
+  reader.Start(kPriority);
+  gate->SetSample(kA);
+  ASSERT_TRUE(gate->Step());
+  const ds::DriverStationData view = reader.Read(kT0, kTimeoutUs);
+  EXPECT_TRUE(view == kA) << Describe(view);
+  reader.Stop();
+
+#ifdef __linux__
+  ASSERT_EQ(reports.size(), 1u);
+  if (reports[0].find("refused") != std::string::npos) {
+    EXPECT_NE(
+        reports[0].find("SCHED_FIFO 5 refused, errno " + std::to_string(EPERM)),
+        std::string::npos)
+        << reports[0];
+  } else {
+    EXPECT_EQ(observed_policy & ~SCHED_RESET_ON_FORK, SCHED_FIFO)
+        << "policy=" << observed_policy << " report=" << reports[0];
+    EXPECT_NE(observed_policy & SCHED_RESET_ON_FORK, 0)
+        << "missing SCHED_RESET_ON_FORK; policy=" << observed_policy
+        << " report=" << reports[0];
+    EXPECT_EQ(observed_priority, kPriority) << reports[0];
+    EXPECT_EQ(reports[0], "driver station reader SCHED_FIFO 5");
+  }
+#else
+  EXPECT_TRUE(reports.empty());
+#endif
 }
 
 }  // namespace
