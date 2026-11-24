@@ -118,6 +118,12 @@ class ClockOffsetEstimator {
   // Ignored for another boot, t1 == 0, t4 < t1, or a round trip over 1 s.
   void ObserveExchange(std::uint64_t boot_id, std::uint64_t t1,
                        std::uint64_t t2, std::uint64_t t4);
+  // Advances exchange expiry to bridge clock now_us without a new State:
+  // re-selects among kept exchanges still within kExchangeLifetimeUs of now_us
+  // and clears accuracy_valid() (zeroing bounded_offset_us(), round_trip_us()
+  // and uncertainty_us()) once all have expired. Safe with no prior
+  // observations or now_us earlier than the last selection.
+  void Expire(std::uint64_t now_us);
   bool accuracy_valid() const { return exchange_valid_; }
   std::int64_t bounded_offset_us() const { return bounded_offset_us_; }
   std::uint64_t uncertainty_us() const { return uncertainty_us_; }
@@ -147,8 +153,8 @@ class ClockOffsetEstimator {
   };
 
   // Picks the minimum-RTT kept exchange at most kExchangeLifetimeUs old at
-  // (bridge receipt_us, gateway sample_time_us), and sets accuracy_valid()
-  // and the bound from it.
+  // (bridge receipt_us, gateway sample_time_us), sets accuracy_valid() and
+  // the bound from it, or zeroes the bound fields when none remains.
   void SelectExchange(std::uint64_t receipt_us, std::uint64_t sample_time_us);
 
   std::array<std::int64_t, kWindowSamples> delays_us_{};  // ring buffer
@@ -186,6 +192,8 @@ class ClockOffsetEstimator {
   std::array<Exchange, kExchangeSlots> exchanges_{};  // ring buffer
   std::size_t next_exchange_{0};
   std::size_t exchange_count_{0};
+  std::uint64_t last_select_receipt_us_{0};
+  std::uint64_t max_exchange_sample_us_{0};
 };
 
 }  // namespace talos::hardware

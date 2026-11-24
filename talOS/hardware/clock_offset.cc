@@ -43,6 +43,8 @@ bool ClockOffsetEstimator::Observe(std::uint64_t boot_id,
     round_trip_us_ = 0;
     next_exchange_ = 0;
     exchange_count_ = 0;
+    last_select_receipt_us_ = 0;
+    max_exchange_sample_us_ = 0;
     anchor_sample_us_ = sample_time_us;
     anchor_receipt_us_ = receipt_us;
     next_anchor_count_ = 0;
@@ -154,7 +156,14 @@ void ClockOffsetEstimator::ObserveExchange(std::uint64_t boot_id,
   };
   next_exchange_ = (next_exchange_ + 1) % kExchangeSlots;
   exchange_count_ = std::min(exchange_count_ + 1, kExchangeSlots);
+  max_exchange_sample_us_ = std::max(max_exchange_sample_us_, t2);
   SelectExchange(t4, std::max(t2, last_sample_time_us_));
+}
+
+void ClockOffsetEstimator::Expire(std::uint64_t now_us) {
+  if (!exchange_valid_ || now_us <= last_select_receipt_us_) return;
+  SelectExchange(now_us,
+                 std::max(last_sample_time_us_, max_exchange_sample_us_));
 }
 
 void ClockOffsetEstimator::SelectExchange(std::uint64_t receipt_us,
@@ -181,7 +190,14 @@ void ClockOffsetEstimator::SelectExchange(std::uint64_t receipt_us,
     }
   }
   exchange_valid_ = best != nullptr;
-  if (best == nullptr) return;
+  if (best == nullptr) {
+    bounded_offset_us_ = 0;
+    round_trip_us_ = 0;
+    uncertainty_us_ = 0;
+    last_select_receipt_us_ = 0;
+    return;
+  }
+  last_select_receipt_us_ = receipt_us;
   bounded_offset_us_ = best->offset_us;
   round_trip_us_ = best->round_trip_us;
   // Assumed maximum relative oscillator drift: 1000 ppm. Include integer
