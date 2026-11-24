@@ -372,10 +372,13 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
       continue;
     }
     const auto time = entry->last_write_time(unreadable);
-    // Before TreeBytes: it may leave its verdict in the directory.
-    const SessionFacts facts = unreadable || kind == Retained::kAbandoned
-                                   ? SessionFacts{}
-                                   : InspectSession(entry->path());
+    // Before TreeBytes: it may leave its verdict in the directory (except
+    // during unlocked recovery, when the disk may be full or sessions live).
+    const SessionFacts facts =
+        unreadable || kind == Retained::kAbandoned
+            ? SessionFacts{}
+            : InspectSession(entry->path(), unlocked ? ClassCache::kReadOnly
+                                                     : ClassCache::kReadWrite);
     const uintmax_t bytes = unreadable || kind == Retained::kAbandoned
                                 ? 0
                                 : TreeBytes(entry->path(), unreadable);

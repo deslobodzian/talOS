@@ -1564,6 +1564,118 @@ class SessionReportTest(unittest.TestCase):
         self.assertNotIn("can_buses[2].utilization_frac", st2)
         self.assertNotIn("can_buses[3].utilization_frac", st2)
 
+    # REQ-OPS-16, REQ-OPS-12: log_dump skips incomplete-header .tlog files
+    # with `warning: skipping <path>: ...` and exits 0; --strict must record
+    # them in session_issues and fail rather than passing silently, while
+    # leaving `warning: log gap in ...` unmatched (handled via GAP records).
+    def test_strict_catches_skipped_incomplete_header_logs(self):
+        for label, payload in (("empty", b""), ("truncated header", b"TALO")):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                shutil.copytree(self._default_fixture_dir, directory, dirs_exist_ok=True)
+                extra = os.path.join(directory, "extra.tlog")
+                with open(extra, "wb") as file:
+                    file.write(payload)
+                result = self.run_in_process("--json", "--strict", directory)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                report = json.loads(result.stdout)
+                skipped = [issue for issue in report["session_issues"]
+                           if issue.startswith(f"skipping {extra}: ")]
+                self.assertEqual(len(skipped), 1, report["session_issues"])
+                self.assertIn(f"session_report: strict: {skipped[0]}",
+                              result.stderr.splitlines())
+
+        stderr_sample = (
+            "warning: log gap in /s/a.tlog: 4 records lost\n"
+            "warning: damaged log /s/b.tlog: 1 bad record\n"
+            "warning: skipping /s/c.tlog: truncated header\n"
+        )
+        self.assertEqual(
+            session_report.DAMAGED_LOG.findall(stderr_sample),
+            ["damaged log /s/b.tlog: 1 bad record",
+             "skipping /s/c.tlog: truncated header"],
+        )
+
+        # On an otherwise-passing synthetic session, a skipped-log entry fails
+        # --strict by itself.
+        def record(process, kind, topic, now, age_ms=0, **extra):
+            return dict(process=process, kind=kind, topic=topic, now_ms=now,
+                        event_ms=now, publish_ms=now - age_ms, decoded="", **extra)
+        lane = record("lift", "MESSAGE", "/lift/target/teleop", 50)
+        lane["decoded"] = "{mode_since_us: 1200, active: true, message: {position_rot: 0.5}}"
+        passing = [
+            record("hardware_node", "SEND", "/hw/state/driver_station", 0, ds_enabled=True),
+            lane,
+            record("lift", "READ", "/lift/target/teleop", 51, 1),
+            *[record("hardware_node", "SEND", "/hw/state", t) for t in range(0, 105, 5)],
+        ]
+        manifest = {"end_wall_ns": 1, "nodes": [], **BENCH_BOUNDS}
+        self.assertEqual(
+            session_report.strict_failures(session_report.analyze(manifest, passing)), [])
+        skip_issue = "skipping /s/extra.tlog: file too short for log header"
+        self.assertEqual(
+            session_report.strict_failures(
+                session_report.analyze(manifest, passing, log_damage=[skip_issue])),
+            [skip_issue])
+
+    # REQ-OPS-16, REQ-OPS-08: --strict catches any recording node's .tlog
+    # listed in manifest.json that is missing beside manifest.json, while
+    # accepting non-recording nodes, rotated <stem>.segment<k>.tlog files,
+    # and hostile log_paths without raising tracebacks.
+    def test_strict_catches_missing_manifest_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            shutil.copytree(self._default_fixture_dir, directory, dirs_exist_ok=True)
+            manifest_path = pathlib.Path(directory) / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["nodes"].append({
+                "name": "arm",
+                "log_path": "/robot/logs/42/arm.tlog",
+                "log_paths": [
+                    "/robot/logs/42/arm.tlog",
+                    "/robot/logs/42/arm.restart1.tlog",
+                ],
+            })
+            manifest["nodes"].append({
+                "name": "studio_bridge",
+                "log_path": "",
+                "log_paths": [],
+            })
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            result = self.run_in_process("--json", "--strict", directory)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            report = json.loads(result.stdout)
+            for expected in ("arm: missing log arm.tlog",
+                             "arm: missing log arm.restart1.tlog"):
+                self.assertIn(expected, report["session_issues"])
+                self.assertIn(f"session_report: strict: {expected}",
+                              result.stderr.splitlines())
+            self.assertFalse(
+                any(i.startswith("studio_bridge:") for i in report["session_issues"]))
+
+            # A rotated segment file `<stem>.segment<k>.tlog` satisfies `<stem>.tlog`,
+            # while an unrelated restart log remains missing.
+            (pathlib.Path(directory) / "arm.segment0.tlog").write_bytes(b"")
+            self.assertEqual(
+                session_report.missing_logs(directory, manifest),
+                ["arm: missing log arm.restart1.tlog"],
+            )
+
+            # Hostile log_paths (non-str, embedded NUL, bare "/") raise no traceback.
+            hostile = {
+                "nodes": [
+                    {"name": "viewer", "log_path": "", "log_paths": []},
+                    {
+                        "name": "hostile",
+                        "log_path": 999,
+                        "log_paths": [123, None, "", "bad\x00.tlog", "/"],
+                    },
+                ]
+            }
+            self.assertEqual(
+                session_report.missing_logs(directory, hostile),
+                ["hostile: missing log bad\x00.tlog", "hostile: missing log /"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
