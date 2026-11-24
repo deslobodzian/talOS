@@ -25,7 +25,7 @@ from control.PositionTarget import PositionTarget
 from control.VelocityTarget import VelocityTarget
 from demo.Goal import Goal
 import talos
-from talos import _abi
+from talos import _abi, testing
 from talos._messages import message_type
 from talos.mechanisms import (PositionMechanism, RollerWithSensor,
                               VelocityMechanism)
@@ -687,6 +687,33 @@ class SafetyParityTest(unittest.TestCase):
             hw.set_gateway_clock(offset=1.0)
         with self.assertRaises(talos.TalosError):
             hw.motor_request("roller", "wheel")
+
+    # REQ-CONTRACT-14: Sim.__del__ captures native destroy helpers as default
+    # arguments so interpreter shutdown (Py_Finalize clearing module globals to
+    # None) destroys SimHardware, destroys Sim, and unlinks the temp TOML
+    # without raising TypeError or AttributeError.
+    def test_sim_del_survives_cleared_module_globals(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+
+        class Probe:
+            def __init__(self, node):
+                self.node = node
+
+        probe = sim.add(Probe, "planner")
+        config_path = probe.node.config_path
+        self.assertTrue(os.path.exists(config_path))
+        hw = SimHardware(sim)
+
+        with mock.patch.object(testing, "_destroy_hardware_cell", None), \
+                mock.patch.object(testing, "lib", None):
+            sim.__del__()
+
+        self.assertIsNone(sim._handle)
+        self.assertIsNone(hw._cell[0])
+        self.assertIsNone(probe.node._native)
+        self.assertFalse(os.path.exists(config_path))
+        with self.assertRaises(talos.TalosError):
+            hw.enable(True)
 
     # REQ-RT-05: Sim.resume() rejects re-entrant Sim.remove() inside overdue
     # callbacks and settles prompt subscribers at sim.now() before returning.
