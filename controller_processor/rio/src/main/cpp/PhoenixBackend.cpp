@@ -20,6 +20,7 @@
 #include <string>
 #include <string_view>
 
+#include "hardware/feedback.h"
 #include "hardware/gate.h"
 
 #ifndef __FRC_ROBORIO__
@@ -53,8 +54,7 @@ void SetGains(Slot& slot, const hw::Gains& gains) {
 // Diagnostics only (effort, fault field, temperature). Motion feedback is not
 // held to an age here: Read reports its ages and the gateway judges them
 // (Backend::Read, FeedbackFresh).
-bool Fresh(const ph::BaseStatusSignal& signal,
-           units::second_t max_age = 50_ms) {
+bool Fresh(const ph::BaseStatusSignal& signal, units::second_t max_age) {
   return signal.GetStatus().IsOK() &&
          signal.GetTimestamp().GetLatency() < max_age;
 }
@@ -126,11 +126,11 @@ bool ValidMotionFeedback(const Position& position, const Velocity& velocity,
          std::isfinite(velocity.GetValue().value());
 }
 
-// TorqueCurrentFOC's MaxAbsDutyCycle: max_voltage over the battery voltage,
-// so the mode never applies more than max_voltage, the ceiling
-// PeakForwardVoltage sets for every voltage-based request but not for this
-// one. 0 (no output) while no battery reading has been taken.
-double TorqueDutyCap(double max_voltage, double battery_v) {
+// Maximum absolute duty cycle corresponding to max_voltage at battery_v:
+// applied to DutyCycleOut (which ignores PeakForwardVoltage/PeakReverseVoltage)
+// and TorqueCurrentFOC's MaxAbsDutyCycle, so neither mode applies more than
+// max_voltage. 0 (no output) while no valid battery reading has been taken.
+double VoltageDutyCap(double max_voltage, double battery_v) {
   if (!(battery_v > 0)) return 0.0;
   return std::clamp(max_voltage / battery_v, 0.0, 1.0);
 }
@@ -1068,8 +1068,8 @@ bool PhoenixBackend::Read(hw::State& s) {
                    });
   s.health.valid = true;
   s.health.battery_v = frc::RobotController::GetBatteryVoltage().value();
-  // The torque-current duty cap's divisor (TorqueDutyCap): a lost reading
-  // keeps the last real one.
+  // The duty-cycle and torque-current duty cap's divisor (VoltageDutyCap): a
+  // lost reading keeps the last real one.
   if (std::isfinite(s.health.battery_v) && s.health.battery_v > 1.0)
     last_battery_v_ = s.health.battery_v;
   s.health.brownout = frc::RobotController::IsBrownedOut();
@@ -1105,6 +1105,8 @@ bool PhoenixBackend::Read(hw::State& s) {
   // Four status periods: the LATE line's threshold (NoteLateness).
   const auto late_us =
       static_cast<uint32_t>(std::ceil(4'000'000.0 / config_.status_hz));
+  const units::second_t diagnostic_max_age = units::microsecond_t{
+      static_cast<double>(hw::DiagnosticMaxAgeUs(config_.status_hz))};
   for (std::size_t i = 0; i < motors_.size(); ++i) {
     auto& motor = *motors_[i];
     auto& out = s.motors[i];
@@ -1118,18 +1120,21 @@ bool PhoenixBackend::Read(hw::State& s) {
     out.velocity_rps = v.GetValue().value();
     out.position_age_us = Age(p);
     out.velocity_age_us = Age(v);
-    // FaultField is its own 50 Hz signal, separate from the motion feedback
-    // that sets `valid`. A stale FaultField reports no asserted limit and no
-    // active current limiter (kMotorNotFaultFlags), so neither a limit getter
-    // nor a display shows an old state, but keeps its last fault bits: losing
-    // the signal must not un-fault a faulted motor.
+    // FaultField is its own signal (requested at min(status_hz, 50) Hz),
+    // separate from the motion feedback that sets `valid`. A stale FaultField
+    // reports no asserted limit and no active current limiter
+    // (kMotorNotFaultFlags), so neither a limit getter nor a display shows an
+    // old state, but keeps its last fault bits: losing the signal must not
+    // un-fault a faulted motor.
     auto& faults = motor.GetFaultField(false);
     out.fault_flags = faults.GetValue();
-    if (!Fresh(faults)) out.fault_flags &= ~hw::kMotorNotFaultFlags;
+    if (!Fresh(faults, diagnostic_max_age))
+      out.fault_flags &= ~hw::kMotorNotFaultFlags;
     // Stale current/voltage is telemetry-only degradation. The
     // effort fields zero but the sample stays valid and the backend stays
     // healthy; lost motion feedback isolates only the affected motor.
-    const bool effort_ok = Fresh(volts) && Fresh(amps) &&
+    const bool effort_ok = Fresh(volts, diagnostic_max_age) &&
+                           Fresh(amps, diagnostic_max_age) &&
                            std::isfinite(volts.GetValue().value()) &&
                            std::isfinite(amps.GetValue().value());
     out.voltage = effort_ok ? volts.GetValue().value() : 0.0;
@@ -1151,10 +1156,10 @@ bool PhoenixBackend::Read(hw::State& s) {
                                 std::isfinite(temperature.GetValue().value())
                             ? temperature.GetValue().value()
                             : 0.0;
-    out.supply_current_a =
-        Fresh(supply) && std::isfinite(supply.GetValue().value())
-            ? supply.GetValue().value()
-            : 0.0;
+    out.supply_current_a = Fresh(supply, diagnostic_max_age) &&
+                                   std::isfinite(supply.GetValue().value())
+                               ? supply.GetValue().value()
+                               : 0.0;
     if (is_simulation_) {
       // Phoenix models supply current from rotor physics, but provides no
       // temperature input. Report ambient, not a fictitious thermal model.
@@ -1460,11 +1465,18 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
         result =
             m.SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
         break;
-      case hw::Mode::kDutyCycle:
-        result = m.SetControl(ph::controls::DutyCycleOut{r.demand}
+      case hw::Mode::kDutyCycle: {
+        // PeakForwardVoltage/PeakReverseVoltage apply only to Phoenix's
+        // voltage-based controls, so clamp DutyCycleOut to +-max_voltage /
+        // battery_v (matching TorqueCurrentFOC and PhysicsSimBackend).
+        const double duty_cap =
+            VoltageDutyCap(config.max_voltage, last_battery_v_);
+        const double duty = std::clamp(r.demand, -duty_cap, duty_cap);
+        result = m.SetControl(ph::controls::DutyCycleOut{duty}
                                   .WithEnableFOC(config.foc)
                                   .WithUpdateFreqHz(0_Hz));
         break;
+      }
       case hw::Mode::kVoltage:
         result = m.SetControl(ph::controls::VoltageOut{units::volt_t{r.demand}}
                                   .WithEnableFOC(config.foc)
@@ -1511,7 +1523,7 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
         result = m.SetControl(
             ph::controls::TorqueCurrentFOC{units::ampere_t{r.demand}}
                 .WithMaxAbsDutyCycle(
-                    TorqueDutyCap(config.max_voltage, last_battery_v_))
+                    VoltageDutyCap(config.max_voltage, last_battery_v_))
                 .WithUpdateFreqHz(0_Hz));
         break;
       default:
