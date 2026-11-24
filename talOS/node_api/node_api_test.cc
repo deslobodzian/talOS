@@ -11,6 +11,7 @@
 #include <fstream>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "control/control_generated.h"
@@ -1258,6 +1259,121 @@ TEST_F(NodeApi, IndexedDeviceLookupsDoNotAttachHardwareLink) {
   // start (loop registration is closed).
   EXPECT_EQ(talos_hardware_fresh(node, -1), TALOS_ERR);
   talos_sim_hardware_destroy(hw);
+}
+
+// REQ-CONTRACT-14, REQ-RT-04, REQ-RT-06: invalid-index target, target-lane,
+// and operator-arming lookups return errors without attaching Targets, and
+// off-thread talos_target_source_name returns nullptr with the loop-thread
+// error.
+TEST_F(NodeApi, IndexedTargetLookupsValidateIndexAndLoopThread) {
+  struct Probe {
+    int32_t target_neg = TALOS_OK;
+    int32_t target_zero = TALOS_OK;
+    std::string target_zero_err;
+    const char* source_neg = "";
+    const char* source_zero = "";
+    std::string source_zero_err;
+    int32_t lane_neg = TALOS_OK;
+    int32_t lane_zero = TALOS_OK;
+    std::string lane_zero_err;
+    int32_t arming_neg = TALOS_OK;
+    int32_t arming_zero = TALOS_OK;
+    std::string arming_zero_err;
+  } probe;
+  auto build_plain = [](TalosNode* node, void* user) -> int32_t {
+    auto& p = *static_cast<Probe*>(user);
+    float value = 0.0f;
+    int32_t source = 99;
+    p.target_neg = talos_target_get(node, -1, &value, &source);
+    p.target_zero = talos_target_get(node, 0, &value, &source);
+    p.target_zero_err = talos_last_error();
+    p.source_neg = talos_target_source_name(node, -1, 0);
+    p.source_zero = talos_target_source_name(node, 0, 0);
+    p.source_zero_err = talos_last_error();
+    p.lane_neg = talos_target_lane_send(node, -1, &value, sizeof value);
+    p.lane_zero = talos_target_lane_send(node, 0, &value, sizeof value);
+    p.lane_zero_err = talos_last_error();
+    p.arming_neg = talos_operator_arming_armed(node, -1);
+    p.arming_zero = talos_operator_arming_armed(node, 0);
+    p.arming_zero_err = talos_last_error();
+    return 0;
+  };
+  TalosNode* plain = talos_sim_add(sim_, "relay", build_plain, &probe);
+  ASSERT_NE(plain, nullptr) << talos_last_error();
+
+  EXPECT_EQ(probe.target_neg, TALOS_ERR);
+  EXPECT_EQ(probe.target_zero, TALOS_ERR);
+  EXPECT_NE(probe.target_zero_err.find("no target at index 0"),
+            std::string::npos)
+      << probe.target_zero_err;
+  EXPECT_EQ(probe.source_neg, nullptr);
+  EXPECT_EQ(probe.source_zero, nullptr);
+  EXPECT_NE(probe.source_zero_err.find("no target at index 0"),
+            std::string::npos)
+      << probe.source_zero_err;
+  EXPECT_EQ(probe.lane_neg, TALOS_ERR);
+  EXPECT_EQ(probe.lane_zero, TALOS_ERR);
+  EXPECT_NE(probe.lane_zero_err.find("no target lane at index 0"),
+            std::string::npos)
+      << probe.lane_zero_err;
+  EXPECT_EQ(probe.arming_neg, TALOS_ERR);
+  EXPECT_EQ(probe.arming_zero, TALOS_ERR);
+  EXPECT_NE(probe.arming_zero_err.find("no operator arming at index 0"),
+            std::string::npos)
+      << probe.arming_zero_err;
+
+  // Post-start invalid-index lookups on a node without Targets still report
+  // out-of-range cleanly.
+  float value = 0.0f;
+  int32_t source = 99;
+  EXPECT_EQ(talos_target_get(plain, 0, &value, &source), TALOS_ERR);
+  EXPECT_NE(std::string{talos_last_error()}.find("no target at index 0"),
+            std::string::npos)
+      << talos_last_error();
+  EXPECT_EQ(talos_target_source_name(plain, 0, 0), nullptr);
+  EXPECT_NE(std::string{talos_last_error()}.find("no target at index 0"),
+            std::string::npos)
+      << talos_last_error();
+  EXPECT_EQ(talos_target_lane_send(plain, 0, &value, sizeof value), TALOS_ERR);
+  EXPECT_NE(std::string{talos_last_error()}.find("no target lane at index 0"),
+            std::string::npos)
+      << talos_last_error();
+  EXPECT_EQ(talos_operator_arming_armed(plain, 0), TALOS_ERR);
+  EXPECT_NE(
+      std::string{talos_last_error()}.find("no operator arming at index 0"),
+      std::string::npos)
+      << talos_last_error();
+
+  // Open a valid target on another node so off-thread rejection is exercised
+  // both on an open target and on a node with no Targets attached.
+  int64_t target = -1;
+  auto build_target = [](TalosNode* node, void* user) -> int32_t {
+    auto& idx = *static_cast<int64_t*>(user);
+    idx = talos_target_open(node, sizeof(float), alignof(float), &kFloatSchema);
+    return idx < 0 ? 1 : 0;
+  };
+  TalosNode* with_target = talos_sim_add(sim_, "roller", build_target, &target);
+  ASSERT_NE(with_target, nullptr) << talos_last_error();
+  ASSERT_NE(talos_target_source_name(with_target, target, 0), nullptr)
+      << talos_last_error();
+
+  const char* off_plain = "";
+  std::string off_plain_err;
+  const char* off_valid = "";
+  std::string off_valid_err;
+  std::thread worker{[&] {
+    off_plain = talos_target_source_name(plain, 0, 0);
+    off_plain_err = talos_last_error();
+    off_valid = talos_target_source_name(with_target, target, 0);
+    off_valid_err = talos_last_error();
+  }};
+  worker.join();
+  EXPECT_EQ(off_plain, nullptr);
+  EXPECT_NE(off_plain_err.find("loop thread"), std::string::npos)
+      << off_plain_err;
+  EXPECT_EQ(off_valid, nullptr);
+  EXPECT_NE(off_valid_err.find("loop thread"), std::string::npos)
+      << off_valid_err;
 }
 
 TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {

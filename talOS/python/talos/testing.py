@@ -88,7 +88,8 @@ class Sim:
         _abi.ok(lib.talos_sim_set_session_dir(
             self._handle, None if path is None else _abi.encode(path)))
 
-    def __del__(self):
+    def __del__(self, _destroy_hw=_destroy_hardware_cell,
+                _destroy_sim=lib.talos_sim_destroy):
         handle = getattr(self, "_handle", None)
         if handle:
             self._handle = None
@@ -101,13 +102,16 @@ class Sim:
             hardwares = getattr(self, "_hardwares", None)
             if hardwares is not None:
                 for cell in list(hardwares.values()):
-                    _destroy_hardware_cell(cell)
+                    _destroy_hw(cell)
                 hardwares.clear()
-            for node, _ in self._nodes.values():
-                node._native = None
-                node._callbacks.clear()
-            self._nodes.clear()
-            lib.talos_sim_destroy(handle)
+            nodes = getattr(self, "_nodes", None)
+            if nodes is not None:
+                for node, _ in nodes.values():
+                    node._native = None
+                    node._callbacks.clear()
+                nodes.clear()
+            destroy = getattr(lib, "talos_sim_destroy", _destroy_sim)
+            destroy(handle)
 
     def add(self, cls, node_name):
         """Builds cls on a node named node_name; returns the object.
@@ -285,11 +289,6 @@ class SimHardware:
             raise _abi.TalosError(
                 "this SimHardware or its Sim has been destroyed")
         return cell[0]
-
-    def _invalidate(self):
-        cell = getattr(self, "_cell", None)
-        if cell is not None:
-            _destroy_hardware_cell(cell)
 
     def enable(self, on=True):
         _abi.ok(lib.talos_sim_hardware_enable(self._handle, bool(on)))
