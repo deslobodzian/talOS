@@ -3983,8 +3983,8 @@ TEST_F(ReviewTest,
               dumped_vel);
     EXPECT_EQ(snap["hw/state/pwm_outputs/41/output"]["value"].get<double>(),
               0.75);
-    EXPECT_EQ(snap["hw/state/digital_outputs/3/value"]["value"].get<bool>(),
-              true);
+    EXPECT_EQ(snap["hw/state/digital_outputs/3/value"]["value"].get<double>(),
+              1.0);
     std::filesystem::remove_all(dir);
   }
 
