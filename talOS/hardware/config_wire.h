@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -36,25 +37,34 @@ inline bool CheckCeilingsInto(const Config& config,
   const auto fail = [reason](const ConfigString& name, const char* what,
                              double value, double ceiling) noexcept {
     if (!reason.empty()) {
-      std::snprintf(
-          reason.data(), reason.size(), "motor '%.*s' %s %f > ceiling %f",
-          static_cast<int>(name.size()), name.data(), what, value, ceiling);
+      if (!std::isfinite(value)) {
+        std::snprintf(reason.data(), reason.size(),
+                      "motor '%.*s' %s is not finite",
+                      static_cast<int>(name.size()), name.data(), what);
+      } else {
+        std::snprintf(
+            reason.data(), reason.size(), "motor '%.*s' %s %f > ceiling %f",
+            static_cast<int>(name.size()), name.data(), what, value, ceiling);
+      }
     }
     return false;
   };
   for (const auto& m : config.motors) {
-    if (m.supply_limit_a > kCeilingMaxSupplyCurrentA) {
+    if (!std::isfinite(m.supply_limit_a) ||
+        m.supply_limit_a > kCeilingMaxSupplyCurrentA) {
       return fail(m.name, "supply limit", m.supply_limit_a,
                   kCeilingMaxSupplyCurrentA);
     }
-    if (m.stator_limit_a > kCeilingMaxStatorCurrentA) {
+    if (!std::isfinite(m.stator_limit_a) ||
+        m.stator_limit_a > kCeilingMaxStatorCurrentA) {
       return fail(m.name, "stator limit", m.stator_limit_a,
                   kCeilingMaxStatorCurrentA);
     }
-    if (m.max_voltage > kCeilingMaxVoltageV) {
+    if (!std::isfinite(m.max_voltage) || m.max_voltage > kCeilingMaxVoltageV) {
       return fail(m.name, "voltage", m.max_voltage, kCeilingMaxVoltageV);
     }
-    if (m.max_velocity_rps > kCeilingMaxVelocityRps) {
+    if (!std::isfinite(m.max_velocity_rps) ||
+        m.max_velocity_rps > kCeilingMaxVelocityRps) {
       return fail(m.name, "velocity", m.max_velocity_rps,
                   kCeilingMaxVelocityRps);
     }
@@ -64,26 +74,33 @@ inline bool CheckCeilingsInto(const Config& config,
 }
 
 inline CeilingCheckResult CheckCeilings(const Config& config) {
+  const auto fail = [](const ConfigString& name, const char* what, double value,
+                       double ceiling) -> CeilingCheckResult {
+    if (!std::isfinite(value)) {
+      return {false, "motor '" + name + "' " + what + " is not finite"};
+    }
+    return {false, "motor '" + name + "' " + what + " " +
+                       std::to_string(value) + " > ceiling " +
+                       std::to_string(ceiling)};
+  };
   for (const auto& m : config.motors) {
-    if (m.supply_limit_a > kCeilingMaxSupplyCurrentA) {
-      return {false, "motor '" + m.name + "' supply limit " +
-                         std::to_string(m.supply_limit_a) + " > ceiling " +
-                         std::to_string(kCeilingMaxSupplyCurrentA)};
+    if (!std::isfinite(m.supply_limit_a) ||
+        m.supply_limit_a > kCeilingMaxSupplyCurrentA) {
+      return fail(m.name, "supply limit", m.supply_limit_a,
+                  kCeilingMaxSupplyCurrentA);
     }
-    if (m.stator_limit_a > kCeilingMaxStatorCurrentA) {
-      return {false, "motor '" + m.name + "' stator limit " +
-                         std::to_string(m.stator_limit_a) + " > ceiling " +
-                         std::to_string(kCeilingMaxStatorCurrentA)};
+    if (!std::isfinite(m.stator_limit_a) ||
+        m.stator_limit_a > kCeilingMaxStatorCurrentA) {
+      return fail(m.name, "stator limit", m.stator_limit_a,
+                  kCeilingMaxStatorCurrentA);
     }
-    if (m.max_voltage > kCeilingMaxVoltageV) {
-      return {false, "motor '" + m.name + "' voltage " +
-                         std::to_string(m.max_voltage) + " > ceiling " +
-                         std::to_string(kCeilingMaxVoltageV)};
+    if (!std::isfinite(m.max_voltage) || m.max_voltage > kCeilingMaxVoltageV) {
+      return fail(m.name, "voltage", m.max_voltage, kCeilingMaxVoltageV);
     }
-    if (m.max_velocity_rps > kCeilingMaxVelocityRps) {
-      return {false, "motor '" + m.name + "' velocity " +
-                         std::to_string(m.max_velocity_rps) + " > ceiling " +
-                         std::to_string(kCeilingMaxVelocityRps)};
+    if (!std::isfinite(m.max_velocity_rps) ||
+        m.max_velocity_rps > kCeilingMaxVelocityRps) {
+      return fail(m.name, "velocity", m.max_velocity_rps,
+                  kCeilingMaxVelocityRps);
     }
   }
   return {true, ""};
@@ -465,6 +482,7 @@ inline uint64_t GetLittleEndian(const uint8_t* in, int bytes) {
 
 inline void EncodeConfigChunkHeader(const ConfigChunkHeader& header,
                                     uint8_t* out) {
+  if (out == nullptr) return;
   detail::PutLittleEndian(out + 0, header.config_id, 8);
   detail::PutLittleEndian(out + 8, header.total_crc32, 4);
   detail::PutLittleEndian(out + 12, header.total_bytes, 4);
@@ -475,6 +493,7 @@ inline void EncodeConfigChunkHeader(const ConfigChunkHeader& header,
 
 inline ConfigChunkHeader DecodeConfigChunkHeader(const uint8_t* in) {
   ConfigChunkHeader header;
+  if (in == nullptr) return header;
   header.config_id = detail::GetLittleEndian(in + 0, 8);
   header.total_crc32 =
       static_cast<uint32_t>(detail::GetLittleEndian(in + 8, 4));
@@ -509,20 +528,27 @@ static_assert(kMaxConfigChunkCount <= std::numeric_limits<uint16_t>::max());
 
 inline std::vector<std::vector<uint8_t>> CreateConfigChunks(
     const Config& config, std::size_t max_payload = protocol::kMaxPayloadSize) {
-  const auto serialized = SerializeConfig(config);
+  if (max_payload <= sizeof(ConfigChunkHeader) ||
+      max_payload > protocol::kMaxPayloadSize) {
+    throw std::invalid_argument("invalid config chunk max_payload");
+  }
   const uint64_t config_id = ConfigurationId(config);
+  const auto serialized = SerializeConfig(config);
+  if (serialized.empty() || serialized.size() > kMaxSerializedConfigSize) {
+    throw std::invalid_argument("serialized config exceeds wire limit");
+  }
   const uint32_t total_crc32 = ComputeCrc32(serialized);
   const uint32_t total_bytes = static_cast<uint32_t>(serialized.size());
 
   const std::size_t max_chunk_data = max_payload - sizeof(ConfigChunkHeader);
-  const uint16_t chunk_count = static_cast<uint16_t>(
-      (total_bytes + max_chunk_data - 1) / max_chunk_data);
+  const uint16_t chunk_count =
+      static_cast<uint16_t>(1 + (serialized.size() - 1) / max_chunk_data);
 
   std::vector<std::vector<uint8_t>> chunks;
   chunks.reserve(chunk_count);
 
   for (uint16_t idx = 0; idx < chunk_count; ++idx) {
-    const std::size_t offset = idx * max_chunk_data;
+    const std::size_t offset = std::size_t{idx} * max_chunk_data;
     const std::size_t chunk_size =
         std::min(max_chunk_data, serialized.size() - offset);
 
@@ -784,7 +810,10 @@ inline std::vector<uint8_t> PersistedConfig(const Config& config) {
 // validates; `config` is left unchanged otherwise.
 inline bool LoadPersistedConfig(std::span<const uint8_t> bytes,
                                 Config& config) {
-  if (bytes.size() < kPersistedConfigHeaderBytes + 4) return false;
+  if (bytes.size() < kPersistedConfigHeaderBytes + 4 ||
+      bytes.size() > kMaxPersistedConfigSize) {
+    return false;
+  }
   if (!std::equal(kPersistedConfigMagic.begin(), kPersistedConfigMagic.end(),
                   bytes.begin()))
     return false;

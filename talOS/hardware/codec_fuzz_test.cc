@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -25,8 +27,37 @@ namespace {
 using namespace talos::hardware;
 
 void CheckCommandRoundTrip(std::span<const uint8_t> input) {
-  Command command;
-  if (!Decode(input, command)) return;
+  static const Command kSentinel = [] {
+    Command c{};
+    c.config_id = 0x1122334455667788ull;
+    c.boot_id = 0x8877665544332211ull;
+    c.count = 1;
+    c.motors[0] = {99, Mode::kVoltage, 1, 3.5, 0.0};
+    return c;
+  }();
+  Command command = kSentinel;
+  if (!Decode(input, command)) {
+    EXPECT_EQ(command, kSentinel);
+    return;
+  }
+  ASSERT_LE(command.count, kMaxMotors);
+  ASSERT_LE(command.digital_output_count, kMaxDigitalOutputs);
+  ASSERT_LE(command.pwm_output_count, kMaxPwmOutputs);
+  for (std::size_t i = 0; i < command.count; ++i) {
+    const auto& m = command.motors[i];
+    EXPECT_LE(m.mode, kLastMode);
+    EXPECT_LE(m.slot, 2u);
+    EXPECT_TRUE(std::isfinite(m.demand));
+    EXPECT_TRUE(std::isfinite(m.feedforward_v));
+  }
+  for (std::size_t i = 0; i < command.pwm_output_count; ++i) {
+    const auto& p = command.pwm_outputs[i];
+    EXPECT_LE(p.mode, kLastPwmMode);
+    EXPECT_TRUE(std::isfinite(p.output));
+    if (p.mode == PwmMode::kOff) {
+      EXPECT_EQ(std::bit_cast<uint64_t>(p.output), 0u);
+    }
+  }
   std::vector<uint8_t> encoded(kMaxCommandSize);
   const auto written = Encode(command, encoded);
   ASSERT_GT(written, 0u);
@@ -45,8 +76,58 @@ void CheckCommandRoundTrip(std::span<const uint8_t> input) {
 }
 
 void CheckStateRoundTrip(std::span<const uint8_t> input) {
-  State state;
-  if (!Decode(input, state)) return;
+  static const State kSentinel = [] {
+    State s{};
+    s.config_id = 0xCAFEBABEDEADBEEFull;
+    s.sequence = 77;
+    s.motor_count = 1;
+    s.motors[0].id = 5;
+    s.motors[0].valid = true;
+    s.motors[0].position_rot = 1.25;
+    return s;
+  }();
+  State state = kSentinel;
+  if (!Decode(input, state)) {
+    EXPECT_EQ(state, kSentinel);
+    return;
+  }
+  ASSERT_LE(state.motor_count, kMaxMotors);
+  ASSERT_LE(state.sensor_count, kMaxSensors);
+  ASSERT_LE(state.digital_input_count, kMaxDigitalInputs);
+  ASSERT_LE(state.digital_output_count, kMaxDigitalOutputs);
+  ASSERT_LE(state.analog_input_count, kMaxAnalogInputs);
+  ASSERT_LE(state.encoder_count, kMaxEncoders);
+  ASSERT_LE(state.pwm_output_count, kMaxPwmOutputs);
+  EXPECT_LE(state.build.program, kLastGatewayProgram);
+  EXPECT_LE(state.health.can_bus_count, kMaxCanBuses);
+  EXPECT_LT(state.health.can_bus_index,
+            std::max<std::size_t>(state.health.can_bus_count, 1));
+  EXPECT_LE(state.health.can_bus.read_state, kLastCanBusReadState);
+  EXPECT_TRUE(std::isfinite(state.health.battery_v));
+  EXPECT_TRUE(std::isfinite(state.health.can_bus.utilization_frac));
+  for (std::size_t i = 0; i < state.motor_count; ++i) {
+    const auto& m = state.motors[i];
+    EXPECT_TRUE(std::isfinite(m.position_rot));
+    EXPECT_TRUE(std::isfinite(m.velocity_rps));
+    EXPECT_TRUE(std::isfinite(m.voltage));
+    EXPECT_TRUE(std::isfinite(m.stator_current_a));
+    EXPECT_TRUE(std::isfinite(m.temperature_c));
+    EXPECT_TRUE(std::isfinite(m.supply_current_a));
+  }
+  for (std::size_t i = 0; i < state.sensor_count; ++i) {
+    EXPECT_TRUE(std::isfinite(state.sensors[i].position_rot));
+    EXPECT_TRUE(std::isfinite(state.sensors[i].velocity_rps));
+  }
+  for (std::size_t i = 0; i < state.analog_input_count; ++i) {
+    EXPECT_TRUE(std::isfinite(state.analog_inputs[i].voltage));
+  }
+  for (std::size_t i = 0; i < state.encoder_count; ++i) {
+    EXPECT_TRUE(std::isfinite(state.encoders[i].position_rot));
+    EXPECT_TRUE(std::isfinite(state.encoders[i].velocity_rps));
+  }
+  for (std::size_t i = 0; i < state.pwm_output_count; ++i) {
+    EXPECT_TRUE(std::isfinite(state.pwm_outputs[i].output));
+  }
   std::vector<uint8_t> encoded(kMaxStateSize);
   const auto written = Encode(state, encoded);
   ASSERT_GT(written, 0u);
@@ -65,8 +146,18 @@ void CheckStateRoundTrip(std::span<const uint8_t> input) {
 }
 
 void CheckConfigRoundTrip(std::span<const uint8_t> input) {
-  Config config;
-  if (!DeserializeConfig(input, config)) return;
+  static const Config kSentinel = [] {
+    Config c{};
+    c.period_us = 12345;
+    c.commissioned = true;
+    c.motors.push_back({1, "sentinel", 1, "rio"});
+    return c;
+  }();
+  Config config = kSentinel;
+  if (!DeserializeConfig(input, config)) {
+    EXPECT_EQ(config, kSentinel);
+    return;
+  }
   const auto encoded = SerializeConfig(config);
   Config again;
   ASSERT_TRUE(DeserializeConfig(encoded, again));
@@ -87,8 +178,18 @@ void CheckConfigRoundTrip(std::span<const uint8_t> input) {
 }
 
 void CheckPersistedConfigRoundTrip(std::span<const uint8_t> input) {
-  Config config;
-  if (!LoadPersistedConfig(input, config)) return;
+  static const Config kSentinel = [] {
+    Config c{};
+    c.period_us = 12345;
+    c.commissioned = true;
+    c.motors.push_back({1, "sentinel", 1, "rio"});
+    return c;
+  }();
+  Config config = kSentinel;
+  if (!LoadPersistedConfig(input, config)) {
+    EXPECT_EQ(config, kSentinel);
+    return;
+  }
   const auto encoded = PersistedConfig(config);
   Config again;
   ASSERT_TRUE(LoadPersistedConfig(encoded, again));
@@ -361,6 +462,24 @@ TEST(HardwareCodecFuzzTest, SeededCodecMutationsAndRoundTrips) {
         m.temperature_c = val;
         m.supply_current_a = val;
       }
+      for (auto& sens : s.sensors) {
+        sens.valid = true;
+        sens.position_rot = val;
+        sens.velocity_rps = val;
+      }
+      for (auto& ai : s.analog_inputs) {
+        ai.valid = true;
+        ai.voltage = val;
+      }
+      for (auto& enc : s.encoders) {
+        enc.valid = true;
+        enc.position_rot = val;
+        enc.velocity_rps = val;
+      }
+      for (auto& pwm : s.pwm_outputs) {
+        pwm.valid = true;
+        pwm.output = val;
+      }
       s.health.valid = true;
       s.health.battery_v = val;
       s.health.can_bus.read_state = CanBusReadState::kOk;
@@ -489,6 +608,138 @@ TEST(HardwareCodecFuzzTest, SeededCodecMutationsAndRoundTrips) {
         (void)est.Observe(boot, t1, t2);
       }
     }
+  }
+}
+
+// REQ-CONTRACT-02, REQ-CONTRACT-03, REQ-SAFE-03: Encode(Command) must refuse
+// invalid motor modes/slots and non-finite demands/feedforwards/PWM pulses
+// upfront without dirtying the output buffer, while preserving canonical kOff
+// encoding regardless of PWM output value.
+TEST(HardwareCodecFuzzTest,
+     EncodeCommandRejectsInvalidFieldsAndPreservesOffPwm) {
+  Command base{};
+  base.config_id = 0x0102030405060708ull;
+  base.boot_id = 1;
+  base.epoch = 2;
+  base.observed_time_us = 3;
+  base.count = 1;
+  base.motors[0] = {1, Mode::kVelocity, 2, 10.0, 1.5};
+  base.pwm_output_count = 1;
+  base.pwm_outputs[0] = {2, PwmMode::kPulse, 0.25};
+
+  const auto expect_rejected = [](const Command& bad) {
+    std::array<uint8_t, kMaxCommandSize> out{};
+    out.fill(0xA5);
+    EXPECT_EQ(Encode(bad, out), 0u);
+    for (const uint8_t b : out) {
+      EXPECT_EQ(b, 0xA5u);
+    }
+  };
+
+  {
+    Command bad = base;
+    bad.motors[0].mode = static_cast<Mode>(static_cast<uint8_t>(kLastMode) + 1);
+    expect_rejected(bad);
+  }
+  {
+    Command bad = base;
+    bad.motors[0].slot = 3;
+    expect_rejected(bad);
+  }
+  for (const double nf : {std::numeric_limits<double>::quiet_NaN(),
+                          std::numeric_limits<double>::infinity(),
+                          -std::numeric_limits<double>::infinity()}) {
+    Command bad_demand = base;
+    bad_demand.motors[0].demand = nf;
+    expect_rejected(bad_demand);
+
+    Command bad_ff = base;
+    bad_ff.motors[0].feedforward_v = nf;
+    expect_rejected(bad_ff);
+
+    Command bad_pwm = base;
+    bad_pwm.pwm_outputs[0].output = nf;
+    expect_rejected(bad_pwm);
+
+    // kOff always encodes canonical +0.0 regardless of output bits.
+    Command off_pwm = base;
+    off_pwm.pwm_outputs[0] = {2, PwmMode::kOff, nf};
+    std::array<uint8_t, kMaxCommandSize> out{};
+    const std::size_t n = Encode(off_pwm, out);
+    ASSERT_GT(n, 0u);
+    Command decoded{};
+    ASSERT_TRUE(Decode(std::span{out}.first(n), decoded));
+    EXPECT_EQ(decoded.pwm_outputs[0].mode, PwmMode::kOff);
+    EXPECT_EQ(std::bit_cast<uint64_t>(decoded.pwm_outputs[0].output), 0u);
+  }
+}
+
+// REQ-CONTRACT-02, REQ-CONTRACT-04: CheckCeilings/CheckCeilingsInto reject
+// non-finite motor limits (no NaN bypass), CreateConfigChunks validates
+// max_payload without div-by-zero/underflow, chunk header helpers guard null
+// pointers, and LoadPersistedConfig rejects buffers above
+// kMaxPersistedConfigSize without mutating out.
+TEST(HardwareCodecFuzzTest,
+     ConfigWireGuardsNonFiniteCeilingsChunkBoundsAndOversizePersist) {
+  const Config base = MakePopulatedConfig();
+  for (const double nf : {std::numeric_limits<double>::quiet_NaN(),
+                          std::numeric_limits<double>::infinity(),
+                          -std::numeric_limits<double>::infinity()}) {
+    for (int field = 0; field < 4; ++field) {
+      Config bad = base;
+      if (field == 0) bad.motors[0].supply_limit_a = nf;
+      if (field == 1) bad.motors[0].stator_limit_a = nf;
+      if (field == 2) bad.motors[0].max_voltage = nf;
+      if (field == 3) bad.motors[0].max_velocity_rps = nf;
+      const auto res = CheckCeilings(bad);
+      EXPECT_FALSE(res.ok);
+      EXPECT_FALSE(res.reason.empty());
+      std::array<char, 160> buf{};
+      EXPECT_FALSE(CheckCeilingsInto(bad, buf));
+      EXPECT_NE(buf[0], '\0');
+    }
+  }
+
+  for (const std::size_t bad_payload :
+       {std::size_t{0}, std::size_t{1}, sizeof(ConfigChunkHeader) - 1,
+        sizeof(ConfigChunkHeader), talos::protocol::kMaxPayloadSize + 1,
+        std::numeric_limits<std::size_t>::max()}) {
+    EXPECT_THROW((void)CreateConfigChunks(base, bad_payload),
+                 std::invalid_argument);
+  }
+
+  // Minimum valid max_payload (1 data byte per chunk) round-trips losslessly.
+  {
+    const auto min_chunks =
+        CreateConfigChunks(base, sizeof(ConfigChunkHeader) + 1);
+    ASSERT_EQ(min_chunks.size(), SerializeConfig(base).size());
+    ConfigAssembler assembler;
+    std::string reason;
+    ConfigAssembler::Status status = ConfigAssembler::Status::kIncomplete;
+    for (const auto& chunk : min_chunks) {
+      status = assembler.AddChunk(chunk, reason);
+    }
+    EXPECT_EQ(status, ConfigAssembler::Status::kComplete) << reason;
+    EXPECT_EQ(assembler.config(), base);
+  }
+
+  // Null pointer guards on raw chunk header helpers.
+  {
+    const ConfigChunkHeader hdr{1, 2, 3, 4, 5, 6};
+    EncodeConfigChunkHeader(hdr, nullptr);
+    const ConfigChunkHeader empty = DecodeConfigChunkHeader(nullptr);
+    EXPECT_EQ(empty.config_id, 0u);
+    EXPECT_EQ(empty.chunk_bytes, 0u);
+  }
+
+  // Oversize persisted config is rejected without modifying caller's Config.
+  {
+    std::vector<uint8_t> oversize(kMaxPersistedConfigSize + 1, 0);
+    std::memcpy(oversize.data(), kPersistedConfigMagic.data(),
+                kPersistedConfigMagic.size());
+    Config preserved = base;
+    EXPECT_FALSE(LoadPersistedConfig(oversize, preserved));
+    EXPECT_EQ(preserved, base);
   }
 }
 #endif
