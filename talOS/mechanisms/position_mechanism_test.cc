@@ -2200,19 +2200,20 @@ TEST(PositionMechanism, StallHomingToleratesOneFrameLatencyJitterDuringPush) {
     EXPECT_EQ(hood.Applied().mode, Mode::kPosition);
   }
   {
-    SCOPED_TRACE("1-frame CAN sample-age jitter at 0.6 * max_velocity_rps");
+    SCOPED_TRACE("CAN sample-age drop at 0.6 * max_velocity_rps");
     Rig hood{"hood"};
-    hood.hw.set_motor("hood", "hood", 5.0, -60.0, 5'000, 0, 0, 0, 5.0);
+    hood.hw.set_motor("hood", "hood", 5.0, -60.0, 15'000, 0, 0, 0, 5.0);
     hood.Start();
     hood.Drive(0.5, 20ms);
     ASSERT_EQ(hood.mech().phase(), PositionPhase::kHoming);
 
-    // Next tick delivers a fresh sample (age 0 us) 10 ms of real motion after
-    // the 5 ms-aged sample (-0.6 rot at 60 rps), hitting the stop under load.
-    hood.hw.set_motor("hood", "hood", 4.4, 0.0, 0, 0, 0, 0, 30.0);
-    // 70 ms is past homing_stall_us (50 ms) but well under homing_min_push_us
-    // (200 ms), so homing succeeds here only if push_since_ and travel were
-    // preserved across the 1-frame CAN jitter.
+    // Next tick delivers a fresh sample (age 0 us) 20 ms of real motion after
+    // the 15 ms-aged sample (-1.2 rot at 60 rps), hitting the stop under load.
+    // 1.2 rot exceeds frame_jump_slack_ alone (100 rps * (5 ms + 5 ms) = 1.0
+    // rot), so homing succeeds in 70 ms (< homing_min_push_us = 200 ms) only
+    // because push_last_age_ credits the 15 ms sample-age drop and preserves
+    // push_since_ and push_start_rot_.
+    hood.hw.set_motor("hood", "hood", 3.8, 0.0, 0, 0, 0, 0, 30.0);
     hood.Drive(0.5, 70ms);
     EXPECT_TRUE(hood.mech().homed());
     EXPECT_EQ(hood.mech().fault(), PositionFault::kNone);
