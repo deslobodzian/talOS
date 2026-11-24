@@ -70,6 +70,20 @@ std::size_t Encode(const Command& c, std::span<uint8_t> data) {
       c.pwm_output_count > kMaxPwmOutputs) {
     return 0;
   }
+  for (std::size_t i = 0; i < c.count; ++i) {
+    const auto& m = c.motors[i];
+    if (m.mode > kLastMode || m.slot > 2 || !std::isfinite(m.demand) ||
+        !std::isfinite(m.feedforward_v)) {
+      return 0;
+    }
+  }
+  for (std::size_t i = 0; i < c.pwm_output_count; ++i) {
+    const auto& p = c.pwm_outputs[i];
+    if (p.mode > kLastPwmMode ||
+        (p.mode != PwmMode::kOff && !std::isfinite(p.output))) {
+      return 0;
+    }
+  }
   Writer w{{data}};
   w.Int(c.config_id, 8);
   w.Int(c.boot_id, 8);
@@ -93,7 +107,6 @@ std::size_t Encode(const Command& c, std::span<uint8_t> data) {
   }
   for (std::size_t i = 0; i < c.pwm_output_count; ++i) {
     const auto& p = c.pwm_outputs[i];
-    if (p.mode > kLastPwmMode) return 0;
     w.Int(p.id, 2);
     w.Int(static_cast<uint8_t>(p.mode), 1);
     // Off is written in its one encoding whatever `output` holds (-0.0
