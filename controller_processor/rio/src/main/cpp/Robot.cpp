@@ -32,6 +32,8 @@
 #include <unistd.h>
 #else
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
 
 #include "SimDriverStation.h"
 #endif
@@ -219,6 +221,32 @@ class RioWatchdogOutputs final : public talos::rio::WatchdogOutputs {
 }  // namespace
 
 void Robot::StartCompetition() {
+#ifndef __FRC_ROBORIO__
+  // Validate simulation environment variables before starting background
+  // threads so a malformed setting fails fast without leaving running threads
+  // in WPILib's static Robot instance.
+  const auto sim_ds_settings =
+      talos::rio::SimDriverStation::SettingsFromEnvironment();
+  std::optional<std::chrono::milliseconds> sim_run_duration;
+  if (const char* ms = std::getenv("TALOS_SIM_RUN_MS")) {
+    if (ms[0] < '0' || ms[0] > '9') {
+      throw std::invalid_argument(
+          "TALOS_SIM_RUN_MS must be a non-negative integer, got '" +
+          std::string{ms} + "'");
+    }
+    errno = 0;
+    char* end = nullptr;
+    const long long parsed = std::strtoll(ms, &end, 10);
+    constexpr long long kMaxRunMs = 1'000'000'000'000LL;
+    if (errno == ERANGE || end == ms || *end != '\0' || parsed < 0 ||
+        parsed > kMaxRunMs) {
+      throw std::invalid_argument(
+          "TALOS_SIM_RUN_MS must be a non-negative integer, got '" +
+          std::string{ms} + "'");
+    }
+    sim_run_duration = std::chrono::milliseconds{parsed};
+  }
+#endif
   log_ = std::make_unique<talos::rio::RioLog>();
   log_->Start();
   auto phoenix = std::make_unique<PhoenixBackend>(IsSimulation(), log_.get());
@@ -342,14 +370,14 @@ void Robot::StartCompetition() {
   uint64_t next_us = SteadyUs(loop_start);
 
 #ifndef __FRC_ROBORIO__
-  talos::rio::SimDriverStation simulated_driver_station{
-      talos::rio::SimDriverStation::SettingsFromEnvironment(), loop_start};
+  talos::rio::SimDriverStation simulated_driver_station{sim_ds_settings,
+                                                        loop_start};
 
   // A bounded simulation run, so an automated test does not have to race a
   // kill signal to get a clean summary out.
   std::optional<std::chrono::steady_clock::time_point> stop_at;
-  if (const char* ms = std::getenv("TALOS_SIM_RUN_MS")) {
-    stop_at = loop_start + std::chrono::milliseconds{std::atoi(ms)};
+  if (sim_run_duration) {
+    stop_at = loop_start + *sim_run_duration;
   }
   uint64_t active_ticks = 0;
 #endif
@@ -387,7 +415,7 @@ void Robot::StartCompetition() {
     if (gateway_->configured()) {
       period_us = gateway_->config().period_us;
     }
-    next_us += period_us;
+    next_us = talos::rio::SaturatingAddUs(next_us, period_us);
 
 #ifndef __FRC_ROBORIO__
     if (push_acknowledged) simulated_driver_station.ConfigurationAcknowledged();

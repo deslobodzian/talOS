@@ -1198,6 +1198,40 @@ TEST(SocketRetry, TickSocketLinkUsesDistinctRioLogKeyForSendRecovery) {
   EXPECT_NE(lines[0].find("socket send failed"), std::string::npos) << lines[0];
 }
 
+// REQ-SAFE-10, REQ-SAFE-25: TickSocketLink() must require kDsAttached (in
+// addition to kEnabled and !kEStop) to enable the gateway or pre-arm the
+// watchdog; a detached flag word carrying kEnabled neutralizes active outputs.
+TEST(SocketRetry, TickSocketLinkRequiresDsAttachedToEnable) {
+  namespace ds = talos::driver_station;
+  namespace hw = talos::hardware;
+  constexpr uint32_t kTeleopEnabled =
+      ds::kDsAttached | ds::kEnabled | ds::kTeleop;
+  constexpr uint32_t kDetachedEnabled = ds::kEnabled | ds::kTeleop;
+
+  SocketLinkHarness h;
+  ASSERT_NE(h.companion.port(), 0);
+
+  h.Tick(kStartUs, kTeleopEnabled);
+  ASSERT_TRUE(h.socket_retry.open());
+  ASSERT_NE(h.gateway.snapshot().flags & hw::kEnabled, 0u);
+  ASSERT_TRUE(h.EnergizeMotor(/*seq=*/1, kStartUs));
+  ASSERT_TRUE(h.backend.energized);
+
+  // Detached flag word with kEnabled set: must disable and neutralize outputs.
+  h.last_pre_arm_us = 0;
+  h.Tick(kStartUs + kLoopPeriodUs, kDetachedEnabled);
+  EXPECT_EQ(h.gateway.snapshot().flags & hw::kEnabled, 0u);
+  EXPECT_EQ(h.gateway.snapshot().flags & hw::kCommandActive, 0u);
+  EXPECT_FALSE(h.backend.energized);
+
+  // Next tick with no active command and kDsAttached still clear: must not
+  // pre-arm the watchdog or enable the gateway.
+  h.last_pre_arm_us = 0;
+  h.Tick(kStartUs + 2 * kLoopPeriodUs, kDetachedEnabled);
+  EXPECT_EQ(h.last_pre_arm_us, 0u);
+  EXPECT_EQ(h.gateway.snapshot().flags & hw::kEnabled, 0u);
+}
+
 // REQ-OPS-28, REQ-RT-22: When a permanent receive error closes the socket on a
 // tick whose State send still returned kOk after >= kSpellQuietUs of an open
 // failing-send spell, SendSucceeded()/ObserveSend() must ignore the closed
