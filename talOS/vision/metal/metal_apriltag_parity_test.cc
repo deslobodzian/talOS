@@ -614,7 +614,7 @@ TEST_F(MetalAprilTagParityTest, Stage2CandidateOverflowAfterLargerFrame) {
 TEST_F(MetalAprilTagParityTest, RejectsUnsupportedDimensionsAndInvalidStride) {
   // 1. Sub-4x4 at decimate=1 and 6x6 at decimate=2 must return empty without
   // crashing in upstream threshold().
-  std::vector<uint8_t> small_gray(64 * 64, 128);
+  std::vector<uint8_t> small_gray(size_t{64} * 64, 128);
   EXPECT_TRUE(
       metal_backend_->Detect(small_gray.data(), 3, 3, 3, PixelFormat::kGray8)
           .empty());
@@ -649,7 +649,7 @@ TEST_F(MetalAprilTagParityTest, RejectsUnsupportedDimensionsAndInvalidStride) {
 
   // 3. Stride < width * bpp (e.g. stride == width for kBgra8), negative
   // stride, and width * bpp > INT_MAX must be rejected before allocation/copy.
-  std::vector<uint8_t> bgra_small(64 * 64, 128);
+  std::vector<uint8_t> bgra_small(size_t{64} * 64, 128);
   EXPECT_TRUE(metal_backend_
                   ->Detect(bgra_small.data(), 64, 64, /*stride=*/64,
                            PixelFormat::kBgra8)
@@ -684,6 +684,7 @@ TEST_F(MetalAprilTagParityTest, ConcurrentExecuteAndSetOptionsAreThreadSafe) {
   });
 
   std::vector<std::thread> workers;
+  workers.reserve(2);
   for (int t = 0; t < 2; ++t) {
     workers.emplace_back([&]() {
       while (!stop.load(std::memory_order_acquire)) {

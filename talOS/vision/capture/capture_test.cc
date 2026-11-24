@@ -135,7 +135,7 @@ struct FakeV4L2State {
   static constexpr uint32_t kWidth = 64;
   static constexpr uint32_t kHeight = 48;
   static constexpr uint32_t kFps = 30;
-  static constexpr size_t kBufSize = kWidth * kHeight;
+  static constexpr size_t kBufSize = static_cast<size_t>(kWidth) * kHeight;
 
   std::mutex mu;
   int open_fds{0};
