@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <numbers>
@@ -794,11 +795,35 @@ bool MujocoPlant::Step(int steps,
 
   for (int step = 0; step < steps; ++step) {
     mj_step(m, d);
+    ++steps_;
     for (const int warning : kFatalWarnings) {
       if (d->warning[warning].number != warnings_[warning]) {
         Fail(warning, d->warning[warning].lastinfo);
         return false;
       }
+    }
+    if (rules_.empty()) continue;
+    // mj_step leaves the kinematics at the step's start; the rules read them
+    // at its end (world_rules.h). Positions and velocities, no more: not
+    // mj_forward, whose collision and constraint stages cost a step's worth.
+    mj_kinematics(m, d);
+    mj_comPos(m, d);
+    mj_comVel(m, d);
+    // A rule must not throw; one that does fails the plant like one that
+    // returns false (no cost while none throws).
+    try {
+      for (WorldRules* rules : rules_) {
+        if (!rules->AfterStep(*m, *d, steps_, match_input_)) {
+          Fail(rules->failure());
+          return false;
+        }
+      }
+    } catch (const std::exception& error) {
+      Fail(error.what());
+      return false;
+    } catch (...) {
+      Fail("a world rule threw something that is not a std::exception");
+      return false;
     }
   }
   Refresh();
@@ -846,6 +871,54 @@ void MujocoPlant::Fail(int warning, int info) {
                   d->time, mju_warningText(warning, text_info));
   }
   failed_ = true;
+}
+
+void MujocoPlant::Fail(std::string_view text) {
+  std::snprintf(failure_.data(), failure_.size(),
+                "mujoco world rule at plant time %.4f s: %.*s", data_->time,
+                static_cast<int>(text.size()), text.data());
+  failed_ = true;
+}
+
+void MujocoPlant::AddRules(WorldRules& rules) {
+  if (failed_) {
+    throw std::logic_error("MujocoPlant::AddRules on a failed plant: " +
+                           std::string(failure()));
+  }
+  if (steps_ != 0) {
+    throw std::logic_error(
+        "MujocoPlant::AddRules after the first Step; rules attach before the "
+        "world moves");
+  }
+  if (std::find(rules_.begin(), rules_.end(), &rules) != rules_.end()) {
+    throw std::invalid_argument(
+        "MujocoPlant::AddRules: this rule is already added; a rule runs once "
+        "after each step");
+  }
+  mjModel* m = model_.get();
+  mjData* d = data_.get();
+  rules.Attach(*m, *d);
+  // What Attach placed is the world every reader and the next Attach see,
+  // checked as mj_step checks it, so a bad placement is refused here, naming
+  // the warning, not blamed on the first Step.
+  mj_forward(m, d);
+  mj_checkPos(m, d);
+  mj_checkVel(m, d);
+  mj_checkAcc(m, d);
+  for (const int warning : kFatalWarnings) {
+    if (d->warning[warning].number != warnings_[warning]) {
+      Fail(warning, d->warning[warning].lastinfo);
+      throw std::invalid_argument(
+          "a world rule's Attach left the world unstable: " +
+          std::string(failure()));
+    }
+  }
+  Refresh();
+  rules_.push_back(&rules);
+}
+
+void MujocoPlant::SetMatchInput(const MatchInput& input) {
+  match_input_ = input;
 }
 
 void MujocoPlant::Refresh() {
