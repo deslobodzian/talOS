@@ -898,6 +898,79 @@ node = "//talOS/telemetry:node"
       << reserved;
 }
 
+// REQ-CONTRACT-28: enum labels admit exactly kMaxEnumLabels (1024) labels at
+// construction (and fit the dictionary page cap on tick 0) and refuse one more
+// (1025) cleanly at construction.
+TEST(TelemetryTest, EnumLabelCapAdmitsMaxLabelsAndRefusesOneMore) {
+  const auto make_labels = [](std::size_t count) {
+    std::string array = "[";
+    for (std::size_t i = 0; i < count; ++i) {
+      if (i != 0) array += ", ";
+      array += "\"" + std::to_string(i) + "\"";
+    }
+    array += "]";
+    return array;
+  };
+  const auto config = [&](std::size_t count) {
+    return R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+[subsystems.demo]
+node = "//demo:node"
+[subsystems.demo.motors.m]
+can_id = 1
+[subsystems.autonomous]
+node = "//autonomous:node"
+routines = )" +
+           make_labels(count) + R"(
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+[[subsystems.telemetry.labels]]
+channel = "demo/state/sample_count"
+from = "autonomous.routines"
+)";
+  };
+
+  Sim at_cap = Sim::FromToml(config(telemetry_wire::kMaxEnumLabels));
+  auto& shapes = at_cap.add<ShapesNode>("demo");
+  const auto& telemetry = at_cap.add<Telemetry>("telemetry");
+  const auto dict = DictionaryMap(telemetry);
+  ASSERT_TRUE(dict.contains("demo/state/sample_count"));
+  const auto& labels = dict.at("demo/state/sample_count")->labels;
+  ASSERT_EQ(labels.size(), telemetry_wire::kMaxEnumLabels);
+  EXPECT_EQ(labels.front(), "0");
+  EXPECT_EQ(labels.back(), std::to_string(telemetry_wire::kMaxEnumLabels - 1));
+  const PageBudget budget = MeasurePages(telemetry.dictionary());
+  EXPECT_GE(budget.dictionary_pages, 1u);
+  EXPECT_LE(budget.dictionary_pages + budget.value_pages,
+            telemetry_wire::slot_count);
+  shapes.mixed_.send(schema_test::Mixed{true,
+                                        1.0,
+                                        schema_test::Level::TOP,
+                                        1023,
+                                        {schema_test::Mode::LOW, 0.0f},
+                                        0.0f});
+  at_cap.step(20ms);
+  const auto frame = LatestFrame(at_cap, "/talos/telemetry");
+  ASSERT_NE(frame, nullptr);
+  EXPECT_EQ(DecodeRaw(telemetry, frame.get()).at("demo/state/sample_count"),
+            1023u);
+
+  Sim over = Sim::FromToml(config(telemetry_wire::kMaxEnumLabels + 1));
+  over.add<ShapesNode>("demo");
+  try {
+    over.add<Telemetry>("telemetry");
+    ADD_FAILURE() << "a channel past kMaxEnumLabels constructed";
+  } catch (const std::invalid_argument& error) {
+    const std::string_view msg{error.what()};
+    EXPECT_NE(msg.find("labels[0].from"), std::string_view::npos) << msg;
+    EXPECT_NE(msg.find("1025 labels"), std::string_view::npos) << msg;
+    EXPECT_NE(msg.find("1024-label limit"), std::string_view::npos) << msg;
+  }
+}
+
 TEST(TelemetryTest, PoseTopicMissingErrors) {
   const std::string kAbsentConfig = R"(
 [robot]
