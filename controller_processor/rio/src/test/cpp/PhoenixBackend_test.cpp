@@ -2893,43 +2893,55 @@ TEST_F(PhoenixBackendRecovery, LowStatusHzDiagnosticsStayValidAcrossFrames) {
   // < 250 ms) — proving MotorVoltage, StatorCurrent, SupplyCurrent, and
   // FaultField all use the scaled bound even when Phoenix sim coalesces effort
   // onto a faster frame — and then expire once aged past 2.5 periods (250 ms)
-  // while motion feedback stays valid.
+  // while motion feedback stays valid. Retry if a host stall ages past 240 ms
+  // before the mid-window check can observe [70 ms, 240 ms).
   sim.SetForwardLimit(false);
-  ASSERT_TRUE(ReadUntil(backend, state, [&] {
-    backend.Apply(drive_reverse);
-    return state.motors[0].valid && std::abs(state.motors[0].voltage) > 1.0 &&
-           std::abs(state.motors[0].stator_current_a) > 10.0 &&
-           std::abs(state.motors[0].supply_current_a) > 1.0 &&
-           (state.motors[0].fault_flags & hw::kMotorCurrentLimitFlags) != 0 &&
-           volts.GetTimestamp().GetLatency().value() < 0.05 &&
-           amps.GetTimestamp().GetLatency().value() < 0.05 &&
-           supply.GetTimestamp().GetLatency().value() < 0.05 &&
-           faults.GetTimestamp().GetLatency().value() < 0.05;
-  }));
-  StopRefreshing(backend, volts);
-  StopRefreshing(backend, amps);
-  StopRefreshing(backend, supply);
-  StopRefreshing(backend, faults);
+  bool observed_mid_window = false;
+  for (int attempt = 0; attempt < 5 && !observed_mid_window; ++attempt) {
+    ASSERT_TRUE(ReadUntil(backend, state, [&] {
+      backend.Apply(drive_reverse);
+      return state.motors[0].valid && std::abs(state.motors[0].voltage) > 1.0 &&
+             std::abs(state.motors[0].stator_current_a) > 10.0 &&
+             std::abs(state.motors[0].supply_current_a) > 1.0 &&
+             (state.motors[0].fault_flags & hw::kMotorCurrentLimitFlags) != 0 &&
+             volts.GetTimestamp().GetLatency().value() < 0.05 &&
+             amps.GetTimestamp().GetLatency().value() < 0.05 &&
+             supply.GetTimestamp().GetLatency().value() < 0.05 &&
+             faults.GetTimestamp().GetLatency().value() < 0.05;
+    }));
+    StopRefreshing(backend, volts);
+    StopRefreshing(backend, amps);
+    StopRefreshing(backend, supply);
+    StopRefreshing(backend, faults);
 
-  ASSERT_TRUE(ReadUntil(backend, state, [&] {
-    backend.Apply(drive_reverse);
-    return volts.GetTimestamp().GetLatency().value() >= 0.07 &&
-           amps.GetTimestamp().GetLatency().value() >= 0.07 &&
-           supply.GetTimestamp().GetLatency().value() >= 0.07 &&
-           faults.GetTimestamp().GetLatency().value() >= 0.07;
-  }));
-  const double mid_max_age_s =
-      std::max({volts.GetTimestamp().GetLatency().value(),
-                amps.GetTimestamp().GetLatency().value(),
-                supply.GetTimestamp().GetLatency().value(),
-                faults.GetTimestamp().GetLatency().value()});
-  ASSERT_LT(mid_max_age_s, 0.24)
-      << "host stall aged diagnostics past the 250 ms bound before mid-check";
-  EXPECT_TRUE(state.motors[0].valid);
-  EXPECT_GT(std::abs(state.motors[0].voltage), 1.0);
-  EXPECT_GT(std::abs(state.motors[0].stator_current_a), 10.0);
-  EXPECT_GT(std::abs(state.motors[0].supply_current_a), 1.0);
-  EXPECT_NE(state.motors[0].fault_flags & hw::kMotorCurrentLimitFlags, 0u);
+    ASSERT_TRUE(ReadUntil(backend, state, [&] {
+      backend.Apply(drive_reverse);
+      return volts.GetTimestamp().GetLatency().value() >= 0.07 &&
+             amps.GetTimestamp().GetLatency().value() >= 0.07 &&
+             supply.GetTimestamp().GetLatency().value() >= 0.07 &&
+             faults.GetTimestamp().GetLatency().value() >= 0.07;
+    }));
+    const double mid_max_age_s =
+        std::max({volts.GetTimestamp().GetLatency().value(),
+                  amps.GetTimestamp().GetLatency().value(),
+                  supply.GetTimestamp().GetLatency().value(),
+                  faults.GetTimestamp().GetLatency().value()});
+    if (mid_max_age_s >= 0.24) {
+      ResumeRefreshing(backend, volts);
+      ResumeRefreshing(backend, amps);
+      ResumeRefreshing(backend, supply);
+      ResumeRefreshing(backend, faults);
+      continue;
+    }
+    observed_mid_window = true;
+    EXPECT_TRUE(state.motors[0].valid);
+    EXPECT_GT(std::abs(state.motors[0].voltage), 1.0);
+    EXPECT_GT(std::abs(state.motors[0].stator_current_a), 10.0);
+    EXPECT_GT(std::abs(state.motors[0].supply_current_a), 1.0);
+    EXPECT_NE(state.motors[0].fault_flags & hw::kMotorCurrentLimitFlags, 0u);
+  }
+  ASSERT_TRUE(observed_mid_window)
+      << "host stalls aged diagnostics past 240 ms on every mid-window attempt";
 
   ASSERT_TRUE(ReadUntil(backend, state, [&] {
     backend.Apply(drive_reverse);

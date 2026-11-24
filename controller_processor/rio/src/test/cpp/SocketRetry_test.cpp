@@ -711,8 +711,10 @@ class FaultingEndpoint {
 struct SocketLinkHarness {
   static constexpr uint64_t kBootId = 0x1020'3040'5060'7081ULL;
 
-  SocketLinkHarness()
-      : gateway{MakeConfig(), backend, kBootId}, endpoint{gateway} {}
+  explicit SocketLinkHarness(talos::rio::RioLog::Sink sink = {})
+      : gateway{MakeConfig(), backend, kBootId},
+        endpoint{gateway},
+        log{std::move(sink)} {}
 
   static talos::hardware::Config MakeConfig() {
     talos::hardware::Config config;
@@ -1143,6 +1145,57 @@ TEST(
   ASSERT_TRUE(frames[1].ds.has_value());
   EXPECT_EQ(frames[1].ds->fms.flags, kTeleopEnabled);
   EXPECT_EQ(frames[1].ds->mode_since_us, switch2_us);
+}
+
+// REQ-OPS-28: TickSocketLink() must post SendEvent::kRecovered on its own
+// RioLog key (kSocketSendRecoveredMessage != kSocketSendMessage) so a
+// failing -> recovered -> failing sequence within one second surfaces the
+// recovery line instead of suppressing it behind the failure key's rate limit.
+TEST(SocketRetry, TickSocketLinkUsesDistinctRioLogKeyForSendRecovery) {
+  namespace protocol = talos::protocol;
+  std::vector<std::string> lines;
+  SocketLinkHarness h{[&](std::string_view line) { lines.emplace_back(line); }};
+  ASSERT_NE(h.companion.port(), 0);
+
+  uint64_t now_us = 1'000'000;
+  h.Tick(now_us, /*ds_flags=*/0u);
+  ASSERT_TRUE(h.socket_retry.open());
+
+  // Start a kept-socket send failure spell (ECONNREFUSED) -> posts on
+  // kSocketSendMessage.
+  now_us += kLoopPeriodUs;
+  h.endpoint.InjectNextTickSend(protocol::UdpStatus::kSocketError,
+                                ECONNREFUSED);
+  h.Tick(now_us, /*ds_flags=*/0u);
+
+  // Drain RioLog at t = 1.0 s -> emits the opening failure line.
+  h.log.Drain(1'000'000ULL);
+  ASSERT_EQ(lines.size(), 1u);
+  EXPECT_NE(lines[0].find("socket send failed"), std::string::npos) << lines[0];
+
+  // After kSpellQuietUs (1.0 s) of clean sends, TickSocketLink emits
+  // SendEvent::kRecovered. Because the RioLog drain runs within 500 ms of the
+  // failure drain (simulating a delayed logger thread), recovery only prints
+  // immediately if it uses a distinct key from kSocketSendMessage.
+  now_us += SocketRetry::kSpellQuietUs;
+  h.Tick(now_us, /*ds_flags=*/0u);
+  lines.clear();
+  h.log.Drain(1'500'000ULL);
+  ASSERT_EQ(lines.size(), 1u)
+      << "recovery line was rate-limited behind kSocketSendMessage";
+  EXPECT_NE(lines[0].find("socket sending again"), std::string::npos)
+      << lines[0];
+
+  // A new failure spell right afterward still emits on kSocketSendMessage once
+  // its 1 s window from the first failure passes (not throttled by recovery).
+  now_us += kLoopPeriodUs;
+  h.endpoint.InjectNextTickSend(protocol::UdpStatus::kSocketError,
+                                ECONNREFUSED);
+  h.Tick(now_us, /*ds_flags=*/0u);
+  lines.clear();
+  h.log.Drain(2'000'000ULL);
+  ASSERT_EQ(lines.size(), 1u);
+  EXPECT_NE(lines[0].find("socket send failed"), std::string::npos) << lines[0];
 }
 #endif
 
