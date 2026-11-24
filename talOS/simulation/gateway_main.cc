@@ -1,21 +1,29 @@
 #include "talOS/simulation/gateway_main.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <fstream>
+#include <cstring>
+#include <exception>
 #include <iostream>
 #include <iterator>
 #include <optional>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -100,11 +108,19 @@ double FiniteNumber(const std::string& text) {
       std::isspace(static_cast<unsigned char>(text.front())) != 0) {
     throw std::invalid_argument("number must be finite: " + text);
   }
+  std::string_view digits{text};
+  if (digits.front() == '+' || digits.front() == '-') {
+    digits.remove_prefix(1);
+  }
+  if (digits.size() >= 2 && digits[0] == '0' &&
+      (digits[1] == 'x' || digits[1] == 'X')) {
+    throw std::invalid_argument("number must be finite: " + text);
+  }
   std::size_t used = 0;
   double value = 0.0;
   try {
     value = std::stod(text, &used);
-  } catch (const std::out_of_range&) {
+  } catch (const std::exception&) {
     throw std::invalid_argument("number must be finite: " + text);
   }
   if (used != text.size() || !std::isfinite(value)) {
@@ -133,12 +149,55 @@ std::string Shortest(double value) {
   return {text.data(), result.ptr};
 }
 
-double Seconds(const std::string& text) {
+double DurationSeconds(const std::string& text) {
   const double value = FiniteNumber(text);
-  if (value <= 0) {
-    throw std::invalid_argument("seconds must be finite and positive");
+  if (value < 0.0 || std::signbit(value)) {
+    throw std::invalid_argument("--duration-s must be finite and nonnegative");
   }
   return value;
+}
+
+// Reads `--schedule-start-file` atomically written by a harness (rename).
+// Returns nullopt while the file does not exist yet (ENOENT); throws on any
+// other open/read error (e.g. EACCES, EISDIR) or oversized/malformed content
+// instead of hanging or allocating without bound.
+std::optional<int64_t> ReadScheduleStartFile(const std::string& path) {
+  int fd = -1;
+  do {
+    fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+  } while (fd < 0 && errno == EINTR);
+  if (fd < 0) {
+    const int err = errno;
+    if (err == ENOENT) return std::nullopt;
+    throw std::runtime_error(path + ": " + std::strerror(err));
+  }
+  // A valid schedule start is at most 18 decimal digits and one newline
+  // (ParseScheduleStart); reading up to 32 bytes detects oversized input
+  // without unbounded memory growth.
+  std::array<char, 32> buf{};
+  std::size_t total = 0;
+  while (total < buf.size()) {
+    const ssize_t got = ::read(fd, buf.data() + total, buf.size() - total);
+    if (got > 0) {
+      total += static_cast<std::size_t>(got);
+      continue;
+    }
+    if (got == 0) break;
+    const int err = errno;
+    if (err == EINTR) continue;
+    ::close(fd);
+    if (err == EAGAIN || err == EWOULDBLOCK) {
+      throw std::runtime_error(path + ": schedule start file is not readable");
+    }
+    throw std::runtime_error(path + ": " + std::strerror(err));
+  }
+  ::close(fd);
+  try {
+    return talos::simulation::ParseScheduleStart(
+        std::string{buf.data(), total});
+  } catch (const std::invalid_argument& e) {
+    throw std::invalid_argument(path + ": " + e.what());
+  }
 }
 
 bool AllAsciiDigits(const std::string& text) {
@@ -182,9 +241,9 @@ uint64_t SessionId(const std::string& text) {
 }
 
 // /sim/state under --physics, then the extension's own topics (Topics(),
-// asked once per program), numbered after it. Refuses a topic declared twice
-// (the gateway's own included) and more sources than a registry row holds,
-// which the row would otherwise drop.
+// asked once per program), numbered after it. Refuses empty or overlong names,
+// non-SENDER entries, a topic declared twice (the gateway's own included), and
+// more sources than a registry row holds, which the row would otherwise drop.
 talos::event::Manifest Manifest(bool physics,
                                 const talos::event::Manifest& extension) {
   talos::event::Manifest manifest;
@@ -207,6 +266,20 @@ talos::event::Manifest Manifest(bool physics,
         " a registry row holds");
   }
   for (const auto& topic : extension) {
+    if (topic.name.empty()) {
+      throw std::invalid_argument(
+          "sim_gateway: extension topic name must not be empty");
+    }
+    if (topic.name.size() > talos::event::MAX_SOURCE_NAME) {
+      throw std::invalid_argument(
+          "sim_gateway: extension topic " + topic.name +
+          " exceeds maximum name length " +
+          std::to_string(talos::event::MAX_SOURCE_NAME));
+    }
+    if (topic.kind != talos::event::SourceKind::SENDER) {
+      throw std::invalid_argument("sim_gateway: extension topic " + topic.name +
+                                  " must have kind SENDER");
+    }
     for (const auto& earlier : manifest) {
       if (earlier.name == topic.name) {
         throw std::invalid_argument("sim_gateway: topic " + topic.name +
@@ -224,6 +297,7 @@ talos::event::Manifest Manifest(bool physics,
 std::vector<uint32_t> ExtensionSlots(
     const talos::simulation::GatewayExtension* extension,
     const talos::event::Manifest& topics) {
+  if (extension == nullptr) return {};
   std::vector<uint32_t> slots;
   for (std::size_t i = 0; i < topics.size(); ++i) {
     const uint32_t ring = extension->TopicSlots(i);
@@ -250,9 +324,44 @@ int Describe(std::string_view target, const talos::event::Manifest& manifest,
   for (std::size_t i = 0; i < extension_slots.size(); ++i) {
     description.sources[first + i].slots = extension_slots[i];
   }
-  std::cout << talos::introspect::DescribeToJson(description);
-  return 0;
+  std::cout << talos::introspect::DescribeToJson(description) << std::flush;
+  return std::cout ? 0 : 1;
 }
+
+void PrintSummary(uint64_t active_ticks,
+                  const talos::hardware::State& snapshot) {
+  const double first_wheel_rot =
+      snapshot.motor_count > 0 ? snapshot.motors[0].position_rot : 0.0;
+  const double first_wheel_rps =
+      snapshot.motor_count > 0 ? snapshot.motors[0].velocity_rps : 0.0;
+  std::printf(
+      "sim_gateway: active_ticks=%llu first_wheel_rotations=%.6f "
+      "first_wheel_rps=%.6f command_active=%d\n",
+      static_cast<unsigned long long>(active_ticks), first_wheel_rot,
+      first_wheel_rps, (snapshot.flags & talos::hardware::kCommandActive) != 0);
+  // Flush before any extension writes its own summary (e.g. to std::cout).
+  std::fflush(stdout);
+}
+
+// Ensures backend outputs are neutralised and the UDP socket is closed on any
+// exit path from the live run, including when a hook or poller throws.
+struct CleanupGuard {
+  talos::hardware::Backend* backend{nullptr};
+  talos::hardware::Endpoint* endpoint{nullptr};
+
+  void Release() noexcept {
+    if (backend != nullptr) {
+      backend->Neutral();
+      backend = nullptr;
+    }
+    if (endpoint != nullptr) {
+      endpoint->Close();
+      endpoint = nullptr;
+    }
+  }
+
+  ~CleanupGuard() { Release(); }
+};
 
 // The program's body stays outside talos:: so its unqualified namespaces
 // resolve at global scope (geometry:: is the FlatBuffers message namespace,
@@ -282,7 +391,23 @@ int Run(int argc, char** argv,
     // 0 until a flag sets one; unset, the config's port applies.
     uint16_t port_flag = 0;
     uint16_t remote_port_flag = 0;
+    if (argc < 0 || (argc > 1 && argv == nullptr)) {
+      throw std::invalid_argument(kUsage);
+    }
+    const auto require_value = [&](int& index, const char* flag) {
+      if (index + 1 >= argc || argv[index + 1] == nullptr) {
+        throw std::invalid_argument(kUsage);
+      }
+      const std::string value{argv[++index]};
+      if (value.empty()) {
+        throw std::invalid_argument(std::string{flag} + " must not be empty");
+      }
+      return value;
+    };
     for (int i = 1; i < argc; ++i) {
+      if (argv[i] == nullptr) {
+        throw std::invalid_argument(kUsage);
+      }
       const std::string arg{argv[i]};
       if (arg == "--describe") {
         describe = true;
@@ -296,10 +421,11 @@ int Run(int argc, char** argv,
         physics = true;
       } else if (arg == "--start-pose" && i + 1 < argc) {
         physics_options = true;
-        start_pose_flag = StartPose(argv[++i]);
+        start_pose_flag = StartPose(require_value(i, "--start-pose"));
       } else if (arg == "--wheel-radius-error" && i + 1 < argc) {
         physics_options = true;
-        options.wheel_radius_error_frac = FiniteNumber(argv[++i]);
+        options.wheel_radius_error_frac =
+            FiniteNumber(require_value(i, "--wheel-radius-error"));
         if (options.wheel_radius_error_frac <= -0.5 ||
             options.wheel_radius_error_frac >= 0.5) {
           throw std::invalid_argument(
@@ -307,33 +433,36 @@ int Run(int argc, char** argv,
         }
       } else if (arg == "--wheel-slip-gain" && i + 1 < argc) {
         physics_options = true;
-        options.wheel_slip_gain = FiniteNumber(argv[++i]);
+        options.wheel_slip_gain =
+            FiniteNumber(require_value(i, "--wheel-slip-gain"));
         if (options.wheel_slip_gain < 0.0) {
           throw std::invalid_argument("--wheel-slip-gain must be nonnegative");
         }
       } else if (arg == "--gyro-drift-radps" && i + 1 < argc) {
         physics_options = true;
-        options.gyro_drift_radps = FiniteNumber(argv[++i]);
+        options.gyro_drift_radps =
+            FiniteNumber(require_value(i, "--gyro-drift-radps"));
       } else if (arg == "--session-id" && i + 1 < argc) {
-        session_id = SessionId(argv[++i]);
+        session_id = SessionId(require_value(i, "--session-id"));
       } else if (arg == "--schedule-start-file" && i + 1 < argc) {
-        schedule_start_file = argv[++i];
+        schedule_start_file = require_value(i, "--schedule-start-file");
       } else if (arg == "--port" && i + 1 < argc) {
-        port_flag = Port(argv[++i]);
+        port_flag = Port(require_value(i, "--port"));
       } else if (arg == "--remote-port" && i + 1 < argc) {
-        remote_port_flag = Port(argv[++i]);
+        remote_port_flag = Port(require_value(i, "--remote-port"));
       } else if (arg == "--duration-s" && i + 1 < argc) {
-        const std::string value = argv[++i];
-        duration_s = value == "0" ? 0 : Seconds(value);
+        duration_s = DurationSeconds(require_value(i, "--duration-s"));
       } else if (arg == "--mode-schedule" && i + 1 < argc) {
-        phases = ds::ParseModeSchedule(argv[++i]);
+        phases = ds::ParseModeSchedule(require_value(i, "--mode-schedule"));
       } else if (arg == "--joystick-schedule" && i + 1 < argc) {
-        joysticks = ds::ParseJoystickSchedule(argv[++i]);
+        joysticks =
+            ds::ParseJoystickSchedule(require_value(i, "--joystick-schedule"));
       } else if (arg == "--fault-schedule" && i + 1 < argc) {
         physics_options = true;
-        faults = talos::simulation::ParseFaults(argv[++i]);
+        faults = talos::simulation::ParseFaults(
+            require_value(i, "--fault-schedule"));
       } else if (arg == "--alliance" && i + 1 < argc) {
-        const std::string value = argv[++i];
+        const std::string value = require_value(i, "--alliance");
         if (value == "blue") {
           alliance = ds::Alliance::kBlue;
         } else if (value == "red") {
@@ -342,6 +471,9 @@ int Run(int argc, char** argv,
           throw std::invalid_argument("alliance must be blue or red");
         }
       } else if (arg == "--config" && i + 1 < argc) {
+        if (argv[i + 1] == nullptr || argv[i + 1][0] == '\0') {
+          throw std::invalid_argument("--config path must not be empty");
+        }
         config_path = argv[++i];
       } else {
         throw std::invalid_argument(kUsage);
@@ -353,6 +485,11 @@ int Run(int argc, char** argv,
     if (physics_options && !physics) {
       throw std::invalid_argument(
           std::string{"physics options require --physics\n"} + kUsage);
+    }
+    if (port_flag != 0 && remote_port_flag != 0 &&
+        port_flag == remote_port_flag) {
+      throw std::invalid_argument(
+          "simulator --port and --remote-port must differ");
     }
     // The extension's topics, asked once: the probe and the live row must
     // declare the same endpoints.
@@ -489,20 +626,22 @@ int Run(int argc, char** argv,
     // sim_motor) or [simulation] swerve geometry, hard stops, battery,
     // chassis, or mechanism inertia: configured before Reconfigure, they apply
     // on the first State and survive any config the bridge pushes later.
-    physics_backend.SetLocalMotorTypes(hw_config);
-    physics_backend.SetHomeSwitches(std::move(home_switches));
-    physics_backend.SetHardStops(std::move(hard_stops));
-    if (!swerve_modules.empty()) {
-      physics_backend.SetSwerveModules(std::move(swerve_modules));
-    }
-    if (battery_model) {
-      physics_backend.SetBatteryModel(*battery_model);
-    }
-    if (chassis_dynamics) {
-      physics_backend.SetChassisDynamics(*chassis_dynamics);
-    }
-    if (!mechanisms.empty()) {
-      physics_backend.SetMechanisms(std::move(mechanisms));
+    if (physics) {
+      physics_backend.SetLocalMotorTypes(hw_config);
+      physics_backend.SetHomeSwitches(std::move(home_switches));
+      physics_backend.SetHardStops(std::move(hard_stops));
+      if (!swerve_modules.empty()) {
+        physics_backend.SetSwerveModules(std::move(swerve_modules));
+      }
+      if (battery_model) {
+        physics_backend.SetBatteryModel(*battery_model);
+      }
+      if (chassis_dynamics) {
+        physics_backend.SetChassisDynamics(*chassis_dynamics);
+      }
+      if (!mechanisms.empty()) {
+        physics_backend.SetMechanisms(std::move(mechanisms));
+      }
     }
     if (extension != nullptr) {
       extension->Configure(robot_config, options, physics_backend);
@@ -516,11 +655,27 @@ int Run(int argc, char** argv,
                  : std::string()));
     }
     talos::simulation::ResolveFaults(faults, hw_config);
-    talos::hardware::Endpoint endpoint{gateway};
-    if (endpoint.Open("127.0.0.1", ports.listen, "127.0.0.1", ports.send) !=
-        talos::protocol::UdpStatus::kOk) {
-      throw std::runtime_error("cannot open simulation socket");
+    if (talos::process::stop_requested.load()) {
+      backend.Neutral();
+      PrintSummary(0, gateway.snapshot());
+      if (extension != nullptr) extension->Finish();
+      std::fflush(stdout);
+      return 0;
     }
+    talos::hardware::Endpoint endpoint{gateway};
+    if (const auto open_status =
+            endpoint.Open("127.0.0.1", ports.listen, "127.0.0.1", ports.send);
+        open_status != talos::protocol::UdpStatus::kOk) {
+      const int err = errno;
+      const char* detail =
+          (open_status == talos::protocol::UdpStatus::kSocketError && err != 0)
+              ? std::strerror(err)
+              : talos::protocol::UdpStatusName(open_status);
+      throw std::runtime_error("cannot open simulation socket (listen=" +
+                               std::to_string(ports.listen) + ", send=" +
+                               std::to_string(ports.send) + "): " + detail);
+    }
+    CleanupGuard cleanup{&backend, &endpoint};
     std::optional<ipc::Publisher<geometry::OdometrySample>> truth_publisher;
     if (physics) truth_publisher.emplace(sim::topics::kState);
     std::optional<talos::introspect::NodeRegistration> registration;
@@ -533,6 +688,7 @@ int Run(int argc, char** argv,
       });
       registration->publish(manifest);
     } catch (const std::exception& e) {
+      registration.reset();
       std::fprintf(stderr, "sim_gateway: node registry unavailable: %s\n",
                    e.what());
     }
@@ -553,7 +709,8 @@ int Run(int argc, char** argv,
     // CLOCK_MONOTONIC_RAW on macOS) drives schedules, State/DS stamps,
     // /sim/state truth, and loop wakeups so macOS sleep never skews them apart.
     talos::event::Poller poller;
-    if (const int stop_fd = talos::process::StopFd(); stop_fd >= 0) {
+    const int stop_fd = talos::process::StopFd();
+    if (stop_fd >= 0) {
       poller.add_fd(stop_fd);
     }
     auto next = talos::event::Poller::now();
@@ -571,8 +728,13 @@ int Run(int argc, char** argv,
     driver_station.boot_id = boot_id;
     std::array<uint8_t, talos::protocol::kMaxPayloadSize> ds_buffer{};
     uint64_t active_ticks = 0;
+    bool ds_sent = false;
     uint64_t last_ds_us = 0;
     uint32_t last_ds_mode = 0;  // ModeKey of the last packet sent
+    bool socket_open = true;
+    uint64_t next_reopen_us = 0;
+    bool reopen_error_logged = false;
+    constexpr uint64_t kSocketReopenPeriodUs = 100'000;
     uint64_t ticks = 0;
     uint64_t truth_samples = 0;
     uint64_t truth_dropped = 0;
@@ -587,17 +749,9 @@ int Run(int argc, char** argv,
         manifest.size() - extension_topics.size();
     while (!talos::process::stop_requested.load()) {
       const auto tick_time = talos::event::Poller::now();
-      if (!start_ns) {
-        // Written atomically by the harness (rename), so a read sees all of
-        // it or no file.
-        std::ifstream file{*schedule_start_file};
-        if (file) {
-          try {
-            start_ns = talos::simulation::ParseScheduleStart(
-                std::string{std::istreambuf_iterator<char>{file}, {}});
-          } catch (const std::invalid_argument& e) {
-            throw std::invalid_argument(*schedule_start_file + ": " + e.what());
-          }
+      if (!start_ns && schedule_start_file) {
+        if (const auto parsed = ReadScheduleStartFile(*schedule_start_file)) {
+          start_ns = parsed;
           const int64_t late_ns = tick_time.nanos() - *start_ns;
           if (late_ns > 0) {
             std::fprintf(stderr,
@@ -639,12 +793,64 @@ int Run(int argc, char** argv,
                                .schedule_us = schedule_us,
                                .driver_station = &driver_station});
       }
-      endpoint.Tick(now, GatewayEnabled(driver_station.fms.flags));
+      if (!socket_open && now >= next_reopen_us) {
+        const auto reopen_status = endpoint.Reopen();
+        if (reopen_status == talos::protocol::UdpStatus::kOk) {
+          socket_open = true;
+          reopen_error_logged = false;
+          std::fprintf(stderr, "sim_gateway: reopened simulation UDP socket\n");
+        } else {
+          if (!reopen_error_logged) {
+            const int err = errno;
+            const char* detail =
+                (reopen_status == talos::protocol::UdpStatus::kSocketError &&
+                 err != 0)
+                    ? std::strerror(err)
+                    : talos::protocol::UdpStatusName(reopen_status);
+            std::fprintf(stderr,
+                         "sim_gateway: simulation UDP socket reopen failed "
+                         "(%s); retrying\n",
+                         detail);
+            reopen_error_logged = true;
+          }
+          next_reopen_us = now + kSocketReopenPeriodUs;
+        }
+      }
+      if (socket_open) {
+        const auto tick_status =
+            endpoint.Tick(now, GatewayEnabled(driver_station.fms.flags));
+        const bool tick_broken =
+            endpoint.receive_needs_reopen() ||
+            (tick_status == talos::protocol::UdpStatus::kSocketError &&
+             talos::protocol::SendErrorNeedsNewSocket(
+                 endpoint.udp_stats().last_send_error));
+        if (tick_broken) {
+          const int err = endpoint.receive_needs_reopen()
+                              ? endpoint.last_receive_error()
+                              : endpoint.udp_stats().last_send_error;
+          std::fprintf(stderr,
+                       "sim_gateway: simulation UDP socket broken (%s); "
+                       "reopening\n",
+                       std::strerror(err));
+          endpoint.Close();
+          socket_open = false;
+          next_reopen_us = now;
+        }
+      } else {
+        // REQ-RT-22: a tick with no socket open ticks the gateway disabled and
+        // sends nothing.
+        gateway.Tick(now, false);
+      }
       // After the tick's plant steps, so a packet sent on this tick carries
       // the extension's stamp as of this tick.
       if (extension != nullptr) {
         extension->Stamp(fms_stamp);
-        driver_station.fms.match_time_s = fms_stamp.match_time_s;
+        driver_station.fms.match_time_s = std::isfinite(fms_stamp.match_time_s)
+                                              ? fms_stamp.match_time_s
+                                              : 0.0F;
+        static_assert(
+            std::tuple_size_v<decltype(fms_stamp.game_specific_message)> ==
+            ds::kMaxGameMessageLength);
         std::copy(fms_stamp.game_specific_message.begin(),
                   fms_stamp.game_specific_message.end() - 1,
                   std::begin(driver_station.fms.game_specific_message));
@@ -667,15 +873,34 @@ int Run(int argc, char** argv,
       }
       // Match the RoboRIO: a DS snapshot every 20 ms, independently of the
       // hardware/physics tick rate, and one at once on the tick that observes
-      // a new mode.
+      // a new mode. Only advance the cadence once a send succeeds so a
+      // transient EAGAIN/kWouldBlock retries on the next tick instead of
+      // delaying a mode transition by 20 ms.
       const uint32_t mode = ds::ModeKey(driver_station.fms.flags);
-      if (last_ds_us == 0 || mode != last_ds_mode ||
-          now - last_ds_us >= ds::kSamplePeriodUs) {
+      if (socket_open &&
+          (!ds_sent || mode != last_ds_mode ||
+           (now >= last_ds_us && now - last_ds_us >= ds::kSamplePeriodUs))) {
         const auto ds_size = ds::Encode(driver_station, ds_buffer);
-        endpoint.SendFrame(talos::protocol::FrameType::kDriverStation, now,
-                           ds_buffer.data(), ds_size);
-        last_ds_us = now;
-        last_ds_mode = mode;
+        if (ds_size > 0) {
+          const auto ds_status =
+              endpoint.SendFrame(talos::protocol::FrameType::kDriverStation,
+                                 now, ds_buffer.data(), ds_size);
+          if (ds_status == talos::protocol::UdpStatus::kOk) {
+            ds_sent = true;
+            last_ds_us = now;
+            last_ds_mode = mode;
+          } else if (ds_status == talos::protocol::UdpStatus::kSocketError &&
+                     talos::protocol::SendErrorNeedsNewSocket(
+                         endpoint.udp_stats().last_send_error)) {
+            std::fprintf(stderr,
+                         "sim_gateway: simulation UDP socket broken on DS send "
+                         "(%s); reopening\n",
+                         std::strerror(endpoint.udp_stats().last_send_error));
+            endpoint.Close();
+            socket_open = false;
+            next_reopen_us = now;
+          }
+        }
       }
       if (extension != nullptr) extension->AfterTick(now);
       ++ticks;
@@ -706,34 +931,28 @@ int Run(int argc, char** argv,
       }
       active_ticks +=
           (gateway.snapshot().flags & talos::hardware::kCommandActive) != 0;
-      const auto period = talos::event::Duration{std::chrono::microseconds{
-          gateway.configured() ? gateway.config().period_us : 5000}};
+      const uint32_t tick_period_us =
+          gateway.configured() && gateway.config().period_us > 0
+              ? gateway.config().period_us
+              : 5000U;
+      const auto period =
+          talos::event::Duration{std::chrono::microseconds{tick_period_us}};
       next = NextTickDeadline(next, talos::event::Poller::now(), period);
       while (!talos::process::stop_requested.load()) {
         if (poller.wait_until(next) ==
             talos::event::Poller::WakeReason::DEADLINE) {
           break;
         }
-        if (poller.reported_readable(talos::process::StopFd()) &&
+        if (stop_fd >= 0 && poller.reported_readable(stop_fd) &&
             talos::process::ConsumeStopWake()) {
           break;
         }
       }
     }
-    backend.Neutral();
-    double first_wheel_rot = gateway.snapshot().motor_count > 0
-                                 ? gateway.snapshot().motors[0].position_rot
-                                 : 0.0;
-    double first_wheel_rps = gateway.snapshot().motor_count > 0
-                                 ? gateway.snapshot().motors[0].velocity_rps
-                                 : 0.0;
-    std::printf(
-        "sim_gateway: active_ticks=%llu first_wheel_rotations=%.6f "
-        "first_wheel_rps=%.6f command_active=%d\n",
-        static_cast<unsigned long long>(active_ticks), first_wheel_rot,
-        first_wheel_rps,
-        (gateway.snapshot().flags & talos::hardware::kCommandActive) != 0);
+    cleanup.Release();
+    PrintSummary(active_ticks, gateway.snapshot());
     if (extension != nullptr) extension->Finish();
+    std::fflush(stdout);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "%s\n", e.what());
     return 1;

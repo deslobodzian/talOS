@@ -457,8 +457,9 @@ another seed draws the other alliance at TELEOP's tie; with sleeping on,
 two game runs also end in the same world, bit for bit, with the same trees
 asleep. `sleeping_test` (REQ-DEV-37) holds sleeping on the 2026 field:
 after 2 s at rest every FUEL sleeps and a robot with no actuator does not,
-nor a welded robot's passive flap,
-and a sleeping FUEL the robot strikes wakes and moves. The rules' release
+nor a welded robot's passive flap (at rest below `sleep_tolerance`),
+a sleeping FUEL the robot strikes wakes in `tree_asleep` and moves, and with
+sleeping left off by default resting FUEL stay awake. The rules' release
 test and the scripted shooter's launch test also run with sleeping on: a
 parked FUEL is asleep when its release comes and leaves its exit, and a
 sleeping body launched flies on.
@@ -471,7 +472,8 @@ that is no piece, and the refusals of 641 pieces and of two radii.
 `gateway_extension_test` holds the chassis-owner refusals, one per key
 and flag, against a welded root that accepts them, and the match input
 each Driver Station state gives. `fields_test` holds
-the field names config load accepts to the ones the program loads, each
+the field names config load accepts to the ones the program loads (1-to-1,
+and unknown field names refused), each
 with its FUEL, and attaches each field's game. `match_state_test`
 (integration, REQ-DEV-40) runs the program on the 2026 field, sleeping on,
 through a mode schedule: `/sim/state/match` walks None, AUTO and TELEOP counting down,
@@ -485,10 +487,12 @@ aside; refusals from the
 extension, from the backend, from the plant's `Bind` and from a scripted
 shooter's broken contract, each named on stderr; a model file
 `robot_model_files` omits, against the same config where the file is; a
-diverging model; and 50 ms on the 2026 field. `launcher_describe_test`
+diverging model; and a 10-tick (50 ms) run on the 2026 field.
+`launcher_describe_test`
 (integration) runs the launcher's `--sim --start-sim-gateway
---describe-only` on a config naming the program: the graph is accepted,
-with the `sim_gateway` member described and `/sim/state/match` among its
-endpoints. `testdata/` holds small
+--describe-only` on a config naming the program: the graph is accepted with
+no error diagnostics, with the `sim_gateway` member described and
+`/sim/state`, `/sim/state/match` and `/sim/telemetry/pieces` (8 slots) among
+its endpoints. `testdata/` holds small
 models and configs (an arm on a welded root, a free-root rover with a
 rangefinder input, a model reading an unlisted mesh).

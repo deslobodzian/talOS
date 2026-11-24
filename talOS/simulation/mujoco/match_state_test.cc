@@ -6,14 +6,17 @@
 // the launcher's live-endpoint check requires. REQ-DEV-43: the same run
 // publishes /sim/telemetry/pieces, the field's 504 FUEL every 50 ms.
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <netinet/in.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -88,6 +91,7 @@ int BoundUdpSocket(uint16_t* port) {
   socklen_t length = sizeof address;
   if (::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof address) != 0 ||
       ::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
+    ::close(fd);
     throw std::runtime_error("bind failed");
   }
   *port = ntohs(address.sin_port);
@@ -102,6 +106,7 @@ uint16_t FreePortBelowEphemeral() {
   const int start = static_cast<int>(std::random_device{}() % kSpan);
   for (int offset = 0; offset < kSpan; ++offset) {
     const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) throw std::runtime_error("socket failed");
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -113,6 +118,101 @@ uint16_t FreePortBelowEphemeral() {
     if (free) return port;
   }
   throw std::runtime_error("no free UDP port in 20000..31999");
+}
+
+class ScopedFd {
+ public:
+  explicit ScopedFd(int fd) : fd_(fd) {}
+  ~ScopedFd() { reset(); }
+  ScopedFd(const ScopedFd&) = delete;
+  ScopedFd& operator=(const ScopedFd&) = delete;
+  int get() const { return fd_; }
+  void reset() {
+    if (fd_ >= 0) {
+      ::close(fd_);
+      fd_ = -1;
+    }
+  }
+
+ private:
+  int fd_{-1};
+};
+
+pid_t WaitNoEintr(pid_t pid, int* status, int options) {
+  pid_t waited = -1;
+  do {
+    waited = ::waitpid(pid, status, options);
+  } while (waited < 0 && errno == EINTR);
+  return waited;
+}
+
+class ScopedChild {
+ public:
+  explicit ScopedChild(pid_t pid) : pid_(pid) {}
+  ~ScopedChild() { KillAndReap(); }
+  ScopedChild(const ScopedChild&) = delete;
+  ScopedChild& operator=(const ScopedChild&) = delete;
+
+  pid_t pid() const { return pid_; }
+
+  bool TryReap(int* exit_code) {
+    if (pid_ <= 0) return true;
+    int status = 0;
+    if (WaitNoEintr(pid_, &status, WNOHANG) == pid_) {
+      pid_ = -1;
+      *exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+      return true;
+    }
+    return false;
+  }
+
+  void KillAndReap() {
+    if (pid_ > 0) {
+      ::kill(pid_, SIGKILL);
+      (void)WaitNoEintr(pid_, nullptr, 0);
+      pid_ = -1;
+    }
+  }
+
+ private:
+  pid_t pid_{-1};
+};
+
+// Removes the gateway's shared-memory segments when running in a test
+// namespace (ShmObjectName returns "/~...", matching
+// talOS/build/registry_unlink.cc).
+void UnlinkTestShm() {
+  if (!ShmObjectName(introspect::kRegistryPath).starts_with("/~")) return;
+  ::shm_unlink(ShmObjectName(::sim::topics::kState).c_str());
+  ::shm_unlink(ShmObjectName(::sim::topics::kMatchState).c_str());
+  ::shm_unlink(ShmObjectName(::sim::topics::kPieces).c_str());
+  introspect::RegistryMapping::unlink();
+}
+
+class ShmCleanupGuard {
+ public:
+  ShmCleanupGuard() = default;
+  ~ShmCleanupGuard() { UnlinkTestShm(); }
+  ShmCleanupGuard(const ShmCleanupGuard&) = delete;
+  ShmCleanupGuard& operator=(const ShmCleanupGuard&) = delete;
+};
+
+int RunDescribe(const std::string& binary, const std::string& out_path) {
+  std::string prog = binary;
+  std::string flag = "--describe";
+  std::array<char*, 3> argv = {prog.data(), flag.data(), nullptr};
+  const pid_t pid = ::fork();
+  if (pid < 0) throw std::runtime_error("fork failed");
+  if (pid == 0) {
+    const int fd = ::open(out_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0 || ::dup2(fd, STDOUT_FILENO) < 0) ::_exit(126);
+    if (fd != STDOUT_FILENO) ::close(fd);
+    ::execv(argv[0], argv.data());
+    ::_exit(127);
+  }
+  int status = 0;
+  if (WaitNoEintr(pid, &status, 0) != pid) return -1;
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 using Endpoint = std::tuple<std::string, int, uint32_t, uint32_t, uint32_t>;
@@ -140,9 +240,9 @@ std::vector<Endpoint> Endpoints(const std::vector<Source>& sources) {
 }
 
 // One run on the 2026 field. It starts with no schedule start; the first
-// Driver Station packet received sets the schedules' time zero 100 ms after
-// that packet's sample time, and the test then subscribes to
-// /sim/state/match, which the gateway has published since its first tick.
+// Driver Station packet received attaches the /sim/state/match and
+// /sim/telemetry/pieces subscribers, and the first drained /sim/state/match
+// tick sets the schedules' time zero 100 ms past that tick.
 struct MatchRun {
   std::vector<ds::DriverStationData> packets;  // from time zero on
   std::vector<::sim::MatchState> matches;
@@ -174,18 +274,30 @@ std::string SleepingRoverConfig() {
       toml.find('[', table + 1) != std::string::npos) {
     throw std::runtime_error("rover config: [simulation.mujoco] is not last");
   }
-  std::ofstream{dir / "robot.toml"} << toml << "sleeping = true\n";
+  {
+    std::ofstream out{dir / "robot.toml"};
+    out << toml << (!toml.empty() && toml.back() != '\n' ? "\n" : "")
+        << "sleeping = true\n";
+    if (!out.good()) {
+      throw std::runtime_error("failed to write " +
+                               (dir / "robot.toml").string());
+    }
+  }
   return (dir / "robot.toml").string();
 }
 
 MatchRun RunGateway() {
   MatchRun run;
+  // Unlink the test-namespaced segments last, after subscribers are closed and
+  // the child is reaped, on both normal exit and exceptions.
+  ShmCleanupGuard shm_cleanup;
   const std::string start_file = TempPath("schedule_start");
   std::filesystem::remove(start_file);
   uint16_t receive_port = 0;
-  const int receiver = BoundUdpSocket(&receive_port);
+  ScopedFd receiver(BoundUdpSocket(&receive_port));
   timeval timeout{.tv_sec = 0, .tv_usec = 50'000};
-  ::setsockopt(receiver, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+  ::setsockopt(receiver.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout,
+               sizeof timeout);
 
   const std::string log = TempPath("gateway.log");
   std::vector<std::string> args{Runfile("MUJOCO_GATEWAY"),
@@ -201,17 +313,25 @@ MatchRun RunGateway() {
                                 kModeSchedule,
                                 "--duration-s",
                                 kDurationS};
-  const pid_t child = ::fork();
-  if (child == 0) {
-    std::FILE* out = std::freopen(log.c_str(), "w", stdout);
-    if (out != nullptr) ::dup2(::fileno(out), STDERR_FILENO);
-    std::vector<char*> argv;
-    argv.reserve(args.size() + 1);
-    for (auto& arg : args) argv.push_back(arg.data());
-    argv.push_back(nullptr);
+  std::vector<char*> argv;
+  argv.reserve(args.size() + 1);
+  for (auto& arg : args) argv.push_back(arg.data());
+  argv.push_back(nullptr);
+
+  const pid_t pid = ::fork();
+  if (pid < 0) throw std::runtime_error("fork failed");
+  if (pid == 0) {
+    const int log_fd = ::open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (log_fd < 0 || ::dup2(log_fd, STDOUT_FILENO) < 0 ||
+        ::dup2(log_fd, STDERR_FILENO) < 0) {
+      ::_exit(126);
+    }
+    if (log_fd != STDOUT_FILENO && log_fd != STDERR_FILENO) ::close(log_fd);
+    ::close(receiver.get());
     ::execv(argv[0], argv.data());
     ::_exit(127);
   }
+  ScopedChild child(pid);
   std::optional<ipc::Subscriber<::sim::MatchState>> subscriber;
   std::optional<ipc::Subscriber<::sim::GamePieces>> pieces;
   const auto drain = [&] {
@@ -229,17 +349,18 @@ MatchRun RunGateway() {
   // The run ends on data, not on the clock, so a slow host (a sanitizer
   // build) gives the cases the same sample, only later. It holds enough
   // once it has:
-  // - TELEOP in /sim/state/match (PublishesThePeriodsInOrderCountingDown:
-  //   None, AUTO and TELEOP, each counting down);
+  // - at least two TELEOP messages in /sim/state/match
+  //   (PublishesThePeriodsInOrderCountingDown: None, AUTO and TELEOP, each
+  //   counting down);
   // - a TELEOP Driver Station packet (DriverStationPacketsCarryTheirTicksMatch
   //   judges the first one; every packet's match comes with the last drain);
   // - the live registry row (LiveRowDeclaresWhatDescribeDeclares);
   // - 11 pieces messages stamped at or after the first recorded tick
   //   (PublishesThePiecesEveryTenthTick: 10 checked gaps).
   const auto holds_enough = [&] {
-    const bool teleop_match =
-        !run.matches.empty() &&
-        run.matches.back().period() == ::sim::MatchPeriod::Teleop;
+    const auto teleop_matches = std::count_if(
+        run.matches.begin(), run.matches.end(),
+        [](const auto& m) { return m.period() == ::sim::MatchPeriod::Teleop; });
     const bool teleop_packet = std::any_of(
         run.packets.begin(), run.packets.end(),
         [](const auto& p) { return (p.fms.flags & ds::kTeleop) != 0; });
@@ -249,7 +370,7 @@ MatchRun RunGateway() {
                  message.sample_time_ns() >=
                      run.matches.front().sample_time_ns();
         });
-    return teleop_match && teleop_packet && run.row.has_value() &&
+    return teleop_matches >= 2 && teleop_packet && run.row.has_value() &&
            recorded >= 11;
   };
   // The counts only bound a hang: 200 receives that time out (10 s without
@@ -260,16 +381,33 @@ MatchRun RunGateway() {
   std::array<uint8_t, protocol::kMaxFrameSize> buffer{};
   while (idle < 200 && received < 20000) {
     drain();
+    // Write schedule_start only after subscriber is attached and has read a
+    // /sim/state/match tick, anchored 100 ms past that newest tick so a host
+    // stall cannot put start_us before subscriber's first tick or in the past.
+    if (run.start_us == 0 && !run.matches.empty()) {
+      run.start_us = run.matches.back().sample_time_ns() / 1000 + 100'000;
+      const std::string partial = start_file + ".partial";
+      {
+        std::ofstream out{partial};
+        out << run.start_us * 1000 << "\n";
+        if (!out.good()) {
+          throw std::runtime_error("failed to write " + partial);
+        }
+      }
+      std::filesystem::rename(partial, start_file);
+    }
     if (!stopped && holds_enough()) {
       // The launcher's stop (talOS/launcher kStopSignal); the gateway's stop
       // handlers end its loop and it exits 0.
-      ::kill(child, SIGINT);
+      ::kill(child.pid(), SIGINT);
       stopped = true;
     }
     if (!run.row) {
       if (const auto reader = introspect::RegistryReader::open()) {
         for (const auto& row : reader->nodes()) {
-          if (row.pid != static_cast<uint64_t>(child) || !row.alive) continue;
+          if (row.pid != static_cast<uint64_t>(child.pid()) || !row.alive) {
+            continue;
+          }
           int counted = 0;
           for (const auto& source : row.sources) {
             if ((source.name == ::sim::topics::kMatchState ||
@@ -282,7 +420,7 @@ MatchRun RunGateway() {
         }
       }
     }
-    const ssize_t n = ::recv(receiver, buffer.data(), buffer.size(), 0);
+    const ssize_t n = ::recv(receiver.get(), buffer.data(), buffer.size(), 0);
     if (n > 0) {
       ++received;
       protocol::DecodedFrame frame;
@@ -291,11 +429,7 @@ MatchRun RunGateway() {
                                 &frame) == protocol::DecodeStatus::kOk &&
           frame.header.type == protocol::FrameType::kDriverStation &&
           ds::Decode({frame.payload, frame.payload_size}, data)) {
-        if (run.start_us == 0) {
-          run.start_us = data.sample_time_us + 100'000;
-          const std::string partial = start_file + ".partial";
-          std::ofstream{partial} << run.start_us * 1000 << "\n";
-          std::filesystem::rename(partial, start_file);
+        if (!subscriber) {
           subscriber.emplace(::sim::topics::kMatchState);
           pieces.emplace(
               ::sim::topics::kPieces,
@@ -303,23 +437,21 @@ MatchRun RunGateway() {
                           .read_mode = ReadMode::SEQUENCE},
               hardware::sim::kPiecesSlots);
         }
-        if (data.sample_time_us >= run.start_us) run.packets.push_back(data);
+        if (run.start_us != 0 && data.sample_time_us >= run.start_us) {
+          run.packets.push_back(data);
+        }
       }
       continue;
     }
+    if (n < 0 && errno == EINTR) continue;
     ++idle;
-    int status = 0;
-    if (::waitpid(child, &status, WNOHANG) == child) {
-      run.status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-      break;
-    }
+    if (child.TryReap(&run.status)) break;
   }
-  if (run.status == -1) {
-    ::kill(child, SIGKILL);
-    ::waitpid(child, nullptr, 0);
-  }
+  child.KillAndReap();
   drain();
-  ::close(receiver);
+  pieces.reset();
+  subscriber.reset();
+  receiver.reset();
   run.log = ReadFile(log);
   return run;
 }
@@ -350,6 +482,8 @@ TEST_F(MujocoGatewayMatch, PublishesThePeriodsInOrderCountingDown) {
                                              ::sim::MatchPeriod::Autonomous,
                                              ::sim::MatchPeriod::Teleop}))
       << run_->log;
+  int auto_countdowns = 0;
+  int teleop_countdowns = 0;
   for (std::size_t i = 1; i < run_->matches.size(); ++i) {
     const auto& before = run_->matches[i - 1];
     const auto& now = run_->matches[i];
@@ -360,7 +494,11 @@ TEST_F(MujocoGatewayMatch, PublishesThePeriodsInOrderCountingDown) {
     EXPECT_LT(now.period_remaining_us(), before.period_remaining_us())
         << "message " << i;
     EXPECT_GT(now.sample_time_ns(), before.sample_time_ns()) << "message " << i;
+    if (now.period() == ::sim::MatchPeriod::Autonomous) ++auto_countdowns;
+    if (now.period() == ::sim::MatchPeriod::Teleop) ++teleop_countdowns;
   }
+  EXPECT_GT(auto_countdowns, 0) << run_->log;
+  EXPECT_GT(teleop_countdowns, 0) << run_->log;
 }
 
 // Every Driver Station packet carries the match of the tick it went out on
@@ -439,9 +577,7 @@ TEST_F(MujocoGatewayMatch, PublishesThePiecesEveryTenthTick) {
 TEST_F(MujocoGatewayMatch, LiveRowDeclaresWhatDescribeDeclares) {
   ASSERT_EQ(run_->status, 0) << run_->log;
   const std::string out_path = TempPath("describe.out");
-  const std::string command =
-      "'" + Runfile("MUJOCO_GATEWAY") + "' --describe >'" + out_path + "'";
-  ASSERT_EQ(std::system(command.c_str()), 0);
+  ASSERT_EQ(RunDescribe(Runfile("MUJOCO_GATEWAY"), out_path), 0);
   introspect::Description described;
   std::string error;
   ASSERT_TRUE(
