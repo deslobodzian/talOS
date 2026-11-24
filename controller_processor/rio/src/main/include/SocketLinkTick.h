@@ -178,7 +178,8 @@ void TickSocketLink(SocketLinkTickContext& ctx, EndpointLike& endpoint,
   };
 
   if (ctx.socket_retry.open()) {
-    const bool enabled = (mode_flags & driver_station::kEnabled) != 0 &&
+    const bool enabled = (mode_flags & driver_station::kDsAttached) != 0 &&
+                         (mode_flags & driver_station::kEnabled) != 0 &&
                          (mode_flags & driver_station::kEStop) == 0;
     // Pre-arm the watchdog before Endpoint::Tick() when enabled with no active
     // command so a stall inside the first Apply()/ApplyOutputs() after enable,
@@ -204,8 +205,9 @@ void TickSocketLink(SocketLinkTickContext& ctx, EndpointLike& endpoint,
                     "replacing it, nothing is sent until then",
                     ctx.socket_retry.last_recv_error());
       ReportRioMessage(ctx.log, kSocketLostMessage, text);
+    } else {
+      sent(tick_status);
     }
-    sent(tick_status);
     // The socket retry and the endpoint's tick.
     const uint64_t ticked_ns = now_ns();
     ctx.log.ClosePhase(TickPhase::kLink, ticked_ns);
