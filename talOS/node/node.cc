@@ -68,6 +68,7 @@ struct Node::Impl {
     std::size_t bytes;
     std::string topic;
     bool is_hardware_request = false;
+    bool is_target_lane = false;
     bool operator_arming = false;
   };
   struct BytePublisherSlot {
@@ -223,7 +224,7 @@ struct Node::Impl {
                               bool prompt = false);
   std::size_t AddPublisher(std::string_view topic, std::size_t bytes,
                            std::size_t alignment,
-                           const schema::Identity& schema,
+                           const schema::Identity& schema, bool is_target_lane,
                            bool operator_arming);
 
   const toml::table* Table() const { return config->GetSubsystemTable(name); }
@@ -413,6 +414,7 @@ void Node::after_update(std::function<void()> fn) {
 }
 
 void Node::every(Duration period, std::function<void()> fn) {
+  impl_->CheckOpen("every");
   if (period <= Duration::zero()) {
     throw std::invalid_argument(impl_->name +
                                 ": every() needs a positive period");
@@ -872,6 +874,7 @@ std::size_t Node::Impl::AddSubscription(
 std::size_t Node::Impl::AddPublisher(std::string_view topic, std::size_t bytes,
                                      std::size_t alignment,
                                      const schema::Identity& schema,
+                                     bool is_target_lane,
                                      bool operator_arming) {
   const std::string resolved = ResolveTopic(topic);
   detail::RefuseHardwareRequest(name, resolved);
@@ -886,6 +889,7 @@ std::size_t Node::Impl::AddPublisher(std::string_view topic, std::size_t bytes,
                         .bytes = bytes,
                         .topic = resolved,
                         .is_hardware_request = false,
+                        .is_target_lane = is_target_lane,
                         .operator_arming = operator_arming});
   if (introspect::naming::IsTargetLane(resolved)) {
     writes_target_lane = true;
@@ -967,6 +971,7 @@ std::size_t NodeDetail::add_publisher(Node& node, std::string_view topic,
                                       std::size_t bytes, std::size_t alignment,
                                       const schema::Identity& schema) {
   return node.impl_->AddPublisher(topic, bytes, alignment, schema,
+                                  /*is_target_lane=*/false,
                                   /*operator_arming=*/false);
 }
 
@@ -975,7 +980,7 @@ std::size_t NodeAccess::add_target_lane_publisher(
     std::size_t alignment, const schema::Identity& schema,
     bool operator_arming) {
   return node.impl_->AddPublisher(topic, bytes, alignment, schema,
-                                  operator_arming);
+                                  /*is_target_lane=*/true, operator_arming);
 }
 
 std::size_t NodeAccess::add_hardware_request(Node& node, std::size_t bytes,
@@ -1054,7 +1059,8 @@ bool NodeAccess::publisher_send(Node& node, std::size_t index, const void* data,
       std::span<const std::byte>{static_cast<const std::byte*>(data), bytes});
 }
 
-// --- NodeDetail::publisher_send (refuses the hardware request slot) --------
+// --- NodeDetail::publisher_send (refuses hardware request and target lane
+// slots) ---
 
 bool NodeDetail::publisher_send(Node& node, std::size_t index, const void* data,
                                 std::size_t bytes) {
@@ -1069,6 +1075,13 @@ bool NodeDetail::publisher_send(Node& node, std::size_t index, const void* data,
         impl.name +
         ": Publisher::send refused on hardware request slot; hardware requests "
         "leave only through the devices-layer flush (RULES.md 2)");
+  }
+  if (impl.publishers[index].is_target_lane) {
+    throw std::logic_error(
+        impl.name + ": Publisher::send refused on target lane slot '" +
+        impl.publishers[index].topic +
+        "'; target lanes leave only through TargetLane::send/release "
+        "(REQ-SAFE-09, REQ-SAFE-14, RULES.md 8)");
   }
   return NodeAccess::publisher_send(node, index, data, bytes);
 }

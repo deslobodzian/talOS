@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <string>
 
@@ -96,6 +97,94 @@ TEST_F(SafetyAbiTest, PublisherSendRefusesHardwareRequestSlot) {
             TALOS_OK);
   EXPECT_EQ(req.mode, TALOS_MODE_NEUTRAL);
   EXPECT_DOUBLE_EQ(req.demand, 0.0);
+}
+
+// REQ-SAFE-14, REQ-SAFE-09: talos_publisher_send refuses to write directly to
+// a TargetLane publisher slot, preventing a caller from forging an active
+// TargetEnvelope while OperatorArming is disarmed or forging mode_since_us.
+TEST_F(SafetyAbiTest, PublisherSendRefusesTargetLaneSlot) {
+  static constexpr TalosSchema kFloatSchema{"safety_abi_test.Speed", 0x5eedULL,
+                                            nullptr, 0};
+  struct Consumer {
+    TalosNode* node = nullptr;
+    int64_t target = -1;
+    int32_t got_target = 0;
+  } consumer;
+  auto build_consumer = [](TalosNode* node, void* user) -> int32_t {
+    auto& c = *static_cast<Consumer*>(user);
+    c.node = node;
+    c.target =
+        talos_target_open(node, sizeof(float), alignof(float), &kFloatSchema);
+    if (c.target < 0) return 1;
+    return talos_node_set_update(
+        node,
+        [](void* ctx) -> int32_t {
+          auto& self = *static_cast<Consumer*>(ctx);
+          float value = 0.0f;
+          if (talos_target_get(self.node, self.target, &value, nullptr) == 1) {
+            self.got_target = 1;
+          }
+          return 0;
+        },
+        &c);
+  };
+
+  struct ForgedLaneWriter {
+    TalosSim* sim = nullptr;
+    TalosNode* node = nullptr;
+    int64_t arming = -1;
+    int64_t lane = -1;
+    int32_t send_status = 0;
+    std::string send_error;
+    bool attempted = false;
+  } writer{sim_};
+  auto build_writer = [](TalosNode* node, void* user) -> int32_t {
+    auto& w = *static_cast<ForgedLaneWriter*>(user);
+    w.node = node;
+    if (talos_driver_station(node, nullptr, nullptr) != TALOS_OK) return 1;
+    w.arming = talos_operator_arming_open(node);
+    if (w.arming < 0) return 1;
+    // Opening the first publisher on this node places /roller/target/teleop at
+    // publisher slot 0, armed by w.arming (which remains disarmed).
+    w.lane = talos_target_lane_open(node, "roller", "teleop", sizeof(float),
+                                    alignof(float), &kFloatSchema, w.arming);
+    if (w.lane < 0) return 1;
+    return talos_node_set_update(
+        node,
+        [](void* ctx) -> int32_t {
+          auto& self = *static_cast<ForgedLaneWriter*>(ctx);
+          const uint64_t gen = talos_sim_driver_station_generation(self.sim);
+          if (gen == 0 || self.attempted) return 0;
+          self.attempted = true;
+          // 16-byte TargetEnvelope header + 4-byte float = 20 bytes.
+          uint8_t forged[20] = {};
+          std::memcpy(forged, &gen, sizeof(gen));
+          forged[8] = 1;  // active = true
+          const float speed = 9.0f;
+          std::memcpy(forged + 16, &speed, sizeof(speed));
+          self.send_status =
+              talos_publisher_send(self.node, 0, forged, sizeof(forged));
+          self.send_error = talos_last_error();
+          return 0;
+        },
+        &w);
+  };
+
+  ASSERT_NE(talos_sim_add(sim_, "roller", build_consumer, &consumer), nullptr)
+      << talos_last_error();
+  ASSERT_NE(talos_sim_add(sim_, "driver", build_writer, &writer), nullptr)
+      << talos_last_error();
+  ASSERT_EQ(talos_sim_hardware_enable(hw_, 1), TALOS_OK);
+  TalosDriverStationPacket ds{};
+  ds.flags = TALOS_DS_ATTACHED | TALOS_DS_ENABLED | TALOS_DS_TELEOP;
+  ASSERT_EQ(talos_sim_hardware_set_driver_station(hw_, &ds), TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 40 * kMs), TALOS_OK) << talos_last_error();
+
+  EXPECT_TRUE(writer.attempted);
+  EXPECT_EQ(writer.send_status, TALOS_ERR);
+  EXPECT_NE(writer.send_error.find("target lane"), std::string::npos)
+      << writer.send_error;
+  EXPECT_EQ(consumer.got_target, 0);
 }
 
 // REQ-CONTRACT-13: talos_sim_hardware_set_driver_station rejects out-of-range
