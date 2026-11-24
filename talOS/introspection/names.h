@@ -502,6 +502,54 @@ inline constexpr std::string_view kRequestTopicPrefix = "/hw/request/";
 inline constexpr std::string_view kDriverStationTopic =
     "/hw/state/driver_station";
 
+// Whether `topic` maps under ShmObjectName (strip leading '/', interior '/' ->
+// '.') to the same POSIX shared-memory name as `/hw/state/driver_station`,
+// well formed or not (e.g. `//hw/state/driver_station`,
+// `/hw.state.driver_station`, `/hw/state.driver_station`,
+// `/hw.state/driver_station`). Used to enforce REQ-SAFE-14 even when
+// `--allow-graph-errors` skips the graph lint.
+inline bool IsDriverStationTopic(std::string_view topic) {
+  if (!topic.starts_with('/')) return false;
+  while (topic.starts_with('/')) topic.remove_prefix(1);
+  constexpr std::string_view kHw = "hw";
+  constexpr std::string_view kState = "state";
+  constexpr std::string_view kDs = "driver_station";
+  if (topic.size() != kHw.size() + 1 + kState.size() + 1 + kDs.size()) {
+    return false;
+  }
+  const auto is_sep = [](char c) { return c == '/' || c == '.'; };
+  return topic.starts_with(kHw) && is_sep(topic[kHw.size()]) &&
+         topic.substr(kHw.size() + 1, kState.size()) == kState &&
+         is_sep(topic[kHw.size() + 1 + kState.size()]) && topic.ends_with(kDs);
+}
+
+struct TargetLaneParts {
+  std::string_view subsystem;
+  std::string_view source;
+};
+
+// If `topic` maps under ShmObjectName (strip leading '/', interior '/' -> '.')
+// to the same POSIX shared-memory name as `/<subsystem>/target/<source>`
+// (three non-empty `/`- or `.`-separated parts with the second equal to
+// `"target"`), returns `{subsystem, source}`; otherwise nullopt.
+inline std::optional<TargetLaneParts> TargetLaneCollisionParts(
+    std::string_view topic) {
+  if (!topic.starts_with('/')) return std::nullopt;
+  while (topic.starts_with('/')) topic.remove_prefix(1);
+  const std::size_t sep1 = topic.find_first_of("/.");
+  if (sep1 == std::string_view::npos || sep1 == 0) return std::nullopt;
+  const std::string_view subsystem = topic.substr(0, sep1);
+  const std::string_view rest = topic.substr(sep1 + 1);
+  const std::size_t sep2 = rest.find_first_of("/.");
+  if (sep2 == std::string_view::npos) return std::nullopt;
+  if (rest.substr(0, sep2) != "target") return std::nullopt;
+  const std::string_view source = rest.substr(sep2 + 1);
+  if (source.empty() || source.find_first_of("/.") != std::string_view::npos) {
+    return std::nullopt;
+  }
+  return TargetLaneParts{subsystem, source};
+}
+
 // The hardware request of node `node`, the one spelling the bridge also reads.
 inline std::string HardwareRequestTopic(std::string_view node) {
   return std::string{kRequestTopicPrefix} + std::string{node};
