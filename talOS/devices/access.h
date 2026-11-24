@@ -54,6 +54,11 @@ struct HardwareAccess {
                         int slot);
   static std::uint64_t motor_clamped_count(const HardwareLink& link,
                                            std::size_t index);
+  // Motor::hardware_index: the motor's slot index in configured motor order
+  // (0..hardware::kMaxMotors-1, the bit position in /hw/status
+  // motor_fault_mask).
+  static std::uint8_t motor_hardware_index(const HardwareLink& link,
+                                           std::size_t index);
   static void motor_rezero(HardwareLink& link, std::size_t index,
                            double position_rot);
   static void gyro_rezero(HardwareLink& link, std::size_t index,

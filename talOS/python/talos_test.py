@@ -949,6 +949,46 @@ dio = 2
         self.assertFalse(lift.connected)
         self.assertFalse(lift.reverse_limit)
 
+    def test_motor_hardware_index_matches_configured_order(self):
+        toml = """
+[robot]
+period_us = 10000
+command_timeout_us = 100000
+
+[subsystems.alpha.motors.first]
+can_id = 1
+
+[subsystems.beta.digital_inputs.beam]
+dio = 0
+[subsystems.beta.motors.second]
+can_id = 2
+[subsystems.beta.motors.third]
+can_id = 3
+"""
+
+        class Alpha:
+            def __init__(self, node):
+                self.first = talos.Motor(node, "first")
+
+        class Beta:
+            def __init__(self, node):
+                # Open a non-motor first and motors in reverse order so
+                # per-node handle indices differ from hardware motor indices.
+                self.beam = talos.DigitalInput(node, "beam")
+                self.third = talos.Motor(node, "third")
+                self.second = talos.Motor(node, "second")
+
+        sim = Sim.from_toml(toml)
+        alpha = sim.add(Alpha, "alpha")
+        beta = sim.add(Beta, "beta")
+        indices = (alpha.first.hardware_index, beta.second.hardware_index,
+                   beta.third.hardware_index)
+        self.assertEqual(set(indices), {0, 1, 2})
+        self.assertNotEqual(beta.third.hardware_index, beta.third._index)
+        sim.remove("alpha")
+        with self.assertRaises(talos.TalosError):
+            _ = alpha.first.hardware_index
+
     def test_neutral_when_disabled_and_requests_when_enabled(self):
         sim = Sim.from_toml(ROBOT_TOML)
         lift = sim.add(Lift, "lift")

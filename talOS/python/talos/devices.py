@@ -274,6 +274,12 @@ class Motor(_Rezeroable, _PositionTimedInput):
             self._node, self._index, ctypes.byref(count)))
         return count.value
 
+    @property
+    def hardware_index(self):
+        """This motor's slot index in configured motor order (0..kMaxMotors-1,
+        the bit position in /hw/status motor_fault_mask)."""
+        return _abi.ok(lib.talos_motor_hardware_index(self._node, self._index))
+
     def set_duty_cycle(self, fraction):  # [-1, 1]
         self._set(Mode.DUTY_CYCLE, fraction)
 

@@ -2703,6 +2703,7 @@ TEST(Devices, DefaultConstructedHandlesThrowInsteadOfDereferencingNull) {
   EXPECT_THROW(motor.rezero(), std::logic_error);
   EXPECT_THROW((void)motor.zeroed(), std::logic_error);
   EXPECT_THROW((void)motor.clamped_count(), std::logic_error);
+  EXPECT_THROW((void)motor.hardware_index(), std::logic_error);
 
   const CANcoder cc{};
   EXPECT_THROW((void)cc.position(), std::logic_error);
@@ -2792,6 +2793,64 @@ TEST(Devices, LateOutputDeviceFailsAtomicallyWithoutLeakingRequestTopic) {
     const std::string what{error.what()};
     EXPECT_EQ(what.find("already registered"), std::string::npos) << what;
   }
+}
+
+// Motor::hardware_index returns the motor's slot in configured motor order
+// (config.hardware.motors / /hw/status motor_fault_mask), independent of the
+// order handles are opened on a node or non-motor handles opened before them.
+TEST(Devices, MotorHardwareIndexMatchesConfiguredMotorOrder) {
+  constexpr const char* kMultiMotorToml = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.alpha.motors.first]
+can_id = 10
+
+[subsystems.beta.digital_inputs.beam]
+dio = 0
+[subsystems.beta.motors.second]
+can_id = 11
+[subsystems.beta.motors.third]
+can_id = 12
+)";
+  struct Alpha {
+    explicit Alpha(Node& n) : first{n, "first"} { AllowUntargetedOutputs(n); }
+    Motor first;
+  };
+  struct Beta {
+    // Open a non-motor handle first and motors in reverse order so per-node
+    // device indices differ from configured hardware motor indices.
+    explicit Beta(Node& n)
+        : beam{n, "beam"},
+          third{n, "third"},
+          second{n, "second"},
+          second_dup{n, "second"} {
+      AllowUntargetedOutputs(n);
+    }
+    DigitalInput beam;
+    Motor third;
+    Motor second;
+    Motor second_dup;
+  };
+  auto sim = Sim::FromToml(kMultiMotorToml);
+  auto& alpha = sim.add<Alpha>("alpha");
+  auto& beta = sim.add<Beta>("beta");
+  const auto& motors =
+      sim.node("beta").extension<HardwareLink>().config().hardware.motors;
+  ASSERT_EQ(motors.size(), 3u);
+  const auto expect_slot = [&](const Motor& motor, std::string_view name) {
+    const std::uint8_t idx = motor.hardware_index();
+    ASSERT_LT(idx, motors.size());
+    EXPECT_EQ(motors[idx].name, name);
+  };
+  expect_slot(alpha.first, "first");
+  expect_slot(beta.second, "second");
+  expect_slot(beta.third, "third");
+  EXPECT_EQ(beta.second.hardware_index(), beta.second_dup.hardware_index());
+  EXPECT_NE(alpha.first.hardware_index(), beta.second.hardware_index());
+  EXPECT_NE(beta.second.hardware_index(), beta.third.hardware_index());
+  EXPECT_NE(alpha.first.hardware_index(), beta.third.hardware_index());
 }
 
 }  // namespace

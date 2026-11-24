@@ -1245,6 +1245,7 @@ TEST_F(NodeApi, IndexedDeviceLookupsDoNotAttachHardwareLink) {
   EXPECT_EQ(talos_motor_zeroed(node, 0), TALOS_ERR);
   EXPECT_EQ(talos_gyro_zeroed(node, 0), TALOS_ERR);
   EXPECT_EQ(talos_motor_clamped_count(node, 0, &clamped), TALOS_ERR);
+  EXPECT_EQ(talos_motor_hardware_index(node, 0), TALOS_ERR);
   EXPECT_EQ(talos_motor_set(node, 0, TALOS_MODE_NEUTRAL, 0.0, 0.0, 0),
             TALOS_ERR);
   EXPECT_EQ(talos_motor_rezero(node, 0, 0.0), TALOS_ERR);
@@ -2048,6 +2049,80 @@ eject_us = 100000
   ASSERT_EQ(talos_sim_step(sim, 10 * kMs), TALOS_OK) << talos_last_error();
 
   talos_sim_hardware_destroy(hw);
+  talos_sim_destroy(sim);
+}
+
+TEST(NodeApiStandalone, MotorHardwareIndexReturnsSlotAndRejectsInvalid) {
+  constexpr const char* kMultiToml = R"(
+[robot]
+period_us = 10000
+command_timeout_us = 100000
+
+[subsystems.alpha.motors.first]
+can_id = 1
+
+[subsystems.beta.digital_inputs.beam]
+dio = 0
+[subsystems.beta.motors.second]
+can_id = 2
+[subsystems.beta.motors.third]
+can_id = 3
+)";
+  TalosSim* sim = talos_sim_from_toml(kMultiToml);
+  ASSERT_NE(sim, nullptr) << talos_last_error();
+
+  struct Alpha {
+    int64_t first = -1;
+  };
+  struct Beta {
+    int64_t beam = -1;
+    int64_t third = -1;
+    int64_t second = -1;
+  };
+  auto build_alpha = [](TalosNode* node, void* user) -> int32_t {
+    auto& a = *static_cast<Alpha*>(user);
+    a.first = talos_device(node, TALOS_DEVICE_MOTOR, "first");
+    return a.first >= 0 ? 0 : 1;
+  };
+  auto build_beta = [](TalosNode* node, void* user) -> int32_t {
+    auto& b = *static_cast<Beta*>(user);
+    // Open a non-motor first and motors in reverse order so C ABI device
+    // indices differ from hardware motor indices.
+    b.beam = talos_device(node, TALOS_DEVICE_DIGITAL_INPUT, "beam");
+    b.third = talos_device(node, TALOS_DEVICE_MOTOR, "third");
+    b.second = talos_device(node, TALOS_DEVICE_MOTOR, "second");
+    return b.beam >= 0 && b.third >= 0 && b.second >= 0 ? 0 : 1;
+  };
+
+  Alpha alpha;
+  Beta beta;
+  TalosNode* alpha_node = talos_sim_add(sim, "alpha", build_alpha, &alpha);
+  ASSERT_NE(alpha_node, nullptr) << talos_last_error();
+  TalosNode* beta_node = talos_sim_add(sim, "beta", build_beta, &beta);
+  ASSERT_NE(beta_node, nullptr) << talos_last_error();
+
+  EXPECT_EQ(talos_motor_hardware_index(nullptr, 0), TALOS_ERR);
+  EXPECT_NE(std::string{talos_last_error()}, "");
+  EXPECT_EQ(talos_motor_hardware_index(beta_node, -1), TALOS_ERR);
+  EXPECT_EQ(talos_motor_hardware_index(beta_node, beta.beam), TALOS_ERR);
+  EXPECT_EQ(talos_motor_hardware_index(beta_node, 99), TALOS_ERR);
+
+  const int32_t first_idx = talos_motor_hardware_index(alpha_node, alpha.first);
+  EXPECT_STREQ(talos_last_error(), "");
+  const int32_t second_idx = talos_motor_hardware_index(beta_node, beta.second);
+  const int32_t third_idx = talos_motor_hardware_index(beta_node, beta.third);
+  EXPECT_GE(first_idx, 0);
+  EXPECT_LT(first_idx, 16);
+  EXPECT_GE(second_idx, 0);
+  EXPECT_LT(second_idx, 16);
+  EXPECT_GE(third_idx, 0);
+  EXPECT_LT(third_idx, 16);
+  EXPECT_NE(first_idx, second_idx);
+  EXPECT_NE(second_idx, third_idx);
+  EXPECT_NE(first_idx, third_idx);
+  // Every motor slot in this 3-motor config is in {0, 1, 2}.
+  EXPECT_EQ((1u << first_idx) | (1u << second_idx) | (1u << third_idx), 0x7u);
+
   talos_sim_destroy(sim);
 }
 
