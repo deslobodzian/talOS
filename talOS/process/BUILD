@@ -39,8 +39,19 @@ cc_test(
     size = "small",
     srcs = ["process_test.cc"],
     deps = [
+        ":durable_sync",
         ":process",
         "//talOS/memory:residency",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "host_qualification_test",
+    size = "small",
+    srcs = ["host_qualification_test.cc"],
+    deps = [
+        ":host_qualification",
         "@googletest//:gtest_main",
     ],
 )

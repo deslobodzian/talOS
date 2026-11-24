@@ -399,18 +399,30 @@ bool WaitFor(const std::stop_token& stop, const std::function<bool()>& done,
   return !stop.stop_requested() && done();
 }
 
+// Stop trap paired with kLoopUntilStopped: exits 0 on SIGINT or SIGTERM and
+// terminates the background sleep so it cannot linger or hold pipes open.
+constexpr std::string_view kStopTrap =
+    "trap 'p=${_sleep_pid:-$!}; [ -n \"$p\" ] && kill \"$p\" 2>/dev/null; "
+    "exit 0' INT TERM\n";
+
 // A stub body that sets its stop trap (exit 0 on SIGINT or SIGTERM), then
 // appends its --log argument to `record`, then runs `then`: a recorded run
 // can be stopped without dying of the signal.
 std::string TrappedRun(const std::string& record, std::string_view then) {
-  return "trap 'exit 0' INT TERM\n" + RecordLogArgThen(record, then);
+  return std::string{kStopTrap} + RecordLogArgThen(record, then);
 }
 
 // A stub's tail that runs until the session stops it. Only safe after an
 // active INT/TERM trap (such as TrappedRun): without a trap, bash's
 // wait-and-cooperative-exit can ignore SIGINT when it lands in a child
 // sleep's fork window; untrapped stubs must use `exec sleep 86400`.
-constexpr std::string_view kLoopUntilStopped = "while :; do sleep 0.05; done\n";
+// Uses background sleep + `wait` instead of `while :; do sleep 0.05; done`
+// because macOS `/bin/sh` (bash 3.2) defers trapped signals while foreground
+// `sleep` runs/forks, which can miss the 500 ms bridge stop timeout, whereas
+// POSIX `wait` is interrupted immediately by a trapped signal.
+constexpr std::string_view kLoopUntilStopped =
+    "while :; do sleep 86400 </dev/null >/dev/null 2>&1 & _sleep_pid=$!; "
+    "wait $_sleep_pid; done\n";
 
 // A run whose live endpoints differ from its probe's is reported, recorded
 // in the manifest, and stops the session (exit 1) on its own, before its
@@ -1324,7 +1336,10 @@ TEST(Supervision,
 
 // A long-lived stub that exits 0 when the launcher stops it.
 constexpr std::string_view kRunUntilStopped =
-    "trap 'exit 0' INT TERM\nwhile :; do sleep 0.05; done\n";
+    "trap 'p=${_sleep_pid:-$!}; [ -n \"$p\" ] && kill \"$p\" 2>/dev/null; "
+    "exit 0' INT TERM\n"
+    "while :; do sleep 86400 </dev/null >/dev/null 2>&1 & _sleep_pid=$!; "
+    "wait $_sleep_pid; done\n";
 
 // A critical node that exits 0 while its peers run on is lost, not finished:
 // it restarts, once, into its next log. Every stub records its --log
@@ -1397,7 +1412,7 @@ TEST(Supervision, CriticalCleanExitRestartsWhileRestartedPeerRuns) {
   ::remove(alpha_restarted.c_str());
   ::remove(beta_runs.c_str());
   const auto restart_once_then_signal = [](const std::string& marker) {
-    return "trap 'exit 0' INT TERM\n"
+    return std::string{kStopTrap} +
            "prev=\"\"\n"
            "log=\"\"\n"
            "for arg in \"$@\"; do\n"
@@ -1716,11 +1731,8 @@ TEST(Supervision, RequestedStopDoesNotRestartCleanExits) {
     const std::string target = name == "hardware_node"
                                    ? "//talOS/bridge:hardware_node"
                                    : "//example/" + name + ":node";
-    options.binary_overrides[target] =
-        WriteStub("clean_stop_" + name,
-                  "trap 'exit 0' INT TERM\n" +
-                      RecordLogArgThen(runs, "while :; do sleep 0.05; done\n"),
-                  name);
+    options.binary_overrides[target] = WriteStub(
+        "clean_stop_" + name, TrappedRun(runs, kLoopUntilStopped), name);
   }
   const pid_t launcher = ::fork();
   ASSERT_GE(launcher, 0);
@@ -2075,9 +2087,8 @@ TEST(Supervision, ABoundedSessionEndsAtItsStopNotAtAMembersOwnDuration) {
   options.binary_overrides["//talOS/bridge:hardware_node"] =
       runfiles->Rlocation(bridge);
   for (const std::string name : {"alpha", "beta"}) {
-    options.binary_overrides["//example/" + name + ":node"] = WriteStub(
-        "bounded_stop_" + name,
-        "trap 'exit 0' INT TERM\n" + std::string{kLoopUntilStopped}, name);
+    options.binary_overrides["//example/" + name + ":node"] =
+        WriteStub("bounded_stop_" + name, kRunUntilStopped, name);
   }
   testing::SteppedClock clock;
   const SupervisionTime held = clock.Freeze();
@@ -4092,9 +4103,7 @@ TEST(Supervision, ManifestRecordsLockLossRetakeCriticalAndStudioBridge) {
         "lock_manifest_" + name, TrappedRun(runs, kLoopUntilStopped), name);
   }
   options.binary_overrides["//studio/bridge:studio_bridge"] =
-      WriteStub("lock_manifest_bridge",
-                "trap 'exit 0' INT TERM\n" + std::string{kLoopUntilStopped},
-                "studio_bridge");
+      WriteStub("lock_manifest_bridge", kRunUntilStopped, "studio_bridge");
 
   const std::string dir =
       options.output_dir + "/" + std::to_string(options.session_id);
@@ -4307,7 +4316,7 @@ TEST(Supervision, StudioBridgeRestartAloneWakesTheLoop) {
 // A Studio bridge stub's body: once its stop trap is set, appends its pid
 // to `record` (one line per run), then runs `then`.
 std::string BridgeRun(const std::string& record, std::string_view then) {
-  return "trap 'exit 0' INT TERM\necho $$ >> " + record + "\n" +
+  return std::string{kStopTrap} + "echo $$ >> " + record + "\n" +
          std::string{then};
 }
 
@@ -4347,8 +4356,8 @@ TEST(Supervision, CrashedStudioBridgeRestartsAndNoNodeIsDisturbed) {
                                            crash +
                                            "' ]; do sleep 0.01; done\n"
                                            "  kill -KILL $$\n"
-                                           "fi\n"
-                                           "while :; do sleep 0.05; done\n"),
+                                           "fi\n" +
+                                           std::string{kLoopUntilStopped}),
                 "studio_bridge");
   // RunSession rewrites options.output_dir on return; not read concurrently.
   const std::string live = options.output_dir + "/" +
@@ -4451,8 +4460,8 @@ TEST(Supervision,
                                            "' ]; do sleep 0.01; done\n"
                                            "  kill -KILL $$\n"
                                            "fi\n"
-                                           "printf 'listening %s\\n' \"$2\"\n"
-                                           "while :; do sleep 0.05; done\n"),
+                                           "printf 'listening %s\\n' \"$2\"\n" +
+                                           std::string{kLoopUntilStopped}),
                 "studio_bridge");
   const std::string session_dir =
       options.output_dir + "/" + std::to_string(options.session_id);
@@ -6344,12 +6353,11 @@ TEST(Supervision, AdvancingDispatchCountPreventsStallKillWithFrozenHeartbeat) {
   const auto runs = TempPath("frozen_hb_runs");
   ::remove(pid_file.c_str());
   ::remove(runs.c_str());
-  options.binary_overrides["//example/alpha:node"] = WriteStub(
-      "frozen_hb_alpha",
-      "trap 'exit 0' INT TERM\n" +
-          RecordLogArgThen(runs, "echo $$ > '" + pid_file + ".tmp' && mv '" +
-                                     pid_file + ".tmp' '" + pid_file +
-                                     "'\nwhile :; do sleep 0.05; done\n"));
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("frozen_hb_alpha",
+                TrappedRun(runs, "echo $$ > '" + pid_file + ".tmp' && mv '" +
+                                     pid_file + ".tmp' '" + pid_file + "'\n" +
+                                     std::string{kLoopUntilStopped}));
   // PublishStubRow stamps heartbeat_monotonic_ns once when claiming the row;
   // this tick advances only dispatch_count so heartbeat_monotonic_ns remains
   // frozen for the entire session.

@@ -25,10 +25,11 @@ them in __init__; the C++ object lives as long as the node. Requests
 node's update() and raise TalosError, naming the mechanism, anywhere else;
 a request lasts that tick only. Call set_goal only with a live talos.Target.
 The C++ getters are properties here, and state() is the control message the
-C++ state() returns, all read from one snapshot that update() (and
-clear_fault()) takes in a single C call: as of the last update(), when the
-C++ values change, except that the C++ homed() also reads the motor's zero
-between updates, which the next update() sees.
+C++ state() returns, read from one snapshot that update() (and clear_fault())
+takes in a single C call (as of the last update(), when the C++ values
+change); PositionMechanism.homed queries the live motor zero state directly,
+matching C++ PositionMechanism::homed() even before update() on a post-reset
+tick.
 """
 
 import ctypes
@@ -153,7 +154,12 @@ class PositionMechanism(_Mechanism):
 
     phase = property(lambda self: PositionPhase(self._live_snapshot.phase))
     fault = property(lambda self: PositionFault(self._live_snapshot.fault))
-    homed = property(lambda self: bool(self._live_snapshot.homed))
+
+    @property
+    def homed(self):
+        return _abi.boolean(
+            lib.talos_position_mechanism_homed(self._node, self._index))
+
     at_goal = property(lambda self: bool(self._live_snapshot.at_goal))
     connected = property(lambda self: bool(self._live_snapshot.connected))
     position_rot = property(lambda self: self._live_snapshot.position_rot)

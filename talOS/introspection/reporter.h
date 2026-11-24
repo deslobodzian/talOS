@@ -297,12 +297,16 @@ class Reporter {
       });
     }
 
-    // Attributes from both places a node can declare one: by topic name for
-    // the loop's sources, and inline on the extra sources.
+    // Attributes from both places a node can declare one: by topic name or
+    // source id for the loop's sources, and inline on the extra sources
+    // (scoped by manifest source id so flags never smear onto a loop source
+    // sharing the same topic name).
     std::vector<EndpointAttribute> endpoints = options_.endpoints;
-    for (const ExtraSource& extra : options_.extra) {
+    for (std::size_t i = 0; i < options_.extra.size(); ++i) {
+      const ExtraSource& extra = options_.extra[i];
       if (extra.flags != 0) {
-        endpoints.push_back({extra.name, extra.flags});
+        endpoints.push_back({extra.name, extra.flags,
+                             static_cast<std::uint32_t>(loop_sources_ + i)});
       }
     }
 

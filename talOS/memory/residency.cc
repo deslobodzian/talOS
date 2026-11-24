@@ -52,9 +52,11 @@ int MakeResident(void* address, std::size_t size) noexcept {
   // changes nothing, even under a concurrent writer in another process.
   auto* bytes = static_cast<unsigned char*>(address);
   const std::size_t page = PageSize();
-  for (std::size_t offset = 0; offset < size; offset += page) {
+  for (std::size_t offset = 0;;) {
     __atomic_fetch_or(bytes + offset, static_cast<unsigned char>(0),
                       __ATOMIC_RELAXED);
+    if (size - offset <= page) break;
+    offset += page;
   }
   __atomic_fetch_or(bytes + size - 1, static_cast<unsigned char>(0),
                     __ATOMIC_RELAXED);

@@ -142,6 +142,11 @@ struct NodeDetail {
   static void* find_extension(const Node& node, std::type_index type);
   static void add_extension(Node& node, std::type_index type,
                             std::shared_ptr<void> object);
+
+  // Thread-local error channel for HostCppNode<T> so C ABI hosts can report
+  // C++ constructor diagnostics via talos_last_error().
+  static void set_host_error(std::string_view message) noexcept;
+  static const char* host_error() noexcept;
 };
 
 }  // namespace talos::detail
