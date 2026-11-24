@@ -20,6 +20,7 @@ import argparse
 import json
 import math
 import struct
+from xml.sax.saxutils import escape as _xml_escape
 
 # Every dimension, in inches (the unit of the sources). Sources: GM = 2026
 # Game Manual TU22, section; DWG = 2026 Field Dimension Drawings FE-2026
@@ -270,6 +271,8 @@ def box(name, x0, x1, y0, y1, z0, z1, **kw):
 
 def _red(item):
     """The red counterpart of a blue item: 180 degrees about the centre."""
+    if not item.name.startswith("blue_"):
+        raise ValueError(f"expected blue_ item name, got {item.name!r}")
     x, y, z = item.pos
     name = "red_" + item.name[len("blue_"):]
     rgba = item.rgba
@@ -280,7 +283,7 @@ def _red(item):
     return Item(item.tag, name, item.kind,
                 (2 * CENTRE[0] - x, 2 * CENTRE[1] - y, z),
                 qmul(QZ180, item.quat), item.size, item.mesh, item.cls, rgba,
-                item.friction)
+                item.friction, extra=item.extra)
 
 
 def _red_point(p):
@@ -721,17 +724,54 @@ def all_fuel():
     return fuel
 
 
+def _reject_json_constant(token):
+    raise ValueError(f"non-finite JSON constant in tag file: {token!r}")
+
+
+def _finite_float(value, label):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} is not a number: {value!r}")
+    out = float(value)
+    if not math.isfinite(out):
+        raise ValueError(f"{label} is not finite: {value!r}")
+    return out
+
+
 def tags(path):
     """Visual AprilTag panels at the official poses."""
     with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-    items = []
-    for tag in data.get("field-tags", data.get("tags", [])):
+        data = json.load(f, parse_constant=_reject_json_constant)
+    if not isinstance(data, dict):
+        raise ValueError("tag file root must be a JSON object")
+    raw_tags = data.get("field-tags")
+    if raw_tags is None:
+        raw_tags = data.get("tags", [])
+    if not isinstance(raw_tags, list):
+        raise ValueError("tag list must be a JSON array")
+    parsed = []
+    seen_ids = set()
+    for tag in raw_tags:
+        tag_id = tag["ID"]
+        if isinstance(tag_id, bool) or not isinstance(tag_id, int) or tag_id < 0:
+            raise ValueError(f"tag ID must be a non-negative integer: {tag_id!r}")
+        if tag_id in seen_ids:
+            raise ValueError(f"duplicate tag ID: {tag_id}")
+        seen_ids.add(tag_id)
         t = tag["pose"]["translation"]
         q = tag["pose"]["rotation"]["quaternion"]
-        quat = (q["W"], q["X"], q["Y"], q["Z"])
-        pos = (t["x"], t["y"], t["z"])
-        name = f"tag_{tag['ID']:02d}"
+        pos = tuple(_finite_float(t[k], f"tag {tag_id} translation.{k}")
+                    for k in ("x", "y", "z"))
+        raw_q = tuple(_finite_float(q[k], f"tag {tag_id} quaternion.{k}")
+                      for k in ("W", "X", "Y", "Z"))
+        norm = math.sqrt(sum(c * c for c in raw_q))
+        if not (norm > 1e-12) or not math.isfinite(norm):
+            raise ValueError(f"tag {tag_id} has zero-norm quaternion")
+        quat = tuple(0.0 if c == 0.0 else c / norm for c in raw_q)
+        parsed.append((tag_id, pos, quat))
+    parsed.sort(key=lambda entry: entry[0])
+    items = []
+    for tag_id, pos, quat in parsed:
+        name = f"tag_{tag_id:02d}"
         panel = D["tag_panel"] / 2
         code = D["tag_code"] / 2
         normal = (1 - 2 * (quat[2] ** 2 + quat[3] ** 2),
@@ -750,28 +790,41 @@ def tags(path):
 # --- output ------------------------------------------------------------------
 
 
+def _xml_attr(name, value):
+    escaped = _xml_escape(str(value), {'"': "&quot;"})
+    return f'{name}="{escaped}"'
+
+
 def fmt(values):
     """Exact (round-trip) decimals: red is checked against blue to 1e-9 m."""
-    return " ".join(repr(float(v)) if abs(v) > 1e-15 else "0" for v in values)
+    out = []
+    for v in values:
+        f = float(v)
+        if not math.isfinite(f):
+            raise ValueError(f"non-finite value in MJCF output: {v!r}")
+        out.append(repr(f) if abs(f) > 1e-15 else "0")
+    return " ".join(out)
 
 
 def write_item(out, item):
-    attrs = [f'name="{item.name}"', f'type="{item.kind}"',
-             f'pos="{fmt(item.pos)}"']
+    if item.tag not in ("geom", "site"):
+        raise ValueError(f"unsupported MJCF item tag: {item.tag!r}")
+    attrs = [_xml_attr("name", item.name), _xml_attr("type", item.kind),
+             _xml_attr("pos", fmt(item.pos))]
     if item.quat != IDENTITY:
-        attrs.append(f'quat="{fmt(item.quat)}"')
+        attrs.append(_xml_attr("quat", fmt(item.quat)))
     if item.mesh:
-        attrs.append(f'mesh="{item.mesh}"')
+        attrs.append(_xml_attr("mesh", item.mesh))
     else:
-        attrs.append(f'size="{fmt(item.size)}"')
+        attrs.append(_xml_attr("size", fmt(item.size)))
     if item.cls:
-        attrs.append(f'class="{item.cls}"')
+        attrs.append(_xml_attr("class", item.cls))
     if item.extra:
         attrs.append(item.extra)
     if item.rgba:
-        attrs.append(f'rgba="{item.rgba}"')
+        attrs.append(_xml_attr("rgba", item.rgba))
     if item.friction is not None:
-        attrs.append(f'friction="{item.friction} 0.005 0.0001"')
+        attrs.append(_xml_attr("friction", f"{item.friction} 0.005 0.0001"))
     out.append(f"    <{item.tag} {' '.join(attrs)}/>")
 
 
@@ -825,8 +878,10 @@ def build(tags_path):
     ]
     first = 0
     for group, count in FUEL_RANGES:
-        out.append(f'    <numeric name="fuel_{group}_first" data="{first}"/>')
-        out.append(f'    <numeric name="fuel_{group}_count" data="{count}"/>')
+        out.append(f"    <numeric {_xml_attr('name', f'fuel_{group}_first')} "
+                   f"{_xml_attr('data', first)}/>")
+        out.append(f"    <numeric {_xml_attr('name', f'fuel_{group}_count')} "
+                   f"{_xml_attr('data', count)}/>")
         first += count
     out += [
         "  </custom>",
@@ -850,9 +905,10 @@ def build(tags_path):
         "  </default>",
         "  <asset>",
     ]
-    for name, verts in meshes.items():
+    for name, verts in sorted(meshes.items()):
         flat = [c for v in verts for c in v]
-        out.append(f'    <mesh name="{name}" vertex="{fmt(flat)}"/>')
+        out.append(f"    <mesh {_xml_attr('name', name)} "
+                   f"{_xml_attr('vertex', fmt(flat))}/>")
     out += [
         "  </asset>",
         "  <worldbody>",
@@ -863,9 +919,11 @@ def build(tags_path):
         write_item(out, item)
     for i, p in enumerate(fuel):
         out += [
-            f'    <body name="fuel_{i:03d}" pos="{fmt(p)}">',
-            f'      <freejoint name="fuel_{i:03d}_joint"/>',
-            f'      <geom name="fuel_{i:03d}_geom" class="fuel"/>',
+            f"    <body {_xml_attr('name', f'fuel_{i:03d}')} "
+            f"{_xml_attr('pos', fmt(p))}>",
+            f"      <freejoint {_xml_attr('name', f'fuel_{i:03d}_joint')}/>",
+            f"      <geom {_xml_attr('name', f'fuel_{i:03d}_geom')} "
+            'class="fuel"/>',
             "    </body>",
         ]
     out += ["  </worldbody>", "</mujoco>", ""]
@@ -979,6 +1037,8 @@ def _hull(points):
         v = cross(n, u)
         flat = sorted({(_dot(p, u), _dot(p, v)): p for p in on}.items())
         polygon = _convex_ring([f for f, _ in flat])
+        if len(polygon) < 3:
+            continue
         lookup = dict(flat)
         faces.append(([lookup[f] for f in polygon], n))
     return _from_polygons(faces)
@@ -1021,7 +1081,7 @@ def build_glb(tags_path):
     geoms = [item for item in items
              if item.tag == "geom" and item.kind != "plane"]
     shapes = {"box": _unit_box(), "cylinder": _unit_cylinder()}
-    for name, verts in meshes.items():
+    for name, verts in sorted(meshes.items()):
         shapes["mesh:" + name] = _hull([tuple(v) for v in verts])
     binary = bytearray()
     views, accessors, gltf_meshes, materials = [], [], [], []
@@ -1041,13 +1101,19 @@ def build_glb(tags_path):
         if key.startswith("mesh:") and not any(
                 g.mesh == key[5:] for g in geoms):
             continue
+        if len(positions) >= 65535:
+            raise ValueError(
+                f"glTF mesh {key!r} has {len(positions)} vertices "
+                "(exceeds UNSIGNED_SHORT limit)")
         flat = [c for p in positions for c in p]
         pos_view = view(struct.pack(f"<{len(flat)}f", *flat), 34962)
         lows = [min(p[i] for p in positions) for i in range(3)]
         highs = [max(p[i] for p in positions) for i in range(3)]
         # Bounds as the float32 values stored, so a reader's check is exact.
-        lows = list(struct.unpack("<3f", struct.pack("<3f", *lows)))
-        highs = list(struct.unpack("<3f", struct.pack("<3f", *highs)))
+        lows = [0.0 if v == 0.0 else v
+                for v in struct.unpack("<3f", struct.pack("<3f", *lows))]
+        highs = [0.0 if v == 0.0 else v
+                 for v in struct.unpack("<3f", struct.pack("<3f", *highs))]
         accessors.append({"bufferView": pos_view, "componentType": 5126,
                           "count": len(positions), "type": "VEC3",
                           "min": lows, "max": highs})
@@ -1083,16 +1149,21 @@ def build_glb(tags_path):
             coloured[pair] = len(gltf_meshes) - 1
         w, x, y, z = item.quat
         norm = math.sqrt(w * w + x * x + y * y + z * z)
+        if not (norm > 1e-12) or not math.isfinite(norm):
+            raise ValueError(f"geom {item.name!r} has invalid quaternion")
         if item.kind == "box":
             size = list(item.size)
         elif item.kind == "cylinder":
             size = [item.size[0], item.size[0], item.size[1]]
         else:
             size = [1.0, 1.0, 1.0]
+        rot = [0.0 if c == 0.0 else c / norm for c in (x, y, z, w)]
+        pos = [0.0 if c == 0.0 else float(c) for c in item.pos]
+        scale_v = [0.0 if c == 0.0 else float(c) for c in size]
         nodes.append({"name": item.name, "mesh": coloured[pair],
-                      "translation": list(item.pos),
-                      "rotation": [x / norm, y / norm, z / norm, w / norm],
-                      "scale": size})
+                      "translation": pos,
+                      "rotation": rot,
+                      "scale": scale_v})
     while len(binary) % 4:
         binary.append(0)
     gltf = {
@@ -1106,7 +1177,9 @@ def build_glb(tags_path):
         "bufferViews": views,
         "buffers": [{"byteLength": len(binary)}],
     }
-    text = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+    text = json.dumps(
+        gltf, separators=(",", ":"), sort_keys=True, allow_nan=False
+    ).encode("utf-8")
     text += b" " * (-len(text) % 4)
     total = 12 + 8 + len(text) + 8 + len(binary)
     return (struct.pack("<4sII", b"glTF", 2, total) +
