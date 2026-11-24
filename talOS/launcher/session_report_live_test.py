@@ -4,9 +4,11 @@ import contextlib
 import io
 import json
 import os
+import select
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -119,20 +121,44 @@ class SessionReportLiveTest(unittest.TestCase):
             for arg in gateway_args:
                 args += ["--sim-gateway-arg", arg]
 
+            stall_max_ms = 0.0
+            stall_r, stall_w = os.pipe()
+
+            def measure_host_stalls():
+                nonlocal stall_max_ms
+                interval_s = 0.005
+                while True:
+                    t0_ns = time.clock_gettime_ns(node_clock)
+                    ready, _, _ = select.select([stall_r], [], [], interval_s)
+                    dt_ms = (time.clock_gettime_ns(node_clock) - t0_ns) / 1e6
+                    if ready:
+                        break
+                    overrun_ms = dt_ms - interval_s * 1000.0
+                    if overrun_ms > stall_max_ms:
+                        stall_max_ms = overrun_ms
+
+            stall_thread = threading.Thread(target=measure_host_stalls, daemon=True)
             with open(log, "wb") as out, \
                     sim_check.Launch(args, out, cwd=work, env=env) as run:
                 unready = sim_check.wait_ready(run, output, 15)
                 ended = run.process.poll()
                 if not unready and ended is None:
-                    pending = start_file + ".pending"
-                    with open(pending, "w", encoding="utf-8") as handle:
-                        handle.write(str(time.clock_gettime_ns(node_clock)))
-                    os.rename(pending, start_file)
+                    stall_thread.start()
                     try:
-                        ended = run.process.wait(timeout=0.65)
-                    except subprocess.TimeoutExpired:
-                        pass
+                        pending = start_file + ".pending"
+                        with open(pending, "w", encoding="utf-8") as handle:
+                            handle.write(str(time.clock_gettime_ns(node_clock)))
+                        os.rename(pending, start_file)
+                        try:
+                            ended = run.process.wait(timeout=0.65)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    finally:
+                        os.write(stall_w, b"x")
+                        stall_thread.join(timeout=5)
                 in_order, killed = run.finish(8, 3)
+            os.close(stall_r)
+            os.close(stall_w)
 
             with open(log, encoding="utf-8", errors="replace") as handle:
                 diagnostics = handle.read()
@@ -148,9 +174,17 @@ class SessionReportLiveTest(unittest.TestCase):
             session = sessions[0]
 
             result = self._run_session_report("--json", "--strict", session)
+            if result.returncode != 0:
+                sim_check.preserve_failure_artifacts(
+                    "session_report_live_test", log, output)
+            host_tag = (
+                f"[HOST_UNQUALIFIED] host scheduler stall {stall_max_ms:.1f} ms "
+                f"exceeded 10.0 ms during 5 ms cadence window\n"
+                if stall_max_ms > 10.0 else ""
+            )
             self.assertEqual(
                 result.returncode, 0,
-                f"session_report --strict failed:\n{result.stderr}\n"
+                f"{host_tag}session_report --strict failed:\n{result.stderr}\n"
                 f"{result.stdout}\n{diagnostics}")
             report = json.loads(result.stdout)
             verdicts = {v["measurement"]: v for v in report["verdicts"]}
