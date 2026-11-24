@@ -336,5 +336,68 @@ TEST(PipelineTest, SyntheticSourceHandlesIntMinTagIdWithoutUb) {
   EXPECT_EQ(result.detections.front().tag_id, 8);
 }
 
+TEST(PipelineTest, NullGpuBackendFactoryFallsBackOrRejectsWithoutCrash) {
+  const auto frame = TagFrame();
+  const auto null_factory =
+      [](const apriltag::DetectorOptions&) -> std::shared_ptr<ComputeBackend> {
+    return nullptr;
+  };
+
+  // Synchronous auto falls back to CPU instead of leaving backend_ null.
+  {
+    auto config = Config();
+    config.backend_name = "auto";
+    config.deferred_gpu_init = false;
+    config.gpu_backend_factory = null_factory;
+    AprilTagPipeline pipeline(config);
+    EXPECT_EQ(pipeline.backend_name(), "cpu");
+    const auto result = pipeline.ProcessFrame(frame);
+    ASSERT_TRUE(result.success) << result.error_message;
+    EXPECT_EQ(result.backend, "cpu");
+    ASSERT_EQ(result.detections.size(), 1u);
+    EXPECT_EQ(result.detections.front().tag_id, 0);
+  }
+
+  // Synchronous metal refuses unavailable GPU without dereferencing null.
+  {
+    auto config = Config();
+    config.backend_name = "metal";
+    config.deferred_gpu_init = false;
+    config.gpu_backend_factory = null_factory;
+    EXPECT_THROW(AprilTagPipeline{config}, std::invalid_argument);
+  }
+
+  // Deferred metal waits for the background worker and rejects unavailable GPU.
+  {
+    auto config = Config();
+    config.backend_name = "metal";
+    config.deferred_gpu_init = true;
+    config.gpu_backend_factory = null_factory;
+    EXPECT_THROW(AprilTagPipeline{config}, std::invalid_argument);
+  }
+
+  // Deferred auto stays on CPU after the background worker sees a null factory.
+  {
+    auto called = std::make_shared<std::promise<void>>();
+    std::future<void> called_future = called->get_future();
+    auto config = Config();
+    config.backend_name = "auto";
+    config.deferred_gpu_init = true;
+    config.gpu_backend_factory = [called](const apriltag::DetectorOptions&)
+        -> std::shared_ptr<ComputeBackend> {
+      called->set_value();
+      return nullptr;
+    };
+    AprilTagPipeline pipeline(config);
+    ASSERT_EQ(called_future.wait_for(std::chrono::seconds(10)),
+              std::future_status::ready);
+    const auto result = pipeline.ProcessFrame(frame);
+    ASSERT_TRUE(result.success) << result.error_message;
+    EXPECT_EQ(result.backend, "cpu");
+    ASSERT_EQ(result.detections.size(), 1u);
+    EXPECT_EQ(result.detections.front().tag_id, 0);
+  }
+}
+
 }  // namespace
 }  // namespace talos::vision

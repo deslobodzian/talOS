@@ -343,6 +343,185 @@ class SimGatewayStartup(unittest.TestCase):
                 self.assertAlmostEqual(
                     pigeon_vel_rps / drive_vel_rps, expected_ratio, places=5)
 
+    # REQ-DEV-05, REQ-DEV-10
+    def test_physics_reads_battery_chassis_and_mechanisms_from_config(self):
+        """[simulation.battery], [simulation.chassis], and
+        [[simulation.mechanisms]] in an overlay config drive sim_gateway
+        --physics end-to-end: State.health.battery_v reflects resting and
+        under-load sag, flywheel inertia limits spin-up well below legacy 50 ms
+        lag, and chassis mass/traction limits yaw rate with physical wheel
+        slip."""
+        wheel_radius_m = 0.0508
+        y_m = 0.30
+        nominal_v = 12.6
+        r_int_ohm = 0.03
+        base_current_a = 5.0
+        expected_resting_v = nominal_v - r_int_ohm * base_current_a
+        with tempfile.TemporaryDirectory() as tmp, socket.socket(
+                socket.AF_INET, socket.SOCK_DGRAM) as peer:
+            base = Path(tmp) / "robot.toml"
+            base.write_text(
+                '[robot]\nname = "sim_physics_models_test"\nperiod_us = 5000\n'
+                'command_timeout_us = 100000\n'
+                'controller_address = "127.0.0.1"\n'
+                '[subsystems.sim.motors]\n'
+                'flywheel = { can_id = 1, stator_limit_a = 40.0, '
+                'supply_limit_a = 40.0 }\n'
+                'left_drive = { can_id = 2, sensor_to_mechanism_ratio = 6.0, '
+                'stator_limit_a = 80.0, supply_limit_a = 60.0 }\n'
+                'left_steer = { can_id = 3 }\n'
+                'right_drive = { can_id = 4, sensor_to_mechanism_ratio = 6.0, '
+                'stator_limit_a = 80.0, supply_limit_a = 60.0 }\n'
+                'right_steer = { can_id = 5 }\n'
+                '[subsystems.sim.sensors.imu]\n'
+                'type = "Pigeon2"\ncan_id = 6\n',
+                encoding="utf-8")
+            overlay = Path(tmp) / "robot_sim.toml"
+            overlay.write_text(
+                'include = "robot.toml"\n'
+                '[simulation]\n'
+                f'wheel_radius_m = {wheel_radius_m}\n'
+                '[simulation.battery]\n'
+                f'nominal_voltage_v = {nominal_v}\n'
+                f'internal_resistance_ohm = {r_int_ohm}\n'
+                f'base_current_a = {base_current_a}\n'
+                'brownout_voltage_v = 6.75\n'
+                '[simulation.chassis]\n'
+                'mass_kg = 60.0\n'
+                'moment_of_inertia_kg_m2 = 6.0\n'
+                'traction_coefficient = 0.3\n'
+                '[[simulation.swerve_modules]]\n'
+                'drive = "left_drive"\nsteer = "left_steer"\n'
+                f'x_m = 0.0\ny_m = {y_m}\n'
+                '[[simulation.swerve_modules]]\n'
+                'drive = "right_drive"\nsteer = "right_steer"\n'
+                f'x_m = 0.0\ny_m = {-y_m}\n'
+                '[[simulation.mechanisms]]\n'
+                'motor = "flywheel"\n'
+                'inertia_kg_m2 = 0.05\n'
+                'load = "flywheel"\n'
+                'viscous_damping_nm_per_radps = 0.001\n',
+                encoding="utf-8")
+            peer.bind(("127.0.0.1", 0))
+            peer.settimeout(0.1)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
+                reserve.bind(("127.0.0.1", 0))
+                gateway_port = reserve.getsockname()[1]
+            with subprocess.Popen(
+                    [str(binary()), "--config", str(overlay), "--physics",
+                     "--port", str(gateway_port),
+                     "--remote-port", str(peer.getsockname()[1]),
+                     "--duration-s", "0.5"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True) as proc:
+                cmd_seq = 0
+                resting_v = None
+                min_battery_v = None
+                first_cmd_sample_us = None
+                final_sample = None
+                try:
+                    for _ in range(150):
+                        try:
+                            packet = peer.recv(4096)
+                        except socket.timeout:
+                            if proc.poll() is not None:
+                                break
+                            continue
+                        if struct.unpack_from("<H", packet, 12)[0] != 20:
+                            continue
+                        (config_id, boot_id, epoch, sample_time_us,
+                         last_cmd_seq) = struct.unpack_from(
+                             "<QQQQQ", packet, 40)
+                        motors, sensors = struct.unpack_from(
+                            "<HH", packet, 40 + 70)
+                        self.assertEqual((motors, sensors), (5, 1))
+                        # Motor order is alphabetical: flywheel(0),
+                        # left_drive(1), left_steer(2), right_drive(3),
+                        # right_steer(4).
+                        motor_ids = []
+                        motor_vels = []
+                        for i in range(motors):
+                            m_off = 40 + 84 + 45 * i
+                            m_id, _, _, vel_rps = struct.unpack_from(
+                                "<HBdd", packet, m_off)
+                            motor_ids.append(m_id)
+                            motor_vels.append(vel_rps)
+                        s_off = 40 + 84 + 45 * motors
+                        _, _, _, pigeon_vel_rps = struct.unpack_from(
+                            "<HBdd", packet, s_off)
+                        health_off = s_off + 27 * sensors
+                        health_valid, battery_v, _ = struct.unpack_from(
+                            "<?d?", packet, health_off)
+                        self.assertTrue(health_valid)
+                        if last_cmd_seq == 0 and resting_v is None:
+                            resting_v = battery_v
+                        if last_cmd_seq > 0:
+                            if first_cmd_sample_us is None:
+                                first_cmd_sample_us = sample_time_us
+                            if min_battery_v is None or battery_v < min_battery_v:
+                                min_battery_v = battery_v
+                            driven_s = (sample_time_us - first_cmd_sample_us) * 1e-6
+                            if driven_s >= 0.15:
+                                final_sample = (
+                                    driven_s, motor_vels[0], motor_vels[3],
+                                    pigeon_vel_rps)
+                                break
+                        # Drive flywheel at +1.0 duty and rotate chassis CCW
+                        # (left_drive = -1.0, right_drive = +1.0, steer = 0).
+                        demands = [
+                            (motor_ids[0], 1, 1.0),
+                            (motor_ids[1], 1, -1.0),
+                            (motor_ids[2], 0, 0.0),
+                            (motor_ids[3], 1, 1.0),
+                            (motor_ids[4], 0, 0.0),
+                        ]
+                        cmd_seq += 1
+                        payload = bytearray(struct.pack(
+                            "<QQQQHHH", config_id, boot_id, epoch,
+                            sample_time_us, len(demands), 0, 0))
+                        for motor_id, mode, demand in demands:
+                            payload += struct.pack(
+                                "<HBBdd", motor_id, mode, 0, demand, 0.0)
+                        frame = (
+                            packet[:12]
+                            + struct.pack("<HHQQII", 21, 0, cmd_seq,
+                                          sample_time_us, len(payload), 0)
+                            + payload
+                        )
+                        peer.sendto(frame, ("127.0.0.1", gateway_port))
+                    stdout, stderr = proc.communicate(timeout=5)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.communicate()
+                self.assertEqual(proc.returncode, 0, stdout + stderr)
+                self.assertIsNotNone(resting_v)
+                self.assertAlmostEqual(resting_v, expected_resting_v, places=5)
+                self.assertIsNotNone(min_battery_v)
+                self.assertLess(
+                    min_battery_v, expected_resting_v - 0.3,
+                    f"expected battery sag under load below {expected_resting_v - 0.3:.2f} V, got {min_battery_v:.3f} V")
+                self.assertIsNotNone(
+                    final_sample, "gateway did not reach 0.15 s of driven ticks")
+                driven_s, flywheel_vel_rps, drive_vel_rps, pigeon_vel_rps = final_sample
+                # Flywheel spin-up is current-limited by J = 0.05 kg*m^2 and
+                # 40 A stator limit (~2.47 rps/s), orders of magnitude slower
+                # than legacy 50 ms first-order lag (> 40 rps/s).
+                self.assertGreater(flywheel_vel_rps, 0.15)
+                self.assertLess(flywheel_vel_rps / driven_s, 4.0)
+                # Chassis mass/MOI/traction limits yaw rate and causes physical
+                # wheel slip (pigeon yaw rate well below rigid kinematic ratio
+                # drive_vel_rps * wheel_radius_m / y_m).
+                self.assertGreater(drive_vel_rps, 5.0)
+                self.assertGreater(pigeon_vel_rps, 0.05)
+                kinematic_yaw_rps = drive_vel_rps * (wheel_radius_m / y_m)
+                self.assertLess(
+                    pigeon_vel_rps, 0.5 * kinematic_yaw_rps,
+                    f"expected traction-limited wheel slip: pigeon={pigeon_vel_rps:.3f} rps vs kinematic={kinematic_yaw_rps:.3f} rps")
+                # Theoretical traction-limited angular acceleration ceiling is
+                # (2 * mu * m * g / 2 * y_m / MOI) / (2*pi) ~= 1.405 rps/s.
+                self.assertLess(pigeon_vel_rps / driven_s, 1.8)
+
     # REQ-DEV-05, REQ-DEV-31
     def test_pause_realigns_ticks_on_node_clock_without_catchup_burst(self):
         """After a host pause (SIGSTOP/SIGCONT), sim_gateway drops missed
