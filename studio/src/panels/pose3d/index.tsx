@@ -9,11 +9,11 @@ import {useEffect, useRef, useState} from 'react';
 import {Canvas, useThree} from '@react-three/fiber';
 import * as THREE from 'three';
 import {OrbitControls} from 'three/examples/jsm/controls/OrbitControls.js';
-import {GLTFLoader} from 'three/examples/jsm/loaders/GLTFLoader.js';
 
 import {useChassis} from '../../data/hooks';
 import {FIELD_HEIGHT_M, FIELD_WIDTH_M} from '../field/geometry';
 import type {PanelDefinition} from '../types';
+import {loadFieldModel} from './field_model';
 import './pose3d.css';
 
 export type Pose3dConfig = Record<string, never>;
@@ -124,14 +124,12 @@ function Pose3dPanel() {
               if (!f) return;
               const request = ++requestRef.current;
               try {
-                const gltf =
-                    await new GLTFLoader().parseAsync(await f.arrayBuffer(), '');
+                const scene = await loadFieldModel(await f.arrayBuffer());
                 if (!mountedRef.current || request !== requestRef.current) {
-                  disposeModel(gltf.scene);
+                  disposeModel(scene);
                   return;
                 }
-                gltf.scene.rotation.x = Math.PI / 2;
-                setModel(gltf.scene);
+                setModel(scene);
                 setError('');
               } catch {
                 if (mountedRef.current && request === requestRef.current)
