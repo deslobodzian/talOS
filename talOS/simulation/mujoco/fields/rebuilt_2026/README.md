@@ -1,0 +1,198 @@
+# 2026 field (REBUILT) for MuJoCo
+
+`:rebuilt_2026_xml` writes `rebuilt_2026.xml`, a MuJoCo model (MJCF) of the
+2026 FRC field: perimeter, both HUBs, four BUMPs, four TRENCHes, both
+TOWERs, both DEPOTs, both OUTPOSTs, the 32 AprilTag panels and all 504 FUEL
+(REQ-DEV-38). `generate_field.py` (stdlib only) builds it at build time from
+the dimension table at its top and the official tag poses
+(`//talOS/vision/testdata:2026-rebuilt-welded.json`); nothing generated is
+checked in. Packages under `//talOS/simulation` take the file as `data`
+through `:rebuilt_2026`.
+
+```sh
+bazel build //talOS/simulation/mujoco/fields/rebuilt_2026:rebuilt_2026_xml
+bazel test //talOS/simulation/mujoco/fields/rebuilt_2026:field_test
+```
+
+Every field structure is a static geom of the world body; the 504 fuel are
+the only moving bodies. Of the model's `<option>`, the CG solver, the 5 ms
+step, 20 iterations and sleeping off are settings measured on 2026 field
+scenes for step cost (REQ-DEV-37); the elliptic cone, `implicitfast`, the
+1e-8 tolerance and every contact value below are chosen, not measured.
+`<size memory="64M"/>`.
+
+## Frame
+
+The WPILib field frame, which is the drawings' frame: origin at the blue
+alliance wall on the scoring-table side, +x toward the red wall, +y away from
+the scoring table, z up, metres. The field is 651.22 x 317.69 in
+(16.541 x 8.069 m); its centre, site `field_centre`, is (8.2705, 4.0347) m.
+The red half is the blue half rotated 180 degrees about that centre: the
+generator builds each red geom and site from its blue one and holds no red
+dimension. Each alliance's elements are named by its own OUTPOST and DEPOT
+sides (blue's outpost is on the scoring-table side, red's on the far side),
+which the rotation keeps true.
+
+## Collision contract
+
+MuJoCo collides two geoms when `(contype1 & conaffinity2) ||
+(contype2 & conaffinity1)`. A robot model added to this field follows the
+robot row.
+
+| What | contype | conaffinity |
+|---|---|---|
+| field structure (walls, hub, bump, trench, tower, depot bars, outpost, chute door) | 1 | 0 |
+| fuel | 2 | 15 |
+| robot geoms (not in this model) | 4 | 21 |
+| `carpet_fuel` (plane, condim 6, rolling friction 0.01 m) | 8 | 0 |
+| `carpet_robot` (plane, condim 3, group 3) | 16 | 0 |
+| visual only (`tag_*`) | 0 | 0 |
+
+Fuel: sphere of radius 2.955 in (0.07506 m), 0.215 kg, sliding friction 0.7,
+`solref="0.02 1"`, `solimp="0.9 0.95 0.001"`. Carpet friction 0.8.
+Structure friction: HDPE (bumps, hub exit floors, chute floor and door) 0.6;
+polycarbonate, aluminium and steel 0.4.
+
+Structure geoms carry `solmix="1000"`, so their `solref` (below) governs
+every contact with the structure, a robot geom's included: against the
+field, a robot geom's own `solref` and `solimp` are ignored unless it sets
+`priority`. A robot geom against `carpet_robot` mixes equally with the
+carpet's default contact parameters. Friction and condim take the larger of
+the two geoms' values, as MuJoCo does by default.
+
+## Robustness rule
+
+MuJoCo has no continuous collision detection, and a ball at 10 m/s moves
+5 cm in one 5 ms step. So:
+
+- structure contacts are as stiff as the step allows: `solref` is twice the
+  timestep (`0.01 1`, computed from the timestep by the generator), the
+  shortest time constant MuJoCo keeps stable, and governs a contact with
+  fuel through `solmix`. A 10 m/s ball's centre then stops in front of the
+  surface it hits, whatever the phase of its first contact; fuel's own,
+  softer contact lets it cross a wall's plane;
+- every static collision geom has material behind the surface a ball
+  touches wherever nothing else is there: guardrails 0.2 m and alliance
+  walls 0.25 m outward, the net 0.2 m away from the hub, funnel panels
+  0.05 m (normal to the panel) and roof panels 0.07 m (vertical) away from
+  the side a ball touches, the hub's lower walls 0.06 m inward, floor-level
+  parts 0.1 m into the carpet. Around
+  the outpost's openings the wall is 0.05 m thick, because the chute and
+  corral are behind it.
+
+`field_test`'s `FastFuelDoesNotTunnel` checks the first point at 10 m/s.
+
+## Names
+
+| Name | What |
+|---|---|
+| `fuel_000` ... `fuel_503` | fuel bodies, each with free joint `fuel_NNN_joint` and sphere geom `fuel_NNN_geom` |
+| `carpet_fuel`, `carpet_robot` | the two coincident carpet planes |
+| `guardrail_table`, `guardrail_far` | guardrails along y = 0 and y = 8.069 m |
+| `blue_wall_*` | alliance wall segments: `stations_outpost`, `tower`, `stations_depot`, `outpost_guardrail`, `outpost_depot`, `corral_sill`, `outpost_middle`, `chute_jamb_guardrail`, `chute_jamb_depot`, `outpost_top` |
+| `blue_hub_*` | `wall_alliance`, `wall_outpost`, `wall_depot`, `wall_neutral` (above the exits), `pocket_back`, `pocket_roof`, `pocket_floor`, `pocket_divider_0..2`, `roof_0..5`, `funnel_0..5`, `net` |
+| `blue_bump_outpost`, `blue_bump_depot` | bumps, on the hub's outpost and depot sides |
+| `blue_trench_outpost_*`, `blue_trench_depot_*` | `block`, `arm`, `post`, `panel` |
+| `blue_tower_*` | `base`, `upright_outpost`, `upright_depot`, `arm_outpost`, `arm_depot`, `rung_low`, `rung_mid`, `rung_high` |
+| `blue_depot_bar_*` | `field`, `outpost` (the side bar toward the outpost), `guardrail` |
+| `blue_outpost_*` | `chute_floor`, `chute_side_guardrail`, `chute_side_depot`, `chute_back`, `corral_side_guardrail`, `corral_side_depot`, `corral_back`, `corral_pipe` |
+| `blue_chute_door` | closes the chute opening; a referee opens it by clearing its contype |
+| `tag_01` ... `tag_32`, `tag_NN_code` | visual tag panels at the official poses |
+
+Every `blue_` geom and site has a `red_` twin. Sites (group 4, for a
+referee):
+
+| Site | Where |
+|---|---|
+| `blue_hub_score` | cylinder on the throat's axis: radius the throat's inscribed radius (11.66 in), half-height one ball radius, centred one ball radius below the throat plane |
+| `blue_hub_exit_0..3` | release points, one in each exit pocket (blue's in order of increasing y): a fuel's centre resting on the pocket's floor, the site's +x axis horizontal and out of the hub |
+| `blue_tower` | the centre of the tower's base plate, on the carpet |
+| `field_centre` | the field centre, on the carpet |
+
+The field model alone keeps what a hub scores: the lower box is a closed
+bin whose floor is the fuel carpet. It holds scored fuel only until it
+fills; the model does not define what a full hub does, so a simulator that
+scores fuel takes it out of the bin. Returning fuel to the field is a
+release at an exit, and a release follows this contract:
+
+- the pocket is empty: no fuel centre is within one ball diameter of the
+  `*_hub_exit_N` site;
+- the fuel's centre is placed at the site, with 3 to 5 m/s within 20
+  degrees of the site's +x axis in the horizontal plane, varied from
+  release to release (the manual's hubs distribute fuel at random);
+- a fuel left at rest in a pocket rolls out by itself, which keeps a pocket
+  from holding fuel; it is not a way to return fuel at a rate.
+
+`ContractReleasesClearTheirExit` holds one exit to this contract.
+
+Fuel index ranges, also `<custom><numeric>` entries
+`fuel_<range>_first` and `fuel_<range>_count`:
+
+| Range | Indices | Staged |
+|---|---|---|
+| `neutral` | 000-359 | 12 along x by 30 along y, centred on the field centre, ball edges at +-35.95 in in x and +-90.95 in in y |
+| `blue_depot` | 360-383 | 4 along x by 6 along y in the depot |
+| `red_depot` | 384-407 | rotated from blue |
+| `blue_chute` | 408-431 | rows of five up the chute floor, behind the door (the last row four) |
+| `red_chute` | 432-455 | rotated from blue |
+| `reserve` | 456-503 | a robot's preloads: parked on the carpet outside the field at y = -2.0 m, x = 1.0 m + 0.2 m per ball |
+
+Staged fuel starts clear of the carpet by 0.5 mm, with no two balls
+touching.
+
+## Elements
+
+Blue side; inches, as the sources give them. GM is the 2026 Game Manual
+(TU22); DWG the field dimension drawings FE-2026 rev B; GS the game-specific
+field drawings (PDF page). QUOTED is a printed number or a sum of printed
+numbers; ESTIMATED is chosen or scaled, with the reason.
+
+| Element | Dimension | in | Tag | Source or reason |
+|---|---|---|---|---|
+| field | length x width | 651.22 x 317.69 | QUOTED | DWG s3 |
+| guardrail | height | 20.0 | QUOTED | GM 5.2 |
+| alliance wall | height (36.8 plate + 42 plastic); at the tower and the outpost | 78.8; 78.25 | QUOTED | GM 5.9.1; GM 5.8, GS p164 |
+| hub | centre x, y | 182.11, 158.84 | QUOTED | DWG s3 |
+| hub | lower box footprint | 47.00 square | QUOTED | GM 5.4, GS p89 |
+| hub | lower box top | 49.75 | QUOTED | GS p89 |
+| hub | rim height; rim hexagon flat to flat (flats facing +-y) | 72.00; 41.73 | QUOTED | GM 5.4, DWG s4 |
+| hub | throat flat to flat | 23.32 | QUOTED | GS p111 |
+| hub | funnel panel slant; throat height 72.00 - 15.35 | 17.90; 56.65 | QUOTED | GS p133 |
+| hub | roof: from the box edge at 49.75 up to the throat, in six pieces | - | ESTIMATED | GS p89 shows a roof of about 5 degrees under the funnel; a hip roof to the throat keeps every piece convex |
+| hub | lower wall thickness | 2.36 | ESTIMATED | 0.06 m, the robustness rule inside a 47 in box |
+| hub | interior below the throat: a closed bin, the fuel carpet its floor | - | ESTIMATED | the interior between the scoring site and the exits is not modelled: no source dimensions it |
+| hub | exits: four pockets in the base of the neutral face, 8.9 high, 7.0 deep, in four lanes 9.82 wide between three 1.0 dividers at y offsets 0 and +-10.82; each closed against the bin by a back wall and a roof, its floor falling 15 degrees down and outward to the carpet at the face | 8.9; 7.0; 9.82; 1.0; 15 degrees | ESTIMATED | GM 5.4 puts four exits at the base of the neutral-zone face; GS p100 and p132 give lower panels 30.00 and 38.88 tall with no ball openings, which fits an opening of 38.88 - 30.00 = 8.9 below a 30.00 panel (the drawings' "30.13" is a tag offset). A pocket holds one fuel with 1.09 to spare, and a 5.91 ball on the 15 degree floor clears the 8.9 roof; the slope rolls a fuel left in the pocket out by itself |
+| hub | net: 58.41 wide, 65.6 to 120.36 high, 10.26 beyond the neutral-zone face | 58.41; 65.6; 120.36; 10.26 | QUOTED (bottom ESTIMATED) | GS p89; on the neutral-zone side: GM 5.4 puts the net at the back of the hub, against fuel launched from areas where shooting is not allowed, and the rim's front edge faces the alliance |
+| bump | depth (x) x length (y), centred on the hub's x, 23.5 to 96.5 from the centre line | 44.40 x 73.00 | QUOTED | GM 5.5, DWG s4 chain |
+| bump | lip at each long edge; apex | 0.61; 6.513 | QUOTED | GS p27 |
+| trench | block: 12.00 (y) x 47.00 (x), 96.5 to 108.5 from the centre line | - | QUOTED | GS p43, DWG s4 |
+| trench | block height | 26.25 | ESTIMATED | GS p43 section, to the arm's top |
+| trench | arm: bottom 22.25, 6.00 along x, from the block to the guardrail | - | QUOTED | GM 5.6, GS p45. The field's pivoting arm (the trench away from the scoring table) is 4.00 along x (GS p43); every arm here is 6.00 so red stays blue rotated |
+| trench | arm thickness | 4.00 | ESTIMATED | GS p43 |
+| trench | opening, block to guardrail | 50.34 (outpost side), 50.35 (depot side) | QUOTED | DWG s4, s8 |
+| trench | tag panel: 12.0 (y) x 2.8 (x), arm top to 40.25, centred on the opening | - | ESTIMATED (top QUOTED) | tags 17 and 28 are 2.95 apart in x |
+| trench | post at the guardrail: 6.0 (x) x 2.0 (y), carpet to the arm, behind the guardrail's plane | - | ESTIMATED | footprint not drawn; behind the rail so the opening stays 50.35 |
+| tower | centre y; width of the tower and its wall plate | 147.47; 49.25 | ESTIMATED; QUOTED | the centred tag 31 (GM 5.11), DWG s3 (11.38); GM 5.8 |
+| tower | uprights: 1.50 (y) x 3.51 (x) x 72.1, x 40.00 to 43.51, 32.25 apart face to face | - | QUOTED | GM 5.8, GS p164 |
+| tower | rungs: 1.66 OD, 47.0 long along y, centre x 41.755, centres 27, 45, 63 high | - | QUOTED | GM 5.8, GS p164 |
+| tower | support arms, upright to wall, 35.125 to 43.375 high | - | ESTIMATED (heights QUOTED) | GS p164; one plate each stands in for the drawn bar and gusset |
+| tower | base plate 39.0 (y) x 45.18 (x) x 0.25 | 39.0 x 45.18; 0.25 | QUOTED; ESTIMATED | GM 5.8; edges 0.2 to 0.3 |
+| depot | centre y | 234.85 | QUOTED | DWG s3, 317.69 - 82.84 |
+| depot | U of bars 3.0 wide and 1.125 tall, 42 (y) x 27 (x), open toward the wall | - | QUOTED | GM 5.7, GS p183 |
+| outpost | openings centred on y | 26.22 | ESTIMATED | tag 29 |
+| outpost | width along the wall | 49.84 | QUOTED | DWG s3 |
+| outpost | chute opening 31.8 x 7.0, bottom 28.13 | - | QUOTED | GM 5.9.2, GS p2 |
+| outpost | chute floor rising 15 degrees away from the field | 15 degrees | QUOTED | GM 5.9.2 |
+| outpost | chute floor length along its slope; side walls above its high end | 36.0; 12.0 | ESTIMATED | holds 24 fuel in one layer |
+| outpost | corral opening 32.0 x 7.0, bottom 1.88, split by a 1.66 OD pipe | - | QUOTED | GM 5.9.2, GS p2 |
+| outpost | corral 35.8 (y) x 37.6 (x), walls 8.13 high | - | QUOTED | GM 5.9.2 |
+| fuel | diameter 5.91; mass 0.203 to 0.227 kg (0.215 used) | - | QUOTED | GM 5.10.1 |
+| AprilTag | panel 10.5 square, printed tag 8.125, at the WPILib welded poses | - | QUOTED | GM 5.11 |
+
+Not modelled: hub lights and electronics, the trench's electronics and pivot,
+guardrail gates (closed in a match), driver-station shelves and sponsor
+panels, the outpost's structure other than its chute and corral, field
+tape, human players, and the hub's interior between its scoring site and its
+exits (not dimensioned in any source; the field model keeps scored fuel in
+the bin, and fuel returns to the field by a release at an exit), its fuel
+counter and its exit randomness.
