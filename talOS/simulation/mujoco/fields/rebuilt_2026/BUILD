@@ -1,3 +1,4 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_python//python:defs.bzl", "py_binary")
 
@@ -45,6 +46,42 @@ cc_test(
         "@googletest//:gtest_main",
         "@mujoco",
         "@nlohmann_json//:json",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+# The 2026 game's rules on this model (README.md "Rules"; REQ-DEV-40), the
+# GameRules a simulator's field table names.
+cc_library(
+    name = "rules",
+    srcs = ["rules.cc"],
+    hdrs = ["rules.h"],
+    visibility = ["//talOS/simulation/mujoco:__subpackages__"],
+    deps = [
+        "//talOS/simulation/mujoco:game",
+        "@mujoco",
+    ],
+)
+
+# REQ-DEV-40 on the generated field through MujocoPlant: scoring once,
+# parking and release from an empty pocket, the shift order, the grace edge,
+# preloads, the match report and Driver Station stamp, the seeded stream,
+# bit-identical runs and no allocation.
+cc_test(
+    name = "rules_test",
+    size = "small",
+    srcs = ["rules_test.cc"],
+    data = [":rebuilt_2026.xml"],
+    env = {"FIELD_XML": "$(rlocationpath :rebuilt_2026.xml)"},
+    deps = [
+        ":rules",
+        "//talOS/hardware:sim_messages",
+        "//talOS/node:allocation_probe",
+        "//talOS/simulation/mujoco:game",
+        "//talOS/simulation/mujoco:plant",
+        "//talOS/simulation/mujoco:world_rules",
+        "@googletest//:gtest_main",
+        "@mujoco",
         "@rules_cc//cc/runfiles",
     ],
 )
