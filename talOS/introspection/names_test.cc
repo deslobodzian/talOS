@@ -1066,6 +1066,76 @@ TEST(LintGraph, AlertFieldsAreBoolsOfAKnownLevelInAStatusTopic) {
     ASSERT_NE(err, nullptr) << Describe(diagnostics);
     EXPECT_TRUE(Names(err->message, "shooter")) << err->message;
   }
+  {
+    // REQ-CONTRACT-09, REQ-OPS-17: target lanes wrap their payload struct in
+    // talos.TargetEnvelope<M> while carrying M's bfbs. AlertPrefixedFields
+    // unwraps the envelope so valid target lanes pass, illegal alerts inside
+    // target payloads are caught, and malformed/missing inner structs fail
+    // closed.
+    const schema::Identity plain_target =
+        schema::Envelope(schema::Of<schema_test::Mixed>());
+    {
+      SCOPED_TRACE("valid target lane with TargetEnvelope passes");
+      const std::vector<NodeShape> nodes = {
+          {"driver",
+           "//robot/driver:node",
+           {with(Sender("/shooter/target/teleop"), plain_target)}},
+          {"shooter",
+           "//robot/shooter:node",
+           {with(Watcher("/shooter/target/teleop"), plain_target)}},
+      };
+      const auto diagnostics = LintGraph(nodes, {{"shooter", {"teleop"}}});
+      EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
+    }
+    {
+      SCOPED_TRACE("alert fields inside TargetEnvelope payload are rejected");
+      const schema::Identity alert_target = schema::Envelope(good);
+      const std::vector<NodeShape> nodes = {
+          {"driver",
+           "//robot/driver:node",
+           {with(Sender("/shooter/target/teleop"), alert_target)}},
+          {"shooter",
+           "//robot/shooter:node",
+           {with(Watcher("/shooter/target/teleop"), alert_target)}},
+      };
+      const auto diagnostics = LintGraph(nodes, {{"shooter", {"teleop"}}});
+      const auto findings =
+          alert_findings(diagnostics, "/shooter/target/teleop");
+      ASSERT_EQ(findings.size(), 3u) << Describe(diagnostics);
+      for (const auto* field :
+           {"alert_error_link_lost", "alert_warning_hot", "alert_info_homed"}) {
+        const auto it = std::find_if(
+            findings.begin(), findings.end(), [field](const Diagnostic& d) {
+              return d.message.find(field) != std::string::npos;
+            });
+        ASSERT_NE(it, findings.end()) << field << Describe(findings);
+        EXPECT_EQ(it->severity, Severity::ERROR) << field;
+      }
+    }
+    for (const auto* bad_envelope :
+         {"talos.TargetEnvelope<schema_test.DoesNotExist>",
+          "talos.TargetEnvelope<>"}) {
+      SCOPED_TRACE(std::string{"malformed envelope fails closed: "} +
+                   bad_envelope);
+      SourceShape bad_sender = Sender("/shooter/target/teleop");
+      bad_sender.schema = bad_envelope;
+      bad_sender.schema_hash = plain_target.hash;
+      bad_sender.bfbs = plain_target.bfbs;
+      SourceShape bad_watcher = Watcher("/shooter/target/teleop");
+      bad_watcher.schema = bad_envelope;
+      bad_watcher.schema_hash = plain_target.hash;
+      bad_watcher.bfbs = plain_target.bfbs;
+      const std::vector<NodeShape> nodes = {
+          {"driver", "//robot/driver:node", {bad_sender}},
+          {"shooter", "//robot/shooter:node", {bad_watcher}},
+      };
+      const auto diagnostics = LintGraph(nodes, {{"shooter", {"teleop"}}});
+      const auto* err =
+          Find(diagnostics, Severity::ERROR, "/shooter/target/teleop");
+      ASSERT_NE(err, nullptr) << Describe(diagnostics);
+      EXPECT_TRUE(Names(err->message, "driver")) << err->message;
+    }
+  }
 }
 
 TEST(LintGraph, ErrorsSortAheadOfWarnings) {

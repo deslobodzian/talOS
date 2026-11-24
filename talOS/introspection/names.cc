@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "flatbuffers/reflection.h"
+#include "talOS/schema/identity.h"
 #include "talOS/schema/verify.h"
 
 namespace talos::introspect::naming::detail {
@@ -81,9 +82,10 @@ class AlertFieldWalk {
 AlertFieldsResult AlertPrefixedFields(std::string_view bfbs,
                                       std::string_view root) {
   AlertFieldsResult result;
-  // Uses header-only //talOS/schema:verify rather than :field_path: this
-  // library is part of libtalos_node.so, and a compiled library in that
-  // closure is left out of every talos_cc_shared_node's own link.
+  // Uses header-only //talOS/schema:verify and :identity rather than
+  // :field_path: this library is part of libtalos_node.so, and a compiled
+  // library in that closure is left out of every talos_cc_shared_node's own
+  // link.
   const reflection::Schema* schema = schema::VerifySchema(bfbs);
   if (schema == nullptr || schema->objects() == nullptr) {
     result.error = "reflection schema (bfbs) failed verification";
@@ -93,17 +95,23 @@ AlertFieldsResult AlertPrefixedFields(std::string_view bfbs,
     result.error = "reflection schema (bfbs) has no root struct name";
     return result;
   }
+  // Target lanes declare schema "talos.TargetEnvelope<M>" while their bfbs
+  // describes the inner payload struct M. Unwrap non-empty envelopes so valid
+  // target lanes pass and alert fields inside target payloads are checked;
+  // malformed "talos.TargetEnvelope<>" leaves lookup as root and fails closed.
+  const std::string_view inner = schema::EnvelopeInner(root);
+  const std::string_view lookup = inner.empty() ? root : inner;
   const auto* objects = schema->objects();
   for (flatbuffers::uoffset_t i = 0; i < objects->size(); ++i) {
     const auto* obj = objects->Get(i);
     if (obj != nullptr && obj->name() != nullptr &&
-        obj->name()->string_view() == root) {
+        obj->name()->string_view() == lookup) {
       AlertFieldWalk{*schema, result.fields}.Struct(i);
       return result;
     }
   }
   result.error = "reflection schema (bfbs) does not contain struct '" +
-                 std::string{root} + "'";
+                 std::string{lookup} + "'";
   return result;
 }
 
