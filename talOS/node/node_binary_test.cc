@@ -30,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "node_test/node_test_message_generated.h"
@@ -108,8 +109,108 @@ std::string ConfigFlag() {
   return "--config '" + Runfile("TALOS_TEST_CONFIG") + "'";
 }
 
+std::string TempFile(const std::string& name) {
+  const char* tmp = std::getenv("TEST_TMPDIR");
+  return std::string{tmp != nullptr ? tmp : "/tmp"} + "/" + name;
+}
+
+// Waits up to `timeout` for `child`'s live registry row to appear in
+// `registry_path` (either kRegistryPath or a pre-namespaced ShmObjectName).
+// Sets `exited` and `status` if the child terminates first.
+std::optional<introspect::NodeSnapshot> WaitForLiveRegistryRow(
+    pid_t child, std::string_view registry_path, std::chrono::seconds timeout,
+    bool& exited, int& status) {
+  const auto lookup =
+      [child, registry_path]() -> std::optional<introspect::NodeSnapshot> {
+    const auto reader = introspect::RegistryReader::open(registry_path);
+    if (!reader) return std::nullopt;
+    for (const auto& node : reader->nodes()) {
+      if (node.pid == static_cast<std::uint64_t>(child) && node.alive) {
+        return node;
+      }
+    }
+    return std::nullopt;
+  };
+  auto live = lookup();
+  const auto give_up = std::chrono::steady_clock::now() + timeout;
+  while (!live && std::chrono::steady_clock::now() < give_up) {
+    if (::waitpid(child, &status, WNOHANG) == child) {
+      exited = true;
+      break;
+    }
+    std::this_thread::sleep_for(1ms);  // paces the poll; the row is the event
+    live = lookup();
+  }
+  return live;
+}
+
+// Compares a node's --describe endpoints against its live registry row using
+// the same multiset key as talos::launcher::EndpointMismatch (talOS/node
+// cannot depend on talOS/launcher per RULES.md 5). Returns empty on match.
+std::string DescribeLiveEndpointMismatch(
+    const std::vector<introspect::naming::SourceShape>& declared,
+    const std::vector<introspect::SourceSnapshot>& live) {
+  using Key =
+      std::tuple<std::string, int, std::uint32_t, std::uint32_t, std::uint32_t>;
+  constexpr std::uint32_t kComparedFlags =
+      introspect::naming::kSourceFlagExternal |
+      introspect::naming::kSourceFlagOptional |
+      introspect::naming::kSourceFlagObserver |
+      introspect::naming::kSourceFlagHardwareRequest |
+      introspect::naming::kSourceFlagUntargetedOutputs |
+      introspect::naming::kSourceFlagOperatorArming |
+      introspect::naming::kSourceFlagInternalDriverStation |
+      introspect::naming::kSourceFlagLatestOnly;
+  std::vector<Key> described_keys;
+  for (const auto& source : declared) {
+    if (source.kind == event::SourceKind::TIMER) continue;
+    described_keys.emplace_back(source.name, static_cast<int>(source.kind),
+                                source.message_bytes, source.alignment,
+                                source.flags & kComparedFlags);
+  }
+  std::vector<Key> live_keys;
+  for (const auto& source : live) {
+    if (source.kind == event::SourceKind::TIMER) continue;
+    live_keys.emplace_back(source.name, static_cast<int>(source.kind),
+                           source.message_bytes, source.alignment,
+                           source.flags & kComparedFlags);
+  }
+  std::sort(described_keys.begin(), described_keys.end());
+  std::sort(live_keys.begin(), live_keys.end());
+  std::vector<Key> live_only;
+  std::vector<Key> described_only;
+  std::set_difference(live_keys.begin(), live_keys.end(),
+                      described_keys.begin(), described_keys.end(),
+                      std::back_inserter(live_only));
+  std::set_difference(described_keys.begin(), described_keys.end(),
+                      live_keys.begin(), live_keys.end(),
+                      std::back_inserter(described_only));
+  const auto format = [](const std::vector<Key>& keys) {
+    std::string out;
+    for (const auto& [name, kind, bytes, alignment, flags] : keys) {
+      if (!out.empty()) out += ", ";
+      out += event::to_string(static_cast<event::SourceKind>(kind));
+      out += " " + name + " (" + std::to_string(bytes) + " B, align " +
+             std::to_string(alignment) + ", flags " + std::to_string(flags) +
+             ")";
+    }
+    return out;
+  };
+  std::string out;
+  if (!live_only.empty()) out = "live only: " + format(live_only);
+  if (!described_only.empty()) {
+    out += (out.empty() ? "" : "; ") + std::string{"described only: "} +
+           format(described_only);
+  }
+  return out;
+}
+
 // REQ-CONTRACT-12, REQ-OPS-06
 TEST(Binary, DescribeListsEveryEndpointIncludingOptionalOnes) {
+  // Prime this process's cached shared-memory namespace before temporarily
+  // overriding TALOS_SHM_NAMESPACE for the child binary below, so later tests
+  // in this binary still share TEST_TMPDIR with their children.
+  static_cast<void>(ShmObjectName(introspect::kRegistryPath));
   const std::string fresh_ns = "describe_no_shm_" + std::to_string(::getpid());
   struct ScopedNamespace {
     std::optional<std::string> previous;
@@ -216,11 +317,66 @@ TEST(Binary, DescribeListsEveryEndpointIncludingOptionalOnes) {
     EXPECT_EQ(fd, -1) << name << " (" << shm << ") created by --describe";
     EXPECT_EQ(errno, ENOENT) << name << " (" << shm << ")";
   }
-}
 
-std::string TempFile(const std::string& name) {
-  const char* tmp = std::getenv("TEST_TMPDIR");
-  return std::string{tmp != nullptr ? tmp : "/tmp"} + "/" + name;
+  // Run the same binary live in the fresh namespace and prove --describe
+  // matches every endpoint it registers in the live registry.
+  const std::string binary = Runfile("TALOS_TEST_NODE");
+  const std::string config = Runfile("TALOS_TEST_CONFIG");
+  const std::string log = TempFile("describe_live_match.tlog");
+  std::filesystem::remove(log);
+  int output[2];
+  ASSERT_EQ(::pipe(output), 0);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    ::dup2(output[1], STDOUT_FILENO);
+    ::dup2(output[1], STDERR_FILENO);
+    ::close(output[0]);
+    ::close(output[1]);
+    ::execl(binary.c_str(), binary.c_str(), "--sim", "--duration-s", "60",
+            "--log", log.c_str(), "--config", config.c_str(), nullptr);
+    ::_exit(127);
+  }
+  ::close(output[1]);
+  int status = 0;
+  bool exited = false;
+  const std::string fresh_registry =
+      ShmObjectName(introspect::kRegistryPath, fresh_ns);
+  const auto live_row =
+      WaitForLiveRegistryRow(child, fresh_registry, 20s, exited, status);
+  if (!exited) ::kill(child, live_row ? SIGTERM : SIGKILL);
+  std::string printed;
+  char buffer[256];
+  for (;;) {
+    const ssize_t got = ::read(output[0], buffer, sizeof buffer);
+    if (got <= 0) break;
+    printed.append(buffer, static_cast<std::size_t>(got));
+  }
+  ::close(output[0]);
+  if (!exited) {
+    ASSERT_EQ(::waitpid(child, &status, 0), child);
+  }
+  for (const std::string& name : shm_names) {
+    if (name == introspect::kRegistryPath) {
+      introspect::RemoveRegistryUnlessHeld(0, fresh_registry);
+    } else {
+      ::shm_unlink(ShmObjectName(name, fresh_ns).c_str());
+    }
+  }
+  std::filesystem::remove(log);
+
+  ASSERT_TRUE(live_row.has_value())
+      << "live test_node never published a registry row: " << printed;
+  ASSERT_TRUE(WIFEXITED(status))
+      << "killed by signal " << (WIFSIGNALED(status) ? WTERMSIG(status) : 0)
+      << "\n"
+      << printed;
+  EXPECT_EQ(WEXITSTATUS(status), 0) << printed;
+  EXPECT_EQ(live_row->name, described.name);
+  EXPECT_EQ(live_row->target, described.target);
+  EXPECT_EQ(live_row->declared_source_count, live_row->sources.size());
+  EXPECT_EQ(DescribeLiveEndpointMismatch(described.sources, live_row->sources),
+            "");
 }
 
 // The launcher's two describe passes and its run, against a node that reads
@@ -811,28 +967,11 @@ TEST(Binary, StopEndsARunningNodeThatWaitsOnNothing) {
     ::_exit(127);
   }
   ::close(output[1]);
-  const auto running = [child] {
-    const auto reader = introspect::RegistryReader::open();
-    if (!reader) return false;
-    for (const auto& node : reader->nodes()) {
-      if (node.pid == static_cast<std::uint64_t>(child) && node.alive) {
-        return true;
-      }
-    }
-    return false;
-  };
   int status = 0;
   bool exited = false;
-  bool live = running();
-  const auto give_up = std::chrono::steady_clock::now() + 20s;
-  while (!live && std::chrono::steady_clock::now() < give_up) {
-    if (::waitpid(child, &status, WNOHANG) == child) {
-      exited = true;
-      break;
-    }
-    std::this_thread::sleep_for(1ms);  // paces the poll; the row is the event
-    live = running();
-  }
+  const bool live = WaitForLiveRegistryRow(child, introspect::kRegistryPath,
+                                           20s, exited, status)
+                        .has_value();
   const auto signalled = std::chrono::steady_clock::now();
   if (!exited) ::kill(child, live ? SIGTERM : SIGKILL);
   std::string printed;
