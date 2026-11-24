@@ -5,4 +5,4 @@
 [subsystem]
 name = "superstructure"
 period_us = 20000
-high_rot = 10.0  # elevator height for SCORE_HIGH, within the lift's soft limits
+high_rot = 10.0  # elevator height for SCORE_HIGH, within [lift] max_rot

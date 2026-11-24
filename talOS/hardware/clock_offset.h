@@ -44,13 +44,35 @@
 // 100 ppm).
 //
 // A new gateway boot (a boot_id not seen before) restarts the window: the
-// gateway clock restarts with the boot. A sample whose sample_time_us is not
-// after the last one accepted in this boot (a duplicate or a reordered frame)
-// is ignored, and so is one from a boot the gateway has since left
-// (BootHistory: a datagram delayed across a reboot). Observe() is the
-// bridge's State ordering gate: a State it ignores is dropped whole.
-// The estimate is valid -- converged() -- once the window holds
-// kConvergedSamples samples of the current boot (40 ms at 5 ms).
+// gateway clock restarts with the boot, and its first accepted State sets the
+// boot's baseline (gateway and bridge clocks are independent monotonic clocks
+// with an arbitrary constant offset, so that first frame's absolute value
+// cannot be bounded without rolling back within a boot, which REQ-SAFE-11
+// forbids). Within the current boot, a sample whose sample_time_us is not
+// after the last one accepted (a duplicate or reordered frame) is ignored, and
+// so is one from a boot the gateway has since left (BootHistory: a datagram
+// delayed across a reboot). Forward jumps within a boot are checked against a
+// per-boot prompt anchor: a sample advancing farther ahead of the anchor than
+// elapsed bridge time plus kMaxSampleJumpMarginUs (1 s) and
+// 1 / kMaxClockDriftDivisor (2000 ppm, twice the 1000 ppm relative oscillator
+// drift assumed above) of elapsed bridge time allows is held as a single-slot
+// jump candidate and ignored; any normal accepted sample or boot change clears
+// that candidate (a duplicate or reordered sample returns early before
+// touching it), while the next sample past the bound strictly advancing past
+// the candidate with non-decreasing bridge receipt time and a symmetrically
+// consistent physical clock rate re-syncs the anchor and is accepted (so an
+// unseen-boot SIGSTOP / SO_RCVBUF tail-drop recovers on the second live frame
+// while isolated or inconsistent far-future timestamps are ignored).
+// On normal accepted frames, the anchor advances immediately only when the
+// sample is at least as prompt as it (sample_delta >= receipt_delta), so a
+// delayed buffered frame after a long outage never pulls the anchor back; when
+// sustained bridge-fast drift keeps samples less prompt for at least
+// kConvergedSamples frames spanning kAnchorRefreshUs (1 s) of bridge receipt
+// time, the anchor promotes to the most prompt sample of that window so the
+// drift allowance stays bounded over long runs. Observe() is the bridge's
+// State ordering gate: a State it ignores is dropped whole. The estimate is
+// valid -- converged() -- once the window holds kConvergedSamples samples of
+// the current boot (40 ms at 5 ms).
 
 #include <array>
 #include <cstddef>
@@ -68,10 +90,24 @@ class ClockOffsetEstimator {
   // faster caller overwrites the oldest; any exchange kept is still causal.
   static constexpr std::size_t kExchangeSlots = 64;
   static constexpr std::uint64_t kExchangeLifetimeUs = 1'000'000;
+  // Forward-jump bound for State sample_time_us within a boot: allows up to
+  // kMaxSampleJumpMarginUs (1 s) of one-way jitter / burst catch-up plus
+  // 1 / kMaxClockDriftDivisor (2000 ppm) of elapsed bridge time since the
+  // prompt anchor so arbitrarily long outages recover cleanly while rejecting
+  // corrupt far-future timestamps that would otherwise lock out later States.
+  static constexpr std::uint64_t kMaxSampleJumpMarginUs = 1'000'000;
+  static constexpr std::uint64_t kMaxClockDriftDivisor = 500;
+  // Sustained bridge-receipt window required (with at least kConvergedSamples
+  // accepted frames) before a slower-than-anchor minimum promotes to the
+  // prompt anchor. Prevents a single delayed packet or burst after a long
+  // outage from pulling the anchor back while keeping the drift allowance
+  // bounded under steady bridge-fast oscillator drift.
+  static constexpr std::uint64_t kAnchorRefreshUs = 1'000'000;
 
   // One received gateway state: its boot, its gateway-clock sample time and
   // the bridge-clock time it was received. Returns whether it entered the
-  // window (false: a duplicate, reordered or retired-boot sample, ignored).
+  // window (false: a duplicate, reordered, far-future or retired-boot sample,
+  // ignored).
   bool Observe(std::uint64_t boot_id, std::uint64_t sample_time_us,
                std::uint64_t receipt_us);
 
@@ -98,7 +134,8 @@ class ClockOffsetEstimator {
   std::size_t window_count() const { return count_; }
   // Restarts for a new gateway boot after the first.
   std::uint64_t resets_count() const { return resets_; }
-  // Samples ignored as duplicates, reordered or from a retired boot.
+  // Samples ignored as duplicates, reordered, far-future or from a retired
+  // boot.
   std::uint64_t ignored_count() const { return ignored_; }
 
  private:
@@ -119,6 +156,25 @@ class ClockOffsetEstimator {
   std::size_t count_{0};  // delays held, at most kWindowSamples
   BootHistory boots_;
   std::uint64_t last_sample_time_us_{0};
+  // Prompt baseline of the current boot (always <= last_sample_time_us_), used
+  // to bound forward sample_time_us jumps against elapsed bridge receipt time.
+  std::uint64_t anchor_sample_us_{0};
+  std::uint64_t anchor_receipt_us_{0};
+  // Most prompt accepted sample observed during a sustained slower-than-anchor
+  // spell; promotes to anchor_* once at least kConvergedSamples frames span
+  // kAnchorRefreshUs of bridge receipt time.
+  std::uint64_t next_anchor_sample_us_{0};
+  std::uint64_t next_anchor_receipt_us_{0};
+  std::uint64_t next_anchor_since_us_{0};
+  std::size_t next_anchor_count_{0};
+  // Single-slot forward-jump candidate: holds the most recent rejected
+  // far-future sample until cleared by a normal accepted sample or a new boot
+  // (duplicates and reordered samples return early without touching it), or
+  // confirmed by the next sample past the bound at a physically consistent
+  // rate.
+  bool has_jump_candidate_{false};
+  std::uint64_t jump_sample_us_{0};
+  std::uint64_t jump_receipt_us_{0};
   std::int64_t offset_us_{0};
   std::uint64_t spread_us_{0};
   std::uint64_t resets_{0};

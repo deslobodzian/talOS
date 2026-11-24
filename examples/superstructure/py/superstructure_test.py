@@ -237,6 +237,52 @@ class SuperstructureTest(unittest.TestCase):
         self.assertTrue(self.intake_status().sensor_connected)
         self.assertEqual(self.roller()[:2], (VOLTAGE, INTAKE_VOLTS))
 
+    # REQ-SAFE-46
+    def test_disconnected_beam_break_exits_scoring_and_does_not_hold_latched_piece(
+            self):
+        enable_teleop(self.sim, self.hw)
+        self.hw.ideal_motors()
+        self.collect()
+
+        # Disconnect while HOLDING: latched has_piece must not hold or raise.
+        self.hw.set_connected("intake", "beam_break", False)
+        self.hold(Command.SCORE_HIGH, 0.1)
+        self.assertFalse(self.intake_status().sensor_connected)
+        self.assertTrue(self.intake_status().has_piece)
+        self.assertEqual(self.superstructure_state(), SuperstructureState.STOWED)
+        self.assertEqual(self.lift().demand, 0.0)
+
+        self.hold(Command.STOW, 0.06)
+        self.assertEqual(self.superstructure_state(), SuperstructureState.STOWED)
+
+        # Reconnect with beam still broken: returns to HOLDING and scores.
+        self.hw.set_connected("intake", "beam_break", True)
+        self.hold(Command.STOW, 0.06)
+        self.assertEqual(self.superstructure_state(),
+                         SuperstructureState.HOLDING)
+
+        self.hold(Command.SCORE_HIGH, 0.12)
+        self.assertEqual(self.superstructure_state(),
+                         SuperstructureState.SCORING)
+        self.assertEqual(self.intake_status().state, IntakeState.EJECTING)
+
+        # Disconnect mid-score: Superstructure stows instead of trapping the
+        # lift high in SCORING once the intake's timed eject finishes.
+        self.hw.set_connected("intake", "beam_break", False)
+        self.hold(Command.SCORE_HIGH, 0.1)
+        self.assertFalse(self.intake_status().sensor_connected)
+        self.assertEqual(self.superstructure_state(), SuperstructureState.STOWED)
+        self.assertEqual(self.lift().demand, 0.0)
+
+        self.hold(Command.SCORE_HIGH, 0.5)
+        self.assertEqual(self.intake_status().state, IntakeState.IDLE)
+        self.assertEqual(self.roller().mode, NEUTRAL)
+        self.assertEqual(self.superstructure_state(), SuperstructureState.STOWED)
+        self.assertEqual(self.lift().demand, 0.0)
+
+        self.hold(Command.STOW, 0.06)
+        self.assertEqual(self.superstructure_state(), SuperstructureState.STOWED)
+
 
 if __name__ == "__main__":
     unittest.main()

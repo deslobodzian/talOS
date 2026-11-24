@@ -33,7 +33,12 @@ take_copy_lock() {
     [ -f "$lock/pid" ] ||
       die "$lock has no pid yet: another check is starting (if none is, rmdir $lock)"
     holder="$(cat "$lock/pid" 2>/dev/null || true)"
-    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+    case "$holder" in
+      ''|*[!0-9]*)
+        die "$lock has no valid pid: another check is starting or releasing it (if none is, remove $lock)"
+        ;;
+    esac
+    if kill -0 "$holder" 2>/dev/null; then
       die "another check (pid $holder) is using $what"
     fi
     mkdir "$lock.retake" 2>/dev/null ||
