@@ -360,14 +360,14 @@ void CheckStartPoseOnField(const toml::table& tbl, const std::string& where) {
 // robot_model_files entry that is not a non-empty string, a
 // robot_model_files that is not an array, a field that is not a string or
 // names no known field model, a seed that is not a non-negative integer,
-// and, when `refuse_absolute` (paths as written in a file, before they are
-// resolved), an absolute path.
+// a sleeping that is not a boolean, and, when `refuse_absolute` (paths as
+// written in a file, before they are resolved), an absolute path.
 void CheckSimulationMujoco(const toml::table& mujoco, const std::string& where,
                            bool refuse_absolute) {
   const std::string table = where + ": [simulation.mujoco] ";
   for (auto&& [k, v] : mujoco) {
     if (k.str() != "robot_model" && k.str() != "robot_model_files" &&
-        k.str() != "field" && k.str() != "seed") {
+        k.str() != "field" && k.str() != "seed" && k.str() != "sleeping") {
       throw std::invalid_argument(table + "unknown key '" +
                                   std::string(k.str()) + "'");
     }
@@ -418,6 +418,10 @@ void CheckSimulationMujoco(const toml::table& mujoco, const std::string& where,
       throw std::invalid_argument(
           table + "seed must be an integer from 0 to 9223372036854775807");
     }
+  }
+  if (const auto* sleeping = mujoco.get("sleeping");
+      sleeping != nullptr && !sleeping->is_boolean()) {
+    throw std::invalid_argument(table + "sleeping must be true or false");
   }
 }
 
@@ -2214,6 +2218,7 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
       if (const auto seed = (*mujoco)["seed"].value_exact<std::int64_t>()) {
         m.seed = static_cast<std::uint64_t>(*seed);
       }
+      m.sleeping = Read<bool>(*mujoco, "sleeping", false);
       RequireRegularFile("config: [simulation.mujoco] robot_model",
                          m.robot_model);
       if (const auto* files = (*mujoco)["robot_model_files"].as_array()) {

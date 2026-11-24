@@ -178,6 +178,9 @@ struct SimulationMujocoConfig {
   // The seed a field's game rules draw from: 0 to 2^63 - 1 (a TOML integer
   // is signed 64-bit; a negative one is refused).
   std::uint64_t seed{1};
+  // Whether MuJoCo puts resting free bodies to sleep (the robot's never
+  // sleep): off unless a file sets it.
+  bool sleeping{false};
   bool operator==(const SimulationMujocoConfig&) const = default;
 };
 

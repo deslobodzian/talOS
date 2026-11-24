@@ -19,7 +19,11 @@ Every field structure is a static geom of the world body; the 504 fuel are
 the only moving bodies. Of the model's `<option>`, the CG solver, the 5 ms
 step, 20 iterations and sleeping off are settings measured on 2026 field
 scenes for step cost (REQ-DEV-37); the elliptic cone, `implicitfast`, the
-1e-8 tolerance and every contact value below are chosen, not measured.
+1e-8 tolerance and every contact value below are chosen, not measured. The
+MuJoCo gateway replaces these with its own option table, where sleeping
+follows the config's `[simulation.mujoco] sleeping`
+([solver](../../README.md#writing-a-robot-model)); the model keeps sleeping off for
+whatever else loads it.
 `<size memory="64M"/>`.
 
 ## Viewing the field

@@ -456,10 +456,14 @@ int Run(int argc, char** argv,
       const std::string pose = Shortest(options.start_x_m) + "," +
                                Shortest(options.start_y_m) + "," +
                                Shortest(options.start_yaw_rad);
-      std::fprintf(stderr, "sim_gateway: backend=%s start_pose=%s (%.*s)\n",
+      // A MuJoCo world with sleeping on says so (nothing is added when off).
+      const bool sleeping = extension != nullptr &&
+                            robot_config.simulation.mujoco &&
+                            robot_config.simulation.mujoco->sleeping;
+      std::fprintf(stderr, "sim_gateway: backend=%s start_pose=%s (%.*s)%s\n",
                    backend_name.c_str(), pose.c_str(),
                    static_cast<int>(start_pose_source.size()),
-                   start_pose_source.data());
+                   start_pose_source.data(), sleeping ? " sleeping=on" : "");
     } else {
       std::fprintf(stderr, "sim_gateway: backend=%s\n", backend_name.c_str());
     }

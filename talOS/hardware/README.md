@@ -301,17 +301,21 @@ inertia/friction, the robot's start pose and the MuJoCo model:
   today `"rebuilt_2026"`; absent or `""` is flat carpet) and `seed`
   (optional, default 1: the seed the MuJoCo gateway gives the field's game
   rules to draw from, an integer from 0 to 2^63 - 1, the non-negative range
-  of a TOML integer). The file
+  of a TOML integer) and `sleeping` (optional boolean, default false: true
+  lets MuJoCo put resting game pieces to sleep, the robot's bodies never;
+  [what it changes](../simulation/mujoco/README.md#when-the-host-cannot-hold-real-time)).
+  The file
   that sets `robot_model` sets the whole model: `robot_model_files` comes
   only from that file (absent there, none), so a file that includes another
-  and sets `robot_model` discards the included file's list, while `field`
-  and `seed` each override on their own. Each path is relative to the file that sets it and never
+  and sets `robot_model` discards the included file's list, while `field`,
+  `seed` and `sleeping` each override on their own. Each path is relative to the file that sets it and never
   absolute; each file must exist, and the build lists it in the config's
   `CONFIG_FILES`, so `talos_sim` and `talos_bundle` carry it, as
   `[trajectories]` files are. Config load refuses an unknown key, a
   non-string or empty path, a non-array `robot_model_files`,
   `robot_model_files` in a file that does not set `robot_model`, an
-  unknown `field` and a `seed` that is not a non-negative integer, naming the key and the file that sets it. It checks only
+  unknown `field`, a `seed` that is not a non-negative integer and a
+  `sleeping` that is not a boolean, naming the key and the file that sets it. It checks only
   that the files exist and the field name is known: it does not open the
   model, so a file the model reads but the list omits is not refused at
   load.
