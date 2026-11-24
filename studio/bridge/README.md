@@ -44,13 +44,14 @@ These named options are removed before positional parsing:
   nonzero (as the launcher passes), the bridge claims a live registry row under
   that session id and exits nonzero if claiming fails; default `0` (standalone:
   claims no registry row). Ignored in `--describe`.
-- `--config PATH`: read `[studio] max_clients` and `[studio] dashboard` (the
-  driver dashboard's layout; see [Driver dashboard feed](#driver-dashboard-feed))
-  from robot configuration, and each subsystem's `critical` for the drive
-  summary (its roster too, when no `--manifest` is read).
-- `--idle-timeout-s S`: a client's idle timeout, 8 to 960 s (default 16; see
-  [WebSocket operating limits](#websocket-operating-limits)). Tests pass 8 to
-  keep their runtime short.
+- `--config PATH` or `--config=PATH`: read `[studio] max_clients` and
+  `[studio] dashboard` (the driver dashboard's layout; see
+  [Driver dashboard feed](#driver-dashboard-feed)) from robot configuration, and
+  each subsystem's `critical` for the drive summary (its roster too, when no
+  `--manifest` is read).
+- `--idle-timeout-s S` or `--idle-timeout-s=S`: a client's idle timeout, 8 to
+  960 s (default 16; see [WebSocket operating limits](#websocket-operating-limits)).
+  Tests pass 8 to keep their runtime short.
 - `--declared PATH` or `--declared=PATH`: cache the file at startup for
   `/declared.json`.
 - `--manifest PATH` or `--manifest=PATH`: read the file on each
@@ -58,6 +59,8 @@ These named options are removed before positional parsing:
 - `--refusal-file PATH` or `--refusal-file=PATH`: serve a launcher phase-1
   refusal on `/drive` without opening shared memory or the registry (see
   [Driver dashboard feed](#driver-dashboard-feed)).
+- `--refusal-reason TEXT` or `--refusal-reason=TEXT`: fallback refusal text
+  when `--refusal-file` is absent or unreadable.
 - `--sim`: simulation mode; keeps the loop timeshare unless `TALOS_REALTIME=1`
   is set and marks the bridge's registry row with `kFlagSimulation`. Ignored in
   `--describe`.
@@ -190,7 +193,9 @@ pauses notices past 1 s
 ([Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary))
 can never be sent: the bridge logs that once when the graph crosses the
 burst, sends no notice (the client's graph goes stale, which is the truth),
-and still serves it at `/system.json`. It opens the registry lazily. Topic health is
+and still serves it at `/system.json`. It opens the registry lazily, drops its
+mapping when the segment is unlinked, and re-attaches when a new registry
+segment appears or replaces it. Topic health is
 computed in [`system.h`](system.h): missing ends are `bridged` when any end is
 `external`; with no publisher, `unconnected` when an end is `optional` and no
 non-observer subscriber requires it (neither `optional` nor `external`),
@@ -584,7 +589,8 @@ graph update (500 ms) or deferral notice (750 ms), its telemetry heartbeat
 instant the egress budget can afford a deferred send; for each drive client,
 its heartbeat (100 ms), the end of its update interval while a change waits
 for it, and the end of its 500 ms summary interval while a changed summary
-waits. Idle and attached, with
+waits (in refusal mode, only the drive clients' due sends and budget retries,
+at most every 1 s when idle). Idle and attached, with
 no client, that is about six wakes a second: four refreshes, one segment check
 and uWebSockets' own one-second date timer. A pass that stops at its page
 budget, an arm that keeps finding pages (three tries), or a wake receiver that

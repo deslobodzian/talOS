@@ -3,7 +3,7 @@
 // are wired only through the data hooks and the navigation context; the shell
 // owns the layout and persistence.
 
-import {useEffect, useMemo, useRef, useState} from 'react';
+import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 
 import {useActions, useEvents, usePlayback, useRecorded} from '../data/hooks';
 import {detectReviewServer} from '../data/review';
@@ -115,8 +115,11 @@ export function Shell() {
 
   // --- pages ---------------------------------------------------------------
 
-  const setActivePage = (id: string) =>
-      setWorkspace(w => ({...w, activePage: id}));
+  const setActivePage = (id: string) => {
+    setMaximized(null);
+    setRenamingPage(null);
+    setWorkspace(w => ({...w, activePage: id}));
+  };
 
   const addPage = () => setWorkspace(w => {
     const page = makePage(
@@ -135,19 +138,24 @@ export function Shell() {
     }));
   };
 
-  const closePage = (id: string) => setWorkspace(w => {
-    if (w.pages.length <= 1) return w;
-    const remaining = w.pages.filter(p => p.id !== id);
-    return {
-      ...w,
-      pages: remaining,
-      activePage: w.activePage === id ? (remaining[0]?.id ?? '') : w.activePage
-    };
-  });
+  const closePage = (id: string) => {
+    setMaximized(null);
+    setRenamingPage(r => r === id ? null : r);
+    setWorkspace(w => {
+      if (w.pages.length <= 1) return w;
+      const remaining = w.pages.filter(p => p.id !== id);
+      return {
+        ...w,
+        pages: remaining,
+        activePage: w.activePage === id ? (remaining[0]?.id ?? '') : w.activePage
+      };
+    });
+  };
 
   const resetPage = (id: string, presetName: string) => {
     const preset = presetByName(presetName);
     if (!preset) return;
+    setMaximized(null);
     setWorkspace(w => ({
       ...w,
       pages: w.pages.map(
@@ -167,12 +175,15 @@ export function Shell() {
                      newInstanceId(), panel.config);
       }));
     },
-    onClose: (instanceId) => setWorkspace(w => withActiveRoot(w, root => {
-      const next = close(root, instanceId);
-      // A page is never left empty: closing its last panel leaves a fresh
-      // health panel the user can switch to anything.
-      return next ?? panelNode('health', newInstanceId(), undefined);
-    })),
+    onClose: (instanceId) => {
+      setMaximized(m => m === instanceId ? null : m);
+      setWorkspace(w => withActiveRoot(w, root => {
+        const next = close(root, instanceId);
+        // A page is never left empty: closing its last panel leaves a fresh
+        // health panel the user can switch to anything.
+        return next ?? panelNode('health', newInstanceId(), undefined);
+      }));
+    },
     onSwitch: (instanceId, panelId) => setWorkspace(w => withActiveRoot(
         w, root => replacePanel(root, instanceId, panelId))),
     onConfig: (instanceId, config) => setWorkspace(w => withActiveRoot(
@@ -241,6 +252,7 @@ export function Shell() {
     try {
       setWorkspace(importWorkspace(text));
       setMaximized(null);
+      setTransportError('');
     } catch (err) {
       setTransportError(
           err instanceof Error ? err.message : 'Could not import workspace');
@@ -286,6 +298,10 @@ export function Shell() {
   ] :
                                              [];
 
+  const closePalette = useCallback(() => setPaletteOpen(false), []);
+  const closeReview = useCallback(() => setReviewOpen(false), []);
+  const closeShortcuts = useCallback(() => setShortcutsOpen(false), []);
+
   // --- keyboard -------------------------------------------------------------
 
   useEffect(() => {
@@ -295,20 +311,23 @@ export function Shell() {
       if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey &&
           e.key.toLowerCase() === 'k') {
         e.preventDefault();
+        if (e.repeat) return;
         setShortcutsOpen(false);
         setPaletteOpen(open => !open);
         return;
       }
 
       if (e.metaKey || e.ctrlKey || e.altKey) return;
-      const target = e.target as HTMLElement|null;
-      if (target?.closest(
+      const target = e.target;
+      if (target instanceof HTMLElement && target.isContentEditable) return;
+      if (target instanceof Element && target.closest(
           'button, input, textarea, select, [contenteditable="true"], [role="menu"], [role="dialog"], [role="separator"], [role="slider"]'))
         return;
 
       // '?' toggles the shortcuts overlay.
       if (e.key === '?') {
         e.preventDefault();
+        if (e.repeat) return;
         setPaletteOpen(false);
         setShortcutsOpen(open => !open);
         return;
@@ -321,12 +340,14 @@ export function Shell() {
           playback.mode === 'LIVE_STREAMING';
       if (e.key === ' ') {
         e.preventDefault();
+        if (e.repeat) return;
         actions.setMode(playing ? 'PAUSED' : 'REPLAY_PLAYING');
       } else if (e.key === 'ArrowLeft') {
         if (/^[1-9]\d{0,17}$/.test(stepNs)) actions.step('-' + stepNs);
       } else if (e.key === 'ArrowRight') {
         if (/^[1-9]\d{0,17}$/.test(stepNs)) actions.step(stepNs);
       } else if (e.key.toLowerCase() === 'l') {
+        if (e.repeat) return;
         actions.live();
       }
     };
@@ -371,11 +392,11 @@ export function Shell() {
                }
              }}/>
       {paletteOpen &&
-       <CommandPalette commands={commands} onClose={() => setPaletteOpen(false)}/>}
-      {reviewOpen && <ReviewPicker onClose={() => setReviewOpen(false)}
+       <CommandPalette commands={commands} onClose={closePalette}/>}
+      {reviewOpen && <ReviewPicker onClose={closeReview}
                                    server={reviewServer ?? undefined}/>}
       {shortcutsOpen &&
-       <ShortcutsOverlay onClose={() => setShortcutsOpen(false)}/>}
+       <ShortcutsOverlay onClose={closeShortcuts}/>}
     </div>
   </PanelNavigationProvider>;
 }

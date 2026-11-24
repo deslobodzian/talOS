@@ -35,12 +35,13 @@ export function NodeCard(
   // process whose rate matters most.
   const busiest = (timers.length ? timers : node.sources)
                       .map(s => rates[rateKey(node.name, s.id)])
-                      .filter((r): r is number => r !== undefined)
+                      .filter((r): r is number => r !== undefined && Number.isFinite(r))
                       .sort((a, b) => b - a)[0];
   const lost = deliveryLoss(node);
   const liveness = nodeLiveness(node, {stale});
   const held = outputsHeld(node, liveness === 'live');
   const driver = drivenByLine(node, liveness === 'live');
+  const age = staleness(graph, node);
 
   return <button
       className={'node-card' + (selected ? ' selected' : '') +
@@ -64,8 +65,7 @@ export function NodeCard(
       <div><dt>dispatches</dt><dd>{integer(node.dispatch_count)}</dd></div>
       <div><dt>loop</dt><dd>{hertz(busiest)}</dd></div>
       <div><dt>seen</dt><dd>{
-          staleness(graph, node) <= 0 ? 'now' :
-                                        duration(staleness(graph, node)) + ' ago'
+          !Number.isFinite(age) ? '—' : age <= 0 ? 'now' : duration(age) + ' ago'
       }</dd></div>
       {driver !== null &&
        <div className="driven-by"><dt>driven by</dt><dd className={

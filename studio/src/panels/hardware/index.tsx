@@ -136,7 +136,7 @@ const COUNTERS: CounterSpec[] = [
 type CounterRow = CounterSpec & {total: string; rate: string};
 
 const rateString = (rate: number|null): string =>
-    rate === null ? '—' : `${rate >= 100 ? rate.toFixed(0) : rate.toFixed(1)}/s`;
+    rate === null || !Number.isFinite(rate) ? '—' : `${rate >= 100 ? rate.toFixed(0) : rate.toFixed(1)}/s`;
 
 const volts = (v: number|undefined) =>
     v === undefined || !Number.isFinite(v) ? '—' : `${v.toFixed(2)} V`;
@@ -148,8 +148,9 @@ const count = (value: number|undefined) =>
 
 // When a bit last rose, as a human offset from the end of the retained view.
 const ago = (lastSetAt: number|null, endSec: number): string => {
-  if (lastSetAt === null) return '—';
-  return `${(endSec - lastSetAt).toFixed(1)}s ago`;
+  if (lastSetAt === null || !Number.isFinite(lastSetAt) || !Number.isFinite(endSec))
+    return '—';
+  return `${Math.max(0, endSec - lastSetAt).toFixed(1)}s ago`;
 };
 
 function BitList({title, bits, prefix, empty, endSec, channel}: {

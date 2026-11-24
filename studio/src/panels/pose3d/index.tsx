@@ -15,7 +15,7 @@ import {useChassis, usePieces} from '../../data/hooks';
 import {MAX_PIECES, pieceMatrices} from '../../data/pieces';
 import {FIELD_HEIGHT_M, FIELD_WIDTH_M} from '../field/geometry';
 import type {PanelDefinition} from '../types';
-import {loadFieldModel} from './field_model';
+import {FieldModelLoader, isFinitePose} from './field_model';
 import './pose3d.css';
 
 export type Pose3dConfig = Record<string, never>;
@@ -49,65 +49,61 @@ function OrbitNavigation() {
 }
 
 // The game pieces in play, one instanced unit sphere scaled by their
-// radius. The mesh and its transforms are allocated once, for MAX_PIECES;
-// a pieces message rewrites them in place and asks for one frame.
+// radius. The mesh and its transforms are allocated once per mount, for
+// MAX_PIECES; a pieces message rewrites them in place and asks for one frame.
 function GamePieces() {
   const pieces = usePieces();
   const {invalidate} = useThree();
-  const [mesh] = useState(() => {
+  const [mesh, setMesh] = useState<THREE.InstancedMesh|null>(null);
+  useEffect(() => {
     const instanced = new THREE.InstancedMesh(
         new THREE.SphereGeometry(1, 16, 12),
         new THREE.MeshStandardMaterial({color: '#f2c94c'}), MAX_PIECES);
     instanced.count = 0;
     instanced.frustumCulled = false;
-    return instanced;
-  });
-  useEffect(() => () => {
-    mesh.geometry.dispose();
-    (mesh.material as THREE.Material).dispose();
-    mesh.dispose();
-  }, [mesh]);
+    setMesh(instanced);
+    return () => {
+      instanced.geometry.dispose();
+      (instanced.material as THREE.Material).dispose();
+      instanced.dispose();
+    };
+  }, []);
   useEffect(() => {
+    if (!mesh) return;
     mesh.count = pieces ? pieceMatrices(pieces, mesh.instanceMatrix.array as Float32Array) : 0;
     mesh.instanceMatrix.needsUpdate = true;
     invalidate();
   }, [pieces, mesh, invalidate]);
-  return <primitive object={mesh}/>;
-}
-
-function disposeModel(model: THREE.Group) {
-  model.traverse(object => {
-    if (object instanceof THREE.Mesh) {
-      object.geometry.dispose();
-      const materials = Array.isArray(object.material) ? object.material :
-                                                         [object.material];
-      materials.forEach(material => {
-        for (const value of Object.values(material))
-          if (value instanceof THREE.Texture) value.dispose();
-        material.dispose();
-      });
-    }
-  });
+  return mesh ? <primitive object={mesh}/> : null;
 }
 
 function Pose3dPanel() {
   const reading = useChassis();
+  const validReading = reading && isFinitePose(reading.pose) ? reading : null;
   const [model, setModel] = useState<THREE.Group|null>(null);
   const [error, setError] = useState('');
   const isBrowser = typeof window !== 'undefined';
-  const requestRef = useRef(0);
-  const mountedRef = useRef(false);
+  const loaderRef = useRef<FieldModelLoader|null>(null);
 
   useEffect(() => {
-    mountedRef.current = true;
+    const loader = new FieldModelLoader({
+      onLoad(scene) {
+        setModel(scene);
+        setError('');
+      },
+      onError(message) {
+        setError(message);
+      }
+    });
+    loaderRef.current = loader;
     return () => {
-      mountedRef.current = false;
-      requestRef.current++;
+      loaderRef.current = null;
+      loader.destroy();
     };
   }, []);
 
-  useEffect(() => () => {
-    if (model) disposeModel(model);
+  useEffect(() => {
+    loaderRef.current?.retain(model);
   }, [model]);
 
   return <>
@@ -126,14 +122,15 @@ function Pose3dPanel() {
                          position={[FIELD_WIDTH_M / 2, FIELD_HEIGHT_M / 2, 0]}/>
              {model && <primitive object={model}/>}
              <GamePieces/>
-             {reading && <group
-                 position={[reading.pose.x, reading.pose.y, reading.pose.z + .2]}
-                 rotation={[reading.pose.roll, reading.pose.pitch, reading.pose.yaw,
-                            'ZYX']}>
+             {validReading && <group
+                 position={[validReading.pose.x, validReading.pose.y,
+                            validReading.pose.z + .2]}
+                 rotation={[validReading.pose.roll, validReading.pose.pitch,
+                            validReading.pose.yaw, 'ZYX']}>
                <mesh>
                  <boxGeometry args={[.8, .7, .4]}/>
                  <meshStandardMaterial color="#48e1cf" transparent
-                                       opacity={reading.stale ? .35 : 1}/>
+                                       opacity={validReading.stale ? .35 : 1}/>
                </mesh>
              </group>}
            </Canvas> :
@@ -143,32 +140,20 @@ function Pose3dPanel() {
     </div>
     <div className="panel-footer">
       Z UP · METERS
-      {!reading && <span role="status">Pose unavailable</span>}
-      {reading?.stale && <span className="text-warn" role="status">Pose STALE</span>}
+      {!validReading && <span role="status">Pose unavailable</span>}
+      {validReading?.stale && <span className="text-warn" role="status">Pose STALE</span>}
       {isBrowser && <label className="file">
         Load field GLB
         <input
             aria-label="Load self-contained field model in meters, glTF Y-up"
-            type="file" accept=".glb" onChange={async (e) => {
-              const f = e.target.files?.[0];
-              if (!f) return;
-              const request = ++requestRef.current;
-              try {
-                const scene = await loadFieldModel(await f.arrayBuffer());
-                if (!mountedRef.current || request !== requestRef.current) {
-                  disposeModel(scene);
-                  return;
-                }
-                setModel(scene);
-                setError('');
-              } catch {
-                if (mountedRef.current && request === requestRef.current)
-                  setError('Could not load model');
-              }
+            type="file" accept=".glb" onChange={(e) => {
+              const f = e.currentTarget.files?.[0];
+              e.currentTarget.value = '';
+              if (f) void loaderRef.current?.load(f);
             }}/>
       </label>}
     </div>
-    {error && <small>{error}</small>}
+    {error && <small role="alert">{error}</small>}
   </>;
 }
 

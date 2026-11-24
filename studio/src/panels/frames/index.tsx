@@ -16,12 +16,14 @@ import {
   filterFrames,
   framePoseError,
   loadFrameFiles,
+  MAX_FRAME_FILES,
   type FrameArchive,
   type FrameDetection,
   type FrameMetadata,
   type FrameReason,
   type LocalFrameFile,
 } from '../../frames';
+import {integer} from '../../ui/formatters';
 import type {PanelDefinition} from '../types';
 import './frames.css';
 
@@ -43,10 +45,11 @@ type HandleValues = FileSystemDirectoryHandle & {
 type PickedFile = LocalFrameFile & {blob: Blob};
 
 async function collectDirectory(
-    handle: FileSystemDirectoryHandle, prefix = ''): Promise<PickedFile[]> {
-  const out: PickedFile[] = [];
+    handle: FileSystemDirectoryHandle, prefix = '',
+    out: PickedFile[] = []): Promise<PickedFile[]> {
   const values = (handle as HandleValues).values();
   for await (const entry of values) {
+    if (out.length > MAX_FRAME_FILES) break;
     const path = prefix ? `${prefix}/${entry.name}` : entry.name;
     if (entry.kind === 'file') {
       const file = await (entry as FileSystemFileHandle).getFile();
@@ -58,15 +61,15 @@ async function collectDirectory(
         blob: file
       });
     } else {
-      out.push(...await collectDirectory(
-          entry as FileSystemDirectoryHandle, path));
+      await collectDirectory(entry as FileSystemDirectoryHandle, path, out);
     }
   }
   return out;
 }
 
-const formatNs = (ns: string) => BigInt(ns).toLocaleString('en-US');
-const digits = (value: number, places = 4) => value.toFixed(places);
+const formatNs = (ns: string) => integer(ns);
+const digits = (value: number, places = 4) =>
+    Number.isFinite(value) ? value.toFixed(places) : '—';
 
 function Detection({detection, fontSize}: {
   detection: FrameDetection;
@@ -215,7 +218,7 @@ function FramesPanel() {
   const [index, setIndex] = useState(0);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const [url, setUrl] = useState<string|null>(null);
+  const [url, setUrl] = useState<{id: string; href: string}|null>(null);
   const requestRef = useRef(0);
 
   useEffect(() => () => { requestRef.current++; }, []);
@@ -229,16 +232,18 @@ function FramesPanel() {
   const cameras = useMemo(
       () => [...new Set(frames.map(f => f.metadata.camera))].sort(),
       [frames]);
-  const selected = filtered[Math.min(index, filtered.length - 1)] ?? null;
+  const selectedIndex =
+      filtered.length ? Math.max(0, Math.min(index, filtered.length - 1)) : -1;
+  const selected = selectedIndex >= 0 ? filtered[selectedIndex] : null;
 
   useEffect(() => {
     if (!selected) {
       setUrl(null);
       return;
     }
-    const next = URL.createObjectURL(selected.image.blob);
-    setUrl(next);
-    return () => URL.revokeObjectURL(next);
+    const href = URL.createObjectURL(selected.image.blob);
+    setUrl({id: selected.id, href});
+    return () => URL.revokeObjectURL(href);
   }, [selected]);
 
 
@@ -282,7 +287,7 @@ function FramesPanel() {
   };
 
   const fromInput = (list: FileList|null) => {
-    if (!list) return;
+    if (!list || list.length === 0) return;
     load([...list].map(file => ({
       name: file.name,
       webkitRelativePath: file.webkitRelativePath || undefined,
@@ -299,7 +304,10 @@ function FramesPanel() {
       16;
 
   return <FramesKeyScope onStep={delta => setIndex(i =>
-      filtered.length ? Math.max(0, Math.min(filtered.length - 1, i + delta)) : i)}>
+      filtered.length ?
+          Math.max(0, Math.min(filtered.length - 1,
+                               Math.min(i, filtered.length - 1) + delta)) :
+          0)}>
     <div className="frames-toolbar">
       {hasDirectoryPicker &&
        <button className="primary" onClick={pickDirectory} disabled={busy}>
@@ -373,7 +381,7 @@ function FramesPanel() {
              <div className="frames-list-body">
                {filtered.map((frame, i) =>
                  <button key={frame.id}
-                         className={'frame-item' + (i === index ? ' selected' : '')}
+                         className={'frame-item' + (i === selectedIndex ? ' selected' : '')}
                          onClick={() => setIndex(i)}>
                    <span className={'ui-badge ' + frame.metadata.reason}>
                      {frame.metadata.reason}
@@ -397,7 +405,8 @@ function FramesPanel() {
              {selected ?
                   <>
                     <div className="frames-image-stage">
-                      {url && <img src={url} alt={`Frame ${selected.id}`}/>}
+                      {url && url.id === selected.id &&
+                       <img src={url.href} alt={`Frame ${selected.id}`}/>}
                       <svg className="frames-overlay"
                            viewBox={`0 0 ${selected.metadata.width} ${selected.metadata.height}`}
                            preserveAspectRatio="xMidYMid meet">
@@ -425,10 +434,10 @@ function FramesPanel() {
 
            <section className="panel frames-details">
              <div className="panel-heading">
-               <h2>Frame details</h2><span>{selected ? `${index + 1} / ${filtered.length}` : ''}</span>
+               <h2>Frame details</h2><span>{selected ? `${selectedIndex + 1} / ${filtered.length}` : ''}</span>
              </div>
              {selected ?
-                  <Details metadata={selected.metadata} position={index + 1}
+                  <Details metadata={selected.metadata} position={selectedIndex + 1}
                            total={filtered.length}/> :
                   <div className="empty-state">No frame selected.</div>}
            </section>

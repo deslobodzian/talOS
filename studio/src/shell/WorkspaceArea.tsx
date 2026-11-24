@@ -40,6 +40,7 @@ function SplitHandle({path, index, direction, sizes, onResize}: {
     if (!splitEl) return;
     const rect = splitEl.getBoundingClientRect();
     const size = direction === 'row' ? rect.width : rect.height;
+    if (!Number.isFinite(size) || size <= 0) return;
     drag.current = {
       startPos: direction === 'row' ? e.clientX : e.clientY,
       startSizes: sizes.slice(),
@@ -50,22 +51,29 @@ function SplitHandle({path, index, direction, sizes, onResize}: {
 
   const move = (e: React.PointerEvent) => {
     const d = drag.current;
-    if (!d) return;
-    const pos = direction === 'row' ? e.clientX : e.clientY;
-    const pair = (d.startSizes[index] ?? 0) + (d.startSizes[index + 1] ?? 0);
+    if (!d || !Number.isFinite(d.size) || d.size <= 0) return;
+    const a = d.startSizes[index], b = d.startSizes[index + 1];
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return;
+    const pair = a + b;
     if (pair <= 0) return;
-    const delta = (pos - d.startPos) / (d.size || 1);
+    const pos = direction === 'row' ? e.clientX : e.clientY;
+    if (!Number.isFinite(pos)) return;
+    const delta = (pos - d.startPos) / d.size;
     const minShare = Math.min(MIN_PANEL_SIZE, pair / 2);
-    const nextA = Math.min(pair - minShare,
-                          Math.max(minShare, d.startSizes[index] + delta));
+    const nextA = Math.min(pair - minShare, Math.max(minShare, a + delta));
     const next = d.startSizes.slice();
     next[index] = nextA;
     next[index + 1] = pair - nextA;
     onResize(path, next);
   };
 
-  const end = () => {
+  const end = (e?: React.PointerEvent) => {
     drag.current = null;
+    const el = e?.currentTarget as HTMLElement|undefined;
+    if (el && typeof e?.pointerId === 'number' &&
+        el.hasPointerCapture?.(e.pointerId)) {
+      el.releasePointerCapture?.(e.pointerId);
+    }
   };
 
   const key = (e: React.KeyboardEvent) => {
@@ -75,12 +83,13 @@ function SplitHandle({path, index, direction, sizes, onResize}: {
     if (!delta) return;
     e.preventDefault();
     e.stopPropagation();
-    const pair = sizes[index] + sizes[index + 1];
+    const a = sizes[index], b = sizes[index + 1];
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return;
+    const pair = a + b;
     if (pair <= 0) return;
     const minShare = Math.min(MIN_PANEL_SIZE, pair / 2);
     const next = sizes.slice();
-    next[index] = Math.min(pair - minShare,
-                           Math.max(minShare, sizes[index] + delta));
+    next[index] = Math.min(pair - minShare, Math.max(minShare, a + delta));
     next[index + 1] = pair - next[index];
     onResize(path, next);
   };
@@ -88,7 +97,7 @@ function SplitHandle({path, index, direction, sizes, onResize}: {
   return <div className="split-handle" role="separator" tabIndex={0}
               aria-orientation={direction === 'row' ? 'vertical' : 'horizontal'}
               onPointerDown={begin} onPointerMove={move} onPointerUp={end}
-              onPointerCancel={end} onKeyDown={key}/>;
+              onPointerCancel={end} onLostPointerCapture={end} onKeyDown={key}/>;
 }
 
 function NotForRecorded({reason, children}: {

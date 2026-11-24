@@ -338,13 +338,15 @@ function LiveHealthPanel() {
         });
       else
         for (const node of graph.nodes)
-          if (!node.alive)
+          if (!node.alive) {
+            const age = staleness(graph, node);
             out.push({
               severity: 'warn',
               text: `${node.name} stopped heartbeating ${
-                  duration(staleness(graph, node))} ago`,
+                  duration(Number.isFinite(age) ? Math.max(0, age) : NaN)} ago`,
               panel: 'system'
             });
+          }
       for (const topic of graph.topics) {
         const state = health(topic);
         if (state === 'orphaned' && !linted.has(topic.name))
