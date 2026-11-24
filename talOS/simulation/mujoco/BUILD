@@ -27,8 +27,48 @@ cc_library(
     hdrs = ["plant.h"],
     visibility = ["//talOS/simulation/mujoco:__subpackages__"],
     deps = [
+        ":world_rules",
         "//talOS/hardware",
         "//talOS/hardware:codecs",
+        "@mujoco",
+    ],
+)
+
+# What changes the MuJoCo world after a step besides physics (a scripted
+# shot, a game's referee): the interface MujocoPlant::Step runs.
+cc_library(
+    name = "world_rules",
+    hdrs = ["world_rules.h"],
+    visibility = ["//talOS/simulation/mujoco:__subpackages__"],
+)
+
+# The robot model's scripted shooters (README.md "Scripted shooter";
+# REQ-DEV-39), a WorldRules.
+cc_library(
+    name = "scripted_shooter",
+    srcs = ["scripted_shooter.cc"],
+    hdrs = ["scripted_shooter.h"],
+    visibility = ["//talOS/simulation/mujoco:__subpackages__"],
+    deps = [
+        ":world_rules",
+        "@mujoco",
+    ],
+)
+
+# REQ-DEV-39: launches from a stationary and from a moving, turning robot,
+# the flywheel's momentum debit, robot bodies never launched, one body at a
+# time, the contract's refusals, bit-identical runs and no allocation.
+cc_test(
+    name = "scripted_shooter_test",
+    size = "small",
+    srcs = ["scripted_shooter_test.cc"],
+    deps = [
+        ":plant",
+        ":scripted_shooter",
+        ":world_rules",
+        "//talOS/hardware",
+        "//talOS/node:allocation_probe",
+        "@googletest//:gtest_main",
         "@mujoco",
     ],
 )
@@ -39,6 +79,7 @@ cc_test(
     srcs = ["plant_test.cc"],
     deps = [
         ":plant",
+        ":world_rules",
         "//talOS/hardware",
         "//talOS/node:allocation_probe",
         "@googletest//:gtest_main",

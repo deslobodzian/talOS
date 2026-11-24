@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "talOS/hardware/sim_plant.h"
+#include "talOS/simulation/mujoco/world_rules.h"
 
 // MuJoCo's model and data (mujoco.h typedefs them as mjModel and mjData).
 struct mjModel_;
@@ -96,10 +97,26 @@ class MujocoPlant final : public hardware::sim::ExternalPlant {
   // (one per excursion, not per Step): logged by the caller, not fatal (Q9).
   uint64_t overspeed_excursions() const { return overspeed_excursions_; }
   // The compiled world and its state, for a truth publisher; the plant owns
-  // both and changes them only in Bind and Step (Step rewrites the bound
-  // actuators' gain, bias and force range).
+  // both and changes them only in Bind, AddRules (a rule's Attach) and Step
+  // (Step rewrites the bound actuators' gain, bias and force range, and its
+  // rules write what world_rules.h allows).
   const mjModel_* model() const { return model_.get(); }
   const mjData_* data() const { return data_.get(); }
+
+  // World rules (world_rules.h). Before the first Step; not owned; run in the
+  // order added. Calls Attach, then mj_forward and mj_step's position,
+  // velocity and acceleration checks, so the next rule's Attach and every
+  // reader see what it placed; a fatal warning there fails the plant and
+  // throws std::invalid_argument naming it. Throws std::invalid_argument for
+  // a rule already added, and std::logic_error after the first Step or on a
+  // failed plant. While rules are attached, each MuJoCo step that passes the
+  // fatal-warning check is followed by mj_kinematics, mj_comPos and
+  // mj_comVel, then every rule's AfterStep. AfterStep must not throw: a rule
+  // that returns false, or throws anyway, fails the plant for good with its
+  // failure() text (or the exception's), and no rule runs again.
+  void AddRules(WorldRules& rules);
+  // The match input every rule sees in every Step until the next call.
+  void SetMatchInput(const MatchInput& input);
 
  private:
   friend std::unique_ptr<MujocoPlant> MakePlant(
@@ -139,6 +156,8 @@ class MujocoPlant final : public hardware::sim::ExternalPlant {
   // velocities up to the current qpos and qvel, then the rotors and chassis.
   void Refresh();
   void Fail(int warning, int info);
+  // Fails the plant for good with `text`, at the current plant time.
+  void Fail(std::string_view text);
 
   std::unique_ptr<mjModel_, ModelDeleter> model_;
   std::unique_ptr<mjData_, DataDeleter> data_;
@@ -156,6 +175,9 @@ class MujocoPlant final : public hardware::sim::ExternalPlant {
   hardware::sim::PlantChassis chassis_{};
   double raw_yaw_rad_{};
   std::array<int, 7> warnings_{};  // d->warning[].number per mjtWarning
+  std::vector<WorldRules*> rules_;
+  MatchInput match_input_{};
+  uint64_t steps_{};  // MuJoCo steps taken, the rules' step count
   bool failed_{false};
   std::array<char, 768> failure_{};
 };

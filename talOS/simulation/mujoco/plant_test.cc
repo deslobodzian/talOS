@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -22,6 +23,7 @@
 
 #include "talOS/hardware/sim_plant.h"
 #include "talOS/node/allocation_probe.h"
+#include "talOS/simulation/mujoco/world_rules.h"
 
 namespace talos::simulation::mujoco {
 namespace {
@@ -438,6 +440,130 @@ TEST(MujocoPlant, StepDoesNotAllocate) {
   }
   EXPECT_EQ(probe.stop(), 0u) << probe.sites();
   EXPECT_TRUE(plant->failure().empty()) << plant->failure();
+}
+
+// A world rule that logs each AfterStep and, at step `fail_at` (0: never),
+// returns false or, with `throws`, throws.
+struct RuleCall {
+  int rule{};
+  uint64_t step{};
+  MatchInput::Mode mode{};
+  uint64_t schedule_us{};
+  bool operator==(const RuleCall&) const = default;
+};
+
+class LoggingRule final : public WorldRules {
+ public:
+  LoggingRule(int id, std::vector<RuleCall>& log, uint64_t fail_at = 0,
+              bool throws = false)
+      : id_(id), log_(log), fail_at_(fail_at), throws_(throws) {}
+  void Attach(const mjModel& /*model*/, mjData& /*data*/) override {
+    ++attached;
+  }
+  bool AfterStep(mjModel& /*model*/, mjData& /*data*/, uint64_t step,
+                 const MatchInput& input) override {
+    log_.push_back({id_, step, input.mode, input.schedule_us});
+    if (step == fail_at_ && throws_) {
+      throw std::runtime_error("the hub ran dry");
+    }
+    return step != fail_at_;
+  }
+  std::string_view failure() const override { return "the hub ran dry"; }
+  int attached{0};
+
+ private:
+  int id_;
+  std::vector<RuleCall>& log_;
+  uint64_t fail_at_;
+  bool throws_;
+};
+
+// The rules seam: rules attach once when added (a rule added twice is
+// refused) and run after every MuJoCo step, in the order added, numbered
+// from 1, with the match input last set.
+TEST(MujocoPlant, RulesRunInOrderAfterEveryStepWithTheMatchInput) {
+  const std::vector<PlantMotor> motors = {Motor("arm")};
+  auto plant = Make("rules", HingeRobot(0.01), motors);
+  std::vector<RuleCall> log;
+  LoggingRule first(0, log);
+  LoggingRule second(1, log);
+  plant->AddRules(first);
+  plant->AddRules(second);
+  EXPECT_THROW(plant->AddRules(first), std::invalid_argument);
+  EXPECT_EQ(first.attached, 1);
+  EXPECT_EQ(second.attached, 1);
+
+  using Mode = MatchInput::Mode;
+  plant->SetMatchInput({.mode = Mode::kTeleop, .schedule_us = 7000});
+  ASSERT_TRUE(plant->Step(2, {}));
+  plant->SetMatchInput({.mode = Mode::kAutonomous, .schedule_us = 12000});
+  ASSERT_TRUE(plant->Step(1, {}));
+  EXPECT_EQ(log, (std::vector<RuleCall>{{0, 1, Mode::kTeleop, 7000},
+                                        {1, 1, Mode::kTeleop, 7000},
+                                        {0, 2, Mode::kTeleop, 7000},
+                                        {1, 2, Mode::kTeleop, 7000},
+                                        {0, 3, Mode::kAutonomous, 12000},
+                                        {1, 3, Mode::kAutonomous, 12000}}));
+  LoggingRule late(2, log);
+  EXPECT_THROW(plant->AddRules(late), std::logic_error);
+}
+
+// The rules seam fails closed: a rule that returns false, or throws, fails
+// the plant for good with its text; no rule runs after it, in that step or
+// in a later Step.
+TEST(MujocoPlant, AFailingRuleFailsThePlantForGood) {
+  for (const bool throws : {false, true}) {
+    SCOPED_TRACE(throws ? "throws" : "returns false");
+    const std::vector<PlantMotor> motors = {Motor("arm")};
+    auto plant = Make("failing_rule", HingeRobot(0.01), motors);
+    std::vector<RuleCall> log;
+    LoggingRule failing(0, log, 2, throws);
+    LoggingRule after(1, log);
+    plant->AddRules(failing);
+    plant->AddRules(after);
+    EXPECT_FALSE(plant->Step(3, {}));
+    EXPECT_NE(plant->failure().find("the hub ran dry"), std::string_view::npos)
+        << plant->failure();
+    const std::vector<RuleCall> expected = {{0, 1}, {1, 1}, {0, 2}};
+    EXPECT_EQ(log, expected);
+    EXPECT_FALSE(plant->Step(1, {}));
+    EXPECT_EQ(log, expected);
+    EXPECT_EQ(plant->data()->time, 2 * kH);
+  }
+}
+
+// A rule whose Attach leaves the world unstable is refused by AddRules,
+// naming the warning and the joint, not blamed on the first Step; the plant
+// is failed and takes no further rule.
+TEST(MujocoPlant, AnUnstableAttachIsRefusedWhenAdded) {
+  class BadPlacement final : public WorldRules {
+   public:
+    void Attach(const mjModel& /*model*/, mjData& data) override {
+      data.qpos[0] = std::numeric_limits<double>::quiet_NaN();
+    }
+    bool AfterStep(mjModel& /*model*/, mjData& /*data*/, uint64_t /*step*/,
+                   const MatchInput& /*input*/) override {
+      return true;
+    }
+    std::string_view failure() const override { return {}; }
+  };
+  const std::vector<PlantMotor> motors = {Motor("arm")};
+  auto plant = Make("bad_attach", HingeRobot(0.01), motors);
+  BadPlacement bad;
+  try {
+    plant->AddRules(bad);
+    ADD_FAILURE() << "not refused";
+  } catch (const std::invalid_argument& error) {
+    const std::string_view message = error.what();
+    EXPECT_NE(message.find("Attach"), std::string_view::npos) << message;
+    EXPECT_NE(message.find("BADQPOS"), std::string_view::npos) << message;
+    EXPECT_NE(message.find("arm_joint"), std::string_view::npos) << message;
+  }
+  EXPECT_FALSE(plant->failure().empty());
+  EXPECT_FALSE(plant->Step(1, {}));
+  std::vector<RuleCall> log;
+  LoggingRule later(0, log);
+  EXPECT_THROW(plant->AddRules(later), std::logic_error);
 }
 
 // A model MakePlant cannot bind or place is refused before it runs, naming
