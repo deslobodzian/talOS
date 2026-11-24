@@ -588,6 +588,17 @@ class ScopedNofileLimit {
 // RLIMIT_NOFILE, failing at epoll_create1, timerfd_create, or eventfd) must
 // report EMFILE and close every descriptor opened so far.
 TEST(PollerTest, ConstructorFailureUnderFdCapReportsEmfileAndLeaksNoFds) {
+#if defined(__SANITIZE_ADDRESS__)
+  GTEST_SKIP()
+      << "ASan runtime calls pipe() on exception paths while RLIMIT_NOFILE is "
+         "exhausted";
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+  GTEST_SKIP()
+      << "ASan runtime calls pipe() on exception paths while RLIMIT_NOFILE is "
+         "exhausted";
+#endif
+#endif
   for (const std::size_t free_fds :
        {std::size_t{0}, std::size_t{1}, std::size_t{2}}) {
     SCOPED_TRACE(free_fds);
