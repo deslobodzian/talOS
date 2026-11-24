@@ -348,12 +348,32 @@ struct MetalAprilTagBackend::Impl {
 
   void SetOptions(const talos::vision::apriltag::DetectorOptions& opts) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
-    options = opts;
-    cpu_backend->SetOptions(opts);
-    compute_cpu_backend =
+    auto next_compute_cpu =
         std::make_unique<talos::vision::CpuAprilTagBackend>(opts);
+    apriltag_family_t* next_tf =
+        talos::vision::apriltag::CreateTagFamily(opts.family_name);
+    if (next_tf == nullptr) {
+      throw std::invalid_argument("Unsupported AprilTag family: " +
+                                  opts.family_name);
+    }
+    try {
+      cpu_backend->SetOptions(opts);
+    } catch (...) {
+      talos::vision::apriltag::DestroyTagFamily(opts.family_name, next_tf);
+      throw;
+    }
     DestroyDetector();
-    InitDetector();
+    options = opts;
+    compute_cpu_backend = std::move(next_compute_cpu);
+    tf = next_tf;
+    active_family = opts.family_name;
+    td = apriltag_detector_create();
+    apriltag_detector_add_family_bits(td, tf, options.max_hamming);
+    td->nthreads = options.threads;
+    td->quad_decimate = options.quad_decimate;
+    td->quad_sigma = options.quad_sigma;
+    td->refine_edges = options.refine_edges ? 1 : 0;
+    td->decode_sharpening = options.decode_sharpening;
   }
 
   std::vector<talos::vision::apriltag::Detection> CpuDetect(
@@ -946,7 +966,8 @@ talos::vision::BackendExecutionResult MetalAprilTagBackend::Execute(
   if (frame.width() > kMaxInt || frame.height() > kMaxInt ||
       frame.stride() > kMaxInt) {
     result.effective_backend = "metal";
-    result.success = true;
+    result.success = false;
+    result.error_message = "Frame dimensions or stride exceed INT_MAX";
     return result;
   }
 

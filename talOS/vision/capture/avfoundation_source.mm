@@ -80,6 +80,7 @@ class Source final : public CameraSource {
     return mode_;
   }
   bool SetMode(const CameraMode& mode) override {
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
     std::lock_guard<std::mutex> lock(device_mutex_);
     if (running_.load(std::memory_order_acquire)) return false;
     if (!mode.width || !mode.height || !std::isfinite(mode.fps) ||
@@ -93,6 +94,7 @@ class Source final : public CameraSource {
     return controls_;
   }
   bool SetControls(const CameraControls& c) override {
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
     std::lock_guard<std::mutex> lock(device_mutex_);
     if (running_.load(std::memory_order_acquire)) return false;
     controls_ = c;
@@ -125,7 +127,15 @@ class Source final : public CameraSource {
   }
   bool controls_applied() const override { return controls_applied_; }
   bool Start() override {
+    std::unique_lock<std::mutex> lifecycle(lifecycle_mutex_);
     if (running_.load(std::memory_order_acquire)) return true;
+    auto fail = [&](ConnectionState state, const std::string& message) {
+      StopLocked();
+      const std::string full = device_id() + ": " + message;
+      lifecycle.unlock();
+      NotifyConnection(state, full);
+      return false;
+    };
     @autoreleasepool {
       std::string device_id;
       CameraMode mode;
@@ -139,7 +149,7 @@ class Source final : public CameraSource {
       if (device_id.empty()) {
         const auto devices = DiscoverCaptureDevices();
         if (id_ >= devices.size())
-          return Fail(ConnectionState::kDisconnected,
+          return fail(ConnectionState::kDisconnected,
                       "no camera at index " + std::to_string(id_));
         device_id = devices[id_].id;
         {
@@ -154,10 +164,10 @@ class Source final : public CameraSource {
         device_ = device;
       }
       if (!device_)
-        return Fail(ConnectionState::kDisconnected,
+        return fail(ConnectionState::kDisconnected,
                     "no camera with uniqueID " + device_id);
       if (!device_.connected)
-        return Fail(ConnectionState::kDisconnected,
+        return fail(ConnectionState::kDisconnected,
                     "camera " + device_id + " is not connected");
       const auto permission =
           [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
@@ -170,11 +180,11 @@ class Source final : public CameraSource {
                                    completionHandler:^(BOOL granted){
                                    }];
         }
-        return Fail(ConnectionState::kDisconnected,
+        return fail(ConnectionState::kDisconnected,
                     "Waiting for macOS camera permission");
       }
       if (permission != AVAuthorizationStatusAuthorized) {
-        return Fail(ConnectionState::kError,
+        return fail(ConnectionState::kError,
                     "Camera access is not authorized for this process; "
                     "enable camera access in macOS Privacy settings");
       }
@@ -185,18 +195,18 @@ class Source final : public CameraSource {
           [AVCaptureDeviceInput deviceInputWithDevice:device_ error:&error];
       if (!input) {
         [session_ commitConfiguration];
-        return Fail(ConnectionState::kError,
+        return fail(ConnectionState::kError,
                     "cannot open camera input: " + Describe(error));
       }
       if (![session_ canAddInput:input]) {
         [session_ commitConfiguration];
-        return Fail(ConnectionState::kError,
+        return fail(ConnectionState::kError,
                     "capture session refused the camera input (in use?)");
       }
       [session_ addInput:input];
       if (![device_ lockForConfiguration:&error]) {
         [session_ commitConfiguration];
-        return Fail(ConnectionState::kError,
+        return fail(ConnectionState::kError,
                     "cannot lock camera configuration: " + Describe(error));
       }
       bool selected = false;
@@ -226,7 +236,7 @@ class Source final : public CameraSource {
       [device_ unlockForConfiguration];
       if (!selected) {
         [session_ commitConfiguration];
-        return Fail(ConnectionState::kError,
+        return fail(ConnectionState::kError,
                     "camera has no " + std::to_string(mode.width) + "x" +
                         std::to_string(mode.height) + " format at " +
                         std::to_string(mode.fps) + " fps");
@@ -263,10 +273,11 @@ class Source final : public CameraSource {
       dispatch_ = dispatch_queue_create(
           "talos.camera", dispatch_queue_attr_make_with_qos_class(
                               DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+      dispatch_queue_set_specific(dispatch_, &kDispatchQueueKey, this, nullptr);
       [output_ setSampleBufferDelegate:delegate_ queue:dispatch_];
       if (![session_ canAddOutput:output_]) {
         [session_ commitConfiguration];
-        return Fail(ConnectionState::kError,
+        return fail(ConnectionState::kError,
                     "capture session refused the video output");
       }
       [session_ addOutput:output_];
@@ -276,22 +287,34 @@ class Source final : public CameraSource {
       running_.store(true, std::memory_order_release);
       [session_ startRunning];
       if (!session_.running) {
-        return Fail(ConnectionState::kError, "Capture session did not start");
+        return fail(ConnectionState::kError, "Capture session did not start");
       }
       connected_.store(true, std::memory_order_release);
-      NotifyConnection(ConnectionState::kConnected, "");
-      return true;
     }
+    lifecycle.unlock();
+    NotifyConnection(ConnectionState::kConnected, "");
+    return true;
   }
   void Stop() override {
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
+    StopLocked();
+  }
+
+  uint64_t dropped_frames() const override { return dropped_frames_.load(); }
+
+ private:
+  void StopLocked() {
     running_.store(false, std::memory_order_release);
     connected_.store(false, std::memory_order_release);
     @autoreleasepool {
       [session_ stopRunning];
       [output_ setSampleBufferDelegate:nil queue:nullptr];
-      if (dispatch_)
+      const bool on_dispatch_queue =
+          dispatch_ && dispatch_get_specific(&kDispatchQueueKey) == this;
+      if (dispatch_ && !on_dispatch_queue) {
         dispatch_sync(dispatch_, ^{
                       });
+      }
       if (delegate_) delegate_->callback = {};
       delegate_ = nil;
       output_ = nil;
@@ -303,10 +326,6 @@ class Source final : public CameraSource {
       dispatch_ = nullptr;
     }
   }
-
-  uint64_t dropped_frames() const override { return dropped_frames_.load(); }
-
- private:
   void NotifyConnection(ConnectionState state, const std::string& message) {
     ConnectionCallback cb;
     {
@@ -314,13 +333,6 @@ class Source final : public CameraSource {
       cb = connection_;
     }
     if (cb) cb(state, message);
-  }
-  // Tears down any partially initialized capture state, reports why Start
-  // failed, and returns false.
-  bool Fail(ConnectionState state, const std::string& message) {
-    Stop();
-    NotifyConnection(state, device_id() + ": " + message);
-    return false;
   }
   static std::string Describe(NSError* error) {
     if (!error) return "unknown error";
@@ -395,7 +407,9 @@ class Source final : public CameraSource {
   std::atomic<uint64_t> dropped_frames_{0};
   bool controls_applied_{true};
   uint64_t session_id_ = 0, sequence_ = 0;
+  mutable std::mutex lifecycle_mutex_;
   mutable std::mutex device_mutex_;
+  static constexpr char kDispatchQueueKey = 0;
   AVCaptureDevice* device_ = nil;
   AVCaptureSession* session_ = nil;
   AVCaptureVideoDataOutput* output_ = nil;

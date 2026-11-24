@@ -349,6 +349,80 @@ TEST(Capture, LinuxDisconnectReleasesDeviceAllowsSelfStopAndSetMode) {
       EXPECT_EQ(state.active_mmaps, 0);
     }
   }
+
+  // Case 3: Calling Stop() from FrameCallback on the worker thread must not
+  // self-join and must not close fd_/unmap buffers before Capture() finishes
+  // VIDIOC_QBUF and exits cleanly.
+  {
+    FakeV4L2State state;
+    std::atomic<int> poll_calls{0};
+    auto sys = state.Syscalls([&](pollfd* fds, nfds_t, int) {
+      if (poll_calls.fetch_add(1) == 0) {
+        fds[0].revents = POLLIN;
+        return 1;
+      }
+      return 0;
+    });
+    auto base_ioctl = sys.ioctl_fn;
+    std::atomic<bool> qbuf_saw_closed_device{false};
+    std::atomic<int> qbuf_after_frame{0};
+    std::atomic<bool> frame_delivered{false};
+    sys.ioctl_fn = [&, base_ioctl](int fd, unsigned long req, void* arg) {
+      if (req == VIDIOC_DQBUF) {
+        auto* b = static_cast<v4l2_buffer*>(arg);
+        b->index = 0;
+        b->bytesused = FakeV4L2State::kBufSize;
+        b->flags = 0;
+        return 0;
+      }
+      if (req == VIDIOC_QBUF && frame_delivered.load()) {
+        std::lock_guard lock(state.mu);
+        if (state.open_fds <= 0 || state.active_mmaps <= 0) {
+          qbuf_saw_closed_device.store(true);
+        }
+        qbuf_after_frame.fetch_add(1);
+      }
+      return base_ioctl(fd, req, arg);
+    };
+    auto source = CreateV4L2CameraSourceForTest(config, std::move(sys));
+    std::mutex mu;
+    std::condition_variable cv;
+    bool cb_ran = false;
+    int open_fds_after_self_stop = -1;
+    int active_mmaps_after_self_stop = -1;
+    source->SetFrameCallback([&](const Frame&) {
+      frame_delivered.store(true);
+      source->Stop();
+      {
+        std::lock_guard lock(state.mu);
+        open_fds_after_self_stop = state.open_fds;
+        active_mmaps_after_self_stop = state.active_mmaps;
+      }
+      {
+        std::lock_guard lock(mu);
+        cb_ran = true;
+      }
+      cv.notify_one();
+    });
+    ASSERT_TRUE(source->Start());
+    {
+      std::unique_lock lock(mu);
+      ASSERT_TRUE(
+          cv.wait_for(lock, std::chrono::seconds{10}, [&] { return cb_ran; }));
+    }
+    EXPECT_GT(open_fds_after_self_stop, 0);
+    EXPECT_GT(active_mmaps_after_self_stop, 0);
+    // External Stop() joins the retired worker after Capture() finishes
+    // VIDIOC_QBUF and releases the device.
+    source->Stop();
+    EXPECT_EQ(qbuf_after_frame.load(), 1);
+    EXPECT_FALSE(qbuf_saw_closed_device.load());
+    {
+      std::lock_guard lock(state.mu);
+      EXPECT_EQ(state.open_fds, 0);
+      EXPECT_EQ(state.active_mmaps, 0);
+    }
+  }
 }
 
 // FIELD-4 (no REQ row covers live capture modes yet): a live camera opens
