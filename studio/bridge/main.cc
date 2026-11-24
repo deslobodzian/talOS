@@ -14,13 +14,14 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include "drive.h"
@@ -73,6 +74,24 @@ constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{1024} * 1024;
 
 enum class BoundedReadStatus { kOk, kNotFound, kTooLarge };
 
+struct ScopedFd {
+  int fd{-1};
+  explicit ScopedFd(int descriptor) : fd(descriptor) {}
+  ~ScopedFd() {
+    if (fd >= 0) ::close(fd);
+  }
+  ScopedFd(const ScopedFd&) = delete;
+  ScopedFd& operator=(const ScopedFd&) = delete;
+};
+
+int OpenShmReadOnly(const std::string& segment) {
+  int fd = -1;
+  do {
+    fd = ::shm_open(segment.c_str(), O_RDONLY, 0);
+  } while (fd < 0 && errno == EINTR);
+  return fd;
+}
+
 // Reads one regular file up to `max_bytes` using O_NONBLOCK + fstat + bounded
 // chunked reads so FIFOs, device nodes, and growing files cannot block the
 // loop thread or allocate unbounded memory.
@@ -80,17 +99,11 @@ BoundedReadStatus ReadBoundedFile(const fs::path& path,
                                   std::uintmax_t max_bytes, std::string& out) {
   out.clear();
   if (path.empty()) return BoundedReadStatus::kNotFound;
-  struct ScopedFd {
-    int fd{-1};
-    explicit ScopedFd(int descriptor) : fd(descriptor) {}
-    ~ScopedFd() {
-      if (fd >= 0) ::close(fd);
-    }
-    ScopedFd(const ScopedFd&) = delete;
-    ScopedFd& operator=(const ScopedFd&) = delete;
-  };
-  const ScopedFd opened{
-      ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC)};
+  int raw_fd = -1;
+  do {
+    raw_fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+  } while (raw_fd < 0 && errno == EINTR);
+  const ScopedFd opened{raw_fd};
   if (opened.fd < 0) return BoundedReadStatus::kNotFound;
   struct stat sb {};
   if (::fstat(opened.fd, &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size < 0) {
@@ -131,16 +144,16 @@ std::string ReadManifest(const std::string& path) {
 // nullopt while there is none or its creator has not finished initializing
 // it. Maps only the header, read-only, and keeps nothing open.
 std::optional<std::uint64_t> SegmentId(const std::string& segment) {
-  const int fd = ::shm_open(segment.c_str(), O_RDONLY, 0);
-  if (fd < 0) return std::nullopt;
+  const ScopedFd opened{OpenShmReadOnly(segment)};
+  if (opened.fd < 0) return std::nullopt;
   std::optional<std::uint64_t> id;
   struct stat status {};
   // A segment still being sized is shorter than its header; mapping past
   // its end would fault on the first read.
-  if (::fstat(fd, &status) == 0 &&
+  if (::fstat(opened.fd, &status) == 0 &&
       status.st_size >= static_cast<off_t>(sizeof(RTMSHeader))) {
-    void* mapped =
-        ::mmap(nullptr, sizeof(RTMSHeader), PROT_READ, MAP_SHARED, fd, 0);
+    void* mapped = ::mmap(nullptr, sizeof(RTMSHeader), PROT_READ, MAP_SHARED,
+                          opened.fd, 0);
     if (mapped != MAP_FAILED) {
       const auto* header = static_cast<const RTMSHeader*>(mapped);
       if (header->magic.load(std::memory_order_acquire) == kRtmsMagic) {
@@ -149,7 +162,6 @@ std::optional<std::uint64_t> SegmentId(const std::string& segment) {
       ::munmap(mapped, sizeof(RTMSHeader));
     }
   }
-  ::close(fd);
   return id;
 }
 using Socket = uWS::WebSocket<false, true, Client>;
@@ -175,6 +187,9 @@ struct PiecesTopic {
   // IngestPieces would not draw).
   std::uint64_t events = 0, dropped = 0;
 
+  PiecesTopic() = default;
+  PiecesTopic(const PiecesTopic&) = delete;
+  PiecesTopic& operator=(const PiecesTopic&) = delete;
   ~PiecesTopic() { detach(); }
   void detach() {
     if (!queue) return;
@@ -565,19 +580,69 @@ struct Bridge {
   // /telemetry.json, /channels.json and every client's updates.
   studio::TelemetryState telemetry_state;
 
+  struct RegistryIdentity {
+    dev_t dev{0};
+    ino_t ino{0};
+    bool valid() const { return dev != 0 || ino != 0; }
+    bool operator==(const RegistryIdentity&) const = default;
+  };
+
   // Opened lazily: the bridge may well start before any node, and a viewer
   // that refuses to run until the robot is up is a viewer you cannot use to
-  // watch the robot come up.
+  // watch the robot come up. Re-checked on each refresh so a standalone
+  // bridge drops an unlinked segment and attaches cleanly to any replacement.
+  std::string registry_segment =
+      ShmObjectName(talos::introspect::kRegistryPath);
   std::optional<talos::introspect::RegistryReader> registry;
+  std::optional<RegistryIdentity> registry_identity;
   // The latest refresh; empty until the first, so no client is sent "{}".
   studio::SystemGraphDocument system_graph;
   bool system_json_oversized = false;
   std::int64_t started_wall_ns = talos::introspect::wall_now_ns();
 
-  void refresh_system() {
-    if (!registry) {
-      registry = talos::introspect::RegistryReader::open();
+  void sync_registry() {
+    const ScopedFd before{OpenShmReadOnly(registry_segment)};
+    if (before.fd < 0) {
+      registry.reset();
+      registry_identity.reset();
+      return;
     }
+    struct stat before_stat {};
+    if (::fstat(before.fd, &before_stat) != 0) {
+      registry.reset();
+      registry_identity.reset();
+      return;
+    }
+    const RegistryIdentity current{before_stat.st_dev, before_stat.st_ino};
+    // On Linux (/dev/shm tmpfs), (st_dev, st_ino) uniquely identifies the live
+    // segment while our existing mapping pins its inode, so a match proves the
+    // path still points to the same segment with no remap. On macOS, fstat on a
+    // POSIX shm descriptor reports dev/ino 0, so reopen on refresh to pick up
+    // any unlink or replacement.
+    if (registry && current.valid() && registry_identity &&
+        *registry_identity == current) {
+      return;
+    }
+
+    // Reopen while `before.fd` pins the observed inode so an unlink+recreate
+    // cannot recycle (st_dev, st_ino) underneath RegistryReader::open().
+    registry.reset();
+    registry_identity.reset();
+    auto opened = talos::introspect::RegistryReader::open();
+    if (!opened) return;
+    registry = std::move(opened);
+
+    if (!current.valid()) return;
+    const ScopedFd after{OpenShmReadOnly(registry_segment)};
+    struct stat after_stat {};
+    if (after.fd >= 0 && ::fstat(after.fd, &after_stat) == 0 &&
+        RegistryIdentity{after_stat.st_dev, after_stat.st_ino} == current) {
+      registry_identity = current;
+    }
+  }
+
+  void refresh_system() {
+    sync_registry();
 
     studio::SystemGraphInput input;
     input.bridge = {.topic = topic,
@@ -781,20 +846,34 @@ struct Bridge {
   std::int64_t next_wake_ns(std::int64_t now_ns) const {
     if (refusal_mode) {
       std::int64_t due = now_ns + 1'000'000'000;
-      for (Socket* client : drive_clients.clients()) {
-        const std::int64_t next = client->getUserData()->drive_feed.NextDueNs();
-        if (next < due) due = next;
+      const auto consider = [&due, now_ns](std::int64_t candidate_ns) {
+        if (candidate_ns > now_ns && candidate_ns < due) due = candidate_ns;
+      };
+      if (schedule.retry_ns != studio::kNeverNs) {
+        due =
+            std::min(due, std::max(schedule.retry_ns,
+                                   now_ns + studio::WakeSchedule::kFallbackNs));
       }
-      return std::max(due, now_ns + 1'000'000);
+      for (Socket* client : drive_clients.clients()) {
+        consider(client->getUserData()->drive_feed.NextDueNs());
+      }
+      return std::max(due, now_ns + 1);
     }
-    return schedule.NextWakeNs(now_ns, !wake || backlog, system_graph,
-                               [this](const auto& visit) {
-                                 visit(shared_reservation);
-                                 for (Socket* client : clients.clients())
-                                   visit(client->getUserData()->feeds);
-                                 for (Socket* client : drive_clients.clients())
-                                   visit(client->getUserData()->drive_feed);
-                               });
+    std::int64_t due = schedule.NextWakeNs(
+        now_ns, !wake || backlog, system_graph, [this](const auto& visit) {
+          visit(shared_reservation);
+          for (Socket* client : clients.clients())
+            visit(client->getUserData()->feeds);
+          for (Socket* client : drive_clients.clients())
+            visit(client->getUserData()->drive_feed);
+        });
+    // If a budget deferral's wait elapsed between pass_clients() and here,
+    // WakeSchedule::NextWakeNs skipped retry_ns (<= now_ns); come back at
+    // kFallbackNs rather than stalling until the next 250 ms refresh.
+    if (schedule.retry_ns != studio::kNeverNs && schedule.retry_ns <= now_ns) {
+      due = std::min(due, now_ns + studio::WakeSchedule::kFallbackNs);
+    }
+    return due;
   }
 };
 
@@ -805,6 +884,9 @@ us_poll_t* WatchReadable(us_loop_t* loop, int fd, void* user,
                          void (*on_ready)(us_internal_callback_t*)) {
   auto* poll =
       us_create_poll(loop, 0, sizeof(us_internal_callback_t) + sizeof(user));
+  if (poll == nullptr) {
+    throw std::runtime_error("event poll allocation failed");
+  }
   us_poll_init(poll, fd, POLL_TYPE_CALLBACK);
   auto* callback = reinterpret_cast<us_internal_callback_t*>(poll);
   callback->loop = loop;
@@ -831,12 +913,18 @@ T* WatchedUser(us_internal_callback_t* callback) {
 // bridge cannot know which checkout (talOS's own, a submodule, a sibling
 // `local_path_override`) the reader uses.
 std::string NotBuiltCommand(const fs::path& webroot) {
-  std::ifstream file(webroot / "NOT_BUILT.txt");
-  std::string line;
+  std::string content;
   constexpr std::size_t kMaxLine = 1024;
-  if (file && std::getline(file, line) && !line.empty() &&
-      line.size() <= kMaxLine) {
-    return line;
+  if (ReadBoundedFile(webroot / "NOT_BUILT.txt", kMaxManifestBytes, content) ==
+      BoundedReadStatus::kOk) {
+    const std::size_t nl = content.find('\n');
+    std::string_view line = nl == std::string::npos
+                                ? std::string_view{content}
+                                : std::string_view{content}.substr(0, nl);
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    if (!line.empty() && line.size() <= kMaxLine) {
+      return std::string{line};
+    }
   }
   return "build them with `bazel build //studio:web_dist` in the talOS "
          "checkout this workspace uses (talOS itself, or the one a robot "
@@ -980,6 +1068,7 @@ int main(int argc, char** argv) try {
   // position, so either can be passed anywhere on the line without shifting
   // the positional arguments.
   std::vector<const char*> args;
+  args.push_back(argc > 0 ? argv[0] : "studio_bridge");
   std::string declared_path;
   std::string manifest_path;
   std::string config_path;
@@ -987,27 +1076,39 @@ int main(int argc, char** argv) try {
   std::string refusal_reason;
   std::uint64_t session_id = 0;
   bool bad_session_id = false;
-  bool bad_config = false;
+  bool bad_option = false;
   bool simulation = false;
   unsigned idle_timeout_s = kIdleTimeoutS;
   bool bad_idle_timeout = false;
+  const auto parse_nonempty = [&](std::string_view value, std::string& target) {
+    if (value.empty()) {
+      bad_option = true;
+    } else {
+      target.assign(value);
+    }
+  };
   const auto parse_session_id = [&](std::string_view value) {
+    std::uint64_t parsed = 0;
     const auto [end, error] =
-        std::from_chars(value.data(), value.data() + value.size(), session_id);
+        std::from_chars(value.data(), value.data() + value.size(), parsed);
     if (error != std::errc{} || end != value.data() + value.size()) {
       bad_session_id = true;
+    } else {
+      session_id = parsed;
     }
   };
   const auto parse_idle_timeout = [&](std::string_view value) {
-    const auto [end, error] = std::from_chars(
-        value.data(), value.data() + value.size(), idle_timeout_s);
+    unsigned parsed = 0;
+    const auto [end, error] =
+        std::from_chars(value.data(), value.data() + value.size(), parsed);
     if (error != std::errc{} || end != value.data() + value.size() ||
-        idle_timeout_s < kMinIdleTimeoutS ||
-        idle_timeout_s > kMaxIdleTimeoutS) {
+        parsed < kMinIdleTimeoutS || parsed > kMaxIdleTimeoutS) {
       bad_idle_timeout = true;
+    } else {
+      idle_timeout_s = parsed;
     }
   };
-  for (int i = 0; i < argc; ++i) {
+  for (int i = 1; i < argc; ++i) {
     const std::string_view argument = argv[i];
     static constexpr std::string_view kConfig = "--config";
     static constexpr std::string_view kDeclared = "--declared";
@@ -1021,42 +1122,33 @@ int main(int argc, char** argv) try {
       continue;
     }
     if (argument == kConfig && i + 1 < argc) {
-      const std::string_view value = argv[++i];
-      if (value.empty()) {
-        bad_config = true;
-      } else {
-        config_path = std::string(value);
-      }
+      parse_nonempty(argv[++i], config_path);
       continue;
     }
     if (argument.starts_with(kConfig) && argument.size() > kConfig.size() &&
         argument[kConfig.size()] == '=') {
-      const std::string_view value = argument.substr(kConfig.size() + 1);
-      if (value.empty()) {
-        bad_config = true;
-      } else {
-        config_path = std::string(value);
-      }
+      parse_nonempty(argument.substr(kConfig.size() + 1), config_path);
       continue;
     }
     if (argument == kRefusalFile && i + 1 < argc) {
-      refusal_file = argv[++i];
+      parse_nonempty(argv[++i], refusal_file);
       continue;
     }
     if (argument.starts_with(kRefusalFile) &&
         argument.size() > kRefusalFile.size() &&
         argument[kRefusalFile.size()] == '=') {
-      refusal_file = argument.substr(kRefusalFile.size() + 1);
+      parse_nonempty(argument.substr(kRefusalFile.size() + 1), refusal_file);
       continue;
     }
     if (argument == kRefusalReason && i + 1 < argc) {
-      refusal_reason = argv[++i];
+      parse_nonempty(argv[++i], refusal_reason);
       continue;
     }
     if (argument.starts_with(kRefusalReason) &&
         argument.size() > kRefusalReason.size() &&
         argument[kRefusalReason.size()] == '=') {
-      refusal_reason = argument.substr(kRefusalReason.size() + 1);
+      parse_nonempty(argument.substr(kRefusalReason.size() + 1),
+                     refusal_reason);
       continue;
     }
     if (argument == kSessionId && i + 1 < argc) {
@@ -1080,21 +1172,21 @@ int main(int argc, char** argv) try {
       continue;
     }
     if (argument == kDeclared && i + 1 < argc) {
-      declared_path = argv[++i];
+      parse_nonempty(argv[++i], declared_path);
       continue;
     }
     if (argument.starts_with(kDeclared) && argument.size() > kDeclared.size() &&
         argument[kDeclared.size()] == '=') {
-      declared_path = argument.substr(kDeclared.size() + 1);
+      parse_nonempty(argument.substr(kDeclared.size() + 1), declared_path);
       continue;
     }
     if (argument == kManifest && i + 1 < argc) {
-      manifest_path = argv[++i];
+      parse_nonempty(argv[++i], manifest_path);
       continue;
     }
     if (argument.starts_with(kManifest) && argument.size() > kManifest.size() &&
         argument[kManifest.size()] == '=') {
-      manifest_path = argument.substr(kManifest.size() + 1);
+      parse_nonempty(argument.substr(kManifest.size() + 1), manifest_path);
       continue;
     }
     args.push_back(argv[i]);
@@ -1103,11 +1195,12 @@ int main(int argc, char** argv) try {
   const auto at = [&args](std::size_t i) { return args[i]; };
 
   const bool unknown_option =
+      count > 1 &&
       std::any_of(args.begin() + 1, args.end(), [](const char* argument) {
         return std::string_view(argument).starts_with("--");
       });
   if (count > 4 || unknown_option || bad_idle_timeout || bad_session_id ||
-      bad_config) {
+      bad_option) {
     std::cerr
         << "Usage: studio_bridge "
            "[topic=/talos/telemetry] [HTTP=5800] [webroot=studio/dist]\n"
@@ -1121,6 +1214,7 @@ int main(int argc, char** argv) try {
            "dashboard\n"
            "       [--refusal-file PATH]  serve a launcher phase-1 refusal on "
            "/drive\n"
+           "       [--refusal-reason TEXT] fallback refusal text on /drive\n"
            "       [--idle-timeout-s S]  client idle timeout, 8 to 960 "
            "(default 16)\n"
            "       [--sim]               simulation mode (timeshare unless "
@@ -1292,8 +1386,8 @@ int main(int argc, char** argv) try {
         reinterpret_cast<std::uintptr_t>(ws->getNativeHandle()));
     const int send_buffer =
         studio::ClientSendBuffer::Bytes(bridge.client_rate());
-    if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer,
-                     sizeof send_buffer) != 0) {
+    if (fd >= 0 && ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer,
+                                sizeof send_buffer) != 0) {
       std::cerr << "client send buffer not set: " << std::strerror(errno)
                 << '\n';
     }
@@ -1346,8 +1440,8 @@ int main(int argc, char** argv) try {
         reinterpret_cast<std::uintptr_t>(ws->getNativeHandle()));
     const int send_buffer = studio::ClientSendBuffer::Bytes(
         bridge.egress.plan().drive_client_bytes_per_s);
-    if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer,
-                     sizeof send_buffer) != 0) {
+    if (fd >= 0 && ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer,
+                                sizeof send_buffer) != 0) {
       std::cerr << "client send buffer not set: " << std::strerror(errno)
                 << '\n';
     }
