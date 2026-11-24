@@ -590,7 +590,11 @@ py_test(
         "tidy.sh",
     ],
     legacy_create_init = False,
-    deps = ["@rules_python//python/runfiles"],
+    shard_count = 2,
+    deps = [
+        ":sharded_test_loader",
+        "@rules_python//python/runfiles",
+    ],
 )
 
 # python3 tools/run_rio_clang_tidy.py (CI's rio-adapter job)
