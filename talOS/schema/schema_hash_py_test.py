@@ -20,7 +20,9 @@ from reflection import Enum as ReflectionEnum
 from reflection import EnumVal as ReflectionEnumVal
 from reflection import Field as ReflectionField
 from reflection import Object as ReflectionObject
+from reflection import RPCCall as ReflectionRPCCall
 from reflection import Schema as ReflectionSchema
+from reflection import Service as ReflectionService
 from reflection import Type as ReflectionType
 from schema_test.Arrays import Arrays
 from schema_test.Inner import Inner
@@ -58,6 +60,21 @@ def _cpp_hashes_from_bfbs(bfbs_path, decl_file):
             text = f.read()
     return {m.group(1): int(m.group(2), 16)
             for m in _DESCRIPTOR_HASH_RE.finditer(text)}
+
+
+def _cpp_verify_bfbs(bfbs_bytes, decl_file):
+    """Runs descriptor_gen cc on in-memory .bfbs bytes and returns True iff
+    C++ VerifySchema accepts the buffer."""
+    gen = _RUNFILES.Rlocation(os.environ["TALOS_DESCRIPTOR_GEN"])
+    with tempfile.TemporaryDirectory() as tmp:
+        bfbs_path = os.path.join(tmp, "test.bfbs")
+        out_h = os.path.join(tmp, "out.h")
+        with open(bfbs_path, "wb") as f:
+            f.write(bfbs_bytes)
+        result = subprocess.run(
+            [gen, "cc", bfbs_path, decl_file, out_h, "//talOS/schema:variants"],
+            capture_output=True, text=True, check=False)
+        return result.returncode == 0
 
 
 def _cpp_variant_hashes(variant):
@@ -231,6 +248,74 @@ class VariantTest(unittest.TestCase):
         self.assertIsNone(talos_schema.struct_hash(base, "schema_variant.Kind"))
         self.assertIsNone(talos_schema.struct_hash(b"\xa5" * 64,
                                                    "schema_variant.Reading"))
+
+    # REQ-CONTRACT-07
+    def test_embedded_nul_in_field_name_matches_cpp(self):
+        decl = "//synthetic/nul.fbs"
+
+        def build(field_name):
+            b = flatbuffers.Builder(256)
+            name_off = b.CreateString("synthetic.NulField")
+            decl_off = b.CreateString(decl)
+            field_name_off = b.CreateString(field_name)
+
+            ReflectionType.TypeStart(b)
+            ReflectionType.TypeAddBaseType(b, ReflectionBaseType.BaseType.Int)
+            ReflectionType.TypeAddIndex(b, -1)
+            type_off = ReflectionType.TypeEnd(b)
+
+            ReflectionField.FieldStart(b)
+            ReflectionField.FieldAddName(b, field_name_off)
+            ReflectionField.FieldAddType(b, type_off)
+            ReflectionField.FieldAddOffset(b, 0)
+            field_off = ReflectionField.FieldEnd(b)
+
+            ReflectionObject.ObjectStartFieldsVector(b, 1)
+            b.PrependUOffsetTRelative(field_off)
+            fields_off = b.EndVector()
+
+            ReflectionObject.ObjectStart(b)
+            ReflectionObject.ObjectAddName(b, name_off)
+            ReflectionObject.ObjectAddFields(b, fields_off)
+            ReflectionObject.ObjectAddIsStruct(b, True)
+            ReflectionObject.ObjectAddMinalign(b, 4)
+            ReflectionObject.ObjectAddBytesize(b, 4)
+            ReflectionObject.ObjectAddDeclarationFile(b, decl_off)
+            obj_off = ReflectionObject.ObjectEnd(b)
+
+            ReflectionSchema.SchemaStartObjectsVector(b, 1)
+            b.PrependUOffsetTRelative(obj_off)
+            objs_off = b.EndVector()
+
+            ReflectionSchema.SchemaStartEnumsVector(b, 0)
+            enums_off = b.EndVector()
+
+            ReflectionSchema.SchemaStart(b)
+            ReflectionSchema.SchemaAddObjects(b, objs_off)
+            ReflectionSchema.SchemaAddEnums(b, enums_off)
+            b.Finish(ReflectionSchema.SchemaEnd(b), file_identifier=b"BFBS")
+            return bytes(b.Output())
+
+        bfbs_a = build("x\x00a")
+        bfbs_b = build("x\x00b")
+        with tempfile.TemporaryDirectory() as tmp:
+            path_a = os.path.join(tmp, "a.bfbs")
+            path_b = os.path.join(tmp, "b.bfbs")
+            with open(path_a, "wb") as f:
+                f.write(bfbs_a)
+            with open(path_b, "wb") as f:
+                f.write(bfbs_b)
+            cpp_a = _cpp_hashes_from_bfbs(path_a, decl)["synthetic.NulField"]
+            cpp_b = _cpp_hashes_from_bfbs(path_b, decl)["synthetic.NulField"]
+
+        py_a = talos_schema.struct_hash(bfbs_a, "synthetic.NulField")
+        py_b = talos_schema.struct_hash(bfbs_b, "synthetic.NulField")
+        self.assertIsNotNone(py_a)
+        self.assertIsNotNone(py_b)
+        self.assertNotEqual(py_a, py_b)
+        self.assertEqual(py_a, cpp_a)
+        self.assertEqual(py_b, cpp_b)
+        self.assertNotEqual(cpp_a, cpp_b)
 
 
 def _single_field_bfbs(base, index=-1, offset=0, element=0, fixed_length=0,
@@ -481,6 +566,174 @@ class HostileSchemaTest(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertIsNone(talos_schema.canonical_struct(bfbs, "bad.Struct"))
                 self.assertIsNone(talos_schema.struct_hash(bfbs, "bad.Struct"))
+
+    # REQ-CONTRACT-07
+    def test_missing_required_reflection_fields_match_cpp_rejection(self):
+        decl = "//synthetic/req.fbs"
+
+        def make_object(b, name, is_struct=True, decl_file=None,
+                        omit_name=False, omit_fields=False,
+                        omit_field_name=False, omit_field_type=False):
+            name_off = None if omit_name else b.CreateString(name)
+            decl_off = (None if decl_file is None
+                        else b.CreateString(decl_file))
+            fields_off = None
+            if not omit_fields:
+                fn_off = None if omit_field_name else b.CreateString("v")
+                ft_off = None
+                if not omit_field_type:
+                    ReflectionType.TypeStart(b)
+                    ReflectionType.TypeAddBaseType(
+                        b, ReflectionBaseType.BaseType.Int)
+                    ReflectionType.TypeAddIndex(b, -1)
+                    ft_off = ReflectionType.TypeEnd(b)
+                ReflectionField.FieldStart(b)
+                if fn_off is not None:
+                    ReflectionField.FieldAddName(b, fn_off)
+                if ft_off is not None:
+                    ReflectionField.FieldAddType(b, ft_off)
+                ReflectionField.FieldAddOffset(b, 0)
+                field_off = ReflectionField.FieldEnd(b)
+                ReflectionObject.ObjectStartFieldsVector(b, 1)
+                b.PrependUOffsetTRelative(field_off)
+                fields_off = b.EndVector()
+            ReflectionObject.ObjectStart(b)
+            if name_off is not None:
+                ReflectionObject.ObjectAddName(b, name_off)
+            if fields_off is not None:
+                ReflectionObject.ObjectAddFields(b, fields_off)
+            ReflectionObject.ObjectAddIsStruct(b, is_struct)
+            ReflectionObject.ObjectAddMinalign(b, 4)
+            ReflectionObject.ObjectAddBytesize(b, 4)
+            if decl_off is not None:
+                ReflectionObject.ObjectAddDeclarationFile(b, decl_off)
+            return ReflectionObject.ObjectEnd(b)
+
+        def build_schema(omit=None):
+            b = flatbuffers.Builder(512)
+            # Valid target struct plus an unrelated second object whose
+            # required fields can be omitted without touching synthetic.Good.
+            good_obj = make_object(b, "synthetic.Good", decl_file=decl)
+            other_obj = make_object(
+                b,
+                "synthetic.Other",
+                omit_name=(omit == "Object.name"),
+                omit_fields=(omit == "Object.fields"),
+                omit_field_name=(omit == "Field.name"),
+                omit_field_type=(omit == "Field.type"),
+            )
+            objs_off = None
+            if omit != "Schema.objects":
+                ReflectionSchema.SchemaStartObjectsVector(b, 2)
+                b.PrependUOffsetTRelative(other_obj)
+                b.PrependUOffsetTRelative(good_obj)
+                objs_off = b.EndVector()
+
+            enums_off = None
+            if omit != "Schema.enums":
+                en_name = (None if omit == "Enum.name"
+                           else b.CreateString("synthetic.Kind"))
+                evs_off = None
+                if omit != "Enum.values":
+                    ev_name = (None if omit == "EnumVal.name"
+                               else b.CreateString("A"))
+                    ReflectionEnumVal.EnumValStart(b)
+                    if ev_name is not None:
+                        ReflectionEnumVal.EnumValAddName(b, ev_name)
+                    ReflectionEnumVal.EnumValAddValue(b, 0)
+                    ev_off = ReflectionEnumVal.EnumValEnd(b)
+                    ReflectionEnum.EnumStartValuesVector(b, 1)
+                    b.PrependUOffsetTRelative(ev_off)
+                    evs_off = b.EndVector()
+                ut_off = None
+                if omit != "Enum.underlying_type":
+                    ReflectionType.TypeStart(b)
+                    ReflectionType.TypeAddBaseType(
+                        b, ReflectionBaseType.BaseType.UByte)
+                    ut_off = ReflectionType.TypeEnd(b)
+                ReflectionEnum.EnumStart(b)
+                if en_name is not None:
+                    ReflectionEnum.EnumAddName(b, en_name)
+                if evs_off is not None:
+                    ReflectionEnum.EnumAddValues(b, evs_off)
+                if ut_off is not None:
+                    ReflectionEnum.EnumAddUnderlyingType(b, ut_off)
+                e_off = ReflectionEnum.EnumEnd(b)
+                ReflectionSchema.SchemaStartEnumsVector(b, 1)
+                b.PrependUOffsetTRelative(e_off)
+                enums_off = b.EndVector()
+
+            req_obj = (None if omit == "RPCCall.request"
+                       else make_object(b, "synthetic.Req", is_struct=False))
+            resp_obj = (None if omit == "RPCCall.response"
+                        else make_object(b, "synthetic.Resp", is_struct=False))
+            call_name = (None if omit == "RPCCall.name"
+                         else b.CreateString("Ping"))
+            ReflectionRPCCall.RPCCallStart(b)
+            if call_name is not None:
+                ReflectionRPCCall.RPCCallAddName(b, call_name)
+            if req_obj is not None:
+                ReflectionRPCCall.RPCCallAddRequest(b, req_obj)
+            if resp_obj is not None:
+                ReflectionRPCCall.RPCCallAddResponse(b, resp_obj)
+            call_off = ReflectionRPCCall.RPCCallEnd(b)
+            ReflectionService.ServiceStartCallsVector(b, 1)
+            b.PrependUOffsetTRelative(call_off)
+            calls_off = b.EndVector()
+
+            svc_name = (None if omit == "Service.name"
+                        else b.CreateString("synthetic.Svc"))
+            ReflectionService.ServiceStart(b)
+            if svc_name is not None:
+                ReflectionService.ServiceAddName(b, svc_name)
+            ReflectionService.ServiceAddCalls(b, calls_off)
+            svc_off = ReflectionService.ServiceEnd(b)
+            ReflectionSchema.SchemaStartServicesVector(b, 1)
+            b.PrependUOffsetTRelative(svc_off)
+            svcs_off = b.EndVector()
+
+            ReflectionSchema.SchemaStart(b)
+            if objs_off is not None:
+                ReflectionSchema.SchemaAddObjects(b, objs_off)
+            if enums_off is not None:
+                ReflectionSchema.SchemaAddEnums(b, enums_off)
+            ReflectionSchema.SchemaAddServices(b, svcs_off)
+            b.Finish(ReflectionSchema.SchemaEnd(b), file_identifier=b"BFBS")
+            return bytes(b.Output())
+
+        # Baseline with every required field present passes both C++ and Python.
+        valid = build_schema()
+        self.assertTrue(_cpp_verify_bfbs(valid, decl))
+        self.assertIsNotNone(
+            talos_schema.struct_hash(valid, "synthetic.Good"))
+        talos_schema.find_struct(valid, "synthetic.Good")
+
+        required_fields = (
+            "Schema.objects",
+            "Schema.enums",
+            "Object.name",
+            "Object.fields",
+            "Field.name",
+            "Field.type",
+            "Enum.name",
+            "Enum.values",
+            "Enum.underlying_type",
+            "EnumVal.name",
+            "RPCCall.name",
+            "RPCCall.request",
+            "RPCCall.response",
+            "Service.name",
+        )
+        for missing in required_fields:
+            with self.subTest(missing=missing):
+                bfbs = build_schema(omit=missing)
+                self.assertFalse(_cpp_verify_bfbs(bfbs, decl))
+                self.assertIsNone(
+                    talos_schema.canonical_struct(bfbs, "synthetic.Good"))
+                self.assertIsNone(
+                    talos_schema.struct_hash(bfbs, "synthetic.Good"))
+                with self.assertRaises(talos_schema.SchemaError):
+                    talos_schema.find_struct(bfbs, "synthetic.Good")
 
 
 if __name__ == "__main__":

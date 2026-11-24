@@ -88,8 +88,8 @@ def _text(raw):
 
 class _Verifier:
     """Structural FlatBuffers verifier for reflection.Schema buffers, matching
-    talos::schema::VerifySchema (bounds, alignment, table/vector/string
-    integrity, and raw BaseType byte range)."""
+    talos::schema::VerifySchema (bounds, alignment, required fields,
+    table/vector/string integrity, and raw BaseType byte range)."""
 
     __slots__ = ("_data", "_size", "_tables")
 
@@ -154,9 +154,11 @@ class _Verifier:
             self._check_range(fp, size, align)
         return fp
 
-    def _verify_string(self, table_pos, vtable, vsize, voff):
+    def _verify_string(self, table_pos, vtable, vsize, voff, required=False):
         fp = self._field_pos(table_pos, vtable, vsize, voff)
         if fp is None:
+            if required:
+                raise SchemaError("missing required reflection string")
             return
         spos = self._verify_offset(fp)
         length = self._read_u32(spos)
@@ -166,9 +168,21 @@ class _Verifier:
         if self._data[spos + 4 + length] != 0:
             raise SchemaError("reflection string is not NUL-terminated")
 
-    def _verify_table_vector(self, table_pos, vtable, vsize, voff, verify_elem):
+    def _verify_table(self, table_pos, vtable, vsize, voff, verify_table,
+                      required=False):
         fp = self._field_pos(table_pos, vtable, vsize, voff)
         if fp is None:
+            if required:
+                raise SchemaError("missing required reflection table")
+            return
+        verify_table(self._verify_offset(fp))
+
+    def _verify_table_vector(self, table_pos, vtable, vsize, voff, verify_elem,
+                             required=False):
+        fp = self._field_pos(table_pos, vtable, vsize, voff)
+        if fp is None:
+            if required:
+                raise SchemaError("missing required reflection vector")
             return
         vpos = self._verify_offset(fp)
         length = self._read_u32(vpos)
@@ -191,51 +205,55 @@ class _Verifier:
 
     def _verify_field(self, table_pos):
         vtable, vsize = self._table_start(table_pos)
-        self._verify_string(table_pos, vtable, vsize, 4)  # name
-        tfp = self._field_pos(table_pos, vtable, vsize, 6)  # type
-        if tfp is not None:
-            self._verify_type(self._verify_offset(tfp))
+        self._verify_string(table_pos, vtable, vsize, 4,
+                            required=True)  # name
+        self._verify_table(table_pos, vtable, vsize, 6, self._verify_type,
+                           required=True)  # type
         self._verify_scalar(table_pos, vtable, vsize, 8, 2, 2)   # id
         self._verify_scalar(table_pos, vtable, vsize, 10, 2, 2)  # offset
 
     def _verify_object(self, table_pos):
         vtable, vsize = self._table_start(table_pos)
-        self._verify_string(table_pos, vtable, vsize, 4)  # name
+        self._verify_string(table_pos, vtable, vsize, 4,
+                            required=True)  # name
         self._verify_table_vector(table_pos, vtable, vsize, 6,
-                                  self._verify_field)  # fields
+                                  self._verify_field,
+                                  required=True)  # fields
         self._verify_scalar(table_pos, vtable, vsize, 8, 1, 1)   # is_struct
         self._verify_scalar(table_pos, vtable, vsize, 10, 4, 4)  # minalign
         self._verify_scalar(table_pos, vtable, vsize, 12, 4, 4)  # bytesize
 
     def _verify_enum_val(self, table_pos):
         vtable, vsize = self._table_start(table_pos)
-        self._verify_string(table_pos, vtable, vsize, 4)  # name
+        self._verify_string(table_pos, vtable, vsize, 4,
+                            required=True)  # name
         self._verify_scalar(table_pos, vtable, vsize, 6, 8, 8)  # value
-        ufp = self._field_pos(table_pos, vtable, vsize, 10)  # union_type
-        if ufp is not None:
-            self._verify_type(self._verify_offset(ufp))
+        self._verify_table(table_pos, vtable, vsize, 10,
+                           self._verify_type)  # union_type
 
     def _verify_enum(self, table_pos):
         vtable, vsize = self._table_start(table_pos)
-        self._verify_string(table_pos, vtable, vsize, 4)  # name
+        self._verify_string(table_pos, vtable, vsize, 4,
+                            required=True)  # name
         self._verify_table_vector(table_pos, vtable, vsize, 6,
-                                  self._verify_enum_val)  # values
+                                  self._verify_enum_val,
+                                  required=True)  # values
         self._verify_scalar(table_pos, vtable, vsize, 8, 1, 1)  # is_union
-        utfp = self._field_pos(table_pos, vtable, vsize, 10)  # underlying_type
-        if utfp is not None:
-            self._verify_type(self._verify_offset(utfp))
+        self._verify_table(table_pos, vtable, vsize, 10, self._verify_type,
+                           required=True)  # underlying_type
 
     def _verify_rpc_call(self, table_pos):
         vtable, vsize = self._table_start(table_pos)
-        self._verify_string(table_pos, vtable, vsize, 4)  # name
+        self._verify_string(table_pos, vtable, vsize, 4,
+                            required=True)  # name
         for voff in (6, 8):  # request, response
-            ofp = self._field_pos(table_pos, vtable, vsize, voff)
-            if ofp is not None:
-                self._verify_object(self._verify_offset(ofp))
+            self._verify_table(table_pos, vtable, vsize, voff,
+                               self._verify_object, required=True)
 
     def _verify_service(self, table_pos):
         vtable, vsize = self._table_start(table_pos)
-        self._verify_string(table_pos, vtable, vsize, 4)  # name
+        self._verify_string(table_pos, vtable, vsize, 4,
+                            required=True)  # name
         self._verify_table_vector(table_pos, vtable, vsize, 6,
                                   self._verify_rpc_call)  # calls
 
@@ -245,14 +263,15 @@ class _Verifier:
         root = self._verify_offset(0)
         vtable, vsize = self._table_start(root)
         self._verify_table_vector(root, vtable, vsize, 4,
-                                  self._verify_object)  # objects
+                                  self._verify_object,
+                                  required=True)  # objects
         self._verify_table_vector(root, vtable, vsize, 6,
-                                  self._verify_enum)  # enums
+                                  self._verify_enum,
+                                  required=True)  # enums
         self._verify_string(root, vtable, vsize, 8)   # file_ident
         self._verify_string(root, vtable, vsize, 10)  # file_ext
-        rfp = self._field_pos(root, vtable, vsize, 12)  # root_table
-        if rfp is not None:
-            self._verify_object(self._verify_offset(rfp))
+        self._verify_table(root, vtable, vsize, 12,
+                           self._verify_object)  # root_table
         self._verify_table_vector(root, vtable, vsize, 14,
                                   self._verify_service)  # services
 

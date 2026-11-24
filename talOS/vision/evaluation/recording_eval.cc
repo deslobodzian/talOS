@@ -104,7 +104,7 @@ struct Options {
   std::array<double, 6> mount{};  // x, y, z, roll, pitch, yaw
   bool floor_prior = true;
   bool floor_prior_set = false;
-  float decimate = 2.0f;  // vision.toml's shared detector settings
+  float decimate = 2.0f;
   int threads = 2;
   float sigma = 0.0f;
   bool refine_edges = true;
@@ -634,7 +634,7 @@ int Run(const Options& o) {
   }
   const PoseValidationOptions validation;
   MultiTagPoseSolver solver;
-  const double max_range_m = 8.0;  // vision.toml camera.max_range_m
+  const double max_range_m = 8.0;
 
   std::vector<FrameResult> frames(count);
   for (std::size_t i = 0; i < count; ++i) {
@@ -837,8 +837,7 @@ int Run(const Options& o) {
       s.seen[i] = true;
     }
     if (have_multi) {
-      for (int id = 0; id < 1000; ++id) {
-        if (!field.layout.HasTag(id)) continue;
+      for (const int id : field.layout.TagIds()) {
         if (!Project(field.layout, id, T_layout_camera, k, 12).in_view)
           continue;
         auto& s = tags[id];

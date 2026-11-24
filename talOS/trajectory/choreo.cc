@@ -105,6 +105,16 @@ void CheckVersion(const Json& root) {
         (version.is_number() ? "a fraction" : version.type_name()) +
         " (supported: " + supported + ")");
   }
+  if (version.is_number_unsigned()) {
+    const auto major = version.get<std::uint64_t>();
+    if (major < static_cast<std::uint64_t>(kChoreoMinVersion) ||
+        major > static_cast<std::uint64_t>(kChoreoMaxVersion)) {
+      throw FormatError("unsupported Choreo trajectory version " +
+                        std::to_string(major) + " (supported: " + supported +
+                        ")");
+    }
+    return;
+  }
   const auto major = version.get<std::int64_t>();
   if (major < kChoreoMinVersion || major > kChoreoMaxVersion) {
     throw FormatError("unsupported Choreo trajectory version " +
@@ -195,12 +205,19 @@ std::vector<std::size_t> ReadSplits(const Json& trajectory,
   for (std::size_t i = 0; i < it->size(); ++i) {
     const Json& index = (*it)[i];
     const std::string where = "trajectory.splits[" + std::to_string(i) + "]";
-    if (!index.is_number_unsigned() ||
-        index.get<std::size_t>() >= sample_count) {
+    if (!index.is_number_unsigned()) {
       throw FormatError(where + ": expected a sample index below " +
                         std::to_string(sample_count));
     }
-    splits.push_back(index.get<std::size_t>());
+    const auto idx = index.get<std::size_t>();
+    if (idx >= sample_count) {
+      throw FormatError(where + ": expected a sample index below " +
+                        std::to_string(sample_count));
+    }
+    if (i > 0 && idx <= splits.back()) {
+      throw FormatError(where + ": must be strictly increasing");
+    }
+    splits.push_back(idx);
   }
   return splits;
 }

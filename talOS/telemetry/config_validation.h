@@ -109,9 +109,10 @@ void CheckDictionaryChannelCap(
     const std::map<std::string, std::size_t>& uncounted = {});
 
 // Measures the wire pages of `dictionary` and refuses a dictionary-resend tick
-// whose combined `dictionary_pages + value_pages` exceeds
-// `telemetry_wire::slot_count`, throwing `std::runtime_error` naming the page
-// counts and `slot_count`.
+// whose combined `dictionary_pages + value_pages` exceeds the
+// `OVERWRITE_OLDEST` burst capacity (`telemetry_wire::slot_count - 1` pages,
+// since `slot_count` pages in one tick would lap page 0), throwing
+// `std::runtime_error` naming the page counts, burst limit and `slot_count`.
 PageBudget CheckDictionaryPageBudget(std::span<const ChannelDef> dictionary);
 
 // Builds the telemetry dictionary that `Telemetry::BuildFromGraph` constructs

@@ -40,6 +40,7 @@ constexpr std::string_view kTwoSamples =
 
 // Guards: each sample key lands in its own member (a swapped pair, say vx
 // and vy, would pass every sampling test).
+// REQ-DEV-13
 TEST(ChoreoTest, MapsSampleFieldsToMembers) {
   const LoadResult result = ParseChoreo(
       Document("3", R"([{"t": 0.5, "x": 1, "y": 2, "heading": 3, "vx": 4,
@@ -121,6 +122,7 @@ TEST(ChoreoTest, AcceptsVersionsOneToThree) {
 }
 
 // Guards: trajectory.splits become split starts, 0 prepended when absent.
+// REQ-DEV-13
 TEST(ChoreoTest, ReadsSplits) {
   constexpr std::string_view kThree =
       R"([{"t": 0, "x": 0, "y": 0, "heading": 0, "vx": 0, "vy": 0, "omega": 0,
@@ -144,6 +146,7 @@ TEST(ChoreoTest, ReadsSplits) {
 // events are dropped and counted, not fatal, where ChoreoLib drops them
 // (targetTimestamp not a number, negative time, empty name); a time past
 // the end is kept.
+// REQ-DEV-13
 TEST(ChoreoTest, ReadsEventsAndDropsAsChoreoLibDoes) {
   const LoadResult result = ParseChoreo(Document("1", kTwoSamples,
                                                  R"(, "events": [
@@ -224,6 +227,9 @@ TEST(ChoreoTest, RejectsMalformedInputWithAClearError) {
   constexpr std::size_t kHuge = 1000000;
   const std::string sample_missing_vx =
       R"([{"t": 0, "x": 1, "y": 2, "heading": 0, "vy": 0, "omega": 0}])";
+  const std::string three_samples = "[" + Sample("0", "0") + "," +
+                                    Sample("1", "0") + "," + Sample("2", "0") +
+                                    "]";
   const Malformed cases[] = {
       {"truncated", R"({"version": 1, "trajectory": {)", nullptr},
       {"empty", "", nullptr},
@@ -233,6 +239,8 @@ TEST(ChoreoTest, RejectsMalformedInputWithAClearError) {
        "\"version\""},
       {"zero version", Document("0", kTwoSamples), "version 0"},
       {"next version", Document("4", kTwoSamples), "version 4"},
+      {"unsigned max version", Document("18446744073709551615", kTwoSamples),
+       "version 18446744073709551615"},
       {"fractional version", Document("1.5", kTwoSamples), "\"version\""},
       {"deeply nested version", Document(Nested(kDeep, "1"), kTwoSamples),
        "\"version\""},
@@ -284,6 +292,12 @@ TEST(ChoreoTest, RejectsMalformedInputWithAClearError) {
        "trajectory.splits[1]"},
       {"split out of range",
        Document("1", kTwoSamples, "", R"(, "splits": [0, 5])"),
+       "trajectory.splits[1]"},
+      {"decreasing splits",
+       Document("1", three_samples, "", R"(, "splits": [2, 1])"),
+       "trajectory.splits[1]"},
+      {"duplicate splits",
+       Document("1", three_samples, "", R"(, "splits": [1, 1])"),
        "trajectory.splits[1]"},
       {"events not an array", Document("1", kTwoSamples, R"(, "events": {})"),
        "events"},

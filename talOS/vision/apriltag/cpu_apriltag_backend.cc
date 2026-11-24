@@ -439,4 +439,8 @@ std::optional<PoseEstimation> CpuAprilTagBackend::EstimatePose(
   return result;
 }
 
+apriltag_detector* CpuAprilTagBackend::detector_for_testing() const {
+  return impl_ != nullptr ? impl_->td : nullptr;
+}
+
 }  // namespace talos::vision::apriltag
