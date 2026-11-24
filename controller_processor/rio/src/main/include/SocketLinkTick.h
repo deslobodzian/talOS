@@ -17,14 +17,15 @@
 namespace talos::rio {
 
 // RioLog kMessage indices (rate-limit keys) for socket-link reports in
-// Robot.cpp; 2 is Robot.cpp's kPersistMessage, 0, 7, 8 and 16 to 31 are
-// PhoenixBackend's (configure failure, CAN bus status, CAN bus reader, licence
-// refusals), and 9 to 12 are LoopConsole's.
+// Robot.cpp; 2 is Robot.cpp's kPersistMessage, 0, 7, 8, 13 and 16 to 31 are
+// PhoenixBackend's (configure failure, CAN bus status, CAN bus reader, restore
+// failure, licence refusals), and 9 to 12 are LoopConsole's.
 inline constexpr uint16_t kSocketMessage = 1;
 inline constexpr uint16_t kSocketOpenMessage = 3;
 inline constexpr uint16_t kSocketLostMessage = 4;
 inline constexpr uint16_t kSocketReplacedMessage = 5;
 inline constexpr uint16_t kSocketSendMessage = 6;
+inline constexpr uint16_t kSocketSendRecoveredMessage = 14;
 
 inline void ReportRioMessage(RioLog& log, uint16_t index,
                              std::string_view text) {
@@ -119,7 +120,8 @@ void TickSocketLink(SocketLinkTickContext& ctx, EndpointLike& endpoint,
   // a tick with no socket open ticks the gateway disabled and sends nothing,
   // as before the first open. Any other send error keeps it, and a spell of
   // them prints a line when it starts and one once sends have gone a second
-  // without failing (one key, so RioLog prints at most one a second).
+  // without failing (separate keys so recovery is not rate-limited behind the
+  // spell's opening line).
   const auto sent = [&](protocol::UdpStatus status) {
     using SendEvent = SocketRetry::SendEvent;
     const SendEvent event = ctx.socket_retry.ObserveSend(
@@ -169,7 +171,7 @@ void TickSocketLink(SocketLinkTickContext& ctx, EndpointLike& endpoint,
                                     : 0) /
                 1e6,
             ctx.socket_retry.spell_error(), last);
-        ReportRioMessage(ctx.log, kSocketSendMessage, text);
+        ReportRioMessage(ctx.log, kSocketSendRecoveredMessage, text);
         return;
       }
     }
