@@ -68,9 +68,11 @@ PlantMotor Motor(std::string_view name) {
 
 std::unique_ptr<MujocoPlant> Make(const std::string& name,
                                   const std::string& robot_xml,
-                                  const std::string& field_xml) {
+                                  const std::string& field_xml,
+                                  bool sleeping = false) {
   InstallMujocoProcessHandlers();
   PlantModel model;
+  model.sleeping = sleeping;
   model.robot_xml = ::testing::TempDir() + "/" + name + "_robot.xml";
   model.field_xml = ::testing::TempDir() + "/" + name + "_field.xml";
   std::ofstream(model.robot_xml) << robot_xml;
@@ -179,7 +181,12 @@ ScriptedShooters& Attach(MujocoPlant& plant,
 // inertia with armature, and the launch adds no energy: on a robot at rest,
 // on one moving at (1, 2) m/s and turning at 3 rad/s, whose exit has moved
 // and turned by the end of the step, and with a light flywheel.
-TEST(ScriptedShooter, LaunchesFromTheExitAndDebitsTheFlywheel) {
+// REQ-DEV-37: the same with MuJoCo's sleeping on, the body asleep in the
+// inlet when it is launched; the launch wakes it, so it flies on.
+class LaunchesFromTheExit : public ::testing::TestWithParam<bool> {};
+
+TEST_P(LaunchesFromTheExit, AndDebitsTheFlywheel) {
+  const bool sleeping = GetParam();
   struct Case {
     const char* what;
     Vec3 velocity;
@@ -192,11 +199,19 @@ TEST(ScriptedShooter, LaunchesFromTheExitAndDebitsTheFlywheel) {
         Case{"light flywheel", {0, 0, 0}, 0.0, kLightWheel}}) {
     SCOPED_TRACE(row.what);
     auto plant = Make("launch", Robot(true, "0 0 0.3", row.wheel),
-                      Field(Ball("ball", {0.0, 0.0, 0.8})));
+                      Field(Ball("ball", {0.0, 0.0, 0.8})), sleeping);
     std::unique_ptr<WorldRules> rules;
     ScriptedShooters& shooters = Attach(*plant, rules);
     const mjModel* m = plant->model();
     mjData* d = Writable(*plant);
+    const int ball_tree = m->body_treeid[mj_name2id(m, mjOBJ_BODY, "ball")];
+    if (sleeping) {
+      // Robot and ball at rest, the flywheel stopped (nothing launches): the
+      // ball falls asleep; nothing moves the robot's root from the origin.
+      for (int step = 0; step < 20; ++step) ASSERT_TRUE(plant->Step(1, {}));
+      ASSERT_GE(d->tree_asleep[ball_tree], 0) << "the ball never slept";
+      ASSERT_EQ(shooters.shots(), 0u);
+    }
     constexpr double kSpeed = 300.0;  // rad/s, before the launch
     const int root = Dof(m, "root");
     for (int k = 0; k < 3; ++k) d->qvel[root + k] = row.velocity[k];
@@ -260,7 +275,18 @@ TEST(ScriptedShooter, LaunchesFromTheExitAndDebitsTheFlywheel) {
                           0.5 * kBeta * kBallMass * kBallRadius * kBallRadius *
                               norm(rolling) * norm(rolling);
     EXPECT_LE(gained, 0.5 * inertia * (kSpeed * kSpeed - after * after));
+
+    // Awake, it flies on: one more step moves it by its velocity times the
+    // step (no gravity, no contact).
+    EXPECT_LT(d->tree_asleep[ball_tree], 0) << "the launch left it asleep";
+    ASSERT_TRUE(plant->Step(1, {}));
+    const BodyState next = StateOf(*plant, "ball");
+    for (int k = 0; k < 3; ++k) {
+      position[k] += kH * ball.velocity[k];
+    }
+    ExpectNear(next.position, position, "position a step later");
   }
+  if (sleeping) return;
   // The light flywheel by hand: v = 4.5138 m/s, the wheel left at 177.71
   // rad/s (the pre-launch speed would give 7.62 m/s).
   {
@@ -278,6 +304,13 @@ TEST(ScriptedShooter, LaunchesFromTheExitAndDebitsTheFlywheel) {
     EXPECT_NEAR(plant->data()->qvel[wheel], 177.70715, 1e-5);
   }
 }
+
+INSTANTIATE_TEST_SUITE_P(ScriptedShooter, LaunchesFromTheExit,
+                         ::testing::Bool(),
+                         [](const ::testing::TestParamInfo<bool>& info) {
+                           return info.param ? std::string("SleepingOn")
+                                             : std::string("SleepingOff");
+                         });
 
 // REQ-DEV-39: the robot's own bodies are never launched: a free root whose
 // origin sits inside its own inlet stays where it is.

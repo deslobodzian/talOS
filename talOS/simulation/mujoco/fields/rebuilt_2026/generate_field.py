@@ -125,8 +125,9 @@ CHUTE_SLOPE_DEG = 15.0  # GM 5.9.2; QUOTED
 
 # Solver settings measured on 2026 field scenes when MuJoCo was added
 # (REQ-DEV-37, recorded in that commit): CG, a 5 ms step, 20 iterations,
-# sleeping off. Chosen, not measured: the elliptic cone, implicitfast, the
-# tolerance and every contact value below.
+# sleeping off (the MuJoCo gateway's option table overrides it with the
+# config's [simulation.mujoco] sleeping). Chosen, not measured: the elliptic
+# cone, implicitfast, the tolerance and every contact value below.
 TIMESTEP_S = 0.005
 FUEL_MASS_KG = 0.215  # GM 5.10.1, the middle of 0.203 to 0.227 kg
 FUEL_FRICTION = 0.7  # foam, sliding

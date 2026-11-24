@@ -79,8 +79,9 @@ std::string Robot(int preloads) {
 }
 
 // The full field with the robot at (2, 1.5), in the blue alliance zone away
-// from every HUB, exit and staged FUEL.
-std::unique_ptr<MujocoPlant> Make(const std::string& name, int preloads = 0) {
+// from every HUB, exit and staged FUEL; `sleeping` is MuJoCo's.
+std::unique_ptr<MujocoPlant> Make(const std::string& name, int preloads = 0,
+                                  bool sleeping = false) {
   InstallMujocoProcessHandlers();
   PlantModel model;
   model.field_xml = FieldXml();
@@ -88,6 +89,7 @@ std::unique_ptr<MujocoPlant> Make(const std::string& name, int preloads = 0) {
   std::ofstream(model.robot_xml) << Robot(preloads);
   model.start_x_m = 2.0;
   model.start_y_m = 1.5;
+  model.sleeping = sleeping;
   return MakePlant(model, {});
 }
 
@@ -253,8 +255,15 @@ const MatchInput kBeforeTheMatch = Input(Mode::kNone, 0.0, false, false);
 // 1.0 s later from an exit whose pocket is empty, at the exit, at 3 to 5 m/s
 // within 20 degrees of the exit's +x in the horizontal plane. Before the
 // match it earns no point.
-TEST(Rebuilt2026Rules, ScoresOnceParksAndReleasesFromAnEmptyPocket) {
-  Game game{.plant = Make("release")};
+// REQ-DEV-37: the same with MuJoCo's sleeping on, where a parked FUEL falls
+// asleep and the release's write must wake it: it is asleep the step before
+// its release and 0.1 s after it has left the exit.
+class ScoresOnceParksAndReleases : public ::testing::TestWithParam<bool> {};
+
+TEST_P(ScoresOnceParksAndReleases, FromAnEmptyPocket) {
+  const bool sleeping = GetParam();
+  Game game{.plant =
+                Make(sleeping ? "release_sleeping" : "release", 0, sleeping)};
   DropScenario(game);
   Attach(game, 1);
   const mjModel* m = game.plant->model();
@@ -270,8 +279,15 @@ TEST(Rebuilt2026Rules, ScoresOnceParksAndReleasesFromAnEmptyPocket) {
 
   std::array<int, kDropped.size()> scored_at{};
   std::array<int, kDropped.size()> released_at{};
+  std::array<bool, kDropped.size()> asleep_before{};
   uint32_t red_scored_first_step = 1;
   for (int step = 1; step <= 340; ++step) {
+    // Which dropped FUEL sleep as this step starts.
+    std::array<bool, kDropped.size()> asleep{};
+    for (std::size_t i = 0; i < kDropped.size(); ++i) {
+      const int body = Id(m, mjOBJ_BODY, FuelName(kDropped[i]));
+      asleep[i] = d->tree_asleep[m->body_treeid[body]] >= 0;
+    }
     ASSERT_TRUE(Step(game, kBeforeTheMatch)) << game.plant->failure();
     const sim::MatchState match = ReportOf(*game.rules);
     if (step == 1) red_scored_first_step = match.red_scored_count();
@@ -283,6 +299,18 @@ TEST(Rebuilt2026Rules, ScoresOnceParksAndReleasesFromAnEmptyPocket) {
       const int k = kDropped[i];
       const mjtNum* q = d->qpos + FuelQpos(m, k);
       const mjtNum* v = d->qvel + FuelDof(m, k);
+      // 0.1 s after the release (at least 0.3 m at 3 m/s; friction and a
+      // wall take some of it): it moved.
+      if (released_at[i] != 0 && step == released_at[i] + 20) {
+        const Vec3 left = {q[0], q[1], q[2]};
+        double from_exit = 1e9;
+        for (const Vec3& exit : exits) {
+          from_exit = std::min(from_exit,
+                               std::hypot(left[0] - exit[0], left[1] - exit[1],
+                                          left[2] - exit[2]));
+        }
+        EXPECT_GT(from_exit, 0.1) << "a released FUEL stayed at its exit";
+      }
       const int column = k % 80;
       const int row = k / 80;
       const Vec3 slot = {0.5 + 0.2 * column, -2.5 - 0.2 * row, radius + 0.0005};
@@ -299,6 +327,7 @@ TEST(Rebuilt2026Rules, ScoresOnceParksAndReleasesFromAnEmptyPocket) {
         at_exit = at_exit || Distance(q, exit) < 1e-9;
       if (released_at[i] != 0 || !at_exit) continue;
       released_at[i] = step;
+      asleep_before[i] = asleep[i];
       ASSERT_NE(scored_at[i], 0) << "released before it was scored";
       EXPECT_GE(step, scored_at[i] + kDelaySteps);
       EXPECT_LT(Distance(q, open), 1e-9) << "released into an occupied pocket";
@@ -324,6 +353,10 @@ TEST(Rebuilt2026Rules, ScoresOnceParksAndReleasesFromAnEmptyPocket) {
   EXPECT_EQ(match.blue_scored_count(), kDropped.size());
   for (std::size_t i = 0; i < kDropped.size(); ++i) {
     EXPECT_NE(released_at[i], 0) << "fuel " << kDropped[i] << " never released";
+    EXPECT_LE(released_at[i] + 20, 340)
+        << "fuel " << kDropped[i] << " released too late to be judged";
+    // Parked for 1 s at rest: asleep when its release came, with sleeping on.
+    EXPECT_EQ(asleep_before[i], sleeping) << "fuel " << kDropped[i];
   }
   EXPECT_EQ(*std::min_element(released_at.begin(), released_at.end()),
             *std::min_element(scored_at.begin(), scored_at.end()) + kDelaySteps)
@@ -331,6 +364,13 @@ TEST(Rebuilt2026Rules, ScoresOnceParksAndReleasesFromAnEmptyPocket) {
   EXPECT_EQ(match.pieces_held_count(), 0u) << "every scored FUEL released";
   EXPECT_EQ(match.pieces_in_play_count(), kStaged);
 }
+
+INSTANTIATE_TEST_SUITE_P(Rebuilt2026Rules, ScoresOnceParksAndReleases,
+                         ::testing::Bool(),
+                         [](const ::testing::TestParamInfo<bool>& info) {
+                           return info.param ? std::string("SleepingOn")
+                                             : std::string("SleepingOff");
+                         });
 
 // The shift a hub is inactive in, by stage (0 TRANSITION, 1-4 SHIFT, 5 END
 // GAME), for the alliance inactive first (GM Table 6-3).

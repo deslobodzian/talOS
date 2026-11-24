@@ -139,7 +139,8 @@ void MujocoGatewayExtension::Configure(
                                 .robot_xml = model.robot_model,
                                 .start_x_m = options.start_x_m,
                                 .start_y_m = options.start_y_m,
-                                .start_yaw_rad = options.start_yaw_rad},
+                                .start_yaw_rad = options.start_yaw_rad,
+                                .sleeping = model.sleeping},
                      motors);
 
   if (plant_->chassis()) {

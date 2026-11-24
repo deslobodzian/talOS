@@ -36,6 +36,9 @@ constexpr double kTwoPi = 2.0 * std::numbers::pi;
 constexpr double kTimestepS = 0.005;
 constexpr int kIterations = 20;
 constexpr double kTolerance = 1e-8;
+// MuJoCo 3.17's own default (engine_init.c), written so a field's value does
+// not win; it matters only with sleeping on.
+constexpr double kSleepTolerance = 1e-3;
 constexpr mjtSize kArenaBytes = mjtSize{64} << 20;
 
 // The field's robot-geom collision bits (fields/rebuilt_2026/README.md,
@@ -151,7 +154,7 @@ SpecPtr FlatCarpet() {
 // Writes section E's table into the assembled spec, after attach (which has
 // already dropped the robot's <option> and <size>) and before compile, so
 // the field's solver settings give way too; its other options stay.
-void ApplyOptionTable(mjSpec* spec) {
+void ApplyOptionTable(mjSpec* spec, bool sleeping) {
   mjOption& option = spec->option;
   option.timestep = kTimestepS;
   option.solver = mjSOL_CG;
@@ -159,7 +162,12 @@ void ApplyOptionTable(mjSpec* spec) {
   option.tolerance = kTolerance;
   option.cone = mjCONE_ELLIPTIC;
   option.integrator = mjINT_IMPLICITFAST;
-  option.enableflags &= ~static_cast<int>(mjENBL_SLEEP);
+  if (sleeping) {
+    option.enableflags |= static_cast<int>(mjENBL_SLEEP);
+  } else {
+    option.enableflags &= ~static_cast<int>(mjENBL_SLEEP);
+  }
+  option.sleep_tolerance = kSleepTolerance;
   option.disableflags |= static_cast<int>(mjDSBL_AUTORESET);
   spec->memory = kArenaBytes;
 }
@@ -549,15 +557,32 @@ std::unique_ptr<MujocoPlant> MakePlant(const PlantModel& model,
     plant->actuators_.push_back(std::move(entry));
   }
 
-  ApplyOptionTable(world.get());
+  ApplyOptionTable(world.get(), model.sleeping);
   plant->model_.reset(mj_compile(world.get(), nullptr));
   if (!plant->model_) {
     Refuse("compiling " + robot_file + " on " + field_file + ": " +
            mjs_getError(world.get()));
   }
-  const mjModel* m = plant->model_.get();
   plant->root_body_ = mjs_getId(attached);
   world.reset();
+  // No robot tree sleeps. MuJoCo keeps an actuated tree awake on its own
+  // (compile resolves its policy to mjSLEEP_AUTO_NEVER), but not a robot
+  // tree with no actuator (a passive mechanism, a model whose motors are all
+  // analytic), and a sleeping tree reports a frozen pose and zero velocity
+  // to the chassis, the rotors and the sensors until something wakes it.
+  // MuJoCo reads the policy each step (engine_sleep.c, treeCanSleep), and
+  // only mj_setConst, never called here, resolves a policy again. Every
+  // robot body is in the root's subtree.
+  {
+    mjModel* model_out = plant->model_.get();
+    for (int body = 1; body < model_out->nbody; ++body) {
+      const int tree = model_out->body_treeid[body];
+      if (model_out->body_rootid[body] == plant->root_body_ && tree >= 0) {
+        model_out->tree_sleep_policy[tree] = mjSLEEP_NEVER;
+      }
+    }
+  }
+  const mjModel* m = plant->model_.get();
 
   plant->data_.reset(mj_makeData(m));
   if (!plant->data_) {

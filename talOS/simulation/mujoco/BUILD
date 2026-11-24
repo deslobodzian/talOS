@@ -99,6 +99,22 @@ cc_test(
     ],
 )
 
+# REQ-DEV-37: [simulation.mujoco] sleeping on the 2026 field: resting FUEL
+# sleeps, the robot never, a struck FUEL wakes and moves.
+cc_test(
+    name = "sleeping_test",
+    size = "small",
+    srcs = ["sleeping_test.cc"],
+    data = ["//talOS/simulation/mujoco/fields/rebuilt_2026"],
+    env = {"FIELD_XML": "$(rlocationpath //talOS/simulation/mujoco/fields/rebuilt_2026)"},
+    deps = [
+        ":plant",
+        "@googletest//:gtest_main",
+        "@mujoco",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
 # The MuJoCo gateway (README.md): sim_gateway --physics with the MuJoCo world
 # as the plant (REQ-DEV-37). A config names it in [robot] sim_gateway, whose
 # roster member is sim_gateway, hence the rule's name (the node label rule,
@@ -166,7 +182,8 @@ cc_test(
 
 # REQ-DEV-37: two compiles of one model, ticked at the same jittered times
 # with the same commands and faults, give identical encoded States; a 1 us
-# change at one tick does not.
+# change at one tick does not; with sleeping on, two game runs end in the
+# same world.
 cc_test(
     name = "gateway_bit_identity_test",
     size = "small",
@@ -182,6 +199,7 @@ cc_test(
         "//talOS/hardware:codecs",
         "//talOS/hardware:sim_messages",
         "@googletest//:gtest_main",
+        "@mujoco",
         "@rules_cc//cc/runfiles",
     ],
 )

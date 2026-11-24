@@ -960,6 +960,35 @@ TEST_F(ManifestTest, SimulationMujocoSeedDefaultsToOneAndTakesTheFullRange) {
   }
 }
 
+// [simulation.mujoco] sleeping: off when no file sets it, on when one does,
+// an include's value kept unless robot.toml sets its own.
+// REQ-DEV-37
+TEST_F(ManifestTest, SimulationMujocoSleepingIsOffUnlessAFileSetsIt) {
+  Write("robot.xml", "<mujoco/>\n");
+  const struct {
+    const char* robot_line;  // robot.toml's, after robot_model
+    const char* base;        // base.toml, included when set
+    bool sleeping;
+  } cases[] = {
+      {"", nullptr, false},
+      {"sleeping = true\n", nullptr, true},
+      {"sleeping = false\n", nullptr, false},
+      {"", "[simulation.mujoco]\nsleeping = true\n", true},
+      {"sleeping = false\n", "[simulation.mujoco]\nsleeping = true\n", false},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(std::string(c.robot_line) + (c.base ? c.base : ""));
+    if (c.base != nullptr) Write("base.toml", c.base);
+    Write("robot.toml",
+          std::string(c.base != nullptr ? "include = \"base.toml\"\n" : "") +
+              "[simulation.mujoco]\nrobot_model = \"robot.xml\"\n" +
+              c.robot_line + std::string(kMotor));
+    const auto config = ParseRobotConfig(Robot());
+    ASSERT_TRUE(config.simulation.mujoco.has_value());
+    EXPECT_EQ(config.simulation.mujoco->sleeping, c.sleeping);
+  }
+}
+
 // Each refusal of [simulation.mujoco] names the key and the file that set it
 // (an include's own name when the include set it).
 // REQ-DEV-37, REQ-DEV-40
@@ -1028,6 +1057,16 @@ TEST_F(ManifestTest, SimulationMujocoRefusalsNameTheKeyAndFile) {
       {"include = \"base.toml\"\n",
        "[simulation.mujoco]\nrobot_model = \"robot.xml\"\nseed = -1\n",
        {"seed", "base.toml"}},
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\nsleeping = 1\n",
+       nullptr,
+       {"sleeping", "robot.toml"}},
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+       "sleeping = \"true\"\n",
+       nullptr,
+       {"sleeping", "robot.toml"}},
+      {"include = \"base.toml\"\n",
+       "[simulation.mujoco]\nrobot_model = \"robot.xml\"\nsleeping = 1\n",
+       {"sleeping", "base.toml"}},
       {"[simulation]\nmujoco = 1\n",
        nullptr,
        {"[simulation.mujoco]", "robot.toml"}},

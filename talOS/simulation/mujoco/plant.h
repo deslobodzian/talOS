@@ -44,6 +44,12 @@ struct PlantModel {
   std::string field_xml;  // field MJCF path; empty: flat carpet built in code
   std::string robot_xml;  // robot MJCF path
   double start_x_m{}, start_y_m{}, start_yaw_rad{};  // z from the model
+  // MuJoCo's sleeping (mjENBL_SLEEP, MuJoCo's default tolerance): a tree
+  // whose every velocity stays under it for 10 steps sleeps, and is not
+  // integrated or collided with other sleepers until a contact with an awake
+  // tree, an applied force or a written qpos or qvel wakes it. Never a
+  // robot tree: MakePlant sets each to mjSLEEP_NEVER.
+  bool sleeping{false};
 };
 
 class MujocoPlant final : public hardware::sim::ExternalPlant {
@@ -196,8 +202,9 @@ class MujocoPlant final : public hardware::sim::ExternalPlant {
 // model runs on every field and on the flat carpet. The robot's whole
 // <option> and <size> are dropped when it is attached (the field's win:
 // MuJoCo warns for each field the robot authored, and drops its flags
-// silently); the option table then replaces the field's solver settings, and
-// the field's other options (gravity, say) stay. `motors` are the local
+// silently); the option table then replaces the field's solver settings
+// (sleeping included: off unless `model.sleeping`), and the field's other
+// options (gravity, say) stay. `motors` are the local
 // config's, for the compile-time damping G²·b_m; Bind later refuses a pushed
 // config that changes a bound motor's gear or motor type. Throws
 // std::invalid_argument naming the file, element or rule.

@@ -11,8 +11,12 @@
 // robot's scripted shooter attached, for the State and for /sim/state/match,
 // over a scripted Driver Station sequence that launches and scores; the
 // seed changes the match where the game draws.
+//
+// REQ-DEV-37: with [simulation.mujoco] sleeping on, two game runs agree as
+// well, and end in the same world with the same trees asleep.
 
 #include <gtest/gtest.h>
+#include <mujoco/mujoco.h>
 
 #include <array>
 #include <cmath>
@@ -261,10 +265,10 @@ std::string FieldXml() {
   return runfiles->Rlocation(path);
 }
 
-config::RobotConfig GameConfig(uint64_t seed) {
+config::RobotConfig GameConfig(uint64_t seed, bool sleeping = false) {
   const std::filesystem::path dir =
       std::filesystem::path(::testing::TempDir()) /
-      ("game_" + std::to_string(seed));
+      ("game_" + std::to_string(seed) + (sleeping ? "_sleeping" : ""));
   std::filesystem::create_directories(dir);
   std::ofstream(dir / "robot.xml") << kShooterModel;
   std::ofstream(dir / "robot.toml")
@@ -277,7 +281,8 @@ config::RobotConfig GameConfig(uint64_t seed) {
          "supply_limit_a = 60.0\nstator_limit_a = 100.0\n\n"
          "[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
          "field = \"rebuilt_2026\"\nseed = "
-      << seed << "\n";
+      << seed << "\n"
+      << (sleeping ? "sleeping = true\n" : "");
   return config::ParseRobotConfig((dir / "robot.toml").string());
 }
 
@@ -371,10 +376,21 @@ struct GameAssembly {
   uint64_t last_us = 0;
 };
 
+// What a game run leaves in its world: every qpos and qvel, and which trees
+// sleep.
+struct GameWorld {
+  std::vector<double> qpos;
+  std::vector<double> qvel;
+  std::vector<int> tree_asleep;
+};
+
 // Jittered ticks as RunSchedule's; `shift_us` moves kGameProbeTick's sample
-// time (and only it) across a step boundary.
-std::vector<GameTick> RunGame(uint64_t seed, int64_t shift_us) {
-  GameAssembly a(GameConfig(seed));
+// time (and only it) across a step boundary. `world`, when given, receives
+// the world after the last tick.
+std::vector<GameTick> RunGame(uint64_t seed, int64_t shift_us,
+                              bool sleeping = false,
+                              GameWorld* world = nullptr) {
+  GameAssembly a(GameConfig(seed, sleeping));
   std::vector<GameTick> ticks;
   constexpr uint64_t kStartUs = 1000;
   uint64_t now_us = kStartUs;
@@ -391,6 +407,13 @@ std::vector<GameTick> RunGame(uint64_t seed, int64_t shift_us) {
     if (i == kGameProbeTick + 1) next = probe_us + 5000;
     ticks.push_back(a.Tick(i, next, kStartUs));
     now_us = next;
+  }
+  if (world != nullptr) {
+    const mjModel& m = *a.extension.plant()->model();
+    const mjData& d = *a.extension.plant()->data();
+    world->qpos.assign(d.qpos, d.qpos + m.nq);
+    world->qvel.assign(d.qvel, d.qvel + m.nv);
+    world->tree_asleep.assign(d.tree_asleep, d.tree_asleep + m.ntree);
   }
   return ticks;
 }
@@ -465,6 +488,35 @@ TEST(MujocoGatewayBitIdentity, GameRunsGiveIdenticalStatesAndMatches) {
   }
   EXPECT_GT(differing, 0) << "a 1 us change at tick " << kGameProbeTick
                           << " left every later State identical";
+}
+
+// REQ-DEV-37: with [simulation.mujoco] sleeping = true, two game runs give
+// the same States and matches every tick and end in the same world, bit for
+// bit, the same trees asleep; and some do sleep, or the run proves nothing
+// about sleeping.
+TEST(MujocoGatewayBitIdentity, GameRunsWithSleepingOnGiveIdenticalWorlds) {
+  GameWorld first_world;
+  GameWorld second_world;
+  const std::vector<GameTick> a = RunGame(1, 0, true, &first_world);
+  const std::vector<GameTick> b = RunGame(1, 0, true, &second_world);
+  for (int i = 0; i < kGameTicks; ++i) {
+    ASSERT_EQ(a[i].state, b[i].state) << "tick " << i;
+    ASSERT_EQ(a[i].match, b[i].match) << "tick " << i;
+  }
+  ASSERT_GT(MatchOf(a.back()).blue_scored_count(), 0u);
+  ASSERT_EQ(first_world.qpos.size(), second_world.qpos.size());
+  EXPECT_EQ(std::memcmp(first_world.qpos.data(), second_world.qpos.data(),
+                        first_world.qpos.size() * sizeof(double)),
+            0)
+      << "qpos differs";
+  EXPECT_EQ(std::memcmp(first_world.qvel.data(), second_world.qvel.data(),
+                        first_world.qvel.size() * sizeof(double)),
+            0)
+      << "qvel differs";
+  EXPECT_EQ(first_world.tree_asleep, second_world.tree_asleep);
+  int asleep = 0;
+  for (const int tree : first_world.tree_asleep) asleep += tree >= 0;
+  EXPECT_GT(asleep, 0) << "no tree slept";
 }
 
 // REQ-DEV-40: the tick that first shows TELEOP is TELEOP's in its stamp and

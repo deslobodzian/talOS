@@ -126,7 +126,8 @@ it counts against the launcher's start-up grace for a process with no
 registry row; the 2026 field with its FUEL compiles in a small fraction of
 it. On start the program prints `sim_gateway: backend=mujoco
 start_pose=X,Y,YAW (SOURCE)`, the pose and where it came from
-(`--start-pose`, `config` or `default`), and on its
+(`--start-pose`, `config` or `default`), with ` sleeping=on` after it when
+the config sets `[simulation.mujoco] sleeping = true`, and on its
 first tick, after the gateway bound the plant, the binding table (below),
 to stderr. While it runs it prints to stderr, at most
 once a wall second each, the plant's clock when plant time was dropped
@@ -178,6 +179,46 @@ limit, positions within |ω|h/2 + 0.5 %). These differ by design:
   table warns), though it stays stable;
 - motor and CAN sensor samples are as old as the plant lags the sample
   time, up to half a step.
+
+### When the host cannot hold real time
+
+The gateway steps the plant to each tick's sample time, at most two steps a
+tick, and drops what it cannot step; the `time dilation` lines and the
+summary's `dropped_s` count it ([above](#the-mujoco-gateway);
+[the plant's clock](../../hardware/README.md#an-external-plant)).
+Measured on one Mac mini (M4 Pro) at d4fa58c3: `examples/mujoco_rig` idle
+drops 5 to 8 % of plant time (2.3 to 2.9 s of a 30 s run, against 0.1 to
+0.25 % on a Linux desktop), because macOS runs a thread that sleeps
+between 5 ms ticks on a slow clock, where one step of the 2026 field (all
+506 trees awake, about 590 contacts) costs about 3.1 ms p50 and 4.7 ms p99;
+two such steps overrun the period, and the next tick, an overrun's period
+later, needs two steps again, so the step cap drops one about every fourth
+tick. There, `sleeping = true` dropped 0.005 s of 30.
+
+`[simulation.mujoco] sleeping = true` is the remedy: resting FUEL sleeps,
+and a step costs what the awake trees cost. Measured on a Linux desktop
+(the rig on the 2026 field, the wall time of one 5 ms tick of one step,
+sleeping off then on): at
+rest 1.54 then 0.17 ms p50 (506 then 10 of 506 trees awake, 563 then 19
+contacts); during the rig's shots 1.63 then 0.15 ms p50. What it changes:
+
+- impacts, as chaotically as any change: the swerve example, its root
+  held at 2 m/s, driven across the reserve row of resting FUEL (6 runs, 39 struck FUEL),
+  each FUEL's displacement 2 s after the strike differed between sleeping
+  off and on by 3.9 % p50, 14.4 % p90, 18.5 % at most; moving the robot's
+  start by 1 µm with sleeping off changes them as much (3.7 % p50,
+  13.6 % p90). One run is repeatable either way, bit for bit;
+- not the rig's shot: 30 runs with the pose moved up to 2 cm and 0.01 rad,
+  the flywheel speed up to 2 % and the seed drawn launched and scored 240
+  of 240, sleeping on as off;
+- not where FUEL ends: in a 140 s TELEOP after the rig's eight shots, each
+  scored FUEL the HUB released rolled about 2 m before it slept; at the
+  end all 504 FUEL slept, each on the carpet or a structure (a contact
+  below its centre, none deeper than 0.5 mm), and woken with sleeping off
+  none moved more than 0.3 mm in 1 s.
+
+The default stays off; whether a new robot's config gets it is open
+(TODO.md SIM-22).
 
 ### Writing a robot model
 
@@ -369,8 +410,22 @@ and fails the plant.
 attached: the field's win, MuJoCo prints a warning naming each field the
 robot authored, and the robot's `<flag>`s are dropped without one. Then one
 table replaces the field's solver settings: 5 ms step, CG, 20 iterations,
-tolerance 1e-8, elliptic cone, `implicitfast`, sleeping off, automatic reset
-off, 64 MB arena. The field's other options, such as gravity, stay.
+tolerance 1e-8, elliptic cone, `implicitfast`, sleeping as the config's
+`[simulation.mujoco] sleeping` says (off by default; MuJoCo's tolerance
+1e-3), automatic reset off, 64 MB arena. The field's other options, such as
+gravity, stay. With sleeping on, a tree whose velocities stay under the
+tolerance for 10 steps sleeps, and only when every tree in its contact
+island can sleep, so a piece resting on the robot stays awake with it. A
+sleeping tree is not integrated, and collides only with awake trees, until a contact with an awake tree, an applied force, or a
+written position or velocity (MuJoCo compares each sleeping body's pose
+with its `qpos` every step) wakes it, so the rules' and the scripted
+shooter's writes wake what they move. A sleeping body's position and its
+`qvel` (zero) are exact; its `cvel` and centre-of-mass quantities are left
+from its last awake step, and nothing in the plant, the rules or the
+shooter reads those for a piece. No robot tree sleeps: the plant sets
+each to `mjSLEEP_NEVER` after compile (MuJoCo itself keeps only actuated
+trees awake). [When the host cannot hold real
+time](#when-the-host-cannot-hold-real-time) says what it changes.
 
 **Failure.** An unstable step (a NaN or huge position, velocity,
 acceleration or control) or a full arena stops the world for good, naming
@@ -398,7 +453,15 @@ blue HUB (REQ-DEV-39, REQ-DEV-40), comparing `/sim/state/match` too, over
 a disabled, AUTO and TELEOP sequence: the periods come in order, the
 launch scores in the step that launched it, each tick's Driver Station
 stamp is that tick's match, the tick TELEOP starts on included, and
-another seed draws the other alliance at TELEOP's tie.
+another seed draws the other alliance at TELEOP's tie; with sleeping on,
+two game runs also end in the same world, bit for bit, with the same trees
+asleep. `sleeping_test` (REQ-DEV-37) holds sleeping on the 2026 field:
+after 2 s at rest every FUEL sleeps and a robot with no actuator does not,
+nor a welded robot's passive flap,
+and a sleeping FUEL the robot strikes wakes and moves. The rules' release
+test and the scripted shooter's launch test also run with sleeping on: a
+parked FUEL is asleep when its release comes and leaves its exit, and a
+sleeping body launched flies on.
 `pieces_test` (REQ-DEV-43) holds `/sim/telemetry/pieces` to the stepped
 model on the 2026 field, with a robot whose shooter launches a preload that
 the game scores and parks: each FUEL at its body's position exactly, the

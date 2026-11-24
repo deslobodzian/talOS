@@ -25,6 +25,9 @@ field = "rebuilt_2026"
 # Seed 1 draws red inactive first at TELEOP's 0-0 tie, so the blue HUB
 # counts through SHIFT 1 as well as TRANSITION.
 seed = 1
+# Resting FUEL sleeps, so the gateway holds real time on a slow host (the
+# MuJoCo README's "When the host cannot hold real time").
+sleeping = true
 
 # flywheel: simulation values only; before a real robot drives the flywheel,
 # tune slot0 on the mechanism. Holding joystick button 3 spins it to the
