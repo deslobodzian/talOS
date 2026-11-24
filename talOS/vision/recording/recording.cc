@@ -68,15 +68,29 @@ void AppendInt(std::string& out, std::int64_t value) {
   out += std::to_string(value);
 }
 
+void AppendUint(std::string& out, std::uint64_t value) {
+  out += std::to_string(value);
+}
+
 // --- JSON reading ----------------------------------------------------------
 
 struct JsonMember;
 
 struct Json {
-  enum class Type { kNull, kBool, kInt, kDouble, kString, kArray, kObject };
+  enum class Type {
+    kNull,
+    kBool,
+    kInt,
+    kUint,
+    kDouble,
+    kString,
+    kArray,
+    kObject
+  };
   Type type = Type::kNull;
   bool boolean = false;
   std::int64_t integer = 0;
+  std::uint64_t uinteger = 0;
   double number = 0.0;
   std::string str;
   std::vector<Json> array;
@@ -87,6 +101,12 @@ struct Json {
   std::int64_t AsInt(std::int64_t fallback = 0) const {
     if (type == Type::kInt) {
       return integer;
+    }
+    if (type == Type::kUint) {
+      return uinteger <= static_cast<std::uint64_t>(
+                             std::numeric_limits<std::int64_t>::max())
+                 ? static_cast<std::int64_t>(uinteger)
+                 : fallback;
     }
     if (type == Type::kDouble) {
       constexpr double kMin =
@@ -100,12 +120,32 @@ struct Json {
     }
     return fallback;
   }
+  std::uint64_t AsUint(std::uint64_t fallback = 0) const {
+    if (type == Type::kUint) {
+      return uinteger;
+    }
+    if (type == Type::kInt) {
+      return integer >= 0 ? static_cast<std::uint64_t>(integer) : fallback;
+    }
+    if (type == Type::kDouble) {
+      constexpr double kMaxExclusive =
+          static_cast<double>(std::numeric_limits<std::int64_t>::max());
+      if (!std::isfinite(number) || number < 0.0 || number >= kMaxExclusive) {
+        return fallback;
+      }
+      return static_cast<std::uint64_t>(number);
+    }
+    return fallback;
+  }
   double AsDouble(double fallback = 0.0) const {
     if (type == Type::kDouble) {
       return number;
     }
     if (type == Type::kInt) {
       return static_cast<double>(integer);
+    }
+    if (type == Type::kUint) {
+      return static_cast<double>(uinteger);
     }
     return fallback;
   }
@@ -323,17 +363,26 @@ class Parser {
       char* end = nullptr;
       errno = 0;
       const auto v = std::strtoll(token.c_str(), &end, 10);
-      if (errno != 0 || end == token.c_str() || *end != '\0') {
+      if (errno == 0 && end != token.c_str() && *end == '\0') {
+        out->type = Json::Type::kInt;
+        out->integer = static_cast<std::int64_t>(v);
+      } else if (errno == ERANGE && !token.empty() && token[0] != '-' &&
+                 token[0] != '+') {
+        end = nullptr;
+        errno = 0;
+        const auto u = std::strtoull(token.c_str(), &end, 10);
+        if (errno != 0 || end == token.c_str() || *end != '\0') {
+          return Fail(error, "invalid integer");
+        }
+        out->type = Json::Type::kUint;
+        out->uinteger = static_cast<std::uint64_t>(u);
+      } else {
         return Fail(error, "invalid integer");
       }
-      out->type = Json::Type::kInt;
-      out->integer = static_cast<std::int64_t>(v);
     } else {
       char* end = nullptr;
-      errno = 0;
       const double v = std::strtod(token.c_str(), &end);
-      if (errno != 0 || !std::isfinite(v) || end == token.c_str() ||
-          *end != '\0') {
+      if (!std::isfinite(v) || end == token.c_str() || *end != '\0') {
         return Fail(error, "invalid number");
       }
       out->type = Json::Type::kDouble;
@@ -348,7 +397,6 @@ class Parser {
 };
 
 bool ReadExtrinsics(const Json& o, Extrinsics* out) {
-  out->x_m = o.AsDouble();
   const auto get = [&](const char* k) {
     const Json* v = o.Find(k);
     return v != nullptr ? v->AsDouble() : 0.0;
@@ -379,6 +427,13 @@ bool ReadIntrinsics(const Json& o, CameraIntrinsics* out) {
   return true;
 }
 
+bool FailParse(std::string* error, const char* message) {
+  if (error != nullptr) {
+    *error = message;
+  }
+  return false;
+}
+
 }  // namespace
 
 std::string RecordStem(std::uint64_t capture_ns, std::string_view reason) {
@@ -387,7 +442,11 @@ std::string RecordStem(std::uint64_t capture_ns, std::string_view reason) {
   const std::size_t keep = digits.size() > 20 ? 20 : digits.size();
   std::memcpy(out.data() + (20 - keep), digits.data(), keep);
   out += '_';
-  out += reason;
+  for (const char c : reason) {
+    const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '_' || c == '-';
+    out += safe ? c : '_';
+  }
   return out;
 }
 
@@ -399,7 +458,7 @@ std::string SerializeRecord(const CameraContext& context,
   out += ",\"camera\":";
   AppendEscaped(out, context.camera);
   out += ",\"capture_ns\":";
-  AppendInt(out, static_cast<std::int64_t>(record.capture_ns));
+  AppendUint(out, record.capture_ns);
   out += ",\"reason\":";
   AppendEscaped(out, record.reason);
   out += ",\"width\":";
@@ -531,35 +590,54 @@ bool ParseRecord(std::string_view json, CameraContext* context,
     return false;
   }
   if (root.type != Json::Type::kObject) {
-    if (error != nullptr) {
-      *error = "top level must be an object";
-    }
-    return false;
+    return FailParse(error, "top level must be an object");
+  }
+  const Json* version = root.Find("format_version");
+  if (version == nullptr || version->type != Json::Type::kInt ||
+      version->integer != kFormatVersion) {
+    return FailParse(error, "unsupported or missing format_version");
   }
   const Json* camera = root.Find("camera");
-  if (camera != nullptr && camera->type == Json::Type::kString) {
+  if (camera != nullptr) {
+    if (camera->type != Json::Type::kString) {
+      return FailParse(error, "camera must be a string");
+    }
     context->camera = camera->str;
   }
   context->width = static_cast<int>(
       root.Find("width") != nullptr ? root.Find("width")->AsInt() : 0);
   context->height = static_cast<int>(
       root.Find("height") != nullptr ? root.Find("height")->AsInt() : 0);
-  record->capture_ns = static_cast<std::uint64_t>(
-      root.Find("capture_ns") != nullptr ? root.Find("capture_ns")->AsInt()
-                                         : 0);
+  record->capture_ns = root.Find("capture_ns") != nullptr
+                           ? root.Find("capture_ns")->AsUint()
+                           : 0;
   const Json* reason = root.Find("reason");
-  if (reason != nullptr && reason->type == Json::Type::kString) {
+  if (reason != nullptr) {
+    if (reason->type != Json::Type::kString) {
+      return FailParse(error, "reason must be a string");
+    }
     record->reason = reason->str;
   }
   if (const Json* i = root.Find("intrinsics"); i != nullptr) {
+    if (i->type != Json::Type::kObject) {
+      return FailParse(error, "intrinsics must be an object");
+    }
     ReadIntrinsics(*i, &context->intrinsics);
   }
   if (const Json* m = root.Find("mounting"); m != nullptr) {
+    if (m->type != Json::Type::kObject) {
+      return FailParse(error, "mounting must be an object");
+    }
     ReadExtrinsics(*m, &context->mounting);
   }
   if (const Json* det = root.Find("detector"); det != nullptr) {
-    if (const Json* v = det->Find("backend");
-        v != nullptr && v->type == Json::Type::kString) {
+    if (det->type != Json::Type::kObject) {
+      return FailParse(error, "detector must be an object");
+    }
+    if (const Json* v = det->Find("backend"); v != nullptr) {
+      if (v->type != Json::Type::kString) {
+        return FailParse(error, "detector.backend must be a string");
+      }
       context->detector.backend = v->str;
     }
     context->detector.decimate = det->Find("decimate") != nullptr
@@ -581,12 +659,16 @@ bool ParseRecord(std::string_view json, CameraContext* context,
             ? det->Find("min_decision_margin")->AsDouble()
             : 30.0;
   }
-  if (const Json* dets = root.Find("detections");
-      dets != nullptr && dets->type == Json::Type::kArray) {
+  if (const Json* dets = root.Find("detections"); dets != nullptr) {
+    if (dets->type != Json::Type::kArray) {
+      return FailParse(error, "detections must be an array");
+    }
     record->detections.reserve(dets->array.size());
     for (const auto& d : dets->array) {
+      if (d.type != Json::Type::kObject) {
+        return FailParse(error, "detection entry must be an object");
+      }
       DetectionRecord dr;
-      dr.tag_id = static_cast<int>(d.AsInt());
       if (const Json* v = d.Find("tag_id"); v != nullptr) {
         dr.tag_id = static_cast<int>(v->AsInt());
       }
@@ -606,11 +688,16 @@ bool ParseRecord(std::string_view json, CameraContext* context,
         dr.ambiguity = v->AsDouble();
       }
       if (const Json* v = d.Find("reject_reason");
-          v != nullptr && v->type == Json::Type::kString) {
+          v != nullptr && !v->IsNull()) {
+        if (v->type != Json::Type::kString) {
+          return FailParse(error, "reject_reason must be a string or null");
+        }
         dr.reject_reason = v->str;
       }
-      if (const Json* v = d.Find("corners_px");
-          v != nullptr && v->type == Json::Type::kArray) {
+      if (const Json* v = d.Find("corners_px"); v != nullptr) {
+        if (v->type != Json::Type::kArray) {
+          return FailParse(error, "corners_px must be an array");
+        }
         for (std::size_t c = 0; c < 8 && c < v->array.size(); ++c) {
           dr.corners_px[c] = static_cast<float>(v->array[c].AsDouble());
         }
@@ -619,6 +706,9 @@ bool ParseRecord(std::string_view json, CameraContext* context,
     }
   }
   if (const Json* obs = root.Find("observation"); obs != nullptr) {
+    if (obs->type != Json::Type::kObject) {
+      return FailParse(error, "observation must be an object");
+    }
     record->observation.valid =
         obs->Find("valid") != nullptr ? obs->Find("valid")->AsBool() : false;
     record->observation.x_m =
@@ -643,6 +733,9 @@ bool ParseRecord(std::string_view json, CameraContext* context,
   }
   if (const Json* truth = root.Find("truth");
       truth != nullptr && !truth->IsNull()) {
+    if (truth->type != Json::Type::kObject) {
+      return FailParse(error, "truth must be an object or null");
+    }
     TruthRecord t;
     t.x_m =
         truth->Find("x_m") != nullptr ? truth->Find("x_m")->AsDouble() : 0.0;

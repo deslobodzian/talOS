@@ -560,7 +560,7 @@ TEST_F(RecorderTest,
   // assert FE_INVALID because ARM64 clang speculatively hoists fcvtzs before
   // csel without FENV_ACCESS).
   ASSERT_TRUE(
-      ParseRecord("{\"width\":1e30,\"height\":-1e30,"
+      ParseRecord("{\"format_version\":1,\"width\":1e30,\"height\":-1e30,"
                   "\"capture_ns\":9223372036854775808.0}",
                   &ctx, &rec, &error))
       << error;
@@ -739,6 +739,128 @@ TEST_F(RecorderTest, QueueFullDropDoesNotAdvanceRateLimit) {
       dir_ / (RecordStem(1'000'000'000, "sampled") + ".json")));
   EXPECT_TRUE(std::filesystem::exists(
       dir_ / (RecordStem(1'050'000'000, "sampled") + ".json")));
+}
+
+TEST_F(RecorderTest, ParseRecordRoundTripsSubnormalDoublesAndValidatesSchema) {
+  CameraContext ctx = MakeContext();
+  ctx.intrinsics.k1 = 1e-320;
+  FrameRecord r = MakeRecord((std::uint64_t{1} << 63) + 42u, "sampled");
+  r.observation.x_m = 1e-320;
+  r.truth->x_m = -1e-320;
+
+  const std::string json = SerializeRecord(ctx, r);
+  EXPECT_EQ(json.find("\"capture_ns\":-"), std::string::npos) << json;
+
+  CameraContext parsed_ctx;
+  FrameRecord parsed;
+  std::string error;
+  ASSERT_TRUE(ParseRecord(json, &parsed_ctx, &parsed, &error)) << error;
+  EXPECT_DOUBLE_EQ(parsed_ctx.intrinsics.k1, 1e-320);
+  EXPECT_DOUBLE_EQ(parsed.observation.x_m, 1e-320);
+  ASSERT_TRUE(parsed.truth.has_value());
+  EXPECT_DOUBLE_EQ(parsed.truth->x_m, -1e-320);
+  EXPECT_EQ(parsed.capture_ns, r.capture_ns);
+
+  // Missing, non-integer, or unsupported format_version must fail.
+  for (const char* bad : {
+           "{}",
+           "{\"format_version\":0}",
+           "{\"format_version\":2}",
+           "{\"format_version\":\"1\"}",
+           "{\"format_version\":1.5}",
+       }) {
+    SCOPED_TRACE(bad);
+    error.clear();
+    EXPECT_FALSE(ParseRecord(bad, &parsed_ctx, &parsed, &error));
+    EXPECT_FALSE(error.empty());
+  }
+
+  // Wrong nested JSON object/array/string types must fail.
+  for (const char* bad : {
+           "{\"format_version\":1,\"camera\":123}",
+           "{\"format_version\":1,\"reason\":123}",
+           "{\"format_version\":1,\"intrinsics\":123}",
+           "{\"format_version\":1,\"mounting\":[]}",
+           "{\"format_version\":1,\"detector\":\"cpu\"}",
+           "{\"format_version\":1,\"detections\":{}}",
+           "{\"format_version\":1,\"detections\":[42]}",
+           "{\"format_version\":1,\"detections\":[{\"tag_id\":1,"
+           "\"corners_px\":\"bad\"}]}",
+           "{\"format_version\":1,\"detections\":[{\"tag_id\":1,"
+           "\"reject_reason\":123}]}",
+           "{\"format_version\":1,\"observation\":[]}",
+           "{\"format_version\":1,\"truth\":123}",
+       }) {
+    SCOPED_TRACE(bad);
+    error.clear();
+    EXPECT_FALSE(ParseRecord(bad, &parsed_ctx, &parsed, &error));
+    EXPECT_FALSE(error.empty());
+  }
+}
+
+TEST_F(RecorderTest, JsonWriteFailureRemovesOrphanedPng) {
+  std::filesystem::create_directories(dir_);
+  // Block only the JSON temp file with a non-empty directory so the PNG writes
+  // and renames cleanly, then the JSON write fails deterministically.
+  const auto json_tmp_dir = dir_ / "00000000000000000000_sampled.json.tmp";
+  std::filesystem::create_directories(json_tmp_dir);
+  std::ofstream{json_tmp_dir / "keep"} << "block";
+
+  {
+    FrameRecorder::Options opts;
+    opts.output_dir = dir_;
+    opts.context = MakeContext();
+    opts.queue_slots = 4;
+    FrameRecorder rec{std::move(opts)};
+    ASSERT_TRUE(rec.Record(MakeGrayFrame(), MakeRecord(0, "sampled")));
+  }  // destructor finishes the single queued pair and joins the writer thread
+  EXPECT_FALSE(
+      std::filesystem::exists(dir_ / "00000000000000000000_sampled.png"));
+  for (const auto& entry : std::filesystem::directory_iterator(dir_)) {
+    if (!entry.is_regular_file()) continue;
+    EXPECT_NE(entry.path().extension(), ".png") << entry.path();
+  }
+}
+
+TEST_F(RecorderTest, RejectsPathTraversalReasonAndSanitizesStem) {
+  for (const std::string_view bad : {"../escape", "a/b\\c", ".."}) {
+    const std::string stem = RecordStem(42, bad);
+    EXPECT_EQ(stem.find('/'), std::string::npos) << stem;
+    EXPECT_EQ(stem.find('\\'), std::string::npos) << stem;
+    EXPECT_EQ(stem.find(".."), std::string::npos) << stem;
+  }
+
+  const auto frames_dir = dir_ / "frames";
+  {
+    FrameRecorder::Options opts;
+    opts.output_dir = frames_dir;
+    opts.context = MakeContext();
+    opts.sample_hz = 1e12;
+    opts.rejected_hz = 1e12;
+    opts.queue_slots = 8;
+    FrameRecorder rec{std::move(opts)};
+    const Frame frame = MakeGrayFrame();
+
+    EXPECT_FALSE(rec.Record(frame, MakeRecord(0, "../escape")));
+    EXPECT_FALSE(rec.Record(frame, MakeRecord(1, "sub/dir")));
+    EXPECT_FALSE(rec.Record(frame, MakeRecord(2, "a\\b")));
+    EXPECT_FALSE(rec.Record(frame, MakeRecord(3, "..")));
+    EXPECT_EQ(rec.recorded(), 0u);
+    EXPECT_EQ(rec.dropped(), 4u);
+
+    // The recorder must stay alive and accept subsequent valid records.
+    EXPECT_TRUE(rec.Record(frame, MakeRecord(4, "sampled")));
+    EXPECT_EQ(rec.recorded(), 1u);
+  }
+
+  EXPECT_TRUE(
+      std::filesystem::exists(frames_dir / "00000000000000000004_sampled.png"));
+  EXPECT_TRUE(std::filesystem::exists(frames_dir /
+                                      "00000000000000000004_sampled.json"));
+  // Nothing escaped into parent dir_.
+  for (const auto& entry : std::filesystem::directory_iterator(dir_)) {
+    EXPECT_EQ(entry.path().filename(), "frames") << entry.path();
+  }
 }
 
 }  // namespace
