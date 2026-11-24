@@ -1,7 +1,8 @@
 // REQ-DEV-37: a model that owns the chassis (its root body has a free joint)
 // replaces the analytic chassis, so MujocoGatewayExtension::Configure
 // refuses each analytic chassis key and odometry-error flag, naming it; a
-// welded-root model keeps the analytic chassis and accepts them.
+// welded-root model keeps the analytic chassis and accepts them. The robot
+// starts at the start pose the program resolves.
 
 #include "talOS/simulation/mujoco/gateway_extension.h"
 
@@ -22,6 +23,7 @@
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/sim_physics.h"
+#include "talOS/simulation/gateway_main.h"
 #include "talOS/simulation/mujoco/plant.h"
 
 namespace talos::simulation::mujoco {
@@ -121,6 +123,53 @@ TEST(MujocoGatewayExtension, ChassisOwnerRefusesEachAnalyticChassisSetting) {
                 std::string_view::npos)
           << e.what();
     }
+  }
+}
+
+// REQ-DEV-37: the robot's root body starts where the gateway's start pose
+// says: --start-pose when given, else the config's [simulation.start_pose],
+// else 2, 2, 0, as the program applies it (ApplyStartPose) before Configure.
+TEST(MujocoGatewayExtension, RobotStartsAtTheFlagElseTheConfigsPose) {
+  struct Case {
+    const char* what;
+    std::string toml;
+    std::optional<config::SimulationStartPose> flag;
+    std::string_view source;
+    config::SimulationStartPose at;
+  };
+  const std::string pose =
+      "[simulation.start_pose]\nx_m = 1.907\ny_m = 5.302\nyaw_rad = 2.705\n";
+  const Case cases[] = {
+      {"default", "", std::nullopt, "default", {2.0, 2.0, 0.0}},
+      {"config", pose, std::nullopt, "config", {1.907, 5.302, 2.705}},
+      {"flag over config",
+       pose,
+       config::SimulationStartPose{3.0, 4.0, -1.0},
+       "--start-pose",
+       {3.0, 4.0, -1.0}},
+  };
+  InstallMujocoProcessHandlers();
+  int index = 100;
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.what);
+    const config::RobotConfig config = RowConfig(
+        {c.what, "ROVER_XML", "roller", c.toml, {}, nullptr}, index++);
+    hardware::sim::PhysicsOptions options;
+    EXPECT_EQ(ApplyStartPose(config, c.flag, options), c.source);
+    std::ostringstream log;
+    MujocoGatewayExtension extension(
+        {.field = [](std::string_view) -> std::string { return {}; },
+         .wall_clock_ns = [] { return int64_t{0}; },
+         .log = &log,
+         .summary = &log});
+    hardware::sim::PhysicsSimBackend backend(options);
+    extension.Configure(config, options, backend);
+    ASSERT_TRUE(extension.plant()->chassis().has_value());
+    const hardware::sim::PlantChassis chassis =
+        extension.plant()->chassis().value_or(hardware::sim::PlantChassis{});
+    EXPECT_NEAR(chassis.x_m, c.at.x_m, 1e-12);
+    EXPECT_NEAR(chassis.y_m, c.at.y_m, 1e-12);
+    EXPECT_NEAR(chassis.yaw_rad, c.at.yaw_rad, 1e-12);
   }
 }
 

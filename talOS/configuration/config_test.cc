@@ -1056,6 +1056,152 @@ TEST_F(ManifestTest, SimulationMujocoRefusalsNameTheKeyAndFile) {
   }
 }
 
+// [simulation.start_pose]: unset when no file sets it (the gateway then
+// starts at SimulationStartPose's 2, 2, 0); a file's whole pose, integers
+// read as metres, over its include's; an include's when the file sets none;
+// on a field, the floor's edges included.
+// REQ-DEV-37
+TEST_F(ManifestTest, SimulationStartPoseParsesTheFileThatSetsIt) {
+  Write("robot.xml", "<mujoco/>\n");
+  EXPECT_EQ(SimulationStartPose{}, (SimulationStartPose{2.0, 2.0, 0.0}));
+  const std::string field =
+      "[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+      "field = \"rebuilt_2026\"\n";
+  struct Case {
+    const char* what;
+    std::string robot;  // robot.toml before its subsystem
+    const char* base;   // base.toml, which robot.toml includes when set
+    std::optional<SimulationStartPose> pose;
+  };
+  const std::vector<Case> cases = {
+      {"unset", "", nullptr, std::nullopt},
+      {"set",
+       "[simulation.start_pose]\nx_m = 1.907\ny_m = 5.302\n"
+       "yaw_rad = -2.705\n",
+       nullptr, SimulationStartPose{1.907, 5.302, -2.705}},
+      {"integers", "[simulation.start_pose]\nx_m = 3\ny_m = 4\nyaw_rad = 0\n",
+       nullptr, SimulationStartPose{3.0, 4.0, 0.0}},
+      {"over the include's",
+       "include = \"base.toml\"\n[simulation.start_pose]\nx_m = 1.0\n"
+       "y_m = 1.5\nyaw_rad = 0.5\n",
+       "[simulation.start_pose]\nx_m = 9.0\ny_m = 9.0\nyaw_rad = 9.0\n",
+       SimulationStartPose{1.0, 1.5, 0.5}},
+      {"the include's", "include = \"base.toml\"\n",
+       "[simulation.start_pose]\nx_m = 9.0\ny_m = 3.0\nyaw_rad = 1.0\n",
+       SimulationStartPose{9.0, 3.0, 1.0}},
+      {"the field's far corner",
+       field + "[simulation.start_pose]\nx_m = 16.541188\ny_m = 8.069326\n"
+               "yaw_rad = 3.0\n",
+       nullptr, SimulationStartPose{16.541188, 8.069326, 3.0}},
+      {"the field's origin",
+       field + "[simulation.start_pose]\nx_m = 0.0\ny_m = 0.0\nyaw_rad = 0.0\n",
+       nullptr, SimulationStartPose{0.0, 0.0, 0.0}},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.what);
+    Write("robot.toml", c.robot + std::string(kMotor));
+    if (c.base != nullptr) Write("base.toml", c.base);
+    EXPECT_EQ(ParseRobotConfig(Robot()).simulation.start_pose, c.pose);
+  }
+}
+
+// Each refusal of [simulation.start_pose] names the key and the file that set
+// it (an include's own name when the include set it; "config" for a parsed
+// string): not a table, an unknown or missing key, a value that is not a
+// finite number, and with a field a position off its floor.
+// REQ-DEV-37
+TEST_F(ManifestTest, SimulationStartPoseRefusalsNameTheKeyAndFile) {
+  Write("robot.xml", "<mujoco/>\n");
+  const std::string field =
+      "[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+      "field = \"rebuilt_2026\"\n";
+  const std::string pose = "[simulation.start_pose]\n";
+  struct Case {
+    std::string robot;  // robot.toml before its subsystem
+    const char* base;   // base.toml, which robot.toml includes when set
+    std::vector<const char*> parts;
+  };
+  const std::vector<Case> cases = {
+      {"[simulation]\nstart_pose = [1.0, 2.0, 0.0]\n",
+       nullptr,
+       {"[simulation.start_pose]", "robot.toml"}},
+      {pose + "x_m = 1.0\ny_m = 1.0\nyaw_rad = 0.0\nz_m = 0.0\n",
+       nullptr,
+       {"'z_m'", "robot.toml"}},
+      {pose + "x_m = 1.0\ny_m = 1.0\n", nullptr, {"yaw_rad", "robot.toml"}},
+      {pose + "x_m = \"1.0\"\ny_m = 1.0\nyaw_rad = 0.0\n",
+       nullptr,
+       {"x_m", "robot.toml"}},
+      {pose + "x_m = 1.0\ny_m = true\nyaw_rad = 0.0\n",
+       nullptr,
+       {"y_m", "robot.toml"}},
+      {pose + "x_m = nan\ny_m = 1.0\nyaw_rad = 0.0\n",
+       nullptr,
+       {"x_m", "finite", "robot.toml"}},
+      {pose + "x_m = 1.0\ny_m = 1.0\nyaw_rad = -inf\n",
+       nullptr,
+       {"yaw_rad", "finite", "robot.toml"}},
+      {"include = \"base.toml\"\n",
+       "[simulation.start_pose]\nx_m = 1.0\ny_m = inf\nyaw_rad = 0.0\n",
+       {"y_m", "base.toml"}},
+      // Off the floor, on either side of either axis.
+      {field + pose + "x_m = -0.01\ny_m = 1.0\nyaw_rad = 0.0\n",
+       nullptr,
+       {"x_m", "rebuilt_2026", "robot.toml"}},
+      {field + pose + "x_m = 16.6\ny_m = 1.0\nyaw_rad = 0.0\n",
+       nullptr,
+       {"x_m", "rebuilt_2026", "robot.toml"}},
+      {field + pose + "x_m = 1.0\ny_m = -0.01\nyaw_rad = 0.0\n",
+       nullptr,
+       {"y_m", "rebuilt_2026", "robot.toml"}},
+      {field + pose + "x_m = 1.0\ny_m = 8.1\nyaw_rad = 0.0\n",
+       nullptr,
+       {"y_m", "rebuilt_2026", "robot.toml"}},
+      // The include's field and robot.toml's pose: the pose's file.
+      {"include = \"base.toml\"\n" + pose +
+           "x_m = 20.0\ny_m = 1.0\n"
+           "yaw_rad = 0.0\n",
+       "[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+       "field = \"rebuilt_2026\"\n",
+       {"x_m", "rebuilt_2026", "robot.toml"}},
+      // The include's pose and robot.toml's field: the include.
+      {"include = \"base.toml\"\n" + field,
+       "[simulation.start_pose]\nx_m = 1.0\ny_m = 9.0\nyaw_rad = 0.0\n",
+       {"y_m", "rebuilt_2026", "base.toml"}},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.robot);
+    Write("robot.toml", c.robot + std::string(kMotor));
+    if (c.base != nullptr) Write("base.toml", c.base);
+    try {
+      ParseRobotConfig(Robot());
+      ADD_FAILURE() << "accepted";
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      for (const char* part : c.parts) {
+        EXPECT_NE(what.find(part), std::string::npos) << what;
+      }
+    }
+  }
+  // A parsed string names "config", and its field check runs too.
+  for (const char* body :
+       {"[simulation.start_pose]\nx_m = 1.0\ny_m = 1.0\n",
+        "[simulation.start_pose]\nx_m = 17.0\ny_m = 1.0\nyaw_rad = 0.0\n"
+        "[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+        "field = \"rebuilt_2026\"\n"}) {
+    SCOPED_TRACE(body);
+    try {
+      Parse(body);
+      ADD_FAILURE() << "accepted";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string_view(error.what())
+                    .find("config: [simulation.start_pose]"),
+                std::string_view::npos)
+          << error.what();
+    }
+  }
+}
+
 TEST_F(ManifestTest, MergesSubsystemFilesAndKeepsTopLevelTables) {
   Write("robot.toml", R"(
 [robot]

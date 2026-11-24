@@ -137,11 +137,32 @@ struct SimulationMechanismConfig {
   bool operator==(const SimulationMechanismConfig&) const = default;
 };
 
-// The field models `[simulation.mujoco] field` may name. The configuration
-// layer cannot depend on talOS/simulation, so the list lives here; each name
-// must have its package, //talOS/simulation/mujoco/fields/<name>.
-inline constexpr std::string_view kSimulationMujocoFields[] = {
-    "rebuilt_2026",
+// A field model `[simulation.mujoco] field` may name, with its floor in the
+// field frame: x from 0 to length_m, y from 0 to width_m (twice the model's
+// `field_centre` site, which //talOS/simulation/mujoco:fields_test holds it
+// to). The configuration layer cannot depend on talOS/simulation, so the
+// list lives here; each name must have its package,
+// //talOS/simulation/mujoco/fields/<name>.
+struct SimulationMujocoField {
+  std::string_view name;
+  double length_m;
+  double width_m;
+};
+inline constexpr SimulationMujocoField kSimulationMujocoFields[] = {
+    // The drawings' 651.22 x 317.69 in.
+    {.name = "rebuilt_2026", .length_m = 16.541188, .width_m = 8.069326},
+};
+
+// Optional `[simulation.start_pose]`: where the simulator places the robot
+// at start, in the field frame (metres, yaw radians CCW+). A file that sets
+// it sets all three keys, each a finite number; with a `[simulation.mujoco]
+// field`, (x_m, y_m) lies on that field's floor. Unset, the gateway starts
+// the robot at the defaults below; its `--start-pose` overrides either.
+struct SimulationStartPose {
+  double x_m{2.0};
+  double y_m{2.0};
+  double yaw_rad{0.0};
+  bool operator==(const SimulationStartPose&) const = default;
 };
 
 // Optional `[simulation.mujoco]`: the MuJoCo model to simulate. A config file's
@@ -161,8 +182,8 @@ struct SimulationMujocoConfig {
 };
 
 // Optional `[simulation]` table: physics simulator geometry, battery, chassis,
-// mechanisms, end-of-travel hard stops and the MuJoCo model, all off the
-// hardware wire and never affecting hardware::ConfigurationId.
+// mechanisms, end-of-travel hard stops, the start pose and the MuJoCo model,
+// all off the hardware wire and never affecting hardware::ConfigurationId.
 struct SimulationConfig {
   static constexpr double kDefaultWheelRadiusM = 0.0508;
   double wheel_radius_m{kDefaultWheelRadiusM};
@@ -171,6 +192,7 @@ struct SimulationConfig {
   std::optional<SimulationBatteryConfig> battery;
   std::optional<SimulationChassisConfig> chassis;
   std::vector<SimulationMechanismConfig> mechanisms;
+  std::optional<SimulationStartPose> start_pose;  // unset: the defaults
   std::optional<SimulationMujocoConfig> mujoco;
 
   bool operator==(const SimulationConfig&) const = default;

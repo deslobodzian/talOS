@@ -286,6 +286,74 @@ void RequireStudioDashboard(const std::string& where, const std::string& path) {
   RequireRegularFile(where + ": [studio] dashboard", path);
 }
 
+const SimulationMujocoField* FindSimulationField(std::string_view name) {
+  for (const SimulationMujocoField& field : kSimulationMujocoFields) {
+    if (field.name == name) return &field;
+  }
+  return nullptr;
+}
+
+constexpr std::array<std::string_view, 3> kStartPoseKeys = {"x_m", "y_m",
+                                                            "yaw_rad"};
+
+// [simulation.start_pose] in `document`, as set in `where` (the file that
+// sets it, or "config" for a parsed table): refuses a section that is not a
+// table, an unknown key, and a missing or non-finite x_m, y_m or yaw_rad (a
+// file that sets the pose sets all of it, so a pose never mixes two files'
+// keys), naming the key and `where`. Returns whether `document` sets it.
+bool CheckSimulationStartPose(const toml::table& document,
+                              const std::string& where) {
+  const auto* sim = document["simulation"].as_table();
+  if (sim == nullptr || !sim->contains("start_pose")) return false;
+  const std::string table = where + ": [simulation.start_pose] ";
+  const auto* pose = (*sim)["start_pose"].as_table();
+  if (pose == nullptr) {
+    throw std::invalid_argument(where +
+                                ": [simulation.start_pose] must be a table "
+                                "of x_m, y_m and yaw_rad");
+  }
+  for (auto&& [k, v] : *pose) {
+    if (std::ranges::find(kStartPoseKeys, k.str()) == kStartPoseKeys.end()) {
+      throw std::invalid_argument(table + "unknown key '" +
+                                  std::string(k.str()) + "'");
+    }
+  }
+  for (const std::string_view key : kStartPoseKeys) {
+    const auto value = (*pose)[key].value<double>();
+    if (!value || !std::isfinite(*value)) {
+      throw std::invalid_argument(
+          table + std::string(key) + " must be a finite number" +
+          (pose->contains(key) ? std::string()
+                               : " (a file that sets the start pose "
+                                 "sets x_m, y_m and yaw_rad)"));
+    }
+  }
+  return true;
+}
+
+// The effective [simulation.start_pose] of `tbl` (checked) against its
+// effective [simulation.mujoco] field: with a known field, (x_m, y_m) lies
+// on its floor, edges included. `where` names the file that set the pose.
+void CheckStartPoseOnField(const toml::table& tbl, const std::string& where) {
+  const auto* pose = tbl["simulation"]["start_pose"].as_table();
+  const auto name = tbl["simulation"]["mujoco"]["field"].value<std::string>();
+  if (pose == nullptr || !name) return;
+  const SimulationMujocoField* field = FindSimulationField(*name);
+  if (field == nullptr) return;  // CheckSimulationMujoco refuses it
+  const auto check = [&](const char* key, double extent_m) {
+    const double value = (*pose)[key].value<double>().value_or(0.0);
+    if (value < 0.0 || value > extent_m) {
+      std::ostringstream message;
+      message << where << ": [simulation.start_pose] " << key << " = " << value
+              << " is off field '" << field->name << "', whose floor spans "
+              << key << " 0 to " << extent_m;
+      throw std::invalid_argument(message.str());
+    }
+  };
+  check("x_m", field->length_m);
+  check("y_m", field->width_m);
+}
+
 // [simulation.mujoco] as set in `where` (the file that sets it, or "config"
 // for a parsed table): refuses an unknown key, a robot_model or
 // robot_model_files entry that is not a non-empty string, a
@@ -333,11 +401,10 @@ void CheckSimulationMujoco(const toml::table& mujoco, const std::string& where,
     const auto value = field->value_exact<std::string>();
     if (!value) throw std::invalid_argument(table + "field must be a string");
     const std::string& name = *value;
-    if (!name.empty() && std::ranges::find(kSimulationMujocoFields, name) ==
-                             std::end(kSimulationMujocoFields)) {
+    if (!name.empty() && FindSimulationField(name) == nullptr) {
       std::string known;
-      for (const auto known_name : kSimulationMujocoFields) {
-        known += (known.empty() ? "" : ", ") + std::string(known_name);
+      for (const auto& known_field : kSimulationMujocoFields) {
+        known += (known.empty() ? "" : ", ") + std::string(known_field.name);
       }
       throw std::invalid_argument(table + "field '" + name +
                                   "' names no field model (known: " + known +
@@ -1891,7 +1958,7 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
       if (k.str() != "wheel_radius_m" && k.str() != "swerve_modules" &&
           k.str() != "hard_stops" && k.str() != "battery" &&
           k.str() != "chassis" && k.str() != "mechanisms" &&
-          k.str() != "mujoco") {
+          k.str() != "start_pose" && k.str() != "mujoco") {
         throw std::invalid_argument("[simulation] unknown key '" +
                                     std::string(k.str()) + "'");
       }
@@ -2070,6 +2137,16 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
       }
       s.mechanisms = ParseSimulationMechanisms(*mechanisms, motors_by_name);
     }
+    // ResolveRobotConfig has checked a file's pose, naming the file; a
+    // parsed table's is checked here.
+    if (CheckSimulationStartPose(root, "config")) {
+      CheckStartPoseOnField(root, "config");
+      const auto& pose = *(*sim)["start_pose"].as_table();
+      s.start_pose = SimulationStartPose{
+          .x_m = pose["x_m"].value<double>().value_or(0.0),
+          .y_m = pose["y_m"].value<double>().value_or(0.0),
+          .yaw_rad = pose["yaw_rad"].value<double>().value_or(0.0)};
+    }
     if (sim->contains("mujoco")) {
       const auto* mujoco = (*sim)["mujoco"].as_table();
       if (mujoco == nullptr) {
@@ -2191,6 +2268,9 @@ toml::table ResolveRobotConfig(const std::string& path,
   // [simulation.mujoco]'s paths: this file's keys win over its include's.
   MujocoSources mujoco_sources;
   RebaseSimulationMujoco(tbl, path, mujoco_sources);
+  // [simulation.start_pose]: this file's whole pose wins over its include's.
+  std::string start_pose_source =
+      CheckSimulationStartPose(tbl, path) ? path : std::string();
   if (auto* manifest = tbl["subsystems"].as_array()) {
     NormalizeManifestPaths(*manifest, path);
   }
@@ -2208,6 +2288,9 @@ toml::table ResolveRobotConfig(const std::string& path,
     if (dashboard_source.empty()) dashboard_source = base_dashboard;
     MujocoSources base_mujoco;
     RebaseSimulationMujoco(base, inc_file, base_mujoco);
+    if (CheckSimulationStartPose(base, inc_file) && start_pose_source.empty()) {
+      start_pose_source = inc_file;
+    }
     if (mujoco_sources.table.empty()) mujoco_sources.table = base_mujoco.table;
     if (mujoco_sources.robot_model.empty()) {
       mujoco_sources.robot_model = base_mujoco.robot_model;
@@ -2264,6 +2347,7 @@ toml::table ResolveRobotConfig(const std::string& path,
     RequireStudioDashboard(dashboard_source, dashboard);
   }
   RequireSimulationMujoco(tbl, mujoco_sources, data);
+  if (!start_pose_source.empty()) CheckStartPoseOnField(tbl, start_pose_source);
   if (auto* subs = tbl["subsystems"].as_table()) {
     for (const auto& [subsystem, entries] : table_sources) {
       if (const auto* sub = (*subs)[subsystem].as_table()) {
