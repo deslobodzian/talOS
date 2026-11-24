@@ -1279,8 +1279,16 @@ tick-start rotor speed (`sim::PlantDrive`: volts, whether back-EMF applies,
 and torque bounds), in that speed's regime:
 
 - neutral: a shorted winding under brake, an open one under coast;
-- a voltage mode (a follower included, fed its master's applied volts at its
-  own speed): the command clamped to `max_voltage` and the solved supply;
+- a voltage mode: the command clamped to `max_voltage` and the solved supply;
+- a follower: at its own tick-start speed, exactly the current the analytic
+  model gives it there (its master's applied volts through its own stator
+  band and supply limit). When its master's drive, turned into the
+  follower's direction and bounded only by the follower's own
+  `stator_limit_a`, carries that same current there (a follower on its
+  master's shaft), it takes that drive and follows the master's regime at
+  every step; otherwise (a follower on another shaft, or its own supply
+  limit binding) it holds its master's applied volts for the tick within
+  its own limits;
 - torque current: the voltage ceiling in the demand's direction, with the
   demanded current as the torque bound on that side (0 A gives no torque
   unless the rotor overspeeds the ceiling); a rotor back-driven so hard that
@@ -1299,8 +1307,14 @@ model gives there, except where that current exceeds `stator_limit_a` (back-EMF
 beyond the voltage ceiling plus `stator_limit_a` times the winding
 resistance), which the plant caps at the limit. The ceiling is `max_voltage`
 or the solved supply, whichever is lower, so the cap also applies when a
-sagging battery lowers the ceiling below back-EMF. The State reports the
-voltage and currents of the drive at the speed the plant reached.
+sagging battery lowers the ceiling below back-EMF. The battery sag is solved
+with that same current at the tick-start speed.
+
+The State reports what the drive carried at the speed the plant reached: the
+stator current is the plant's current `I`; the voltage is the winding's,
+`I` times the resistance plus back-EMF, held within the ceiling (at the
+ceiling while the regeneration cap binds); the supply current is that
+voltage times `I` over the bus voltage, at most `supply_limit_a`.
 
 The plant steps in whole steps of its own `step_us`. Each `Read` adds the
 time since the last one to a signed remainder and steps the nearest whole
