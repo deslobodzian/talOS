@@ -189,6 +189,8 @@ _PRIVILEGED_FRAMEWORK_LIBRARIES = (
     "talOS/launcher:launcher_lib",
     "talOS/simulation:schedules",
     "talOS/simulation:gateway_main",
+    "talOS/simulation/mujoco:gateway_extension",
+    "talOS/simulation/mujoco:plant",
 )
 FORBIDDEN_NODE_DEPS = (
     "talOS/rtms/...",

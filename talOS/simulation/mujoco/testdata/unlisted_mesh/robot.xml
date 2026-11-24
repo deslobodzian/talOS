@@ -1,0 +1,14 @@
+<!-- A robot whose visual geom reads meshes/part.obj, which robot.toml does
+     not list in robot_model_files. -->
+<mujoco model="unlisted_mesh">
+  <compiler angle="radian" meshdir="meshes"/>
+  <asset>
+    <mesh name="part" file="part.obj"/>
+  </asset>
+  <worldbody>
+    <body name="mesh_base" pos="0 0 0.3">
+      <geom name="mesh_part" type="mesh" mesh="part" mass="1" contype="0"
+            conaffinity="0"/>
+    </body>
+  </worldbody>
+</mujoco>

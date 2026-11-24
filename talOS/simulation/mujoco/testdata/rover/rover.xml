@@ -1,0 +1,27 @@
+<!-- A small free-root robot (its root has a freejoint, so the model owns the
+     chassis): a box resting on the carpet with a motor-driven roller on top
+     and a downward rangefinder for a digital input. -->
+<mujoco model="rover">
+  <compiler angle="radian"/>
+  <default>
+    <geom contype="4" conaffinity="21"/>
+  </default>
+  <worldbody>
+    <body name="rover_chassis" pos="0 0 0.06">
+      <freejoint name="rover_root" align="false"/>
+      <geom name="rover_box" type="box" size="0.2 0.2 0.05" mass="10"/>
+      <site name="rover_floor_ray" pos="0.15 0 -0.04" zaxis="0 0 -1"/>
+      <body name="rover_roller" pos="0 0 0.08">
+        <joint name="roller_joint" type="hinge" axis="0 1 0" armature="0.0016"/>
+        <geom name="roller_tube" type="cylinder" size="0.025 0.15"
+              zaxis="0 1 0" mass="0.3" contype="0" conaffinity="0"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor name="roller" joint="roller_joint"/>
+  </actuator>
+  <sensor>
+    <rangefinder name="floor" site="rover_floor_ray" cutoff="0.2"/>
+  </sensor>
+</mujoco>
