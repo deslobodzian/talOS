@@ -1,11 +1,17 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cfenv>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -53,6 +59,296 @@ TEST(Capture, LinuxTimestampFlagsRetainSourceMeaning) {
                                   V4L2_BUF_FLAG_TSTAMP_SRC_SOE,
                               "uvcvideo"),
             TimestampKind::kDelivery);
+}
+
+TEST(Capture, LinuxDriverTimestampSanityChecksZeroFutureAndStale) {
+  constexpr uint32_t kMonoSoe =
+      V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC | V4L2_BUF_FLAG_TSTAMP_SRC_SOE;
+  constexpr int64_t kDeliveryNs = 100'000'000'000LL;      // 100.0 s
+  constexpr int64_t kNodeDeliveryNs = 200'000'000'000LL;  // 200.0 s
+
+  // Valid driver timestamp 12 ms before delivery: mapped into node clock.
+  {
+    const timeval tv{99, 988'000};
+    const auto r = ResolveV4L2Timestamp(kMonoSoe, tv, kDeliveryNs,
+                                        kNodeDeliveryNs, "rkisp1");
+    EXPECT_EQ(r.capture_time_ns, kNodeDeliveryNs - 12'000'000LL);
+    EXPECT_EQ(r.raw_timestamp_ns, 99'988'000'000LL);
+    EXPECT_EQ(r.kind, TimestampKind::kStartOfExposure);
+  }
+  // Exact boundary age == 0: accepted.
+  {
+    const timeval tv{100, 0};
+    const auto r = ResolveV4L2Timestamp(kMonoSoe, tv, kDeliveryNs,
+                                        kNodeDeliveryNs, "rkisp1");
+    EXPECT_EQ(r.capture_time_ns, kNodeDeliveryNs);
+    EXPECT_EQ(r.raw_timestamp_ns, kDeliveryNs);
+    EXPECT_EQ(r.kind, TimestampKind::kStartOfExposure);
+  }
+  // Zero driver timestamp (even when delivery_ns < 5 s): falls back.
+  {
+    const timeval zero{0, 0};
+    const auto r =
+        ResolveV4L2Timestamp(kMonoSoe, zero, 2'000'000'000LL, 2'000'000'000LL);
+    EXPECT_EQ(r.capture_time_ns, 2'000'000'000LL);
+    EXPECT_EQ(r.raw_timestamp_ns, 2'000'000'000LL);
+    EXPECT_EQ(r.kind, TimestampKind::kDelivery);
+  }
+  // Future driver timestamp (1 ms ahead of delivery): falls back.
+  {
+    const timeval future{100, 1'000};
+    const auto r = ResolveV4L2Timestamp(kMonoSoe, future, kDeliveryNs,
+                                        kNodeDeliveryNs, "rkisp1");
+    EXPECT_EQ(r.capture_time_ns, kNodeDeliveryNs);
+    EXPECT_EQ(r.raw_timestamp_ns, kDeliveryNs);
+    EXPECT_EQ(r.kind, TimestampKind::kDelivery);
+  }
+  // Stale driver timestamp (exactly 5 s old or 10 s old): falls back.
+  for (const timeval stale : {timeval{95, 0}, timeval{90, 0}}) {
+    const auto r = ResolveV4L2Timestamp(kMonoSoe, stale, kDeliveryNs,
+                                        kNodeDeliveryNs, "rkisp1");
+    EXPECT_EQ(r.capture_time_ns, kNodeDeliveryNs);
+    EXPECT_EQ(r.raw_timestamp_ns, kDeliveryNs);
+    EXPECT_EQ(r.kind, TimestampKind::kDelivery);
+  }
+  // Negative or malformed tv_usec: falls back.
+  for (const timeval bad :
+       {timeval{-1, 0}, timeval{99, -1}, timeval{99, 1'000'000}}) {
+    const auto r = ResolveV4L2Timestamp(kMonoSoe, bad, kDeliveryNs,
+                                        kNodeDeliveryNs, "rkisp1");
+    EXPECT_EQ(r.capture_time_ns, kNodeDeliveryNs);
+    EXPECT_EQ(r.raw_timestamp_ns, kDeliveryNs);
+    EXPECT_EQ(r.kind, TimestampKind::kDelivery);
+  }
+  // Non-monotonic buffer flags: always falls back.
+  {
+    const timeval tv{99, 990'000};
+    const auto r = ResolveV4L2Timestamp(V4L2_BUF_FLAG_TSTAMP_SRC_SOE, tv,
+                                        kDeliveryNs, kNodeDeliveryNs, "rkisp1");
+    EXPECT_EQ(r.capture_time_ns, kNodeDeliveryNs);
+    EXPECT_EQ(r.raw_timestamp_ns, kDeliveryNs);
+    EXPECT_EQ(r.kind, TimestampKind::kDelivery);
+  }
+}
+
+struct FakeV4L2State {
+  static constexpr uint32_t kWidth = 64;
+  static constexpr uint32_t kHeight = 48;
+  static constexpr uint32_t kFps = 30;
+  static constexpr size_t kBufSize = kWidth * kHeight;
+
+  std::mutex mu;
+  int open_fds{0};
+  int active_mmaps{0};
+  int streamon_count{0};
+  int streamoff_count{0};
+  int next_fd{100};
+  std::vector<uint8_t> backing[2]{std::vector<uint8_t>(kBufSize, 0x55),
+                                  std::vector<uint8_t>(kBufSize, 0x55)};
+
+  V4L2Syscalls Syscalls(std::function<int(pollfd*, nfds_t, int)> poll_fn) {
+    V4L2Syscalls sys;
+    sys.open_fn = [this](const char*, int) {
+      std::lock_guard lock(mu);
+      ++open_fds;
+      return next_fd++;
+    };
+    sys.close_fn = [this](int) {
+      std::lock_guard lock(mu);
+      --open_fds;
+      return 0;
+    };
+    // NOLINTNEXTLINE(google-runtime-int): glibc ioctl request type
+    sys.ioctl_fn = [this](int, unsigned long req, void* arg) -> int {
+      switch (req) {
+        case VIDIOC_QUERYCAP: {
+          auto* c = static_cast<v4l2_capability*>(arg);
+          c->capabilities = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
+          std::strncpy(reinterpret_cast<char*>(c->driver), "fakev4l2",
+                       sizeof(c->driver) - 1);
+          return 0;
+        }
+        case VIDIOC_ENUM_FMT: {
+          auto* f = static_cast<v4l2_fmtdesc*>(arg);
+          if (f->index > 0) {
+            errno = EINVAL;
+            return -1;
+          }
+          f->pixelformat = V4L2_PIX_FMT_GREY;
+          return 0;
+        }
+        case VIDIOC_ENUM_FRAMESIZES: {
+          auto* s = static_cast<v4l2_frmsizeenum*>(arg);
+          if (s->index > 0) {
+            errno = EINVAL;
+            return -1;
+          }
+          s->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+          s->discrete.width = kWidth;
+          s->discrete.height = kHeight;
+          return 0;
+        }
+        case VIDIOC_ENUM_FRAMEINTERVALS: {
+          auto* iv = static_cast<v4l2_frmivalenum*>(arg);
+          if (iv->index > 0) {
+            errno = EINVAL;
+            return -1;
+          }
+          iv->type = V4L2_FRMIVAL_TYPE_DISCRETE;
+          iv->discrete.numerator = 1;
+          iv->discrete.denominator = kFps;
+          return 0;
+        }
+        case VIDIOC_S_FMT: {
+          auto* fmt = static_cast<v4l2_format*>(arg);
+          fmt->fmt.pix.bytesperline = kWidth;
+          fmt->fmt.pix.sizeimage = kBufSize;
+          return 0;
+        }
+        case VIDIOC_S_PARM: {
+          auto* p = static_cast<v4l2_streamparm*>(arg);
+          p->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
+          p->parm.capture.timeperframe = {1, kFps};
+          return 0;
+        }
+        case VIDIOC_QUERYCTRL: {
+          errno = EINVAL;
+          return -1;
+        }
+        case VIDIOC_REQBUFS: {
+          auto* r = static_cast<v4l2_requestbuffers*>(arg);
+          r->count = 2;
+          return 0;
+        }
+        case VIDIOC_QUERYBUF: {
+          auto* b = static_cast<v4l2_buffer*>(arg);
+          b->length = kBufSize;
+          b->m.offset = b->index * 4096;
+          return 0;
+        }
+        case VIDIOC_QBUF:
+          return 0;
+        case VIDIOC_STREAMON: {
+          std::lock_guard lock(mu);
+          ++streamon_count;
+          return 0;
+        }
+        case VIDIOC_STREAMOFF: {
+          std::lock_guard lock(mu);
+          ++streamoff_count;
+          return 0;
+        }
+        default:
+          errno = EINVAL;
+          return -1;
+      }
+    };
+    sys.mmap_fn = [this](void*, size_t, int, int, int, off_t offset) -> void* {
+      std::lock_guard lock(mu);
+      ++active_mmaps;
+      const size_t idx = static_cast<size_t>(offset / 4096) % 2;
+      return backing[idx].data();
+    };
+    sys.munmap_fn = [this](void*, size_t) {
+      std::lock_guard lock(mu);
+      --active_mmaps;
+      return 0;
+    };
+    sys.poll_fn = std::move(poll_fn);
+    return sys;
+  }
+};
+
+TEST(Capture, LinuxDisconnectReleasesDeviceAllowsSelfStopAndSetMode) {
+  CameraSourceConfig config;
+  config.device_path = "/dev/fakevideo0";
+  config.width = FakeV4L2State::kWidth;
+  config.height = FakeV4L2State::kHeight;
+  config.fps = FakeV4L2State::kFps;
+  config.format = PixelFormat::kGray8;
+
+  // Case 1: POLLHUP unplug releases fd and mmaps BEFORE invoking the
+  // disconnect callback, and calling Stop() inside the disconnect callback on
+  // the worker thread does not self-join.
+  {
+    FakeV4L2State state;
+    auto source = CreateV4L2CameraSourceForTest(
+        config, state.Syscalls([](pollfd* fds, nfds_t, int) {
+          fds[0].revents = POLLHUP;
+          return 1;
+        }));
+    std::mutex mu;
+    std::condition_variable cv;
+    bool disconnected = false;
+    int open_fds_in_cb = -1;
+    int active_mmaps_in_cb = -1;
+    bool running_in_cb = true;
+    source->SetConnectionCallback([&](ConnectionState conn, std::string_view) {
+      if (conn != ConnectionState::kDisconnected) return;
+      {
+        std::lock_guard lock(state.mu);
+        open_fds_in_cb = state.open_fds;
+        active_mmaps_in_cb = state.active_mmaps;
+      }
+      running_in_cb = source->IsRunning();
+      source->Stop();
+      {
+        std::lock_guard lock(mu);
+        disconnected = true;
+      }
+      cv.notify_one();
+    });
+    ASSERT_TRUE(source->Start());
+    {
+      std::unique_lock lock(mu);
+      ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds{10},
+                              [&] { return disconnected; }));
+    }
+    EXPECT_EQ(open_fds_in_cb, 0);
+    EXPECT_EQ(active_mmaps_in_cb, 0);
+    EXPECT_FALSE(running_in_cb);
+    EXPECT_FALSE(source->IsRunning());
+    EXPECT_FALSE(source->IsConnected());
+    source->Stop();
+  }
+
+  // Case 2: After worker exits on disconnect WITHOUT calling Stop(), SetMode()
+  // and SetControls() join the exited worker and succeed.
+  {
+    FakeV4L2State state;
+    auto source = CreateV4L2CameraSourceForTest(
+        config, state.Syscalls([](pollfd* fds, nfds_t, int) {
+          fds[0].revents = POLLHUP;
+          return 1;
+        }));
+    std::mutex mu;
+    std::condition_variable cv;
+    bool disconnected = false;
+    source->SetConnectionCallback([&](ConnectionState conn, std::string_view) {
+      if (conn != ConnectionState::kDisconnected) return;
+      {
+        std::lock_guard lock(mu);
+        disconnected = true;
+      }
+      cv.notify_one();
+    });
+    ASSERT_TRUE(source->Start());
+    {
+      std::unique_lock lock(mu);
+      ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds{10},
+                              [&] { return disconnected; }));
+    }
+    EXPECT_FALSE(source->IsRunning());
+    EXPECT_TRUE(source->SetMode({128, 96, 60.0, PixelFormat::kGray8}));
+    EXPECT_TRUE(source->SetControls({.exposure_ms = 2.0, .gain = 5.0}));
+    EXPECT_EQ(source->CurrentMode().width, 128u);
+    EXPECT_DOUBLE_EQ(source->GetControls().exposure_ms, 2.0);
+    {
+      std::lock_guard lock(state.mu);
+      EXPECT_EQ(state.open_fds, 0);
+      EXPECT_EQ(state.active_mmaps, 0);
+    }
+  }
 }
 
 // FIELD-4 (no REQ row covers live capture modes yet): a live camera opens
@@ -130,6 +426,20 @@ TEST(Capture, LinuxMjpegFramesDecodeToGrayOrAreRefused) {
       DecodeMjpegGray(truncated.data(), truncated.size(), 128, 80, gray));
   std::vector<uint8_t> other_size(size_t{64} * 80, 0);
   EXPECT_FALSE(DecodeMjpegGray(jpeg.data(), jpeg.size(), 64, 80, other_size));
+
+  // Null input, zero dimensions, or dimensions exceeding INT_MAX must be
+  // rejected before indexing `data` or constructing cv::Mat.
+  EXPECT_FALSE(DecodeMjpegGray(nullptr, 16, 128, 80, gray));
+  EXPECT_FALSE(DecodeMjpegGray(nullptr, 0, 128, 80, gray));
+  std::vector<uint8_t> empty;
+  EXPECT_FALSE(DecodeMjpegGray(jpeg.data(), jpeg.size(), 0, 80, empty));
+  EXPECT_FALSE(DecodeMjpegGray(jpeg.data(), jpeg.size(), 128, 0, empty));
+  constexpr uint32_t kOverIntMax =
+      static_cast<uint32_t>(std::numeric_limits<int>::max()) + 1u;
+  EXPECT_FALSE(
+      DecodeMjpegGray(jpeg.data(), jpeg.size(), kOverIntMax, 1, empty));
+  EXPECT_FALSE(
+      DecodeMjpegGray(jpeg.data(), jpeg.size(), 1, kOverIntMax, empty));
 }
 
 // An Arducam OV9281's controls as uvcvideo reports them: auto_exposure menu
@@ -319,6 +629,27 @@ TEST(Capture, FrameDurationIsOneTheRangeAccepts) {
                                c.range.shortest, c.range.longest),
               c.expected);
   }
+
+  // Non-positive or non-finite rates and non-positive timescales are rejected,
+  // and tiny positive interior rates never yield timescale == 0.
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  EXPECT_EQ(FrameDurationFor(1e-5, 0.0, 30.0, {1, 30}, {1, 1}), std::nullopt);
+  EXPECT_EQ(FrameDurationFor(0.0, 0.0, 30.0, {1, 30}, {1, 1}), std::nullopt);
+  EXPECT_EQ(FrameDurationFor(-1.0, 1.0, 30.0, {1, 30}, {1, 1}), std::nullopt);
+  EXPECT_EQ(FrameDurationFor(15.0, -1.0, 30.0, {1, 30}, {1, 1}), std::nullopt);
+  EXPECT_EQ(FrameDurationFor(15.0, 1.0, 0.0, {1, 30}, {1, 1}), std::nullopt);
+  EXPECT_EQ(FrameDurationFor(nan, 1.0, 30.0, {1, 30}, {1, 1}), std::nullopt);
+  EXPECT_EQ(FrameDurationFor(inf, 1.0, 30.0, {1, 30}, {1, 1}), std::nullopt);
+  EXPECT_EQ(FrameDurationFor(30.0, 1.0, 30.0, {1, 0}, {1, 1}), std::nullopt);
+  EXPECT_EQ(FrameDurationFor(1.0, 1.0, 30.0, {1, 30}, {1, 0}), std::nullopt);
+
+  const auto slow = FrameDurationFor(1e-4, 1e-5, 30.0, {1, 30}, {100000, 1});
+  ASSERT_TRUE(slow.has_value());
+  EXPECT_GE(slow->timescale, 1);
+  EXPECT_GT(slow->value, 0);
+  EXPECT_GE(slow->seconds(), (FrameDuration{1, 30}.seconds()));
+  EXPECT_LE(slow->seconds(), (FrameDuration{100000, 1}.seconds()));
 }
 TEST(Capture, MissingDeviceFailsAndStopIsIdempotent) {
   CameraSourceConfig config;

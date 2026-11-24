@@ -142,6 +142,17 @@ cc_test(
 )
 
 cc_test(
+    name = "synthetic_source_test",
+    size = "small",
+    srcs = ["synthetic_source_test.cc"],
+    deps = [
+        ":synthetic_source",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "pipeline_test",
     size = "small",
     srcs = ["pipeline_test.cc"],

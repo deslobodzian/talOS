@@ -64,15 +64,23 @@ class Source final : public CameraSource {
       : id_(id), device_id_(std::move(device)) {}
   ~Source() override { Stop(); }
   uint32_t camera_id() const override { return id_; }
-  std::string device_id() const override { return device_id_; }
-  std::string name() const override { return device_id_; }
+  std::string device_id() const override {
+    std::lock_guard<std::mutex> lock(device_mutex_);
+    return device_id_;
+  }
+  std::string name() const override { return device_id(); }
   std::vector<CameraMode> SupportedModes() const override {
+    const std::string id = device_id();
     @autoreleasepool {
-      return Modes([AVCaptureDevice deviceWithUniqueID:@(device_id_.c_str())]);
+      return Modes([AVCaptureDevice deviceWithUniqueID:@(id.c_str())]);
     }
   }
-  CameraMode CurrentMode() const override { return mode_; }
+  CameraMode CurrentMode() const override {
+    std::lock_guard<std::mutex> lock(device_mutex_);
+    return mode_;
+  }
   bool SetMode(const CameraMode& mode) override {
+    std::lock_guard<std::mutex> lock(device_mutex_);
     if (running_.load(std::memory_order_acquire)) return false;
     if (!mode.width || !mode.height || !std::isfinite(mode.fps) ||
         mode.fps <= 0 || mode.fps > 2147483.0)
@@ -80,8 +88,12 @@ class Source final : public CameraSource {
     mode_ = mode;
     return true;
   }
-  CameraControls GetControls() const override { return controls_; }
+  CameraControls GetControls() const override {
+    std::lock_guard<std::mutex> lock(device_mutex_);
+    return controls_;
+  }
   bool SetControls(const CameraControls& c) override {
+    std::lock_guard<std::mutex> lock(device_mutex_);
     if (running_.load(std::memory_order_acquire)) return false;
     controls_ = c;
     return true;
@@ -115,25 +127,38 @@ class Source final : public CameraSource {
   bool Start() override {
     if (running_.load(std::memory_order_acquire)) return true;
     @autoreleasepool {
-      if (device_id_.empty()) {
+      std::string device_id;
+      CameraMode mode;
+      CameraControls controls;
+      {
+        std::lock_guard<std::mutex> lock(device_mutex_);
+        device_id = device_id_;
+        mode = mode_;
+        controls = controls_;
+      }
+      if (device_id.empty()) {
         const auto devices = DiscoverCaptureDevices();
         if (id_ >= devices.size())
           return Fail(ConnectionState::kDisconnected,
                       "no camera at index " + std::to_string(id_));
-        device_id_ = devices[id_].id;
+        device_id = devices[id_].id;
+        {
+          std::lock_guard<std::mutex> lock(device_mutex_);
+          device_id_ = device_id;
+        }
       }
       AVCaptureDevice* device =
-          [AVCaptureDevice deviceWithUniqueID:@(device_id_.c_str())];
+          [AVCaptureDevice deviceWithUniqueID:@(device_id.c_str())];
       {
         std::lock_guard<std::mutex> lock(device_mutex_);
         device_ = device;
       }
       if (!device_)
         return Fail(ConnectionState::kDisconnected,
-                    "no camera with uniqueID " + device_id_);
+                    "no camera with uniqueID " + device_id);
       if (!device_.connected)
         return Fail(ConnectionState::kDisconnected,
-                    "camera " + device_id_ + " is not connected");
+                    "camera " + device_id + " is not connected");
       const auto permission =
           [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
       if (permission == AVAuthorizationStatusNotDetermined) {
@@ -178,9 +203,9 @@ class Source final : public CameraSource {
       for (AVCaptureDeviceFormat* format in device_.formats) {
         auto d =
             CMVideoFormatDescriptionGetDimensions(format.formatDescription);
-        if (d.width != mode_.width || d.height != mode_.height) continue;
+        if (d.width != mode.width || d.height != mode.height) continue;
         for (AVFrameRateRange* range in format.videoSupportedFrameRateRanges) {
-          const auto duration = Duration(mode_.fps, range);
+          const auto duration = Duration(mode.fps, range);
           if (!duration) continue;
           device_.activeFormat = format;
           device_.activeVideoMinFrameDuration = *duration;
@@ -193,7 +218,7 @@ class Source final : public CameraSource {
       // macOS exposes exposure-mode selection, but not custom duration/ISO.
       // Keep streaming when unsupported and surface the failed request.
       controls_applied_ =
-          controls_.auto_exposure && controls_.auto_gain &&
+          controls.auto_exposure && controls.auto_gain &&
           [device_ isExposureModeSupported:
                        AVCaptureExposureModeContinuousAutoExposure];
       if (controls_applied_)
@@ -202,20 +227,30 @@ class Source final : public CameraSource {
       if (!selected) {
         [session_ commitConfiguration];
         return Fail(ConnectionState::kError,
-                    "camera has no " + std::to_string(mode_.width) + "x" +
-                        std::to_string(mode_.height) + " format at " +
-                        std::to_string(mode_.fps) + " fps");
+                    "camera has no " + std::to_string(mode.width) + "x" +
+                        std::to_string(mode.height) + " format at " +
+                        std::to_string(mode.fps) + " fps");
       }
       output_ = [[AVCaptureVideoDataOutput alloc] init];
       output_.alwaysDiscardsLateVideoFrames = YES;
-      OSType requested = mode_.format == PixelFormat::kGray8
+      OSType requested = mode.format == PixelFormat::kGray8
                              ? kCVPixelFormatType_OneComponent8
-                         : mode_.format == PixelFormat::kYuyv
+                         : mode.format == PixelFormat::kYuyv
                              ? kCVPixelFormatType_422YpCbCr8_yuvs
                              : kCVPixelFormatType_32BGRA;
       if (![output_.availableVideoCVPixelFormatTypes
               containsObject:@(requested)])
         requested = kCVPixelFormatType_32BGRA;
+      const PixelFormat effective_format =
+          requested == kCVPixelFormatType_OneComponent8
+              ? PixelFormat::kGray8
+          : requested == kCVPixelFormatType_422YpCbCr8_yuvs
+              ? PixelFormat::kYuyv
+              : PixelFormat::kBgra8;
+      {
+        std::lock_guard<std::mutex> lock(device_mutex_);
+        mode_.format = effective_format;
+      }
       output_.videoSettings =
           @{(id)kCVPixelBufferPixelFormatTypeKey : @(requested)};
       delegate_ = [[TalosCaptureDelegate alloc] init];
@@ -284,7 +319,7 @@ class Source final : public CameraSource {
   // failed, and returns false.
   bool Fail(ConnectionState state, const std::string& message) {
     Stop();
-    NotifyConnection(state, device_id_ + ": " + message);
+    NotifyConnection(state, device_id() + ": " + message);
     return false;
   }
   static std::string Describe(NSError* error) {
@@ -302,6 +337,12 @@ class Source final : public CameraSource {
       ++dropped_frames_;
       return;
     }
+    struct PixelBufferUnlockGuard {
+      CVPixelBufferRef buffer;
+      ~PixelBufferUnlockGuard() {
+        CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
+      }
+    } unlock_guard{pixels};
     const size_t size =
         CVPixelBufferGetBytesPerRow(pixels) * CVPixelBufferGetHeight(pixels);
     const auto pixel_type = CVPixelBufferGetPixelFormatType(pixels);
@@ -341,7 +382,6 @@ class Source final : public CameraSource {
       cb = callback_;
     }
     if (cb) cb(frame);
-    CVPixelBufferUnlockBaseAddress(pixels, kCVPixelBufferLock_ReadOnly);
   }
   uint32_t id_;
   std::string device_id_;
