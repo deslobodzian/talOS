@@ -614,6 +614,177 @@ class SimShConfigTest(unittest.TestCase):
     def test_sigint_during_wpilib_wait_exits_130(self):
         self._assert_signal_during_wpilib_wait_exits(signal.SIGINT, 130)
 
+    def _setup_fast_stubs(self, effective=None):
+        resolved = json.dumps({
+            "nodes": ["//bot:node"],
+            "effective": effective or {
+                "robot": {"sim_gateway": "//talOS/simulation:sim_gateway"},
+                "studio": {},
+            },
+        })
+        put(os.path.join(self.root, "bazel-bin", "talOS", "configuration",
+                         "resolve"),
+            f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(resolved)}\n",
+            0o755)
+        bin_dir = os.path.join(self.tmp, "bin")
+        put(os.path.join(bin_dir, "bazel"),
+            '#!/bin/sh\n[ "$1" = run ] || [ "$1" = build ] && exit 0\n'
+            'echo "bazel stub: $*" >&2; exit 97\n',
+            0o755)
+        return bin_dir
+
+    # REQ-DEV-05, REQ-OPS-08
+    def test_clean_launcher_exit_skips_cleanup_sleep(self):
+        bin_dir = self._setup_fast_stubs()
+        real_sleep = shutil.which("sleep")
+        self.assertIsNotNone(real_sleep)
+        exited_marker = os.path.join(self.tmp, "launcher_exited")
+        post_sleep_log = os.path.join(self.tmp, "post_exit_sleeps.log")
+        put(os.path.join(bin_dir, "sleep"),
+            "#!/bin/sh\n"
+            f'if [ -f {shlex.quote(exited_marker)} ] && [ "$1" != "0.5" ]; then\n'
+            f'  printf "%s\\n" "$*" >> {shlex.quote(post_sleep_log)}\n'
+            "fi\n"
+            f'exec {shlex.quote(real_sleep)} "$@"\n',
+            0o755)
+        put(os.path.join(self.root, "bazel-bin", "talOS", "launcher",
+                         "launcher"),
+            "#!/bin/sh\n"
+            'out_dir=""\n'
+            'session_id=""\n'
+            'while [ $# -gt 0 ]; do\n'
+            '  case "$1" in\n'
+            '    --output-dir) out_dir="$2"; shift ;;\n'
+            '    --session-id) session_id="$2"; shift ;;\n'
+            '  esac\n'
+            '  shift\n'
+            'done\n'
+            'mkdir -p "$out_dir/$session_id"\n'
+            'printf "{}\\n" > "$out_dir/$session_id/graph.json"\n'
+            f'echo done > {shlex.quote(exited_marker)}\n'
+            'exit 0\n',
+            0o755)
+        log_root = os.path.join(self.tmp, "sim_logs_clean_exit")
+        env = dict(self.env, PWD=self.root, TALOS_SIM_LOG_DIR=log_root)
+        proc = subprocess.run(
+            ["bash", self.sim, "--config", CONFIG, "--sim-gateway",
+             "--no-studio"],
+            cwd=self.root, env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(
+            os.path.exists(post_sleep_log),
+            "cleanup() should not sleep after the launcher already exited",
+        )
+
+    # REQ-DEV-05, REQ-OPS-03, REQ-OPS-06, REQ-OPS-08
+    def test_sigterm_allows_launcher_graceful_shutdown_past_one_second(self):
+        self._setup_fast_stubs()
+        clean_marker = os.path.join(self.tmp, "launcher_clean_shutdown")
+        put(os.path.join(self.root, "bazel-bin", "talOS", "launcher",
+                         "launcher"),
+            "#!/bin/sh\n"
+            'out_dir=""\n'
+            'session_id=""\n'
+            'while [ $# -gt 0 ]; do\n'
+            '  case "$1" in\n'
+            '    --output-dir) out_dir="$2"; shift ;;\n'
+            '    --session-id) session_id="$2"; shift ;;\n'
+            '  esac\n'
+            '  shift\n'
+            'done\n'
+            'mkdir -p "$out_dir/$session_id"\n'
+            'printf "{}\\n" > "$out_dir/$session_id/graph.json"\n'
+            'sp=""\n'
+            f'trap \'[ -n "$sp" ] && kill "$sp" 2>/dev/null; '
+            f'sleep 1.5; echo clean > {shlex.quote(clean_marker)}; '
+            "exit 0' TERM\n"
+            'sleep 30 &\n'
+            'sp=$!\n'
+            'wait "$sp"\n',
+            0o755)
+        log_root = os.path.join(self.tmp, "sim_logs_graceful")
+        env = dict(self.env, PWD=self.root, TALOS_SIM_LOG_DIR=log_root)
+        proc = subprocess.Popen(
+            ["bash", self.sim, "--config", CONFIG, "--sim-gateway",
+             "--no-studio"],
+            cwd=self.root, env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True)
+        seen = []
+        try:
+            for line in proc.stdout:
+                seen.append(line)
+                if "running. Ctrl-C stops everything." in line:
+                    break
+            else:
+                self.fail(f"sim.sh exited before running: {''.join(seen)}")
+            proc.send_signal(signal.SIGTERM)
+            rest, _ = proc.communicate(timeout=10)
+            out = "".join(seen) + (rest or "")
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            self.fail("sim.sh did not exit after SIGTERM")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.assertEqual(proc.returncode, 143, out)
+        self.assertTrue(
+            os.path.exists(clean_marker),
+            f"launcher was SIGKILLed before completing 1.5 s shutdown:\n{out}",
+        )
+
+    # REQ-DEV-05, REQ-DEV-06
+    def test_wpilib_early_exit_without_failure_marker_exits_promptly(self):
+        self._setup_fast_stubs(effective={"robot": {}, "studio": {}})
+        put(os.path.join(self.root, "bazel-bin", "talOS", "launcher",
+                         "launcher"),
+            '#!/bin/sh\n[ "$1" = "--check-session-lock" ] && exit 0\nexit 0\n',
+            0o755)
+        put(os.path.join(self.root, "controller_processor", "rio", "gradlew"),
+            '#!/bin/sh\necho "JAVA_HOME is not set" >&2\nexit 1\n',
+            0o755)
+        log_root = os.path.join(self.tmp, "sim_logs_rio_early")
+        env = dict(self.env, PWD=self.root, TALOS_SIM_LOG_DIR=log_root)
+        proc = subprocess.run(
+            ["bash", self.sim, "--config", CONFIG, "--headless", "--no-studio"],
+            cwd=self.root, env=env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("JAVA_HOME is not set", proc.stderr)
+        self.assertIn("exited before starting", proc.stderr)
+
+    # REQ-DEV-05, REQ-DEV-06
+    def test_studio_wait_exits_promptly_when_launcher_exits_early(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        unused_port = sock.getsockname()[1]
+        sock.close()
+
+        self._setup_fast_stubs()
+        put(os.path.join(self.root, "bazel-bin", "talOS", "launcher",
+                         "launcher"),
+            "#!/bin/sh\n"
+            'out_dir=""\n'
+            'session_id=""\n'
+            'while [ $# -gt 0 ]; do\n'
+            '  case "$1" in\n'
+            '    --output-dir) out_dir="$2"; shift ;;\n'
+            '    --session-id) session_id="$2"; shift ;;\n'
+            '  esac\n'
+            '  shift\n'
+            'done\n'
+            'mkdir -p "$out_dir/$session_id"\n'
+            'printf "{}\\n" > "$out_dir/$session_id/graph.json"\n'
+            'exit 1\n',
+            0o755)
+        log_root = os.path.join(self.tmp, "sim_logs_studio_early")
+        env = dict(self.env, PWD=self.root, TALOS_SIM_LOG_DIR=log_root)
+        proc = subprocess.run(
+            ["bash", self.sim, "--config", CONFIG, "--sim-gateway",
+             "--no-open", "--http-port", str(unused_port)],
+            cwd=self.root, env=env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main(testLoader=sharded_test_loader.bazel_test_loader())

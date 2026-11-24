@@ -219,6 +219,89 @@ class MainFailClosedAndObserveTest(unittest.TestCase):
             )
             self.assertIn('Nested.cpp', argv_text)
 
+    # REQ-DEV-25
+    def test_exit_zero_tool_errors_and_warnings_are_not_ignored(self):
+        # Broken .clang-tidy YAML or driver errors often exit 0 after falling
+        # back to defaults; they must still fail closed (exit 2) even under
+        # --observe.
+        for label, body in (
+            (
+                'yaml_error_exit_0',
+                'echo "Error parsing .clang-tidy: YAML:1:1: error: bad"\nexit 0\n',
+            ),
+            (
+                'driver_error_exit_0',
+                'echo "error: invalid value in -std=c++99"\nexit 0\n',
+            ),
+            (
+                'yaml_error_plus_warning_exit_0',
+                'echo "Error parsing .clang-tidy: YAML:1:1: error: bad"\n'
+                'echo "A.cpp:1:1: warning: empty catch [bugprone-empty-catch]"\n'
+                'exit 0\n',
+            ),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                tmp_path = pathlib.Path(tmp)
+                src_dir, db = self._make_fixture(tmp_path, sources=('A.cpp',))
+                fake = _write_fake_tidy(tmp_path, body)
+                self.assertEqual(
+                    rio_tidy.main([
+                        '--db', str(db), '--src-dir', str(src_dir),
+                        '--tidy-bin', fake,
+                    ]),
+                    2,
+                )
+                self.assertEqual(
+                    rio_tidy.main([
+                        '--db', str(db), '--src-dir', str(src_dir),
+                        '--tidy-bin', fake, '--observe',
+                    ]),
+                    2,
+                )
+
+        # A lint warning printed while exiting 0 fails strict (exit 1) and
+        # passes --observe (exit 0).
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            src_dir, db = self._make_fixture(tmp_path, sources=('A.cpp',))
+            fake = _write_fake_tidy(
+                tmp_path,
+                'echo "A.cpp:1:1: warning: empty catch [bugprone-empty-catch]"\n'
+                'exit 0\n',
+            )
+            self.assertEqual(
+                rio_tidy.main([
+                    '--db', str(db), '--src-dir', str(src_dir),
+                    '--tidy-bin', fake,
+                ]),
+                1,
+            )
+            self.assertEqual(
+                rio_tidy.main([
+                    '--db', str(db), '--src-dir', str(src_dir),
+                    '--tidy-bin', fake, '--observe',
+                ]),
+                0,
+            )
+
+        # Benign suppressed-warnings summary with exit 0 stays clean.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            src_dir, db = self._make_fixture(tmp_path, sources=('A.cpp',))
+            fake = _write_fake_tidy(
+                tmp_path,
+                'echo "12 warnings generated."\n'
+                'echo "Suppressed 12 warnings (12 in non-user code)."\n'
+                'exit 0\n',
+            )
+            self.assertEqual(
+                rio_tidy.main([
+                    '--db', str(db), '--src-dir', str(src_dir),
+                    '--tidy-bin', fake,
+                ]),
+                0,
+            )
+
 
 if __name__ == '__main__':
     unittest.main()
