@@ -381,9 +381,20 @@ class FakeBazel:
         out = []
         for label in sorted(self.graph):
             if (matches(label, "talOS/simulation/mujoco/...") and
-                    self.kinds.get(label, "cc_library") == "cc_library"):
+                    self.kinds.get(label, "cc_library") in
+                    check_layers.MUJOCO_CONFINED_KINDS):
                 out.append(label)
         return out
+
+    def mujoco_external_visibility(self, targets):
+        out = []
+        for t in targets:
+            label = "//" + t
+            vis = self.visibility.get(label, ())
+            if any(not check_layers._is_allowed_mujoco_visibility(entry)
+                   for entry in vis):
+                out.append(label)
+        return sorted(out)
 
     def visible_to(self, target_label, targets):
         out = []
@@ -763,24 +774,94 @@ class CheckLayersTest(unittest.TestCase):
                 self.assertGreaterEqual(failures, 1, out)
                 self.assertIn(f"  {to}\n", out)
 
-        # A newly added cc_library wrapper under talOS/simulation/mujoco that
-        # is public, repo-wide visible, or visible outside mujoco fails closed
-        # even if not hardcoded in RESTRICTED_INTERNAL_TARGETS.
-        for case, wrapper_vis in (
-                ("public_wrapper", ("//visibility:public",)),
-                ("repo_wide_wrapper", ("//:__subpackages__",)),
-                ("visible_to_talos_node", ("//talOS/node:__pkg__",)),
-                ("visible_to_mujoco_rig_node",
-                 ("//examples/mujoco_rig/main_processor/feeder:__pkg__",))):
+        # A newly added cc_library, cc_import, or alias wrapper under
+        # talOS/simulation/mujoco that is linked outside or visible to ANY
+        # package outside talOS/simulation/mujoco/... (including non-node
+        # packages such as //talOS/simulation or //studio, or an opaque
+        # package_group) fails closed even if not in RESTRICTED_INTERNAL_TARGETS.
+        for kind in ("cc_library", "cc_shared_library", "cc_import", "alias"):
+            with self.subTest(dep_kind=kind):
+                graph = with_edge(
+                    "//talOS/simulation:gateway_main",
+                    "//talOS/simulation/mujoco:wrapper")
+                kinds = dict(KINDS)
+                kinds["//talOS/simulation/mujoco:wrapper"] = kind
+                failures, out = run(graph, kinds=kinds)
+                self.assertGreaterEqual(failures, 1, out)
+                self.assertIn("  //talOS/simulation/mujoco:wrapper\n", out)
+
+        for case, kind, wrapper_vis in (
+                ("public_wrapper", "cc_library", ("//visibility:public",)),
+                ("repo_wide_wrapper", "cc_library", ("//:__subpackages__",)),
+                ("visible_to_talos_node", "cc_library", ("//talOS/node:__pkg__",)),
+                ("visible_to_talos_simulation", "cc_library",
+                 ("//talOS/simulation:__pkg__",)),
+                ("visible_to_studio", "cc_library",
+                 ("//studio:__subpackages__",)),
+                ("opaque_package_group", "cc_library",
+                 ("//talOS/simulation/mujoco:external_group",)),
+                ("visible_to_mujoco_rig_node", "cc_library",
+                 ("//examples/mujoco_rig/main_processor/feeder:__pkg__",)),
+                ("alias_visible_to_talos_simulation", "alias",
+                 ("//talOS/simulation:__pkg__",)),
+                ("cc_shared_library_visible_to_studio", "cc_shared_library",
+                 ("//studio:__pkg__",)),
+                ("cc_import_visible_to_studio", "cc_import",
+                 ("//studio:__pkg__",))):
             with self.subTest(case=case):
                 graph = {k: (g, list(d)) for k, (g, d) in GRAPH.items()}
                 graph["//talOS/simulation/mujoco:wrapper"] = (
                     None, ["//talOS/simulation/mujoco:plant"])
+                kinds = dict(KINDS)
+                kinds["//talOS/simulation/mujoco:wrapper"] = kind
                 vis = dict(VISIBILITY)
                 vis["//talOS/simulation/mujoco:wrapper"] = wrapper_vis
-                failures, out = run(graph, visibility=vis)
+                failures, out = run(graph, kinds=kinds, visibility=vis)
                 self.assertGreaterEqual(failures, 1, out)
                 self.assertIn("//talOS/simulation/mujoco:wrapper", out)
+
+        # Exercise Bazel.mujoco_external_visibility XML parsing directly.
+        bazel = check_layers.Bazel()
+        ok_xml = (
+            '<query version="2">'
+            '<rule class="cc_library" name="//talOS/simulation/mujoco:plant">'
+            '<list name="visibility">'
+            '<label value="//talOS/simulation/mujoco:__subpackages__"/>'
+            '</list></rule>'
+            '<rule class="alias" name="//talOS/simulation/mujoco:priv">'
+            '<list name="visibility">'
+            '<label value="//visibility:private"/>'
+            '</list></rule>'
+            '</query>'
+        )
+        with mock.patch.object(bazel, "query", return_value=[ok_xml]) as q:
+            self.assertEqual(
+                bazel.mujoco_external_visibility((
+                    "talOS/simulation/mujoco:plant",
+                    "talOS/simulation/mujoco:priv",
+                )),
+                [])
+            self.assertEqual(q.call_args.kwargs.get("output"), "xml")
+            self.assertIs(q.call_args.kwargs.get("allow_external_exit_3"), False)
+
+        bad_xml = (
+            '<query version="2">'
+            '<rule class="alias" name="//talOS/simulation/mujoco:leak">'
+            '<list name="visibility">'
+            '<label value="//talOS/simulation:__pkg__"/>'
+            '</list></rule>'
+            '</query>'
+        )
+        with mock.patch.object(bazel, "query", return_value=[bad_xml]):
+            self.assertEqual(
+                bazel.mujoco_external_visibility(
+                    ("talOS/simulation/mujoco:leak",)),
+                ["//talOS/simulation/mujoco:leak"])
+
+        missing_xml = '<query version="2"></query>'
+        with mock.patch.object(bazel, "query", return_value=[missing_xml]), \
+                self.assertRaises(RuntimeError):
+            bazel.mujoco_external_visibility(("talOS/simulation/mujoco:plant",))
 
     # REQ-CONTRACT-16, REQ-SAFE-27
     def test_bazel_query_exit_3_and_partial_results_fail_closed(self):
@@ -2550,8 +2631,17 @@ class CheckMujocoLabelsTest(unittest.TestCase):
             ("module_kwargs_splat_bazel_dep", "MODULE.bazel",
              'OPTS = {"name": "mujoco", "repo_name": "physics"}\n'
              'bazel_dep(**OPTS)\n'),
+            ("module_args_splat_bazel_dep", "MODULE.bazel",
+             'ARGS = ["mujoco", "3.17.0", -1, "physics"]\n'
+             'bazel_dep(*ARGS)\n'),
             ("module_use_repo_alias", "MODULE.bazel",
              'use_repo(ext, physics = "mujoco")\n'),
+            ("module_use_repo_dynamic_kwarg", "MODULE.bazel",
+             'use_repo(ext, physics = get_repo())\n'),
+            ("module_register_toolchains_at_mujoco", "MODULE.bazel",
+             'register_toolchains("@mujoco//:toolchain")\n'),
+            ("module_use_repo_rule_at_mujoco", "MODULE.bazel",
+             'r = use_repo_rule("@mujoco//:defs.bzl", "my_rule")\n'),
             ("module_syntax_error_fails_closed", "MODULE.bazel",
              'bazel_dep(\n'),
             ("nested_module_bazel_repo_name", "examples/robot_repo/MODULE.bazel",
