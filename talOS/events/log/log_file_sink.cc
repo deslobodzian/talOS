@@ -174,6 +174,7 @@ int LogFileSink::sync_directory() const noexcept {
 void LogFileSink::rotate_to(std::uint64_t next) noexcept {
   sync(/*durable=*/true);
   close();
+  if (failed_.load()) return;
   const auto fail = [this](std::string_view step, const std::string& what) {
     set_error("LogWriter: cannot " + std::string{step} + " " + what + ": " +
               std::strerror(errno));
