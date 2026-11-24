@@ -62,9 +62,9 @@ constexpr const char* kConfigPath = "talos_config.bin";
 #endif
 
 // RioLog kMessage index (rate-limit key) of this file's persistence report;
-// 1 and 3 to 6 are SocketLinkTick.h's, 0, 7, 8 and 16 to 31 are
-// PhoenixBackend's (configure failure, CAN bus status, CAN bus reader, licence
-// refusals), and 9 to 12 are LoopConsole's.
+// 1, 3 to 6 and 14 are SocketLinkTick.h's, 0, 7, 8, 13 and 16 to 31 are
+// PhoenixBackend's (configure failure, CAN bus status, CAN bus reader, restore
+// failure, licence refusals), and 9 to 12 are LoopConsole's.
 constexpr uint16_t kPersistMessage = 2;
 
 // The loop watchdog's SCHED_FIFO priority: above the loop thread's, so it
