@@ -1,6 +1,6 @@
 #pragma once
 
-// The GatewayExtension that makes RunSimGateway `mujoco_gateway`
+// The GatewayExtension that makes RunSimGateway the MuJoCo gateway
 // (README.md): at Configure it assembles the MuJoCo world from the robot
 // config's [simulation.mujoco] and attaches it to the physics backend as its
 // external plant; after each tick it ends the program when the plant has
@@ -75,7 +75,7 @@ class MujocoGatewayExtension final : public GatewayExtension {
   MujocoGatewayExtension(MujocoGatewayExtension&&) = delete;
   MujocoGatewayExtension& operator=(MujocoGatewayExtension&&) = delete;
 
-  // Assembles the world (README.md "mujoco_gateway") and attaches it to
+  // Assembles the world (README.md "The MuJoCo gateway") and attaches it to
   // `backend`, which binds it at the gateway's Reconfigure. Throws
   // std::invalid_argument naming the key, flag, file, element or actuator it
   // refuses.

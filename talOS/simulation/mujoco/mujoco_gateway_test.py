@@ -1,4 +1,5 @@
-"""//talOS/simulation/mujoco:mujoco_gateway as a child process (REQ-DEV-37).
+"""//talOS/simulation/mujoco:sim_gateway, the MuJoCo gateway, as a child
+process (REQ-DEV-37).
 
 Its --describe against sim_gateway --physics's, its refusals before the
 socket opens, a model reading a file robot_model_files omits, a diverging
@@ -85,7 +86,7 @@ class MujocoGatewayTest(unittest.TestCase):
         mujoco_json = json.loads(mujoco.stdout)
         plain_json = json.loads(plain.stdout)
         self.assertEqual(mujoco_json.pop("target"),
-                         "//talOS/simulation/mujoco:mujoco_gateway")
+                         "//talOS/simulation/mujoco:sim_gateway")
         plain_json.pop("target")
         match = [source for source in mujoco_json["sources"]
                  if source["name"] == "/sim/state/match"]

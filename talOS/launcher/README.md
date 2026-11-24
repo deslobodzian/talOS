@@ -391,7 +391,10 @@ commissioning gates commands; see
 
 `--sim --start-sim-gateway` starts the binary named by `[robot] sim_gateway`
 (`//talOS/simulation:sim_gateway`, [its README](../simulation/README.md)) as
-a roster member, under the name `sim_gateway`. It is started with
+a roster member, under the name `sim_gateway`, so the label named there
+must have `sim_gateway` as its rule or its package leaf
+([node names](../NAMING.md#nodes)), as the MuJoCo gateway's
+`//talOS/simulation/mujoco:sim_gateway` does. It is started with
 `--config` and `--session-id` and no `--log`, so it writes no event log, and
 `--replay-inputs --only` refuses it. These hold for the member the launcher
 adds only, which it does when `--sim`, `--start-sim-gateway` and a

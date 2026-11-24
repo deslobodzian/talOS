@@ -1,7 +1,7 @@
 # Robot models for MuJoCo
 
 `//talOS/simulation/mujoco/robots:generate_robot` writes a robot's MuJoCo
-model (MJCF) for [`mujoco_gateway`](../README.md#mujoco_gateway) from a
+model (MJCF) for [the MuJoCo gateway](../README.md#the-mujoco-gateway) from a
 parameter file that describes the robot by parts: a frame and bumpers, swerve
 modules, an intake ramp with rollers, a hopper whose floor falls to a feeder
 roller that gates a pocket, a flywheel with its hood, beam breaks and preload
@@ -110,7 +110,7 @@ reads open on the empty robot; `robot_model_test` does for the examples.
   robot.
 - **Scripted shooter.** With `[flywheel]` the model carries the
   [scripted-shooter contract](../README.md#writing-a-robot-model) for the
-  motor `<motor>` (its meaning under `mujoco_gateway` is REQ-DEV-39's): a
+  motor `<motor>` (its meaning under the MuJoCo gateway is REQ-DEV-39's): a
   box site `<motor>_inlet`, the pocket behind the feeder (below); a site `<motor>_exit` whose origin is the hood's exit line
   `exit_offset_m` beyond the hood's end and whose x axis leaves backward at
   `exit_elevation_deg` (its y axis the robot's +y, the axle's line); and
@@ -238,7 +238,7 @@ loads; the command it prints names talOS as the robot repository does
 (`@talos//...`), or by its canonical name (`@@...//`) when the test's
 runfiles carry no mapping for it. To check a model, run the gateway on the
 config for 50 ms and read the binding table
-([how](../README.md#mujoco_gateway)).
+([how](../README.md#the-mujoco-gateway)).
 
 ## Tests
 

@@ -1,5 +1,5 @@
-// mujoco_gateway: sim_gateway --physics with a MuJoCo world as the plant
-// (README.md).
+// The MuJoCo gateway, //talOS/simulation/mujoco:sim_gateway: sim_gateway
+// --physics with a MuJoCo world as the plant (README.md).
 
 #include <chrono>
 #include <cstdint>
@@ -25,6 +25,6 @@ int main(int argc, char** argv) {
       .summary = &std::cout,
   }};
   return talos::simulation::RunSimGateway(
-      argc, argv, {"//talOS/simulation/mujoco:mujoco_gateway", "mujoco", true},
+      argc, argv, {"//talOS/simulation/mujoco:sim_gateway", "mujoco", true},
       &extension);
 }
