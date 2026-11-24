@@ -122,6 +122,18 @@ TEST(Readiness, UnknownOrNegativePoseAgeIsStale) {
   in.pose_age_us = -1;
   EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kStale);
 
+  // Unknown pose age fails closed even when max_pose_age_us is kUnknownAge_us.
+  ReadinessLimits max_age = Limits();
+  max_age.max_pose_age_us = ReadinessInput::kUnknownAge_us;
+  ReadinessInput undated = AllGood();
+  undated.pose_age_us = ReadinessInput::kUnknownAge_us;
+  EXPECT_EQ(CheckReadiness(undated, max_age), ReadinessReason::kStale);
+  ReadinessGate max_age_gate(max_age);
+  const Readiness gated = max_age_gate.Update(undated, 0);
+  EXPECT_FALSE(gated.ready);
+  EXPECT_EQ(gated.reason, ReadinessReason::kStale);
+  EXPECT_EQ(gated.passing_tick_count, 0);
+
   in.pose_age_us = 0;
   ReadinessLimits zero_age = Limits();
   zero_age.max_pose_age_us = 0;
@@ -134,18 +146,32 @@ TEST(Readiness, UnknownOrNegativePoseAgeIsStale) {
 // REQ-DEV-19
 TEST(Readiness, NaNMeasurementFails) {
   const ReadinessLimits limits = Limits();
-  ReadinessInput in = AllGood();
-  in.aim_error_rad = kNaN;
-  EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kAimError);
-  in = AllGood();
-  in.robot_omega_radps = kNaN;
-  EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kRobotRotatingTooFast);
+  for (const double bad : {kNaN, kInf, -kInf}) {
+    SCOPED_TRACE(bad);
+    ReadinessInput in = AllGood();
+    in.robot_speed_mps = bad;
+    EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kRobotTooFast);
+    in = AllGood();
+    in.robot_omega_radps = bad;
+    EXPECT_EQ(CheckReadiness(in, limits),
+              ReadinessReason::kRobotRotatingTooFast);
+    in = AllGood();
+    in.aim_error_rad = bad;
+    EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kAimError);
+    in = AllGood();
+    in.flywheel_error_rps = bad;
+    EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kFlywheelNotAtSpeed);
+    in = AllGood();
+    in.hood_error_rad = bad;
+    EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kHoodNotAtGoal);
+  }
 
   ReadinessLimits unlimited = Limits();
   unlimited.max_robot_speed_mps = kInf;
   unlimited.max_robot_omega_radps = kInf;
-  for (const double bad : {kInf, -kInf}) {
-    in = AllGood();
+  for (const double bad : {kNaN, kInf, -kInf}) {
+    SCOPED_TRACE(bad);
+    ReadinessInput in = AllGood();
     in.robot_speed_mps = bad;
     EXPECT_EQ(CheckReadiness(in, unlimited), ReadinessReason::kRobotTooFast);
     in = AllGood();

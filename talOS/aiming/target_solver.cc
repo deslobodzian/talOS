@@ -41,6 +41,26 @@ struct TurretChoice {
   bool reachable = false;
 };
 
+double LimitEps(double scale_rad) {
+  return std::min(1e-12 * std::max(1.0, std::abs(scale_rad)), 1e-6);
+}
+
+TurretChoice TryShifted(double shifted, const TurretTravel& travel) {
+  if (!std::isfinite(shifted)) return {0.0, false};
+  if (std::isfinite(travel.min_rad) && shifted < travel.min_rad &&
+      travel.min_rad - shifted <= LimitEps(travel.min_rad)) {
+    shifted = travel.min_rad;
+  }
+  if (std::isfinite(travel.max_rad) && shifted > travel.max_rad &&
+      shifted - travel.max_rad <= LimitEps(travel.max_rad)) {
+    shifted = travel.max_rad;
+  }
+  if (shifted >= travel.min_rad && shifted <= travel.max_rad) {
+    return {shifted, true};
+  }
+  return {0.0, false};
+}
+
 // Among needed_rad + 2 pi k, the one inside [min, max] nearest measured.
 // Just past a limit, or when none is inside, a limit is held, unreachable.
 TurretChoice ChooseTurret(double needed_rad, double measured_rad,
@@ -52,8 +72,7 @@ TurretChoice ChooseTurret(double needed_rad, double measured_rad,
     }
     // Clamp floating-point rounding overshoot right at an exact travel limit so
     // it does not trip seam_hysteresis_rad as unreachable.
-    const double limit_eps_rad =
-        std::min(1e-12 * std::max(1.0, std::abs(measured_rad)), 1e-6);
+    const double limit_eps_rad = LimitEps(measured_rad);
     if (nearest > travel.max_rad && nearest - travel.max_rad <= limit_eps_rad) {
       return {travel.max_rad, true};
     }
@@ -61,15 +80,17 @@ TurretChoice ChooseTurret(double needed_rad, double measured_rad,
       return {travel.min_rad, true};
     }
   }
-  // Seam hysteresis: a needed angle that has only just crossed a limit holds
-  // that limit rather than jumping to the far side of the travel.
+  // Seam hysteresis: when the turret is near a limit and the needed angle has
+  // only just crossed that limit, hold it rather than jumping to the far side.
   if (std::isfinite(nearest)) {
     if (nearest > travel.max_rad &&
-        nearest - travel.max_rad <= travel.seam_hysteresis_rad) {
+        nearest - travel.max_rad <= travel.seam_hysteresis_rad &&
+        measured_rad >= travel.max_rad - travel.seam_hysteresis_rad) {
       return {travel.max_rad, false};
     }
     if (nearest < travel.min_rad &&
-        travel.min_rad - nearest <= travel.seam_hysteresis_rad) {
+        travel.min_rad - nearest <= travel.seam_hysteresis_rad &&
+        measured_rad <= travel.min_rad + travel.seam_hysteresis_rad) {
       return {travel.min_rad, false};
     }
   }
@@ -80,18 +101,23 @@ TurretChoice ChooseTurret(double needed_rad, double measured_rad,
       (std::isfinite(nearest) && nearest > travel.max_rad)) {
     const double delta = AngleDiff(needed_rad, travel.max_rad);
     const double shifted =
-        travel.max_rad + (delta <= 0.0 ? delta : delta - kTau);
-    if (std::isfinite(shifted) && shifted >= travel.min_rad &&
-        shifted <= travel.max_rad) {
-      return {shifted, true};
+        (delta > 0.0 && delta <= LimitEps(travel.max_rad))
+            ? travel.max_rad
+            : travel.max_rad + (delta <= 0.0 ? delta : delta - kTau);
+    if (const TurretChoice choice = TryShifted(shifted, travel);
+        choice.reachable) {
+      return choice;
     }
   } else {
     const double delta = AngleDiff(needed_rad, travel.min_rad);
     const double shifted =
-        travel.min_rad + (delta >= 0.0 ? delta : delta + kTau);
-    if (std::isfinite(shifted) && shifted >= travel.min_rad &&
-        shifted <= travel.max_rad) {
-      return {shifted, true};
+        (std::isfinite(travel.min_rad) && delta < 0.0 &&
+         -delta <= LimitEps(travel.min_rad))
+            ? travel.min_rad
+            : travel.min_rad + (delta >= 0.0 ? delta : delta + kTau);
+    if (const TurretChoice choice = TryShifted(shifted, travel);
+        choice.reachable) {
+      return choice;
     }
   }
   // Unreachable: both travel limits are finite (otherwise shifted above would
@@ -301,7 +327,7 @@ Solution TargetSolver::SolveWithFieldVelocity(
   out.virtual_target_y_m = virtual_target_m.y();
   if (config_.turret) {
     const double needed_rad =
-        Wrap(aim.shot_heading_rad - field_to_robot.angle() - mount_yaw_rad_);
+        Wrap(aim.shot_heading_rad - aim.robot_heading_rad - mount_yaw_rad_);
     const TurretChoice choice =
         ChooseTurret(needed_rad, measured_turret_rad, *config_.turret);
     out.turret_rad = choice.turret_rad;
