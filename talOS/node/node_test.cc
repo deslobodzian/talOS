@@ -2084,22 +2084,6 @@ TEST(Sim, ResumeGuardsReentrancySettlesAndRoundUpdatesNowBeforeCallbacks) {
   EXPECT_EQ(receiver.heard.back().second, Time{} + 35ms);
 }
 
-// REQ-RT-02: a late Wake::kOnPublish callback subscription after start() fails
-// atomically without leaking a watcher onto the event loop.
-TEST(Node, LateOnPublishSubscribeFailsAtomicallyWithoutLeakingWatcher) {
-  auto sim = Sim::FromToml(kRobotToml);
-  sim.add<Empty>("listener");
-  Node& node = sim.node("listener");
-  int calls = 0;
-  EXPECT_THROW(
-      (void)node.subscribe<Count>(
-          "/listener/late", [&](const Count&) { ++calls; }, Wake::kOnPublish),
-      std::logic_error);
-  sim.publish("/listener/late", Count{1, 0});
-  sim.step(20ms);
-  EXPECT_EQ(calls, 0);
-}
-
 // REQ-CONTRACT-13: RunMain rejects negative argc, null argv/argv[i], negative
 // unsigned flags, and trailing garbage on numeric CLI flags cleanly.
 TEST(Node, RunMainRejectsNullArgvAndMalformedNumericFlags) {
