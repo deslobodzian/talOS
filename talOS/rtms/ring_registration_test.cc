@@ -1710,7 +1710,7 @@ TEST(RingRegistration, SessionOwnerWaitsForLiveClaimantUnderSignalDelivery) {
     SigUsr1Guard() {
       struct sigaction action {};
       action.sa_handler = CountSigUsr1;
-      ::sigemptyset(&action.sa_mask);
+      sigemptyset(&action.sa_mask);
       // Explicitly omit SA_RESTART so syscalls and nanosleep observe EINTR.
       action.sa_flags = 0;
       installed = ::sigaction(SIGUSR1, &action, &previous) == 0;
