@@ -18,11 +18,13 @@
 #include <cstring>
 #include <format>
 #include <latch>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -86,6 +88,18 @@ class RegistrationPeer {
 
   static void SetOnUnlinkVerified(void (*callback)(std::uint64_t)) {
     RTMSQueue::on_unlink_verified_ = callback;
+  }
+
+  static void SetOnSessionClaimed(void (*callback)(std::uint64_t)) {
+    RTMSQueue::on_session_claimed_ = callback;
+  }
+
+  static int ClaimantWaitAttempts() {
+    return RTMSQueue::claimant_wait_attempts_;
+  }
+
+  static void SetClaimantWaitAttempts(int attempts) {
+    RTMSQueue::claimant_wait_attempts_ = attempts;
   }
 };
 
@@ -221,10 +235,35 @@ TEST(RingRegistration, ReaderRegisteredAcrossLessThanARingReadsEveryMessage) {
       ReadResult::EMPTY);
 }
 
+// The longest topic name RTMSQueue accepts, in bytes after the leading slash
+// (ValidatePath in rtms.cc, the macOS shared-memory name limit; NAMING.md).
+constexpr std::size_t kMaxTopicBytes = 30;
+// The longest pid (Linux pid_max is at most 4194304) and counter suffixes
+// MakeUniquePath appends.
+constexpr std::size_t kMaxPidDigits = 7;
+constexpr int kMaxUniqueCounter = 999;
+constexpr std::size_t kMaxCounterDigits = 3;
+
+// `prefix` plus "_<pid>_<counter>", unique within this binary's run. Refuses
+// a prefix whose name could exceed kMaxTopicBytes with any pid (a sandbox's
+// pid namespace gives two-digit pids, a host up to seven), and more names
+// than the counter's digits allow, so a name too long anywhere fails here.
 std::string MakeUniquePath(const char* prefix) {
   static std::atomic<int> counter{0};
+  const std::string_view name = std::string_view{prefix}.substr(1);
+  if (name.size() + 1 + kMaxPidDigits + 1 + kMaxCounterDigits >
+      kMaxTopicBytes) {
+    throw std::logic_error(std::string{"MakeUniquePath: prefix "} + prefix +
+                           " is too long for a topic with a " +
+                           std::to_string(kMaxPidDigits) + "-digit pid");
+  }
+  const int unique = counter.fetch_add(1, std::memory_order_relaxed);
+  if (unique > kMaxUniqueCounter) {
+    throw std::logic_error("MakeUniquePath: more than " +
+                           std::to_string(kMaxUniqueCounter + 1) + " names");
+  }
   return std::string{prefix} + "_" + std::to_string(::getpid()) + "_" +
-         std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
+         std::to_string(unique);
 }
 
 RTMSQueue OpenSubscriber(const std::string& path, std::size_t slots) {
@@ -475,7 +514,7 @@ TEST(RingRegistration, ForkedChildDestructionPreservesParentReaderSlot) {
 // mark the segment closing, or unlink the parent's live shared-memory segment.
 TEST(RingRegistration, ForkedChildDestructionPreservesParentSegmentLifetime) {
   constexpr std::size_t kSlots = 4;
-  const std::string standalone_path = MakeUniquePath("/ring_fork_standalone");
+  const std::string standalone_path = MakeUniquePath("/ring_fork_alone");
   const std::string session_path = MakeUniquePath("/ring_fork_session");
   ::shm_unlink(ShmObjectName(standalone_path).c_str());
   ::shm_unlink(ShmObjectName(session_path).c_str());
@@ -792,6 +831,23 @@ struct HoldGuard {
   }
 };
 
+// The waits for a live claimant one open() makes before it gives up, lowered
+// from the production bound (about a second) so a test reaches it at once.
+constexpr int kHeldWaitAttempts = 3;
+
+// Sets how many times an open() waits for live claimants, restoring the
+// production bound on destruction.
+struct WaitAttemptsGuard {
+  explicit WaitAttemptsGuard(int attempts)
+      : saved{RegistrationPeer::ClaimantWaitAttempts()} {
+    RegistrationPeer::SetClaimantWaitAttempts(attempts);
+  }
+  ~WaitAttemptsGuard() { RegistrationPeer::SetClaimantWaitAttempts(saved); }
+  WaitAttemptsGuard(const WaitAttemptsGuard&) = delete;
+  WaitAttemptsGuard& operator=(const WaitAttemptsGuard&) = delete;
+  int saved;
+};
+
 // REQ-OPS-03: eight openers find an abandoned closing segment with no
 // claimant; one claims it and is descheduled between checking that the name
 // still holds it and unlinking it (held in the hook). The others wait for
@@ -808,6 +864,7 @@ TEST(RingRegistration, LiveReclaimerHeldPastTheWaitIsNotSuperseded) {
 
   UnlinkHold hold;
   HoldGuard guard{hold};
+  const WaitAttemptsGuard unbounded{std::numeric_limits<int>::max()};
   std::latch ready{static_cast<std::ptrdiff_t>(kOpeners)};
   std::vector<std::optional<RTMSQueue>> queues(kOpeners);
   std::vector<std::string> errors(kOpeners);
@@ -855,6 +912,7 @@ TEST(RingRegistration, LiveCloserHeldBeforeUnlinkIsNotSuperseded) {
 
   UnlinkHold hold;
   HoldGuard guard{hold};
+  const WaitAttemptsGuard unbounded{std::numeric_limits<int>::max()};
   std::optional<RTMSQueue> only;
   only.emplace(OpenSubscriber(path, kSlots));
   const std::uint64_t old_segment_id =
@@ -1052,6 +1110,584 @@ TEST(RingRegistration, ClaimantWhoseUnlinkFailedGivesTheClaimUp) {
       << "the close whose unlink failed must give its claim up";
   EXPECT_NE(report.reopened_segment_id, report.old_segment_id);
   EXPECT_EQ(report.reopened_count, 1U);
+}
+
+RTMSQueue OpenSessionPublisher(const std::string& path, std::size_t slots) {
+  return RTMSQueue{
+      path,
+      sizeof(DropNewestPayload),
+      alignof(DropNewestPayload),
+      kDropNewestSchema,
+      slots,
+      RTMSOptions{.overflow_policy = OverflowPolicy::DROP_NEWEST,
+                  .read_mode = ReadMode::SEQUENCE,
+                  .publisher = true,
+                  .session_owner = true},
+  };
+}
+
+// The name holds `session`'s segment: a queue opening it now attaches to that
+// segment, session-owned, and reads what `session` then publishes.
+void ExpectNameHoldsSessionSegment(const std::string& path, std::size_t slots,
+                                   RTMSQueue& session) {
+  const std::uint64_t session_id =
+      RegistrationPeer::Header(session)->segment_id;
+  RTMSQueue late = OpenSubscriber(path, slots);
+  const RTMSHeader* late_header = RegistrationPeer::Header(late);
+  EXPECT_EQ(late_header->segment_id, session_id)
+      << "a queue opened after the session is on another segment";
+  EXPECT_NE(late_header->lifetime.load(std::memory_order_acquire) &
+                kLifetimeSessionOwned,
+            0U)
+      << "the name holds a standalone segment";
+  const std::optional<std::size_t> reader = late.register_reader();
+  ASSERT_TRUE(reader.has_value());
+  ASSERT_NO_FATAL_FAILURE(WriteSequences(session, 0, 1));
+  DropNewestPayload copy{};
+  MessageInfo info{};
+  EXPECT_EQ(
+      late.read_next(*reader, std::as_writable_bytes(std::span{copy}), info),
+      ReadResult::OK)
+      << "the session's publication did not reach a queue opened after it";
+  EXPECT_EQ(FirstForeignWord(copy, 0), kDropNewestWords);
+}
+
+// The session owner's waits for the held claimant before it is released:
+// past the first, so a session owner that superseded a live claimant after
+// one wait would do so while the claimant is still held.
+constexpr int kSessionWaitsBeforeRelease = 2;
+
+void ReleaseAfterSessionWaits(std::uint64_t /*segment_id*/, int wait_count) {
+  const std::lock_guard lock{g_hold->mutex};
+  g_hold->max_wait = std::max(g_hold->max_wait, wait_count);
+  if (wait_count >= kSessionWaitsBeforeRelease) {
+    g_hold->released = true;
+    g_hold->changed.notify_all();
+  }
+}
+
+// REQ-OPS-03: the only queue of a standalone segment closes, claims it and is
+// descheduled between checking that the name still holds it and unlinking it
+// (held in the hook) when a launcher session opens the name. The session
+// owner waits for that live claimant rather than replace the segment under
+// it, so the claimant's unlink cannot remove the session's segment: a queue
+// opened afterwards is on the session's segment and receives its
+// publication. The claimant is released once the session owner has waited
+// for it kSessionWaitsBeforeRelease times, or once its open returned; the
+// wait is unbounded here, so only an event ends it.
+TEST(RingRegistration, SessionOwnerWaitsForALiveClaimantHeldBeforeItsUnlink) {
+  constexpr std::size_t kSlots = 4;
+  const std::string path = MakeUniquePath("/ring_session_held");
+  ::shm_unlink(ShmObjectName(path).c_str());
+
+  UnlinkHold hold;
+  HoldGuard guard{hold};
+  const WaitAttemptsGuard unbounded{std::numeric_limits<int>::max()};
+  RegistrationPeer::SetOnReclaimWait(ReleaseAfterSessionWaits);
+  std::optional<RTMSQueue> only;
+  only.emplace(OpenSubscriber(path, kSlots));
+  std::thread closer{[&] { only.reset(); }};
+  {
+    std::unique_lock lock{hold.mutex};
+    hold.changed.wait(lock, [&] { return hold.entered; });
+  }
+
+  std::optional<RTMSQueue> session;
+  std::string error;
+  try {
+    session.emplace(OpenSessionPublisher(path, kSlots));
+  } catch (const std::exception& e) {
+    error = e.what();
+  }
+  OpenerReturned(1);
+  closer.join();
+  const int max_wait = hold.max_wait;
+  HoldGuard::Clear();
+
+  ASSERT_TRUE(error.empty()) << "the session owner's open: " << error;
+  ASSERT_TRUE(session.has_value());
+  SCOPED_TRACE(
+      std::format("session owner's waits for the held claimant: {}", max_wait));
+  ASSERT_NO_FATAL_FAILURE(
+      ExpectNameHoldsSessionSegment(path, kSlots, *session));
+}
+
+// What the holder process of ClaimedSegmentHolderClosesWithoutUnlinking sends
+// its parent: that it attached, that its close is about to unlink (held
+// there until the parent releases it), or that its close returned.
+struct HolderMessage {
+  enum Kind : int { kAttached = 1, kUnlinking = 2, kClosed = 3 };
+  int kind{0};
+  int failed{0};  // 1 when an exception ended the holder early
+  std::uint64_t segment_id{0};
+  std::uint64_t lifetime_after_close{0};
+  std::array<char, 160> error{};
+};
+
+// What the parent sends the holder process, one byte each.
+constexpr char kHolderClose = 'c';
+constexpr char kHolderRelease = 'r';
+constexpr char kHolderFinish = 'f';
+
+// The two pipes between the parent and the holder process.
+struct HolderLink {
+  int to_holder{-1};    // the parent writes
+  int from_holder{-1};  // the parent reads
+  int holder_reads{-1};
+  int holder_writes{-1};
+  bool in_holder{false};  // set in the holder process after fork
+  bool session_claimed{false};
+  // A read from the holder failed (it died or closed its end): the parent
+  // writes nothing more, so a dead holder cannot raise SIGPIPE in it.
+  bool broken{false};
+  HolderMessage first_after_close{};
+};
+HolderLink* g_link = nullptr;
+
+bool WriteFull(int fd, const void* data, std::size_t size) {
+  const auto* bytes = static_cast<const char*>(data);
+  while (size > 0) {
+    const ssize_t wrote = ::write(fd, bytes, size);
+    if (wrote < 0 && errno == EINTR) continue;
+    if (wrote <= 0) return false;
+    bytes += wrote;
+    size -= static_cast<std::size_t>(wrote);
+  }
+  return true;
+}
+
+bool ReadFull(int fd, void* data, std::size_t size) {
+  auto* bytes = static_cast<char*>(data);
+  while (size > 0) {
+    const ssize_t got = ::read(fd, bytes, size);
+    if (got < 0 && errno == EINTR) continue;
+    if (got <= 0) return false;
+    bytes += got;
+    size -= static_cast<std::size_t>(got);
+  }
+  return true;
+}
+
+// The parent's side of the link: one command byte to the holder, one
+// message from it. Both fail, without touching the pipe, once the link broke.
+bool SendToHolder(char command) {
+  if (g_link->broken) return false;
+  if (!WriteFull(g_link->to_holder, &command, 1)) g_link->broken = true;
+  return !g_link->broken;
+}
+
+bool ReceiveFromHolder(HolderMessage& message) {
+  if (g_link->broken) return false;
+  if (!ReadFull(g_link->from_holder, &message, sizeof(message))) {
+    g_link->broken = true;
+  }
+  return !g_link->broken;
+}
+
+// The parent tells the holder process to close and reads what its close did
+// first: returned (kClosed), or reached its unlink (kUnlinking, held there).
+HolderMessage CloseHolder() {
+  HolderMessage message{};
+  if (!SendToHolder(kHolderClose) || !ReceiveFromHolder(message)) {
+    message.failed = 1;
+  }
+  return message;
+}
+
+// Closes `fd` if it is open and marks it closed.
+void CloseFd(int& fd) {
+  if (fd >= 0) ::close(fd);
+  fd = -1;
+}
+
+// on_session_claimed_, in the parent: the holder closes between the session
+// owner's claim and its unlink.
+void CloseHolderAtClaim(std::uint64_t /*segment_id*/) {
+  if (g_link->in_holder || g_link->session_claimed) return;
+  g_link->session_claimed = true;
+  g_link->first_after_close = CloseHolder();
+}
+
+// on_unlink_verified_: in the holder process, holds the holder's own unlink,
+// should its close make one, until the parent releases it; passes the
+// parent's.
+void HoldHolderUnlink(std::uint64_t /*segment_id*/) {
+  if (!g_link->in_holder) return;
+  HolderMessage message{};
+  message.kind = HolderMessage::kUnlinking;
+  char release = 0;
+  if (!WriteFull(g_link->holder_writes, &message, sizeof(message)) ||
+      !ReadFull(g_link->holder_reads, &release, 1)) {
+    ::_exit(2);
+  }
+}
+
+// The holder process: attaches to `path` (creating it, count 1), reports,
+// closes when told, and reports the old segment's lifetime word as it saw it
+// after its close.
+[[noreturn]] void RunHolder(const std::string& path, std::size_t slots) {
+  g_link->in_holder = true;
+  ::close(g_link->to_holder);
+  ::close(g_link->from_holder);
+  HolderMessage message{};
+  try {
+    std::optional<RTMSQueue> holder;
+    holder.emplace(OpenSubscriber(path, slots));
+    SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
+    const auto* header = static_cast<const RTMSHeader*>(mapping.ptr());
+    message.kind = HolderMessage::kAttached;
+    message.segment_id = header->segment_id;
+    char command = 0;
+    if (!WriteFull(g_link->holder_writes, &message, sizeof(message)) ||
+        !ReadFull(g_link->holder_reads, &command, 1) ||
+        command != kHolderClose) {
+      ::_exit(2);
+    }
+    holder.reset();
+    message.kind = HolderMessage::kClosed;
+    message.lifetime_after_close =
+        header->lifetime.load(std::memory_order_acquire);
+  } catch (const std::exception& e) {
+    message.kind = HolderMessage::kClosed;
+    message.failed = 1;
+    std::strncpy(message.error.data(), e.what(), message.error.size() - 1);
+  }
+  char finish = 0;
+  const bool ok = WriteFull(g_link->holder_writes, &message, sizeof(message)) &&
+                  ReadFull(g_link->holder_reads, &finish, 1) &&
+                  finish == kHolderFinish;
+  ::_exit(ok ? 0 : 1);
+}
+
+// REQ-OPS-03: a launcher session opens a name whose standalone segment is
+// still attached by a queue of another process (a node: count 1). The
+// session owner takes the segment's unlink from it (marks it closing with
+// itself as claimant), and that queue, closing between the claim and the
+// session owner's unlink (in the hook), recognises the other process's claim:
+// it leaves the claim as it is and unlinks nothing, even with its unlink
+// held until the session's segment exists. The name ends on the session's
+// segment, and the old segment's word, as the holder saw it after its close,
+// names the session owner's process.
+TEST(RingRegistration, ClaimedSegmentHolderClosesWithoutUnlinking) {
+  constexpr std::size_t kSlots = 4;
+  const std::string path = MakeUniquePath("/ring_session_count");
+  ::shm_unlink(ShmObjectName(path).c_str());
+
+  std::array<int, 2> to_holder{-1, -1};
+  std::array<int, 2> from_holder{-1, -1};
+  struct PipeGuard {
+    PipeGuard(std::array<int, 2>& first_in, std::array<int, 2>& second_in)
+        : first{first_in}, second{second_in} {}
+    std::array<int, 2>& first;
+    std::array<int, 2>& second;
+    PipeGuard(const PipeGuard&) = delete;
+    PipeGuard& operator=(const PipeGuard&) = delete;
+    ~PipeGuard() {
+      for (int& fd : first) CloseFd(fd);
+      for (int& fd : second) CloseFd(fd);
+    }
+  } pipes{to_holder, from_holder};
+  ASSERT_EQ(::pipe(to_holder.data()), 0);
+  ASSERT_EQ(::pipe(from_holder.data()), 0);
+  HolderLink link{.to_holder = to_holder[1],
+                  .from_holder = from_holder[0],
+                  .holder_reads = to_holder[0],
+                  .holder_writes = from_holder[1]};
+  g_link = &link;
+  struct LinkGuard {
+    ~LinkGuard() {
+      RegistrationPeer::SetOnSessionClaimed(nullptr);
+      RegistrationPeer::SetOnUnlinkVerified(nullptr);
+      g_link = nullptr;
+    }
+  } link_guard;
+  RegistrationPeer::SetOnSessionClaimed(CloseHolderAtClaim);
+  RegistrationPeer::SetOnUnlinkVerified(HoldHolderUnlink);
+  const pid_t child = ::fork();
+  ASSERT_NE(child, -1);
+  if (child == 0) RunHolder(path, kSlots);
+  CloseFd(to_holder[0]);
+  CloseFd(from_holder[1]);
+
+  HolderMessage attached{};
+  const bool heard = ReceiveFromHolder(attached);
+  std::optional<RTMSQueue> session;
+  std::string error;
+  if (heard && attached.kind == HolderMessage::kAttached) {
+    try {
+      session.emplace(OpenSessionPublisher(path, kSlots));
+    } catch (const std::exception& e) {
+      error = e.what();
+    }
+  }
+  RegistrationPeer::SetOnSessionClaimed(nullptr);
+  RegistrationPeer::SetOnUnlinkVerified(nullptr);
+  HolderMessage closed{};
+  bool held_unlink = false;
+  bool finished = false;
+  if (heard && attached.kind == HolderMessage::kAttached) {
+    // A session owner that never claimed still lets the holder close.
+    closed = link.session_claimed ? link.first_after_close : CloseHolder();
+    held_unlink = closed.kind == HolderMessage::kUnlinking;
+    if (held_unlink &&
+        (!SendToHolder(kHolderRelease) || !ReceiveFromHolder(closed))) {
+      closed.failed = 1;
+    }
+    finished = SendToHolder(kHolderFinish);
+  }
+  CloseFd(to_holder[1]);
+  CloseFd(from_holder[0]);
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+
+  ASSERT_TRUE(heard && attached.kind == HolderMessage::kAttached &&
+              attached.failed == 0)
+      << "the holder did not attach: " << attached.error.data();
+  ASSERT_TRUE(finished && WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "the holder process did not finish";
+  ASSERT_TRUE(error.empty()) << "the session owner's open: " << error;
+  ASSERT_TRUE(session.has_value());
+  EXPECT_TRUE(link.session_claimed)
+      << "the session owner never claimed the segment";
+  EXPECT_FALSE(held_unlink) << "the holder's close unlinked the name";
+  EXPECT_EQ(closed.failed, 0) << closed.error.data();
+  EXPECT_EQ(closed.lifetime_after_close,
+            kLifetimeClosing | talos::OwnProcessWord())
+      << "the holder's close changed the session owner's claim";
+  EXPECT_NE(RegistrationPeer::Header(*session)->segment_id,
+            attached.segment_id);
+  ASSERT_NO_FATAL_FAILURE(
+      ExpectNameHoldsSessionSegment(path, kSlots, *session));
+}
+
+// REQ-OPS-03: a closing segment whose claimant died before unlinking it
+// neither delays nor refuses a launch: the session owner does not wait for
+// the dead claimant, its open succeeds, and the name holds its segment. With
+// the claimant wait bound lowered, a session owner that waited for a dead
+// claimant would fail here at once rather than after a second.
+TEST(RingRegistration, SessionOwnerClaimsAClosingSegmentFromADeadClaimant) {
+  constexpr std::size_t kSlots = 4;
+  std::uint64_t dead_word = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RunChild([] { return talos::OwnProcessWord(); }, dead_word));
+
+  const std::string path = MakeUniquePath("/ring_session_dead");
+  auto [old_mapping, old_segment_id] =
+      MakeAbandonedClosingSegment(path, kSlots, kLifetimeClosing | dead_word);
+
+  const WaitAttemptsGuard bounded{kHeldWaitAttempts};
+  struct HookGuard {
+    ~HookGuard() { RegistrationPeer::SetOnReclaimWait(nullptr); }
+  } guard;
+  static int dead_waits = 0;
+  dead_waits = 0;
+  RegistrationPeer::SetOnReclaimWait(
+      [](std::uint64_t /*segment_id*/, int /*wait_count*/) { ++dead_waits; });
+
+  std::optional<RTMSQueue> session;
+  std::string error;
+  try {
+    session.emplace(OpenSessionPublisher(path, kSlots));
+  } catch (const std::runtime_error& e) {
+    error = e.what();
+  }
+  RegistrationPeer::SetOnReclaimWait(nullptr);
+
+  EXPECT_EQ(dead_waits, 0) << "a dead claimant must not be waited for";
+  ASSERT_TRUE(error.empty()) << "the session owner's open: " << error;
+  ASSERT_TRUE(session.has_value());
+  EXPECT_NE(RegistrationPeer::Header(*session)->segment_id, old_segment_id);
+  ASSERT_NO_FATAL_FAILURE(
+      ExpectNameHoldsSessionSegment(path, kSlots, *session));
+}
+
+// The standalone queue a test's on_session_claimed_ opens on a name it has
+// just unlinked, and the path it does so for (once).
+std::optional<RTMSQueue>* g_recreated = nullptr;
+const std::string* g_recreated_path = nullptr;
+
+// on_session_claimed_: the first time, the segment the session owner has just
+// claimed leaves the name (its claimant's unlink) and a standalone queue
+// creates another there, before the session owner's unlink.
+void RecreateAtClaim(std::uint64_t /*segment_id*/) {
+  if (g_recreated->has_value()) return;
+  ::shm_unlink(ShmObjectName(*g_recreated_path).c_str());
+  g_recreated->emplace(OpenSubscriber(*g_recreated_path, 4));
+}
+
+// REQ-OPS-03: a launcher session claims a closing segment whose claimant died,
+// but meanwhile the name came to hold another segment (the dead claimant had
+// unlinked the claimed one, and a standalone queue created a new one), so
+// the session owner's unlink of the claimed segment unlinks nothing. It looks
+// at the name again and replaces the new segment too: its open succeeds and
+// the name holds the session's segment, while the standalone queue keeps its
+// own.
+TEST(RingRegistration, SessionOwnerReplacesASegmentCreatedDuringItsClaim) {
+  constexpr std::size_t kSlots = 4;
+  std::uint64_t dead_word = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RunChild([] { return talos::OwnProcessWord(); }, dead_word));
+
+  const std::string path = MakeUniquePath("/ring_recreated");
+  auto [old_mapping, old_segment_id] =
+      MakeAbandonedClosingSegment(path, kSlots, kLifetimeClosing | dead_word);
+
+  std::optional<RTMSQueue> recreated;
+  g_recreated = &recreated;
+  g_recreated_path = &path;
+  struct HookGuard {
+    ~HookGuard() {
+      RegistrationPeer::SetOnSessionClaimed(nullptr);
+      g_recreated = nullptr;
+      g_recreated_path = nullptr;
+    }
+  } guard;
+  RegistrationPeer::SetOnSessionClaimed(RecreateAtClaim);
+
+  std::optional<RTMSQueue> session;
+  std::string error;
+  try {
+    session.emplace(OpenSessionPublisher(path, kSlots));
+  } catch (const std::runtime_error& e) {
+    error = e.what();
+  }
+  RegistrationPeer::SetOnSessionClaimed(nullptr);
+
+  ASSERT_TRUE(recreated.has_value()) << "the name was never recreated";
+  ASSERT_TRUE(error.empty()) << "the session owner's open: " << error;
+  ASSERT_TRUE(session.has_value());
+  EXPECT_NE(RegistrationPeer::Header(*session)->segment_id, old_segment_id);
+  EXPECT_NE(RegistrationPeer::Header(*recreated)->segment_id,
+            RegistrationPeer::Header(*session)->segment_id);
+  ASSERT_NO_FATAL_FAILURE(
+      ExpectNameHoldsSessionSegment(path, kSlots, *session));
+}
+
+// The segment the name holds now, read without attaching to it.
+struct NamedSegment {
+  std::uint64_t segment_id{0};
+  std::uint64_t lifetime{0};
+};
+
+std::optional<NamedSegment> SegmentAtName(const std::string& path) {
+  const int fd = ::shm_open(ShmObjectName(path).c_str(), O_RDONLY, 0);
+  if (fd == -1) return std::nullopt;
+  void* mapped =
+      ::mmap(nullptr, sizeof(RTMSHeader), PROT_READ, MAP_SHARED, fd, 0);
+  ::close(fd);
+  if (mapped == MAP_FAILED) return std::nullopt;
+  const auto* header = static_cast<const RTMSHeader*>(mapped);
+  const NamedSegment seen{header->segment_id,
+                          header->lifetime.load(std::memory_order_acquire)};
+  ::munmap(mapped, sizeof(RTMSHeader));
+  return seen;
+}
+
+// What an open made while a live claimant was held before its unlink.
+struct HeldClaimantOutcome {
+  std::string error;  // what the open threw; empty when it returned
+  std::optional<RTMSQueue> opened;
+  std::uint64_t claimant_segment_id{0};
+  // What the name held once the open had returned or thrown, while the
+  // claimant was still held.
+  std::optional<NamedSegment> named;
+  int waits{0};  // the most waits for the held claimant on_reclaim_wait_ saw
+};
+
+// Releases a held claimant and joins its thread however the scope ends.
+struct ReleaseAndJoin {
+  ReleaseAndJoin(UnlinkHold& hold_in, std::thread& closer_in)
+      : hold{hold_in}, closer{closer_in} {}
+  ReleaseAndJoin(const ReleaseAndJoin&) = delete;
+  ReleaseAndJoin& operator=(const ReleaseAndJoin&) = delete;
+  ~ReleaseAndJoin() {
+    {
+      const std::lock_guard lock{hold.mutex};
+      hold.released = true;
+      hold.changed.notify_all();
+    }
+    if (closer.joinable()) closer.join();
+  }
+  UnlinkHold& hold;
+  std::thread& closer;
+};
+
+// The only queue of a standalone segment on `path` closes and is held between
+// its check of the name and its unlink while `open` runs, with the claimant
+// wait bound at kHeldWaitAttempts; the close then finishes.
+template <typename Open>
+HeldClaimantOutcome OpenPastAHeldClaimant(const std::string& path,
+                                          std::size_t slots, Open open) {
+  ::shm_unlink(ShmObjectName(path).c_str());
+  HeldClaimantOutcome outcome;
+  UnlinkHold hold;
+  HoldGuard guard{hold};
+  const WaitAttemptsGuard attempts{kHeldWaitAttempts};
+  std::optional<RTMSQueue> only;
+  only.emplace(OpenSubscriber(path, slots));
+  outcome.claimant_segment_id = RegistrationPeer::Header(*only)->segment_id;
+  std::thread closer{[&] { only.reset(); }};
+  const ReleaseAndJoin finish{hold, closer};
+  {
+    std::unique_lock lock{hold.mutex};
+    hold.changed.wait(lock, [&] { return hold.entered; });
+  }
+  try {
+    outcome.opened.emplace(open());
+  } catch (const std::runtime_error& e) {
+    outcome.error = e.what();
+  }
+  outcome.named = SegmentAtName(path);
+  const std::lock_guard lock{hold.mutex};
+  outcome.waits = hold.max_wait;
+  return outcome;
+}
+
+// REQ-OPS-03: a launcher session opens a name whose standalone segment's live
+// claimant is held before its unlink for longer than the session owner waits.
+// The session owner refuses, naming the topic and the claimant's pid, and
+// neither claims nor unlinks the segment: the name still holds it, closing
+// with the same claimant.
+TEST(RingRegistration, SessionOwnerRefusesALiveClaimantThatOutlastsTheWait) {
+  constexpr std::size_t kSlots = 4;
+  const std::string path = MakeUniquePath("/ring_session_bound");
+  const HeldClaimantOutcome outcome = OpenPastAHeldClaimant(
+      path, kSlots, [&] { return OpenSessionPublisher(path, kSlots); });
+
+  SCOPED_TRACE(std::format("session owner's waits for the held claimant: {}",
+                           outcome.waits));
+  EXPECT_FALSE(outcome.error.empty()) << "the session owner's open returned";
+  EXPECT_NE(outcome.error.find(path), std::string::npos) << outcome.error;
+  EXPECT_NE(outcome.error.find("pid " + std::to_string(::getpid())),
+            std::string::npos)
+      << outcome.error;
+  ASSERT_TRUE(outcome.named.has_value()) << "the name was unlinked";
+  EXPECT_EQ(outcome.named->segment_id, outcome.claimant_segment_id)
+      << "the name holds another segment";
+  EXPECT_EQ(outcome.named->lifetime, kLifetimeClosing | talos::OwnProcessWord())
+      << "the session owner changed the claim";
+}
+
+// REQ-OPS-03: a queue opens a name whose standalone segment's live claimant
+// is held before its unlink for longer than an opener waits. The open gives
+// up with the "stayed closing" error naming the topic, and neither claims nor
+// unlinks the segment: the name still holds it, closing with the same
+// claimant.
+TEST(RingRegistration, OpenerRefusesALiveClaimantThatOutlastsTheWait) {
+  constexpr std::size_t kSlots = 4;
+  const std::string path = MakeUniquePath("/ring_opener_bound");
+  const HeldClaimantOutcome outcome = OpenPastAHeldClaimant(
+      path, kSlots, [&] { return OpenSubscriber(path, kSlots); });
+
+  SCOPED_TRACE(
+      std::format("opener's waits for the held claimant: {}", outcome.waits));
+  EXPECT_FALSE(outcome.error.empty()) << "the open returned";
+  EXPECT_NE(outcome.error.find(path), std::string::npos) << outcome.error;
+  ASSERT_TRUE(outcome.named.has_value()) << "the name was unlinked";
+  EXPECT_EQ(outcome.named->segment_id, outcome.claimant_segment_id)
+      << "the name holds another segment";
+  EXPECT_EQ(outcome.named->lifetime, kLifetimeClosing | talos::OwnProcessWord())
+      << "the opener changed the claim";
 }
 
 }  // namespace
