@@ -19,6 +19,8 @@ import unittest
 
 from python.runfiles import runfiles
 
+from tools import sharded_test_loader
+
 
 def put(path, text, mode=None):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -112,6 +114,54 @@ exit 0
 
 
 class TidyFallbackTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._template_tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._template_tmp.cleanup)
+        root = os.path.realpath(cls._template_tmp.name)
+        cls._template_repo = os.path.join(root, "repo")
+        os.makedirs(os.path.join(cls._template_repo, "tools"))
+        rf = runfiles.Create()
+        for f in ("tidy.sh", "clang18.sh", "run_clang_tidy.py"):
+            shutil.copy(rf.Rlocation(f"_main/tools/{f}"),
+                        os.path.join(cls._template_repo, "tools", f))
+
+        with open(os.path.join(cls._template_repo, "tools", "tidy.sh"),
+                  encoding="utf-8") as f:
+            script = f.read()
+        cls._deb_version = re.search(r'^GCC14_DEB_VERSION="([^"]+)"',
+                                     script, re.M).group(1)
+        libstdcxx_sha = re.search(r'^GCC14_LIBSTDCXX_SHA256="([^"]+)"',
+                                  script, re.M).group(1)
+        libgcc_sha = re.search(r'^GCC14_LIBGCC_SHA256="([^"]+)"',
+                               script, re.M).group(1)
+        cls._fingerprint = f"{cls._deb_version}:{libstdcxx_sha}:{libgcc_sha}"
+
+        git_env = {k: v for k, v in os.environ.items()
+                   if not k.startswith("GIT_")}
+        git_env.update(
+            HOME=root,
+            GIT_CONFIG_GLOBAL=os.devnull,
+            GIT_CONFIG_NOSYSTEM="1",
+            GIT_AUTHOR_NAME="t",
+            GIT_AUTHOR_EMAIL="t@example.com",
+            GIT_COMMITTER_NAME="t",
+            GIT_COMMITTER_EMAIL="t@example.com",
+        )
+        def git(*args):
+            return subprocess.run(
+                ["git", *args], cwd=cls._template_repo, env=git_env,
+                check=True, capture_output=True, text=True).stdout.strip()
+        git("init", "-q", "-b", "main")
+        put(os.path.join(cls._template_repo, ".bazelignore"), "")
+        put(os.path.join(cls._template_repo, "foo.cc"), "int f() { return 1; }\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        cls._template_base = git("rev-parse", "HEAD")
+        put(os.path.join(cls._template_repo, "foo.cc"), "int f() { return 2; }\n")
+        git("add", "foo.cc")
+        git("commit", "-q", "-m", "change")
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -134,28 +184,14 @@ class TidyFallbackTest(unittest.TestCase):
         self.curl_log = os.path.join(self.tmp, "curl.log")
 
         self.repo = os.path.join(self.tmp, "repo")
-        os.makedirs(os.path.join(self.repo, "tools"))
-        rf = runfiles.Create()
-        for f in ("tidy.sh", "clang18.sh", "run_clang_tidy.py"):
-            shutil.copy(rf.Rlocation(f"_main/tools/{f}"),
-                        os.path.join(self.repo, "tools", f))
-
-        # Read the pinned version and SHA-256 fingerprint from tidy.sh so the
-        # test stays locked to the script's constants.
-        with open(os.path.join(self.repo, "tools", "tidy.sh"),
-                  encoding="utf-8") as f:
-            script = f.read()
-        self.deb_version = re.search(r'^GCC14_DEB_VERSION="([^"]+)"',
-                                     script, re.M).group(1)
-        libstdcxx_sha = re.search(r'^GCC14_LIBSTDCXX_SHA256="([^"]+)"',
-                                  script, re.M).group(1)
-        libgcc_sha = re.search(r'^GCC14_LIBGCC_SHA256="([^"]+)"',
-                               script, re.M).group(1)
-        self.fingerprint = f"{self.deb_version}:{libstdcxx_sha}:{libgcc_sha}"
+        shutil.copytree(self._template_repo, self.repo)
+        self.deb_version = self._deb_version
+        self.fingerprint = self._fingerprint
         self.gcc14_root = os.path.join(
             self.cache_dir, "talos", f"gcc-14-sysroot-{self.deb_version}")
         self.gcc_install_dir = os.path.join(
             self.gcc14_root, "usr", "lib", "gcc", "x86_64-linux-gnu", "14")
+        self.base = self._template_base
 
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith("GIT_")}
@@ -172,22 +208,11 @@ class TidyFallbackTest(unittest.TestCase):
             TIDY_LOG=self.tidy_log,
             CURL_LOG=self.curl_log,
         )
-
-        self.git("init", "-q", "-b", "main")
-        put(os.path.join(self.repo, ".bazelignore"), "")
-        put(os.path.join(self.repo, "foo.cc"), "int f() { return 1; }\n")
         put(os.path.join(self.repo, "compile_commands.json"), json.dumps([{
             "directory": self.repo,
             "file": "foo.cc",
             "command": "g++ -std=c++23 -c foo.cc",
         }]))
-        self.git("add", "-A")
-        self.git("commit", "-q", "-m", "base")
-        self.base = self.git("rev-parse", "HEAD")
-
-        put(os.path.join(self.repo, "foo.cc"), "int f() { return 2; }\n")
-        self.git("add", "foo.cc")
-        self.git("commit", "-q", "-m", "change")
 
     def git(self, *args):
         return subprocess.run(
@@ -399,4 +424,4 @@ class TidyFallbackTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(testLoader=sharded_test_loader.bazel_test_loader())
