@@ -177,7 +177,7 @@ The gateway steps the plant to each tick's sample time, at most two steps a
 tick, and drops what it cannot step; the `time dilation` lines and the
 summary's `dropped_s` count it ([above](#the-mujoco-gateway);
 [the plant's clock](../../hardware/README.md#an-external-plant)).
-Measured on one Mac mini (M4 Pro) at d4fa58c3: `examples/mujoco_rig` idle
+Measured on one Mac mini (M4 Pro) at 04898326: `examples/mujoco_rig` idle
 drops 5 to 8 % of plant time (2.3 to 2.9 s of a 30 s run, against 0.1 to
 0.25 % on a Linux desktop), because macOS runs a thread that sleeps
 between 5 ms ticks on a slow clock, where one step of the 2026 field (all
