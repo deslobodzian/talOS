@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 
+#include "control/control_generated.h"
+
 namespace {
 
 constexpr int64_t kMs = 1'000'000;
@@ -1189,6 +1191,74 @@ TEST_F(NodeApi, DeviceHandlesAreCheckedByNameAndKind) {
   EXPECT_EQ(talos_motor_rezero(node, -1, 0), TALOS_ERR);
 }
 
+// REQ-CONTRACT-13: indexed device getters/setters look up HardwareLink without
+// attaching it to a non-hardware node, and check Index(index) before lookup.
+TEST_F(NodeApi, IndexedDeviceLookupsDoNotAttachHardwareLink) {
+  struct Probe {
+    int32_t neg_rc = TALOS_OK;
+    std::string neg_err;
+    int32_t zero_rc = TALOS_OK;
+    std::string zero_err;
+  } probe;
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    auto& p = *static_cast<Probe*>(user);
+    TalosSample sample{};
+    p.neg_rc = talos_motor_sample(node, -1, &sample);
+    p.neg_err = talos_last_error();
+    p.zero_rc = talos_motor_sample(node, 0, &sample);
+    p.zero_err = talos_last_error();
+    return 0;
+  };
+  TalosNode* node = talos_sim_add(sim_, "relay", build, &probe);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+  EXPECT_EQ(probe.neg_rc, TALOS_ERR);
+  EXPECT_NE(probe.neg_err.find("negative index"), std::string::npos)
+      << probe.neg_err;
+  EXPECT_EQ(probe.zero_rc, TALOS_ERR);
+  EXPECT_NE(probe.zero_err.find("no device handle at index 0"),
+            std::string::npos)
+      << probe.zero_err;
+
+  // Step with SimHardware running; if HardwareLink had been silently attached
+  // during build, talos_hardware_fresh would succeed and report 1. Instead,
+  // post-start lazy HardwareLink attachment must fail (registration closed),
+  // while indexed device lookups still report out-of-range cleanly.
+  TalosSimHardware* hw = talos_sim_hardware_create(sim_);
+  ASSERT_NE(hw, nullptr) << talos_last_error();
+  ASSERT_EQ(talos_sim_step(sim_, 20 * kMs), TALOS_OK) << talos_last_error();
+
+  TalosSample sample{};
+  int64_t ts = 0;
+  uint64_t clamped = 0;
+  EXPECT_EQ(talos_motor_sample(node, 0, &sample), TALOS_ERR);
+  EXPECT_NE(std::string{talos_last_error()}.find("no device handle at index 0"),
+            std::string::npos)
+      << talos_last_error();
+  EXPECT_EQ(talos_sensor_sample(node, 0, &sample), TALOS_ERR);
+  EXPECT_EQ(talos_digital_input_sample(node, 0, &sample), TALOS_ERR);
+  EXPECT_EQ(talos_analog_input_sample(node, 0, &sample), TALOS_ERR);
+  EXPECT_EQ(talos_encoder_sample(node, 0, &sample), TALOS_ERR);
+  EXPECT_EQ(talos_motor_time(node, 0, 0, &ts), TALOS_ERR);
+  EXPECT_EQ(talos_sensor_time(node, 0, 0, &ts), TALOS_ERR);
+  EXPECT_EQ(talos_motor_age(node, 0, 0, &ts), TALOS_ERR);
+  EXPECT_EQ(talos_sensor_age(node, 0, 0, &ts), TALOS_ERR);
+  EXPECT_EQ(talos_motor_zeroed(node, 0), TALOS_ERR);
+  EXPECT_EQ(talos_gyro_zeroed(node, 0), TALOS_ERR);
+  EXPECT_EQ(talos_motor_clamped_count(node, 0, &clamped), TALOS_ERR);
+  EXPECT_EQ(talos_motor_set(node, 0, TALOS_MODE_NEUTRAL, 0.0, 0.0, 0),
+            TALOS_ERR);
+  EXPECT_EQ(talos_motor_rezero(node, 0, 0.0), TALOS_ERR);
+  EXPECT_EQ(talos_gyro_rezero(node, 0, 0.0), TALOS_ERR);
+  EXPECT_EQ(talos_digital_output_set(node, 0, 1), TALOS_ERR);
+  EXPECT_EQ(talos_pwm_set(node, 0, 0.0), TALOS_ERR);
+  EXPECT_EQ(talos_pwm_stop(node, 0), TALOS_ERR);
+
+  // HardwareLink was never attached during build, so EnsureLink fails after
+  // start (loop registration is closed).
+  EXPECT_EQ(talos_hardware_fresh(node, -1), TALOS_ERR);
+  talos_sim_hardware_destroy(hw);
+}
+
 TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {
   Roller roller;
   TalosNode* node = talos_sim_add(sim_, "roller", &BuildRoller, &roller);
@@ -1630,6 +1700,355 @@ TEST_F(NodeApi, OperatorProducerTeleopLaneRequiresOperatorArming) {
               nullptr)
         << talos_last_error();
   }
+}
+
+// REQ-CONTRACT-13, REQ-SAFE-36, REQ-SAFE-37, REQ-SAFE-38: C++ ABI coverage of
+// all mechanisms_api.cc entry points (including error/null/buffer-size/invalid-
+// index boundaries and live talos_position_mechanism_homed after reset) plus
+// StateMachine, param_of, every, arming_disarm, and sim hardware reboot/reset
+// (exercised under ASan/TSan where Python ctypes tests cannot run).
+TEST(NodeApiMechanisms, LifecycleStateAndBoundaries) {
+  constexpr const char* kMechToml = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.shared]
+gain = 3.5
+
+[subsystems.arm.motors.arm]
+can_id = 1
+[subsystems.arm.digital_inputs.home_sw]
+dio = 0
+[subsystems.arm.arm]
+min_rot = 0.0
+max_rot = 1.0
+homing = "limit_switch"
+limit_switch = "home_sw"
+limit_switch_closed_reads = true
+homing_v = -1.0
+home_rot = 0.0
+home_samples = 2
+home_margin_rot = 0.2
+homing_timeout_us = 1000000
+homing_stall_rps = 0.05
+homing_stall_us = 200000
+tolerance_rot = 0.01
+units_per_rot = 360.0
+
+[subsystems.shooter.motors.flywheel]
+can_id = 2
+max_velocity_rps = 80.0
+[subsystems.shooter.flywheel]
+at_speed_entry_tick_count = 2
+
+[subsystems.intake.motors.roller]
+can_id = 3
+[subsystems.intake.digital_inputs.beam]
+dio = 1
+[subsystems.intake.roller]
+sensor = "beam"
+intake_v = 6.0
+hold_v = 1.0
+eject_v = -6.0
+eject_us = 100000
+)";
+
+  TalosSim* sim = talos_sim_from_toml(kMechToml);
+  ASSERT_NE(sim, nullptr) << talos_last_error();
+  TalosSimHardware* hw = talos_sim_hardware_create(sim);
+  ASSERT_NE(hw, nullptr) << talos_last_error();
+
+  struct ArmCtx {
+    TalosNode* node = nullptr;
+    int64_t mech = -1;
+    int64_t sm = -1;
+    int64_t arming = -1;
+    double shared_gain = 0.0;
+    int every_calls = 0;
+    enum class Action {
+      kGoal,
+      kGoalUnits,
+      kHold,
+      kStop,
+      kClear
+    } action = Action::kGoal;
+    std::vector<std::pair<int32_t, int32_t>> homed_before_after;
+  } arm_ctx;
+
+  auto build_arm = [](TalosNode* node, void* user) -> int32_t {
+    auto& a = *static_cast<ArmCtx*>(user);
+    a.node = node;
+    TalosParam p{};
+    if (talos_node_param_of(node, "shared", "gain", TALOS_PARAM_DOUBLE, 1,
+                            &p) != 1) {
+      return 1;
+    }
+    a.shared_gain = p.number;
+    a.sm = talos_state_machine_create(node, 10);
+    a.arming = talos_operator_arming_open(node);
+    if (a.sm < 0 || a.arming < 0) return 1;
+    if (talos_node_every(
+            node, 10 * kMs,
+            [](void* ctx) -> int32_t {
+              ++static_cast<ArmCtx*>(ctx)->every_calls;
+              return 0;
+            },
+            &a) != TALOS_OK) {
+      return 1;
+    }
+    a.mech = talos_position_mechanism_open(node, "arm");
+    if (a.mech < 0) return 1;
+    if (talos_allow_untargeted_outputs(node) != TALOS_OK) return 1;
+    return talos_node_set_update(
+        node,
+        [](void* ctx) -> int32_t {
+          auto& self = *static_cast<ArmCtx*>(ctx);
+          const int32_t before =
+              talos_position_mechanism_homed(self.node, self.mech);
+          switch (self.action) {
+            case ArmCtx::Action::kGoal:
+              if (talos_position_mechanism_set_goal(self.node, self.mech, 0.25,
+                                                    0.0) != TALOS_OK) {
+                return 1;
+              }
+              break;
+            case ArmCtx::Action::kGoalUnits:
+              if (talos_position_mechanism_set_goal_units(
+                      self.node, self.mech, 180.0, 0.0) != TALOS_OK) {
+                return 1;
+              }
+              break;
+            case ArmCtx::Action::kHold:
+              if (talos_position_mechanism_hold(self.node, self.mech, 0.0) !=
+                  TALOS_OK) {
+                return 1;
+              }
+              break;
+            case ArmCtx::Action::kStop:
+              if (talos_position_mechanism_stop(self.node, self.mech) !=
+                  TALOS_OK) {
+                return 1;
+              }
+              break;
+            case ArmCtx::Action::kClear:
+              if (talos_position_mechanism_clear_fault(self.node, self.mech) !=
+                  TALOS_OK) {
+                return 1;
+              }
+              break;
+          }
+          if (talos_position_mechanism_update(self.node, self.mech) !=
+              TALOS_OK) {
+            return 1;
+          }
+          const int32_t after =
+              talos_position_mechanism_homed(self.node, self.mech);
+          self.homed_before_after.emplace_back(before, after);
+          return 0;
+        },
+        &a);
+  };
+
+  struct ShooterCtx {
+    TalosNode* node = nullptr;
+    int64_t mech = -1;
+    bool stop = false;
+  } shooter_ctx;
+  auto build_shooter = [](TalosNode* node, void* user) -> int32_t {
+    auto& s = *static_cast<ShooterCtx*>(user);
+    s.node = node;
+    s.mech = talos_velocity_mechanism_open(node, "flywheel");
+    if (s.mech < 0) return 1;
+    if (talos_allow_untargeted_outputs(node) != TALOS_OK) return 1;
+    return talos_node_set_update(
+        node,
+        [](void* ctx) -> int32_t {
+          auto& self = *static_cast<ShooterCtx*>(ctx);
+          const int32_t rc =
+              self.stop ? talos_velocity_mechanism_stop(self.node, self.mech)
+                        : talos_velocity_mechanism_set_goal(
+                              self.node, self.mech, 40.0, 0.5);
+          if (rc != TALOS_OK) return 1;
+          return talos_velocity_mechanism_update(self.node, self.mech);
+        },
+        &s);
+  };
+
+  struct IntakeCtx {
+    TalosNode* node = nullptr;
+    int64_t mech = -1;
+    int32_t cmd = TALOS_ROLLER_COMMAND_INTAKE;
+    bool stop = false;
+  } intake_ctx;
+  auto build_intake = [](TalosNode* node, void* user) -> int32_t {
+    auto& i = *static_cast<IntakeCtx*>(user);
+    i.node = node;
+    i.mech = talos_roller_with_sensor_open(node, "roller");
+    if (i.mech < 0) return 1;
+    if (talos_allow_untargeted_outputs(node) != TALOS_OK) return 1;
+    return talos_node_set_update(
+        node,
+        [](void* ctx) -> int32_t {
+          auto& self = *static_cast<IntakeCtx*>(ctx);
+          const int32_t rc =
+              self.stop ? talos_roller_with_sensor_stop(self.node, self.mech)
+                        : talos_roller_with_sensor_set_goal(
+                              self.node, self.mech, self.cmd);
+          if (rc != TALOS_OK) return 1;
+          return talos_roller_with_sensor_update(self.node, self.mech);
+        },
+        &i);
+  };
+
+  TalosNode* arm = talos_sim_add(sim, "arm", build_arm, &arm_ctx);
+  TalosNode* shooter =
+      talos_sim_add(sim, "shooter", build_shooter, &shooter_ctx);
+  TalosNode* intake = talos_sim_add(sim, "intake", build_intake, &intake_ctx);
+  TalosNode* plain = talos_sim_add(
+      sim, "shared", [](TalosNode*, void*) { return 0; }, nullptr);
+  ASSERT_NE(arm, nullptr) << talos_last_error();
+  ASSERT_NE(shooter, nullptr) << talos_last_error();
+  ASSERT_NE(intake, nullptr) << talos_last_error();
+  ASSERT_NE(plain, nullptr) << talos_last_error();
+  EXPECT_DOUBLE_EQ(arm_ctx.shared_gain, 3.5);
+
+  // StateMachine + OperatorArming::disarm C ABI coverage.
+  EXPECT_EQ(talos_state_machine_state(arm, arm_ctx.sm), 10);
+  EXPECT_EQ(talos_state_machine_previous(arm, arm_ctx.sm), 10);
+  EXPECT_EQ(talos_state_machine_just_entered(arm, arm_ctx.sm), 1);
+  ASSERT_EQ(talos_state_machine_go(arm, arm_ctx.sm, 20), TALOS_OK);
+  EXPECT_EQ(talos_state_machine_state(arm, arm_ctx.sm), 20);
+  EXPECT_EQ(talos_state_machine_previous(arm, arm_ctx.sm), 10);
+  EXPECT_EQ(talos_state_machine_time_in_state_ns(arm, arm_ctx.sm), 0);
+  EXPECT_EQ(talos_state_machine_go(arm, -1, 20), TALOS_ERR);
+
+  // Null / bad name / invalid index / no-mechanism-on-node boundaries.
+  EXPECT_EQ(talos_position_mechanism_open(nullptr, "arm"), -1);
+  EXPECT_EQ(talos_position_mechanism_open(arm, nullptr), -1);
+  EXPECT_EQ(talos_velocity_mechanism_open(nullptr, "flywheel"), -1);
+  EXPECT_EQ(talos_velocity_mechanism_open(shooter, nullptr), -1);
+  EXPECT_EQ(talos_roller_with_sensor_open(nullptr, "roller"), -1);
+  EXPECT_EQ(talos_roller_with_sensor_open(intake, nullptr), -1);
+
+  TalosPositionMechanismState pos_state{};
+  TalosVelocityMechanismState vel_state{};
+  TalosRollerWithSensorState rol_state{};
+  control::PositionState pos_msg{};
+  control::VelocityState vel_msg{};
+  EXPECT_EQ(talos_position_mechanism_state(plain, 0, &pos_state, nullptr, 0),
+            TALOS_ERR);
+  EXPECT_EQ(talos_position_mechanism_homed(plain, 0), TALOS_ERR);
+  EXPECT_EQ(talos_position_mechanism_homed(arm, -1), TALOS_ERR);
+  EXPECT_EQ(talos_position_mechanism_homed(arm, 99), TALOS_ERR);
+  EXPECT_EQ(
+      talos_position_mechanism_state(arm, arm_ctx.mech, nullptr, nullptr, 0),
+      TALOS_ERR);
+  // CopyMessage buffer-size mismatch is refused; nullptr message is allowed.
+  EXPECT_EQ(talos_position_mechanism_state(arm, arm_ctx.mech, &pos_state,
+                                           &pos_msg, 1),
+            TALOS_ERR);
+  EXPECT_NE(std::string{talos_last_error()}.find("bytes"), std::string::npos);
+  EXPECT_EQ(talos_position_mechanism_state(arm, arm_ctx.mech, &pos_state,
+                                           nullptr, 999),
+            TALOS_OK);
+  EXPECT_EQ(talos_position_mechanism_state(arm, arm_ctx.mech, &pos_state,
+                                           &pos_msg, sizeof(pos_msg)),
+            TALOS_OK);
+
+  EXPECT_EQ(talos_velocity_mechanism_state(shooter, shooter_ctx.mech, nullptr,
+                                           nullptr, 0),
+            TALOS_ERR);
+  EXPECT_EQ(talos_velocity_mechanism_state(shooter, shooter_ctx.mech,
+                                           &vel_state, &vel_msg, 1),
+            TALOS_ERR);
+  EXPECT_EQ(
+      talos_velocity_mechanism_state(shooter, shooter_ctx.mech, &vel_state,
+                                     &vel_msg, sizeof(vel_msg)),
+      TALOS_OK);
+  EXPECT_EQ(talos_velocity_mechanism_state(plain, 0, &vel_state, nullptr, 0),
+            TALOS_ERR);
+
+  EXPECT_EQ(talos_roller_with_sensor_state(intake, intake_ctx.mech, nullptr),
+            TALOS_ERR);
+  EXPECT_EQ(talos_roller_with_sensor_state(plain, 0, &rol_state), TALOS_ERR);
+  EXPECT_EQ(talos_roller_with_sensor_set_goal(intake, intake_ctx.mech, -1),
+            TALOS_ERR);
+  EXPECT_EQ(talos_roller_with_sensor_set_goal(intake, intake_ctx.mech, 99),
+            TALOS_ERR);
+
+  // Requests / update outside update() fail naming the mechanism.
+  EXPECT_EQ(talos_position_mechanism_set_goal(arm, arm_ctx.mech, 0.1, 0.0),
+            TALOS_ERR);
+  EXPECT_EQ(
+      talos_position_mechanism_set_goal_units(arm, arm_ctx.mech, 10.0, 0.0),
+      TALOS_ERR);
+  EXPECT_EQ(talos_position_mechanism_hold(arm, arm_ctx.mech, 0.0), TALOS_ERR);
+  EXPECT_EQ(talos_position_mechanism_stop(arm, arm_ctx.mech), TALOS_ERR);
+  EXPECT_EQ(talos_position_mechanism_clear_fault(arm, arm_ctx.mech), TALOS_ERR);
+  EXPECT_EQ(talos_position_mechanism_update(arm, arm_ctx.mech), TALOS_ERR);
+  EXPECT_EQ(
+      talos_velocity_mechanism_set_goal(shooter, shooter_ctx.mech, 10.0, 0.0),
+      TALOS_ERR);
+  EXPECT_EQ(talos_velocity_mechanism_stop(shooter, shooter_ctx.mech),
+            TALOS_ERR);
+  EXPECT_EQ(talos_velocity_mechanism_update(shooter, shooter_ctx.mech),
+            TALOS_ERR);
+  EXPECT_EQ(talos_roller_with_sensor_stop(intake, intake_ctx.mech), TALOS_ERR);
+  EXPECT_EQ(talos_roller_with_sensor_update(intake, intake_ctx.mech),
+            TALOS_ERR);
+
+  // Drive mechanisms through homing, goals, hold, stop, clear_fault, reset, and
+  // reboot.
+  ASSERT_EQ(talos_sim_hardware_enable(hw, 1), TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_ideal_motors(hw, 1), TALOS_OK);
+  TalosDriverStationPacket ds{};
+  ds.flags = TALOS_DS_ATTACHED | TALOS_DS_ENABLED | TALOS_DS_TELEOP;
+  ASSERT_EQ(talos_sim_hardware_set_driver_station(hw, &ds), TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_digital_input(hw, "arm", "home_sw", 1),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim, 40 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_GT(arm_ctx.every_calls, 0);
+  EXPECT_EQ(talos_position_mechanism_homed(arm, arm_ctx.mech), 1);
+
+  // Exercise arming disarm + reboot + reset_device -> live homed == 0 before
+  // update().
+  ASSERT_EQ(talos_operator_arming_evaluate(arm, arm_ctx.arming, 1), 0);
+  EXPECT_EQ(talos_operator_arming_armed(arm, arm_ctx.arming), 1);
+  ASSERT_EQ(talos_operator_arming_disarm(arm, arm_ctx.arming), TALOS_OK);
+  EXPECT_EQ(talos_operator_arming_armed(arm, arm_ctx.arming), 0);
+
+  arm_ctx.action = ArmCtx::Action::kGoalUnits;
+  ASSERT_EQ(talos_sim_step(sim, 10 * kMs), TALOS_OK) << talos_last_error();
+  arm_ctx.action = ArmCtx::Action::kHold;
+  ASSERT_EQ(talos_sim_step(sim, 10 * kMs), TALOS_OK) << talos_last_error();
+  arm_ctx.action = ArmCtx::Action::kClear;
+  ASSERT_EQ(talos_sim_step(sim, 10 * kMs), TALOS_OK) << talos_last_error();
+  arm_ctx.action = ArmCtx::Action::kStop;
+  shooter_ctx.stop = true;
+  intake_ctx.stop = true;
+  ASSERT_EQ(talos_sim_step(sim, 10 * kMs), TALOS_OK) << talos_last_error();
+
+  ASSERT_EQ(talos_sim_hardware_set_digital_input(hw, "arm", "home_sw", 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_reset_device(hw, "arm", "arm"), TALOS_OK);
+  arm_ctx.homed_before_after.clear();
+  ASSERT_EQ(talos_sim_step(sim, 25 * kMs), TALOS_OK) << talos_last_error();
+  bool saw_live_drop = false;
+  for (const auto& [before, after] : arm_ctx.homed_before_after) {
+    if (after == 0) {
+      EXPECT_EQ(before, 0) << "homed must drop live before update()";
+      saw_live_drop = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(saw_live_drop);
+
+  ASSERT_EQ(talos_sim_hardware_reboot(hw), TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim, 10 * kMs), TALOS_OK) << talos_last_error();
+
+  talos_sim_hardware_destroy(hw);
+  talos_sim_destroy(sim);
 }
 
 }  // namespace

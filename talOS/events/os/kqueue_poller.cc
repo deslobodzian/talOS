@@ -12,6 +12,7 @@
 #include <ctime>
 #include <stdexcept>
 #include <system_error>
+#include <utility>
 
 namespace talos::event {
 
@@ -112,7 +113,10 @@ void KqueuePoller::close_fd() noexcept {
 }
 
 KqueuePoller::KqueuePoller(KqueuePoller&& other) noexcept
-    : arm_deadline_timer_(other.arm_deadline_timer_), kq_fd_(other.kq_fd_) {
+    : arm_deadline_timer_(other.arm_deadline_timer_),
+      pending_wake_(other.pending_wake_),
+      kq_fd_(other.kq_fd_) {
+  other.pending_wake_ = false;
   other.kq_fd_ = -1;
 }
 
@@ -120,7 +124,9 @@ KqueuePoller& KqueuePoller::operator=(KqueuePoller&& other) noexcept {
   if (this != &other) {
     close_fd();
     arm_deadline_timer_ = other.arm_deadline_timer_;
+    pending_wake_ = other.pending_wake_;
     kq_fd_ = other.kq_fd_;
+    other.pending_wake_ = false;
     other.kq_fd_ = -1;
   }
   return *this;
@@ -171,71 +177,83 @@ bool KqueuePoller::reported_readable(int fd) const noexcept {
 
 KqueuePoller::WakeReason KqueuePoller::wait_until(MonotonicTime deadline) {
   struct kevent events[kMaxEvents];
+  int n = 0;
 
-  // One fixed ident, EV_ADD | EV_ONESHOT on every finite wait, carried as the
-  // changelist of the waiting kevent() call itself (one syscall per wait).
-  // No timer event from an earlier deadline can be reported as this one's:
-  //  - a delivered EV_ONESHOT timer deletes its own knote;
-  //  - a timer that fired but was not delivered (the previous call returned
-  //    READABLE or WOKEN first) is replaced by this EV_ADD, which re-arms the
-  //    existing knote and discards its pending fire;
-  //  - an infinite wait deletes the knote, pending fire included.
-  struct kevent timer {};
-  int nchanges = 0;
-  const bool finite = deadline != MonotonicTime::max();
-  if (!finite) {
-    EV_SET(&timer, kDeadlineIdent, EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
-    // A separate call: deleting a knote that is already gone (a delivered
-    // one-shot) fails with ENOENT, which in the waiting call would come back
-    // as an EV_ERROR event and end the wait at once. ApplyChange retries
-    // EINTR so a signal cannot leave a previously armed timer active; other
-    // errors (ENOENT is the expected case) are ignored.
-    ApplyChange(kq_fd_, timer);
-  } else if (arm_deadline_timer_) {
-    // A deadline already past arms a timer that fires at once, so the wait
-    // still returns promptly (after collecting any readable fd or wake).
-    EV_SET(&timer, kDeadlineIdent, EVFILT_TIMER, EV_ADD | EV_ONESHOT,
-           kDeadlineTimerFlags, ToMachTicks(deadline.nanos()), nullptr);
-    nchanges = 1;
-  }
-
-  int n;
-  for (;;) {
-    // The backstop timeout, recomputed on every pass so a retry waits only
-    // for what is left. A deadline already past polls (a zero timeout).
-    struct timespec timeout {};
-    if (finite) {
-      const MonotonicTime current = now();
-      const std::int64_t left =
-          deadline <= current ? 0 : (deadline - current).count();
-      timeout.tv_sec = static_cast<time_t>(left / 1'000'000'000);
-      timeout.tv_nsec = static_cast<long>(left % 1'000'000'000);
-    }
-    n = ::kevent(kq_fd_, &timer, nchanges, events, kMaxEvents,
-                 finite ? &timeout : nullptr);
+  if (pending_wake_) {
+    // A deferred WOKEN is already pending from an earlier READABLE batch:
+    // poll non-blockingly so any still-ready fd still outranks WOKEN and any
+    // concurrent wake() collapses into this same wakeup, without blocking.
+    struct timespec zero {};
+    do {
+      n = ::kevent(kq_fd_, nullptr, 0, events, kMaxEvents, &zero);
+    } while (n == -1 && errno == EINTR);
     if (n == -1) {
-      // EINTR is retried, not surfaced: wait_until()'s contract is to return
-      // only for one of the three documented reasons, and a signal landing
-      // mid-wait is not one of them. Re-applying the same absolute EV_ADD on
-      // the retry is harmless: the deadline does not move.
-      if (errno == EINTR) continue;
       throw std::system_error(errno, std::generic_category(), "kevent");
     }
-    // The timeout runs on mach_absolute_time() and is converted to it by
-    // truncation, so it can expire a fraction of a tick before now() reaches
-    // the deadline; wait out the rest rather than report DEADLINE early.
-    if (n > 0 || !finite || now() >= deadline) break;
+  } else {
+    // One fixed ident, EV_ADD | EV_ONESHOT on every finite wait, carried as the
+    // changelist of the waiting kevent() call itself (one syscall per wait).
+    // No timer event from an earlier deadline can be reported as this one's:
+    //  - a delivered EV_ONESHOT timer deletes its own knote;
+    //  - a timer that fired but was not delivered (the previous call returned
+    //    READABLE or WOKEN first) is replaced by this EV_ADD, which re-arms the
+    //    existing knote and discards its pending fire;
+    //  - an infinite wait deletes the knote, pending fire included.
+    struct kevent timer {};
+    int nchanges = 0;
+    const bool finite = deadline != MonotonicTime::max();
+    if (!finite) {
+      EV_SET(&timer, kDeadlineIdent, EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
+      // A separate call: deleting a knote that is already gone (a delivered
+      // one-shot) fails with ENOENT, which in the waiting call would come back
+      // as an EV_ERROR event and end the wait at once. ApplyChange retries
+      // EINTR so a signal cannot leave a previously armed timer active; other
+      // errors (ENOENT is the expected case) are ignored.
+      ApplyChange(kq_fd_, timer);
+    } else if (arm_deadline_timer_) {
+      // A deadline already past arms a timer that fires at once, so the wait
+      // still returns promptly (after collecting any readable fd or wake).
+      EV_SET(&timer, kDeadlineIdent, EVFILT_TIMER, EV_ADD | EV_ONESHOT,
+             kDeadlineTimerFlags, ToMachTicks(deadline.nanos()), nullptr);
+      nchanges = 1;
+    }
+
+    for (;;) {
+      // The backstop timeout, recomputed on every pass so a retry waits only
+      // for what is left. A deadline already past polls (a zero timeout).
+      struct timespec timeout {};
+      if (finite) {
+        const MonotonicTime current = now();
+        const std::int64_t left =
+            deadline <= current ? 0 : (deadline - current).count();
+        timeout.tv_sec = static_cast<time_t>(left / 1'000'000'000);
+        timeout.tv_nsec = static_cast<long>(left % 1'000'000'000);
+      }
+      n = ::kevent(kq_fd_, &timer, nchanges, events, kMaxEvents,
+                   finite ? &timeout : nullptr);
+      if (n == -1) {
+        // EINTR is retried, not surfaced: wait_until()'s contract is to return
+        // only for one of the three documented reasons, and a signal landing
+        // mid-wait is not one of them. Re-applying the same absolute EV_ADD on
+        // the retry is harmless: the deadline does not move.
+        if (errno == EINTR) continue;
+        throw std::system_error(errno, std::generic_category(), "kevent");
+      }
+      // The timeout runs on mach_absolute_time() and is converted to it by
+      // truncation, so it can expire a fraction of a tick before now() reaches
+      // the deadline; wait out the rest rather than report DEADLINE early.
+      if (n > 0 || !finite || now() >= deadline) break;
+    }
   }
 
   // A single kevent() call can report both a readable fd and the wake event
   // together. READABLE outranks WOKEN here for the same reason it outranks
   // a passed deadline: it carries data the caller must not miss a chance to
-  // observe, whereas a deferred WOKEN or DEADLINE simply surfaces on the
-  // next call with no information lost (EV_CLEAR already reset the wake
-  // event's state regardless of whether we act on it now). Otherwise the
+  // observe. Because EV_CLEAR already reset EVFILT_USER, pending_wake_
+  // preserves WOKEN for the next call instead of losing it. Otherwise the
   // event is the EVFILT_TIMER, or there is none because the timeout expired:
   // DEADLINE.
-  bool woken = false;
+  bool woken = std::exchange(pending_wake_, false);
   bool timer_failed = false;
   std::intptr_t timer_error = 0;
   readable_count_ = 0;
@@ -252,7 +270,10 @@ KqueuePoller::WakeReason KqueuePoller::wait_until(MonotonicTime deadline) {
       woken = true;
     }
   }
-  if (readable_count_ > 0) return WakeReason::READABLE;
+  if (readable_count_ > 0) {
+    if (woken) pending_wake_ = true;
+    return WakeReason::READABLE;
+  }
   if (timer_failed) {
     // Returning DEADLINE for it would spin the caller's loop without ever
     // waiting. Behind a readable fd it surfaces on the next wait, which

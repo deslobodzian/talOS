@@ -28,6 +28,14 @@ int unmap_calls = 0;
 // Set to have the next exclusive create find the name and its last holder
 // unlink it before the attach that follows.
 bool unlink_after_exists = false;
+// Set to have the next ATTACH shm_open unlink the opened 0-byte segment right
+// after returning its fd (and optionally recreate a sized segment with a
+// sentinel byte at offset 0).
+bool unlink_after_attach = false;
+std::size_t recreate_after_attach_size = 0;
+unsigned char recreate_after_attach_sentinel = 0;
+// Number of EINTR failures to inject into fstat().
+int fail_fstat_eintr = 0;
 
 int TestTruncate(int fd, off_t size) {
   if (std::exchange(fail_truncate, false)) {
@@ -67,7 +75,38 @@ int TestShmOpen(const char* name, int oflag, mode_t mode) {
     ::shm_unlink(name);
     errno = EEXIST;
   }
+  if (fd != -1 && (oflag & O_CREAT) == 0 &&
+      std::exchange(unlink_after_attach, false)) {
+    ::shm_unlink(name);
+    const std::size_t recreate_size =
+        std::exchange(recreate_after_attach_size, 0);
+    const unsigned char sentinel =
+        std::exchange(recreate_after_attach_sentinel, 0);
+    if (recreate_size > 0) {
+      const int replacement = ::shm_open(name, O_CREAT | O_RDWR | O_EXCL, 0666);
+      if (replacement != -1) {
+        if (::ftruncate(replacement, static_cast<off_t>(recreate_size)) == 0) {
+          void* mapped = ::mmap(nullptr, recreate_size, PROT_READ | PROT_WRITE,
+                                MAP_SHARED, replacement, 0);
+          if (mapped != MAP_FAILED) {
+            static_cast<unsigned char*>(mapped)[0] = sentinel;
+            ::munmap(mapped, recreate_size);
+          }
+        }
+        ::close(replacement);
+      }
+    }
+  }
   return fd;
+}
+
+int TestFstat(int fd, struct stat* st) {
+  if (fail_fstat_eintr > 0) {
+    --fail_fstat_eintr;
+    errno = EINTR;
+    return -1;
+  }
+  return ::fstat(fd, st);
 }
 }  // namespace
 
@@ -78,12 +117,14 @@ int TestShmOpen(const char* name, int oflag, mode_t mode) {
 #define mmap TestMmap
 #define munmap TestUnmap
 #define shm_open TestShmOpen
+#define fstat TestFstat
 #include "shared_memory_ptr.h"
 #undef ftruncate
 #undef close
 #undef mmap
 #undef munmap
 #undef shm_open
+#undef fstat
 
 TEST(SharedMemory, FailedCreatorTruncateRemovesPublishedName) {
   const std::string path = "/truncate_" + std::to_string(::getpid());
@@ -124,6 +165,92 @@ TEST(SharedMemory, ZeroSizeThrowsWithoutCreatingSegment) {
   EXPECT_EQ(fd, -1);
   if (fd != -1) ::close(fd);
   shm_unlink(name.c_str());
+}
+
+// REQ-CONTRACT-22: a size past off_t::max() fails upfront with overflow_error
+// without creating a shared-memory segment.
+TEST(SharedMemory, SizeExceedingOffTThrowsWithoutCreatingSegment) {
+  constexpr auto kMaxOffT =
+      static_cast<std::size_t>(std::numeric_limits<off_t>::max());
+  if constexpr (std::numeric_limits<std::size_t>::max() <= kMaxOffT) {
+    GTEST_SKIP() << "size_t cannot exceed off_t on this platform";
+  } else {
+    const std::string path = "/overflow_" + std::to_string(::getpid());
+    const auto name = ShmObjectName(path);
+    shm_unlink(name.c_str());
+    EXPECT_THROW((SharedMemoryPtr{path, kMaxOffT + 1}), std::overflow_error);
+    const int fd = shm_open(name.c_str(), O_RDWR, 0666);
+    EXPECT_EQ(fd, -1);
+    if (fd != -1) ::close(fd);
+    shm_unlink(name.c_str());
+  }
+}
+
+// REQ-CONTRACT-22: fstat() returning EINTR during ATTACH is retried rather
+// than failing the attach.
+TEST(SharedMemory, AttachRetriesFstatOnEintr) {
+  struct ResetHooks {
+    ~ResetHooks() { fail_fstat_eintr = 0; }
+  } reset;
+  const std::string path = "/fstat_eintr_" + std::to_string(::getpid());
+  const auto name = ShmObjectName(path);
+  shm_unlink(name.c_str());
+  SharedMemoryPtr creator{path, 4096};
+  ASSERT_EQ(creator.mode(), SharedMemoryMode::CREATE);
+
+  fail_fstat_eintr = 2;
+  SharedMemoryPtr attacher{path, 4096};
+  EXPECT_EQ(fail_fstat_eintr, 0);
+  EXPECT_EQ(attacher.mode(), SharedMemoryMode::ATTACH);
+  EXPECT_NE(attacher.ptr(), nullptr);
+  shm_unlink(name.c_str());
+}
+
+// REQ-CONTRACT-22: if an attacher opens a 0-byte segment whose creator then
+// fails ftruncate and unlinks the name, the attacher drops the dead unlinked
+// inode and either creates a fresh segment or attaches to a replacement
+// creator instead of pinning to the dead inode for 50 ms and failing.
+TEST(SharedMemory, AttachRecoversWhenZeroByteSegmentIsUnlinked) {
+  struct ResetHooks {
+    ~ResetHooks() {
+      unlink_after_attach = false;
+      recreate_after_attach_size = 0;
+      recreate_after_attach_sentinel = 0;
+    }
+  } reset;
+  {
+    const std::string path = "/dead_zero_create_" + std::to_string(::getpid());
+    const auto name = ShmObjectName(path);
+    shm_unlink(name.c_str());
+    const int fd = shm_open(name.c_str(), O_CREAT | O_RDWR | O_EXCL, 0666);
+    ASSERT_NE(fd, -1);
+    ::close(fd);
+
+    unlink_after_attach = true;
+    SharedMemoryPtr recovered{path, 4096};
+    EXPECT_FALSE(unlink_after_attach);
+    EXPECT_EQ(recovered.mode(), SharedMemoryMode::CREATE);
+    EXPECT_NE(recovered.ptr(), nullptr);
+    shm_unlink(name.c_str());
+  }
+  {
+    const std::string path = "/dead_zero_replace_" + std::to_string(::getpid());
+    const auto name = ShmObjectName(path);
+    shm_unlink(name.c_str());
+    const int fd = shm_open(name.c_str(), O_CREAT | O_RDWR | O_EXCL, 0666);
+    ASSERT_NE(fd, -1);
+    ::close(fd);
+
+    unlink_after_attach = true;
+    recreate_after_attach_size = 4096;
+    recreate_after_attach_sentinel = 0x5Au;
+    SharedMemoryPtr recovered{path, 4096};
+    EXPECT_FALSE(unlink_after_attach);
+    EXPECT_EQ(recovered.mode(), SharedMemoryMode::ATTACH);
+    ASSERT_NE(recovered.ptr(), nullptr);
+    EXPECT_EQ(static_cast<const unsigned char*>(recovered.ptr())[0], 0x5Au);
+    shm_unlink(name.c_str());
+  }
 }
 
 // REQ-OPS-03: an mmap failure during CREATE unlinks the newly created name so

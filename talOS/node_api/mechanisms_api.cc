@@ -190,6 +190,12 @@ int32_t talos_position_mechanism_clear_fault(TalosNode* node, int64_t index) {
                                  [](PositionMechanism& m) { m.clear_fault(); });
 }
 
+int32_t talos_position_mechanism_homed(TalosNode* node, int64_t index) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    return Get<PositionMechanism>(node, index).homed() ? 1 : 0;
+  });
+}
+
 int32_t talos_position_mechanism_state(TalosNode* node, int64_t index,
                                        TalosPositionMechanismState* out,
                                        void* message, uint32_t message_size) {

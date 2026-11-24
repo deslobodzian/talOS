@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <ctime>
 #include <system_error>
+#include <utility>
 
 // glibc 2.35 added the epoll_pwait2() wrapper (<sys/epoll.h> includes
 // <features.h>, which defines __GLIBC_PREREQ). Without it, the raw syscall
@@ -150,9 +151,11 @@ void EpollPoller::close_all() noexcept {
 
 EpollPoller::EpollPoller(EpollPoller&& other) noexcept
     : pwait2_(other.pwait2_),
+      pending_wake_(other.pending_wake_),
       epoll_fd_(other.epoll_fd_),
       timer_fd_(other.timer_fd_),
       wake_fd_(other.wake_fd_) {
+  other.pending_wake_ = false;
   other.epoll_fd_ = -1;
   other.timer_fd_ = -1;
   other.wake_fd_ = -1;
@@ -162,9 +165,11 @@ EpollPoller& EpollPoller::operator=(EpollPoller&& other) noexcept {
   if (this != &other) {
     close_all();
     pwait2_ = other.pwait2_;
+    pending_wake_ = other.pending_wake_;
     epoll_fd_ = other.epoll_fd_;
     timer_fd_ = other.timer_fd_;
     wake_fd_ = other.wake_fd_;
+    other.pending_wake_ = false;
     other.epoll_fd_ = -1;
     other.timer_fd_ = -1;
     other.wake_fd_ = -1;
@@ -304,17 +309,28 @@ int EpollPoller::wait_for_events(MonotonicTime deadline, epoll_event* events) {
 
 EpollPoller::WakeReason EpollPoller::wait_until(MonotonicTime deadline) {
   epoll_event events[kMaxEvents];
-  const int n = wait_for_events(deadline, events);
+  int n = 0;
+  if (pending_wake_) {
+    // A deferred WOKEN is already pending from an earlier READABLE batch:
+    // poll non-blockingly so any still-ready fd still outranks WOKEN and any
+    // concurrent wake() collapses into this same wakeup, without blocking.
+    do {
+      n = ::epoll_wait(epoll_fd_, events, kMaxEvents, 0);
+    } while (n == -1 && errno == EINTR);
+    if (n == -1) {
+      throw std::system_error(errno, std::generic_category(), "epoll_wait");
+    }
+  } else {
+    n = wait_for_events(deadline, events);
+  }
 
   // A single wait can report the watched fd, the wake fd and the timer fd
   // together. The whole batch is scanned (and the wake/timer fds fully
-  // drained) before deciding what to return, so that never
-  // reporting a WOKEN or DEADLINE that also happened to fire this round
-  // doesn't leave stale state to confuse a later call. READABLE outranks
-  // the other two because it carries data the caller must not miss a
-  // chance to observe; a deferred WOKEN or DEADLINE simply surfaces (or, in
-  // the timer's case, gets rearmed and re-evaluated) on the next call.
-  bool woken = false;
+  // drained) before deciding what to return. READABLE outranks the other two
+  // because it carries data the caller must not miss a chance to observe; if
+  // wake_fd_ also fired, pending_wake_ preserves WOKEN for the next call
+  // instead of losing it after draining eventfd.
+  bool woken = std::exchange(pending_wake_, false);
   readable_count_ = 0;
   for (int i = 0; i < n; ++i) {
     const int fd = events[i].data.fd;
@@ -328,7 +344,10 @@ EpollPoller::WakeReason EpollPoller::wait_until(MonotonicTime deadline) {
     }
   }
 
-  if (readable_count_ > 0) return WakeReason::READABLE;
+  if (readable_count_ > 0) {
+    if (woken) pending_wake_ = true;
+    return WakeReason::READABLE;
+  }
   if (woken) return WakeReason::WOKEN;
   return WakeReason::DEADLINE;
 }

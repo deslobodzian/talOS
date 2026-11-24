@@ -80,6 +80,9 @@ class KqueuePoller {
   void close_fd() noexcept;
 
   bool arm_deadline_timer_{true};
+  // Preserves a WOKEN event that arrived in the same batch as READABLE so
+  // the next wait_until() observes it instead of losing it after EV_CLEAR.
+  bool pending_wake_{false};
   // The watched fds the last wait_until() reported readable.
   int readable_[kMaxEvents]{};
   int readable_count_{0};

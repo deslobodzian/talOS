@@ -527,6 +527,23 @@ def check_nodes(spec, resolved, canonical_to_apparent=None):
             [f"  in nodes but not launched: {label}" for label in extra]))
 
 
+def check_node_names(spec):
+    """Exits when any bundled node's name is empty, escapes `bin/`, or
+    duplicates another bundled node's name."""
+    seen = {}
+    for node in spec.get("nodes", []):
+        name = node.get("name", "")
+        label = node.get("label") or node.get("target") or "<unknown>"
+        if (not isinstance(name, str) or not name or "/" in name
+                or "\\" in name or os.sep in name or "\x00" in name
+                or name in (os.curdir, os.pardir)):
+            sys.exit(f"bundle: invalid node name {name!r} for {label}")
+        if name in seen:
+            sys.exit(f"bundle: duplicate node name {name!r} "
+                     f"({seen[name]} and {label})")
+        seen[name] = label
+
+
 def check_studio(spec, resolved, canonical_to_apparent=None):
     """Exits when the bundle carries a Studio bridge other than the one its
     config's `[studio] bridge` names, or a webroot without Studio's pages
@@ -597,6 +614,7 @@ def main():
     canonical_to_apparent = parse_repo_mappings(args.repo_mapping)
     parse_apparent_repos(args.apparent_repo, canonical_to_apparent)
     check_nodes(spec, resolved, canonical_to_apparent)
+    check_node_names(spec)
     check_studio(spec, resolved, canonical_to_apparent)
 
     out_dir = os.path.abspath(args.out)
@@ -660,9 +678,11 @@ def main():
     # library, but never two different libraries under one name.
     lib_dir = os.path.join(out_dir, "lib")
     staged_libs = {}
-    # python/: each Python runtime file, with its source and the first node
-    # that carried it, and the interpreters venv links exec there.
+    # python/: each Python runtime file (and unresolved runtime symlink), with
+    # its source/target and the first node that carried it, and the
+    # interpreters venv links exec there.
     staged_runtimes = {}
+    staged_runtime_links = {}
     interpreters = set()
     bundle_root = out_dir + os.sep
     for node in spec.get("nodes", []):
@@ -718,7 +738,13 @@ def main():
 
             for rf_rel, rf_src in files.items():
                 if rf_rel.split(os.sep, 1)[0] in runtimes:
-                    stage_runtime_file(name, rf_src, rf_rel, staged_at(rf_rel),
+                    dest = staged_at(rf_rel)
+                    if dest in staged_runtime_links:
+                        first_node = staged_runtime_links[dest][1]
+                        sys.exit(
+                            f"bundle: nodes '{first_node}' and '{name}' "
+                            f"conflict on Python runtime entry {rf_rel}")
+                    stage_runtime_file(name, rf_src, rf_rel, dest,
                                        staged_runtimes)
                     continue
                 if is_test_only_wheel_file(rf_rel, runtimes):
@@ -731,10 +757,33 @@ def main():
                 if (is_test_only_wheel_file(rf_rel, runtimes)
                         or is_test_only_wheel_file(target, runtimes)):
                     continue
-                stage_link(name, os.path.join(rf_dir, rf_rel), rf_rel, link,
-                           staged_at(target), bundle_root)
-                if target.split(os.sep, 1)[0] in runtimes:
-                    interpreters.add(staged_at(target))
+                rf_in_runtime = rf_rel.split(os.sep, 1)[0] in runtimes
+                dest = staged_at(rf_rel)
+                target_dest = staged_at(target)
+                if rf_in_runtime:
+                    if dest in staged_runtimes:
+                        first_node = staged_runtimes[dest][1]
+                        sys.exit(
+                            f"bundle: nodes '{first_node}' and '{name}' "
+                            f"conflict on Python runtime entry {rf_rel}")
+                    seen_link = staged_runtime_links.get(dest)
+                    if seen_link is not None:
+                        if seen_link[0] != target_dest:
+                            sys.exit(
+                                f"bundle: nodes '{seen_link[1]}' and '{name}' "
+                                f"carry different Python runtime links at "
+                                f"{rf_rel}")
+                        continue
+                    stage_link(name, dest, rf_rel, link, target_dest,
+                               bundle_root)
+                    staged_runtime_links[dest] = (target_dest, name)
+                    continue
+                stage_link(name, dest, rf_rel, link, target_dest, bundle_root)
+                target_parts = target.split(os.sep)
+                if (len(target_parts) >= 3 and target_parts[0] in runtimes
+                        and target_parts[1] == "bin"
+                        and is_executable_file(target_dest)):
+                    interpreters.add(target_dest)
 
             if repo_mapping_src:
                 safe_copy(repo_mapping_src, os.path.join(rf_dir, "_repo_mapping"))
