@@ -1712,5 +1712,204 @@ TEST_F(Registry, ReadersTakeNoLockAndWritersTouchOnlyTheirOwnSlot) {
   EXPECT_EQ(snapshot_slot_bytes(writer_b.slot()), slot_b_before);
 }
 
+// State for the release() TOCTOU hook below; hooks are plain function pointers.
+struct ReleaseRaceState {
+  std::string path;
+  bool lock_held{false};
+  std::unique_ptr<NodeRegistration> reclaimed;
+}* release_race_state = nullptr;
+
+// REQ-OPS-17: NodeRegistration::release() must hold RegistryLock across
+// owns_slot() and the SlotState::FREE store so a concurrent claim cannot sweep
+// and reclaim a stale slot in between and then have its live ACTIVE slot
+// clobbered back to FREE.
+TEST_F(Registry, ReleaseHoldsRegistryLockAgainstConcurrentReclaim) {
+  ReleaseRaceState state{.path = path_};
+  release_race_state = &state;
+  const RegistryTestHooks hooks{.releasing = [](NodeRecord*) {
+    const std::string mapped = ShmObjectName(release_race_state->path);
+    try {
+      const RegistryLock probe{mapped, 0ms};
+      release_race_state->lock_held = false;
+    } catch (const std::runtime_error&) {
+      release_race_state->lock_held = true;
+      return;
+    }
+    // Without RegistryLock held during release(), a concurrent writer sweeps
+    // and reclaims the stale slot right before release() stores
+    // SlotState::FREE.
+    release_race_state->reclaimed = std::make_unique<NodeRegistration>(
+        NodeRegistration::Identity{.name = "reclaimed"},
+        release_race_state->path);
+  }};
+
+  auto old = std::make_unique<NodeRegistration>(
+      NodeRegistration::Identity{.name = "stale"}, path_, &hooks);
+  const std::size_t slot_index = old->slot();
+  {
+    RegistryMapping mapping{path_};
+    const auto timeout =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
+            .count();
+    mapping.header()->nodes[slot_index].heartbeat_monotonic_ns.store(
+        monotonic_now_ns() - timeout - 1, std::memory_order_relaxed);
+  }
+  old.reset();
+  release_race_state = nullptr;
+
+  EXPECT_TRUE(state.lock_held) << "release() ran without holding RegistryLock";
+  if (!state.reclaimed) {
+    state.reclaimed = std::make_unique<NodeRegistration>(
+        NodeRegistration::Identity{.name = "reclaimed"}, path_);
+  }
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  const auto nodes = reader->nodes();
+  ASSERT_EQ(nodes.size(), 1u);
+  EXPECT_EQ(nodes.front().name, "reclaimed");
+  EXPECT_TRUE(nodes.front().alive);
+}
+
+// REQ-OPS-17: OpenLockFile must open with O_NONBLOCK and reject non-regular
+// files (FIFOs, directories, symlinks) so a sticky-directory pre-existing file
+// cannot wedge or hijack lock acquisition.
+TEST_F(Registry, OpenLockFileRejectsFifoDirectoryAndSymlinkWithoutBlocking) {
+  const char* test_tmpdir = std::getenv("TEST_TMPDIR");
+  ASSERT_NE(test_tmpdir, nullptr);
+  const std::string base =
+      std::string{test_tmpdir} + "/lock_check_" + std::to_string(::getpid());
+
+  const std::string fifo_path = base + ".fifo";
+  ::unlink(fifo_path.c_str());
+  ASSERT_EQ(::mkfifo(fifo_path.c_str(), 0666), 0);
+  {
+    // Fork with a short alarm so a regression removing O_NONBLOCK fails fast
+    // instead of wedging the test process on open(O_RDONLY) of a FIFO.
+    Children children;
+    const pid_t pid = ::fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+      ::alarm(2);
+      errno = 0;
+      const int fifo_fd = OpenLockFile(fifo_path, O_RDONLY);
+      const int fifo_err = errno;
+      if (fifo_fd >= 0) ::close(fifo_fd);
+      ::_exit((fifo_fd < 0 && fifo_err == EINVAL) ? 0 : 1);
+    }
+    children.add(pid);
+    const int status = children.reap(pid);
+    ::unlink(fifo_path.c_str());
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        << "OpenLockFile on FIFO failed or blocked (status=" << status << ")";
+  }
+
+  const std::string dir_path = base + ".dir";
+  ::rmdir(dir_path.c_str());
+  ASSERT_EQ(::mkdir(dir_path.c_str(), 0755), 0);
+  errno = 0;
+  const int dir_fd = OpenLockFile(dir_path, O_RDONLY);
+  const int dir_err = errno;
+  if (dir_fd >= 0) ::close(dir_fd);
+  ::rmdir(dir_path.c_str());
+  EXPECT_LT(dir_fd, 0);
+  EXPECT_EQ(dir_err, EISDIR);
+
+  const std::string real_path = base + ".real";
+  const std::string link_path = base + ".link";
+  ::unlink(link_path.c_str());
+  ::unlink(real_path.c_str());
+  const int created = OpenLockFile(real_path, O_RDONLY);
+  ASSERT_GE(created, 0);
+  ::close(created);
+  ASSERT_EQ(::symlink(real_path.c_str(), link_path.c_str()), 0);
+  errno = 0;
+  const int link_fd = OpenLockFile(link_path, O_RDONLY);
+  if (link_fd >= 0) ::close(link_fd);
+  ::unlink(link_path.c_str());
+  ::unlink(real_path.c_str());
+  EXPECT_LT(link_fd, 0);
+}
+
+// REQ-CONTRACT-09: Reporter's ExtraSource flags must attach only to the extra
+// source's own manifest entry and not smear onto a loop source sharing the same
+// topic name.
+TEST_F(Registry, ReporterExtraSourceFlagsDoNotSmearOntoLoopSources) {
+  const std::string topic = "/shared/state";
+  event::RealtimeEventLoop<> loop;
+  struct Handler {
+    std::function<void()> on_tick;
+    void OnTick(const event::Context&) { on_tick(); }
+  } handler;
+  auto timer = event::make_timer<&Handler::OnTick>(loop, "tick", &handler);
+  (void)loop.register_watcher(topic, sizeof(std::uint64_t),
+                              alignof(std::uint64_t), kCountSchema, {});
+
+  Reporter reporter{{.name = "mixed",
+                     .extra = {{.kind = event::SourceKind::SENDER,
+                                .name = topic,
+                                .message_bytes = sizeof(std::uint64_t),
+                                .alignment = alignof(std::uint64_t),
+                                .flags = naming::kSourceFlagExternal |
+                                         naming::kSourceFlagOptional}},
+                     .period = 20ms,
+                     .registry_path = path_}};
+  reporter.start(loop);
+  std::optional<std::vector<NodeSnapshot>> live;
+  handler.on_tick = [&] {
+    if (!reporter.published()) return;
+    auto reader = RegistryReader::open(path_);
+    if (!reader) return;
+    auto nodes = reader->nodes();
+    if (nodes.size() == 1 && nodes.front().sources.size() == 3) {
+      live = std::move(nodes);
+      loop.exit();
+    }
+  };
+  timer.setup_periodic(event::Poller::now() + 1ms, 2ms);
+  loop.run_for(5s);
+
+  ASSERT_TRUE(live.has_value());
+  const auto& sources = live->front().sources;
+  ASSERT_EQ(sources.size(), 3u);
+  // Loop watcher on `topic` must NOT inherit the ExtraSource's flags.
+  EXPECT_EQ(sources[1].kind, event::SourceKind::WATCHER);
+  EXPECT_EQ(sources[1].name, topic);
+  EXPECT_FALSE(sources[1].external());
+  EXPECT_FALSE(sources[1].optional());
+  // ExtraSource on `topic` keeps its own flags.
+  EXPECT_EQ(sources[2].kind, event::SourceKind::SENDER);
+  EXPECT_EQ(sources[2].name, topic);
+  EXPECT_TRUE(sources[2].external());
+  EXPECT_TRUE(sources[2].optional());
+}
+
+// REQ-CONTRACT-09, REQ-SAFE-14: source_id-scoped EndpointAttribute attaches
+// only to the matching registration id in NodeRegistration::publish().
+TEST_F(Registry, SourceIdScopedEndpointAttributesDoNotSmearAcrossSameTopic) {
+  event::Manifest manifest;
+  manifest.push_back({.id = 0,
+                      .kind = event::SourceKind::WATCHER,
+                      .name = "/foo/state",
+                      .message_bytes = 16,
+                      .alignment = 8});
+  manifest.push_back({.id = 1,
+                      .kind = event::SourceKind::WATCHER,
+                      .name = "/foo/state",
+                      .message_bytes = 16,
+                      .alignment = 8});
+  const std::vector<EndpointAttribute> endpoints = {
+      {"/foo/state", naming::kSourceFlagOptional, 0u},
+  };
+  NodeRegistration registration{{.name = "reader"}, path_};
+  registration.publish(manifest, endpoints);
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  const auto nodes = reader->nodes();
+  ASSERT_EQ(nodes.size(), 1u);
+  ASSERT_EQ(nodes.front().sources.size(), 2u);
+  EXPECT_EQ(nodes.front().sources[0].flags, naming::kSourceFlagOptional);
+  EXPECT_EQ(nodes.front().sources[1].flags, 0u);
+}
+
 }  // namespace
 }  // namespace talos::introspect

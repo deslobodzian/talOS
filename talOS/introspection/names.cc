@@ -78,24 +78,33 @@ class AlertFieldWalk {
 
 }  // namespace
 
-std::vector<AlertPrefixedField> AlertPrefixedFields(std::string_view bfbs,
-                                                    std::string_view root) {
-  std::vector<AlertPrefixedField> out;
+AlertFieldsResult AlertPrefixedFields(std::string_view bfbs,
+                                      std::string_view root) {
+  AlertFieldsResult result;
   // Uses header-only //talOS/schema:verify rather than :field_path: this
   // library is part of libtalos_node.so, and a compiled library in that
   // closure is left out of every talos_cc_shared_node's own link.
   const reflection::Schema* schema = schema::VerifySchema(bfbs);
-  if (schema == nullptr || schema->objects() == nullptr) return out;
+  if (schema == nullptr || schema->objects() == nullptr) {
+    result.error = "reflection schema (bfbs) failed verification";
+    return result;
+  }
+  if (root.empty()) {
+    result.error = "reflection schema (bfbs) has no root struct name";
+    return result;
+  }
   const auto* objects = schema->objects();
   for (flatbuffers::uoffset_t i = 0; i < objects->size(); ++i) {
     const auto* obj = objects->Get(i);
     if (obj != nullptr && obj->name() != nullptr &&
         obj->name()->string_view() == root) {
-      AlertFieldWalk{*schema, out}.Struct(i);
-      break;
+      AlertFieldWalk{*schema, result.fields}.Struct(i);
+      return result;
     }
   }
-  return out;
+  result.error = "reflection schema (bfbs) does not contain struct '" +
+                 std::string{root} + "'";
+  return result;
 }
 
 }  // namespace talos::introspect::naming::detail
