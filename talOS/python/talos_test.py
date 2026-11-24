@@ -1774,10 +1774,15 @@ class MessageTest(unittest.TestCase):
         alternate_class = type("EquivalentGoal", (Goal,), {})
         alternate_type = message_type(alternate_class)
         equivalent = alternate_type.decode(goal._bytes)
+        def tampered(raw):
+            msg = goal_type.decode(goal._bytes)
+            msg._bytes = raw
+            return msg
+
         mismatches = (
             message_type(changed_hash).decode(goal._bytes),
-            goal_type.decode(goal._bytes[:-1]),
-            goal_type.decode(goal._bytes + b"\0"),
+            tampered(goal._bytes[:-1]),
+            tampered(goal._bytes + b"\0"),
         )
         for name, send, symbol in paths:
             with self.subTest(path=name, identity="equivalent"):
@@ -1887,6 +1892,60 @@ frames = "/hw/request/remapped_bytes"
                 sim = Sim.from_toml(toml)
                 with self.assertRaisesRegex(talos.TalosError, r"/hw/request"):
                     sim.add(BadWriter, subsystem)
+
+
+class LoadTest(unittest.TestCase):
+    # REQ-CONTRACT-14: talos.load() disambiguates same-basename files by path
+    # hash, raises FileNotFoundError/ValueError on invalid paths instead of
+    # AttributeError, and cleans sys.modules when exec_module fails.
+    def test_load_disambiguates_same_basename_files(self):
+        root = Path(os.environ["TEST_TMPDIR"]) / "load_same_basename"
+        dir_a = root / "a"
+        dir_b = root / "b"
+        dir_a.mkdir(parents=True, exist_ok=True)
+        dir_b.mkdir(parents=True, exist_ok=True)
+        file_a = dir_a / "node.py"
+        file_b = dir_b / "node.py"
+        file_a.write_text('VALUE = "from_a"\n', encoding="utf-8")
+        file_b.write_text('VALUE = "from_b"\n', encoding="utf-8")
+
+        mod_a = talos.load(str(file_a))
+        mod_b = talos.load(str(file_b))
+        self.addCleanup(sys.modules.pop, mod_a.__name__, None)
+        self.addCleanup(sys.modules.pop, mod_b.__name__, None)
+
+        self.assertNotEqual(mod_a.__name__, mod_b.__name__)
+        self.assertIs(sys.modules[mod_a.__name__], mod_a)
+        self.assertIs(sys.modules[mod_b.__name__], mod_b)
+        self.assertEqual(mod_a.VALUE, "from_a")
+        self.assertEqual(mod_b.VALUE, "from_b")
+
+    def test_load_rejects_missing_and_non_python_paths(self):
+        root = Path(os.environ["TEST_TMPDIR"]) / "load_invalid"
+        root.mkdir(parents=True, exist_ok=True)
+        missing = root / "does_not_exist.py"
+        txt = root / "notes.txt"
+        txt.write_text("VALUE = 1\n", encoding="utf-8")
+
+        with self.assertRaises(FileNotFoundError):
+            talos.load(str(missing))
+        with self.assertRaises(ValueError):
+            talos.load(str(txt))
+        with self.assertRaises(ValueError):
+            talos.load(str(root))
+
+    def test_load_removes_module_from_sys_modules_on_exec_failure(self):
+        root = Path(os.environ["TEST_TMPDIR"]) / "load_fail"
+        root.mkdir(parents=True, exist_ok=True)
+        broken = root / "broken.py"
+        broken.write_text(
+            'PARTIAL = 1\nraise RuntimeError("broken module")\n',
+            encoding="utf-8",
+        )
+        before = set(sys.modules)
+        with self.assertRaisesRegex(RuntimeError, "broken module"):
+            talos.load(str(broken))
+        self.assertEqual(set(sys.modules), before)
 
 
 if __name__ == "__main__":
