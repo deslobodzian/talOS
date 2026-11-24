@@ -305,21 +305,115 @@ def _literal_string_list(node):
     return values
 
 
-def _collect_bindings(tree):
-    bindings = {}
-    for stmt in tree.body:
-        if isinstance(stmt, ast.Assign):
-            for target in stmt.targets:
-                if isinstance(target, ast.Name):
-                    bindings[target.id] = stmt.value
-    return bindings
+class _MutatedBinding:
+    """Sentinel for a BUILD binding mutated in a way that cannot be statically
+    proven free of `quarantine`."""
+
+
+_MUTATED = _MutatedBinding()
+
+
+class _BoundExpr:
+    """AST expression captured with the bindings active at definition time."""
+
+    __slots__ = ("node", "env")
+
+    def __init__(self, node, env):
+        self.node = node
+        self.env = env
+
+
+class _AugBinding:
+    """Augmented binding (`NAME += rhs`, `NAME |= rhs`, `NAME.append(rhs)`)."""
+
+    __slots__ = ("left", "right", "is_add")
+
+    def __init__(self, left, right, is_add=True):
+        self.left = left
+        self.right = right
+        self.is_add = is_add
+
+
+_MUTATING_METHODS = frozenset({
+    "append",
+    "extend",
+    "insert",
+    "pop",
+    "remove",
+    "clear",
+    "update",
+    "setdefault",
+})
+
+
+def _subscript_root_name(node):
+    cur = node
+    while isinstance(cur, ast.Subscript):
+        cur = cur.value
+    return cur.id if isinstance(cur, ast.Name) else None
+
+
+def _is_static_value_binding(val, seen=frozenset()):
+    if isinstance(val, _MutatedBinding):
+        return False
+    if isinstance(val, _BoundExpr):
+        return _is_static_value(val.node, val.env, seen)
+    if isinstance(val, _AugBinding):
+        return (_is_static_value_binding(val.left, seen) and
+                _is_static_value_binding(val.right, seen))
+    if isinstance(val, ast.AST):
+        return _is_static_value(val, {}, seen)
+    return False
+
+
+def _is_static_value(node, bindings, seen=frozenset()):
+    """True when `node` evaluates purely from static literals/bindings."""
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.Name):
+        if node.id in bindings and node.id not in seen:
+            return _is_static_value_binding(bindings[node.id], seen | {node.id})
+        return False
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return all(_is_static_value(e, bindings, seen) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(
+            (k is not None and _is_static_value(k, bindings, seen) and
+             _is_static_value(v, bindings, seen))
+            for k, v in zip(node.keys, node.values)
+        )
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.BitOr)):
+        return (_is_static_value(node.left, bindings, seen) and
+                _is_static_value(node.right, bindings, seen))
+    if isinstance(node, ast.IfExp):
+        return (_is_static_value(node.body, bindings, seen) and
+                _is_static_value(node.orelse, bindings, seen))
+    return False
+
+
+def _eval_str_binding(val, seen=frozenset()):
+    if isinstance(val, _MutatedBinding):
+        return None
+    if isinstance(val, _BoundExpr):
+        return _eval_str(val.node, val.env, seen)
+    if isinstance(val, _AugBinding):
+        if not val.is_add:
+            return None
+        left = _eval_str_binding(val.left, seen)
+        right = _eval_str_binding(val.right, seen)
+        if left is not None and right is not None:
+            return left + right
+        return None
+    if isinstance(val, ast.AST):
+        return _eval_str(val, {}, seen)
+    return None
 
 
 def _eval_str(node, bindings, seen=frozenset()):
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     if isinstance(node, ast.Name) and node.id in bindings and node.id not in seen:
-        return _eval_str(bindings[node.id], bindings, seen | {node.id})
+        return _eval_str_binding(bindings[node.id], seen | {node.id})
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         left = _eval_str(node.left, bindings, seen)
         right = _eval_str(node.right, bindings, seen)
@@ -328,20 +422,276 @@ def _eval_str(node, bindings, seen=frozenset()):
     return None
 
 
+def _contains_string_constant_binding(val, target, seen=frozenset()):
+    if isinstance(val, _MutatedBinding):
+        return True
+    if isinstance(val, _BoundExpr):
+        return _contains_string_constant(val.node, target, val.env, seen)
+    if isinstance(val, _AugBinding):
+        return (_contains_string_constant_binding(val.left, target, seen) or
+                _contains_string_constant_binding(val.right, target, seen))
+    if isinstance(val, ast.AST):
+        return _contains_string_constant(val, target, {}, seen)
+    return False
+
+
 def _contains_string_constant(node, target, bindings=None, seen=frozenset()):
     """Whether any static string value reachable from `node` (following
-    top-level bindings and `+` string concatenation) equals `target`."""
+    statement-order bindings and `+` string concatenation) equals `target`,
+    or fails closed when `node` references a mutated binding."""
     bindings = bindings or {}
     val = _eval_str(node, bindings, seen)
     if val is not None:
         return val == target
     if isinstance(node, ast.Name) and node.id in bindings and node.id not in seen:
-        return _contains_string_constant(
-            bindings[node.id], target, bindings, seen | {node.id})
+        return _contains_string_constant_binding(
+            bindings[node.id], target, seen | {node.id})
     return any(
         _contains_string_constant(child, target, bindings, seen)
         for child in ast.iter_child_nodes(node)
     )
+
+
+class _QuarantineEvalState:
+    """Statement-order binding tracker for `quarantined_targets()`."""
+
+    def __init__(self, package, build_path):
+        self.package = package
+        self.build_path = build_path
+        self.bindings = {}
+        self.alias_group = {}
+        self.next_alias_id = 1
+        self.targets = []
+
+    def clone_scope(self):
+        copy = _QuarantineEvalState(self.package, self.build_path)
+        copy.bindings = dict(self.bindings)
+        copy.alias_group = dict(self.alias_group)
+        copy.next_alias_id = self.next_alias_id
+        copy.targets = self.targets
+        return copy
+
+    def alloc_alias_id(self):
+        gid = self.next_alias_id
+        self.next_alias_id += 1
+        return gid
+
+    def alias_members(self, name):
+        gid = self.alias_group.get(name)
+        if gid is None:
+            return {name}
+        return {k for k, v in self.alias_group.items() if v == gid}
+
+    def mark_mutated(self, name, include_self=True):
+        affected = set()
+        for member in self.alias_members(name):
+            if not include_self and member == name:
+                continue
+            self.bindings[member] = _MUTATED
+            affected.add(member)
+        return affected
+
+
+def _iter_calls_postorder(node):
+    for child in ast.iter_child_nodes(node):
+        yield from _iter_calls_postorder(child)
+    if isinstance(node, ast.Call):
+        yield node
+
+
+def _apply_quarantine_mutating_call(call, state):
+    func = call.func
+    if not isinstance(func, ast.Attribute):
+        return set()
+    method = func.attr
+    if method not in _MUTATING_METHODS:
+        return set()
+    if isinstance(func.value, ast.Name):
+        target = func.value.id
+        if target not in state.bindings and target not in state.alias_group:
+            return set()
+        if (method in ("append", "extend") and len(call.args) == 1
+                and not call.keywords and target in state.bindings
+                and _is_static_value(call.args[0], state.bindings)):
+            snap_env = dict(state.bindings)
+            state.bindings[target] = _AugBinding(
+                state.bindings[target], _BoundExpr(call.args[0], snap_env),
+                is_add=True,
+            )
+            modified = {target}
+            modified |= state.mark_mutated(target, include_self=False)
+            return modified
+        return state.mark_mutated(target, include_self=True)
+    if isinstance(func.value, ast.Subscript):
+        root = _subscript_root_name(func.value)
+        if root and (root in state.bindings or root in state.alias_group):
+            return state.mark_mutated(root, include_self=True)
+    return set()
+
+
+def _check_quarantine_call(call, state):
+    if not isinstance(call.func, ast.Name):
+        return
+    kws = {kw.arg: kw.value for kw in call.keywords if kw.arg is not None}
+    tags_node = kws.get("tags")
+    is_quarantined = False
+    if tags_node is not None:
+        parsed_tags = _literal_string_list(tags_node)
+        is_quarantined = (
+            "quarantine" in parsed_tags if parsed_tags is not None
+            else _contains_string_constant(tags_node, "quarantine",
+                                           state.bindings))
+    if not is_quarantined:
+        is_quarantined = any(
+            _contains_string_constant(kw.value, "quarantine", state.bindings)
+            for kw in call.keywords if kw.arg is None
+        )
+    if not is_quarantined:
+        return
+    name = _literal_string(kws.get("name"))
+    if name is None:
+        name = f"<dynamic:line{getattr(call, 'lineno', 0)}>"
+    sources = []
+    non_literal_srcs = False
+    if "srcs" in kws:
+        parsed_srcs = _literal_string_list(kws["srcs"])
+        if parsed_srcs is None:
+            non_literal_srcs = True
+        else:
+            for src in parsed_srcs:
+                norm = _normalize_pkg_src(state.package, src)
+                if norm is not None:
+                    sources.append(norm)
+    if "main" in kws:
+        main_src = _literal_string(kws["main"])
+        if main_src is None:
+            non_literal_srcs = True
+        else:
+            norm = _normalize_pkg_src(state.package, main_src)
+            if norm is not None and norm not in sources:
+                sources.append(norm)
+    if ("srcs" not in kws and "main" not in kws and
+            any(kw.arg is None for kw in call.keywords)):
+        non_literal_srcs = True
+    state.targets.append((f"//{state.package}:{name}", state.build_path,
+                          sources, non_literal_srcs))
+
+
+def _walk_quarantine_expr(expr, state):
+    modified = set()
+    for call in _iter_calls_postorder(expr):
+        _check_quarantine_call(call, state)
+        modified |= _apply_quarantine_mutating_call(call, state)
+    return modified
+
+
+def _walk_quarantine_stmts(stmts, state):
+    modified = set()
+    for stmt in stmts:
+        if isinstance(stmt, ast.Expr):
+            modified |= _walk_quarantine_expr(stmt.value, state)
+        elif isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                modified |= _walk_quarantine_expr(target, state)
+            modified |= _walk_quarantine_expr(stmt.value, state)
+            snap_env = dict(state.bindings)
+            alias_source = None
+            if isinstance(stmt.value, ast.Name):
+                alias_source = stmt.value.id
+            elif isinstance(stmt.value, ast.Subscript):
+                alias_source = _subscript_root_name(stmt.value)
+            shared_gid = None
+            if alias_source is not None:
+                shared_gid = state.alias_group.get(alias_source)
+                if shared_gid is None:
+                    shared_gid = state.alloc_alias_id()
+                    state.alias_group[alias_source] = shared_gid
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    tid = target.id
+                    modified.add(tid)
+                    state.bindings[tid] = _BoundExpr(stmt.value, snap_env)
+                    state.alias_group[tid] = (
+                        shared_gid if shared_gid is not None
+                        else state.alloc_alias_id()
+                    )
+                elif isinstance(target, ast.Subscript):
+                    root = _subscript_root_name(target)
+                    if root:
+                        modified |= state.mark_mutated(root, include_self=True)
+                else:
+                    for node in ast.walk(target):
+                        if isinstance(node, ast.Name):
+                            modified.add(node.id)
+                            state.bindings[node.id] = _MUTATED
+                            state.alias_group[node.id] = state.alloc_alias_id()
+        elif isinstance(stmt, ast.AugAssign):
+            modified |= _walk_quarantine_expr(stmt.target, state)
+            modified |= _walk_quarantine_expr(stmt.value, state)
+            if isinstance(stmt.target, ast.Name):
+                tid = stmt.target.id
+                modified.add(tid)
+                if (isinstance(stmt.op, (ast.Add, ast.BitOr))
+                        and _is_static_value(stmt.value, state.bindings)):
+                    snap_env = dict(state.bindings)
+                    prev = state.bindings.get(tid, _MUTATED)
+                    state.bindings[tid] = _AugBinding(
+                        prev, _BoundExpr(stmt.value, snap_env),
+                        is_add=isinstance(stmt.op, ast.Add),
+                    )
+                    modified |= state.mark_mutated(tid, include_self=False)
+                else:
+                    modified |= state.mark_mutated(tid, include_self=True)
+            elif isinstance(stmt.target, ast.Subscript):
+                root = _subscript_root_name(stmt.target)
+                if root:
+                    modified |= state.mark_mutated(root, include_self=True)
+        elif isinstance(stmt, ast.AnnAssign):
+            modified |= _walk_quarantine_expr(stmt.target, state)
+            if stmt.value is not None:
+                modified |= _walk_quarantine_expr(stmt.value, state)
+                snap_env = dict(state.bindings)
+                if isinstance(stmt.target, ast.Name):
+                    tid = stmt.target.id
+                    modified.add(tid)
+                    state.bindings[tid] = _BoundExpr(stmt.value, snap_env)
+                    state.alias_group[tid] = state.alloc_alias_id()
+                elif isinstance(stmt.target, ast.Subscript):
+                    root = _subscript_root_name(stmt.target)
+                    if root:
+                        modified |= state.mark_mutated(root, include_self=True)
+        elif isinstance(stmt, ast.For):
+            modified |= _walk_quarantine_expr(stmt.iter, state)
+            loop_state = state.clone_scope()
+            for node in ast.walk(stmt.target):
+                if isinstance(node, ast.Name):
+                    loop_state.bindings[node.id] = _MUTATED
+                    modified.add(node.id)
+            inner_mod = _walk_quarantine_stmts(stmt.body, loop_state)
+            inner_mod |= _walk_quarantine_stmts(stmt.orelse, loop_state)
+            for name in inner_mod:
+                modified |= state.mark_mutated(name, include_self=True)
+        elif isinstance(stmt, ast.If):
+            modified |= _walk_quarantine_expr(stmt.test, state)
+            then_state = state.clone_scope()
+            else_state = state.clone_scope()
+            inner_mod = _walk_quarantine_stmts(stmt.body, then_state)
+            inner_mod |= _walk_quarantine_stmts(stmt.orelse, else_state)
+            for name in inner_mod:
+                modified |= state.mark_mutated(name, include_self=True)
+        elif isinstance(stmt, ast.FunctionDef):
+            fn_state = state.clone_scope()
+            for arg in (stmt.args.posonlyargs + stmt.args.args +
+                        stmt.args.kwonlyargs):
+                fn_state.bindings[arg.arg] = _MUTATED
+            if stmt.args.vararg:
+                fn_state.bindings[stmt.args.vararg.arg] = _MUTATED
+            if stmt.args.kwarg:
+                fn_state.bindings[stmt.args.kwarg.arg] = _MUTATED
+            _walk_quarantine_stmts(stmt.body, fn_state)
+        else:
+            modified |= _walk_quarantine_expr(stmt, state)
+    return modified
 
 
 def _normalize_pkg_src(package, src):
@@ -386,53 +736,9 @@ def quarantined_targets(files, read):
         tree, _ = _parse_build_file(path, read(path))
         if tree is None:
             continue
-        package = os.path.dirname(path)
-        bindings = _collect_bindings(tree)
-        for call in _build_calls(tree):
-            kws = {kw.arg: kw.value for kw in call.keywords
-                   if kw.arg is not None}
-            tags_node = kws.get("tags")
-            is_quarantined = False
-            if tags_node is not None:
-                parsed_tags = _literal_string_list(tags_node)
-                is_quarantined = (
-                    "quarantine" in parsed_tags if parsed_tags is not None
-                    else _contains_string_constant(tags_node, "quarantine",
-                                                   bindings))
-            if not is_quarantined:
-                is_quarantined = any(
-                    _contains_string_constant(kw.value, "quarantine", bindings)
-                    for kw in call.keywords if kw.arg is None
-                )
-            if not is_quarantined:
-                continue
-            name = _literal_string(kws.get("name"))
-            if name is None:
-                name = f"<dynamic:line{getattr(call, 'lineno', 0)}>"
-            sources = []
-            non_literal_srcs = False
-            if "srcs" in kws:
-                parsed_srcs = _literal_string_list(kws["srcs"])
-                if parsed_srcs is None:
-                    non_literal_srcs = True
-                else:
-                    for src in parsed_srcs:
-                        norm = _normalize_pkg_src(package, src)
-                        if norm is not None:
-                            sources.append(norm)
-            if "main" in kws:
-                main_src = _literal_string(kws["main"])
-                if main_src is None:
-                    non_literal_srcs = True
-                else:
-                    norm = _normalize_pkg_src(package, main_src)
-                    if norm is not None and norm not in sources:
-                        sources.append(norm)
-            if ("srcs" not in kws and "main" not in kws and
-                    any(kw.arg is None for kw in call.keywords)):
-                non_literal_srcs = True
-            targets.append((f"//{package}:{name}", path, sources,
-                            non_literal_srcs))
+        state = _QuarantineEvalState(os.path.dirname(path), path)
+        _walk_quarantine_stmts(tree.body, state)
+        targets.extend(state.targets)
     return targets
 
 

@@ -116,14 +116,17 @@ NODE_RULE_LANG = {
 NODES = re.compile(r"^NODES = \[(.*?)\]", re.MULTILINE | re.DOTALL)
 LABEL = re.compile(r'"//([^:"]*):[^"]*"')
 ACTUATORS = r"(?:Motor|DigitalOutput|PwmOutput)"
+MECHANISMS = r"(?:PositionMechanism|VelocityMechanism|RollerWithSensor)"
 ACTUATOR = (
     re.compile(rf"\btalos(?:::|\.(?:devices\.)?){ACTUATORS}\b"),
     # A talOS/mechanisms block constructs its Motor inside the library.
-    re.compile(r"\btalos::mechanisms::(?:PositionMechanism|VelocityMechanism"
-               r"|RollerWithSensor)\b"),
+    re.compile(rf"\btalos(?:::mechanisms::|\.mechanisms\.){MECHANISMS}\b"),
     # Python: from talos import Motor / from talos.devices import (Motor, ...)
-    re.compile(rf"^\s*from\s+talos(?:\.devices)?\s+import\s+"
+    re.compile(rf"(?:^|;)[ \t]*from\s+talos(?:\.devices)?\s+import\s+"
                rf"(?:\([^)]*|[^\n(]*)\b{ACTUATORS}\b", re.MULTILINE),
+    # Python: from talos.mechanisms import PositionMechanism / (...)
+    re.compile(rf"(?:^|;)[ \t]*from\s+talos\.mechanisms\s+import\s+"
+               rf"(?:\([^)]*|[^\n(]*)\b{MECHANISMS}\b", re.MULTILINE),
 )
 PRODUCER = re.compile(r"\b(?:TargetLane|OperatorArming|TargetAccess)\b")
 HOSTED = re.compile(r"\btalos\.cpp_node\(")
@@ -169,7 +172,12 @@ def reason(text):
 
 TALOS_IMPORT_ALIAS = re.compile(
     r"(?:^|;)[ \t]*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*"
-    r"talos(?:\.devices)?\s+as\s+(\w+)\b",
+    r"talos(?:\.(?:devices|mechanisms))?\s+as\s+(\w+)\b",
+    re.MULTILINE,
+)
+TALOS_SUBMODULE_IMPORT = re.compile(
+    r"(?:^|;)[ \t]*from\s+talos\s+import\s+"
+    r"(?:\([^)]*|[^\n(]*)\b(devices|mechanisms)(?:\s+as\s+(\w+))?\b",
     re.MULTILINE,
 )
 
@@ -284,10 +292,7 @@ def _python_test_names(text):
         return any(callee(d) in SKIPS for d in getattr(node, "decorator_list", ()))
 
     def has_skip_call(fn):
-        return any(
-            isinstance(n, ast.Call) and callee(n) in SKIPS
-            for n in own_nodes(fn)
-        )
+        return any(_is_skip_node(n) for n in own_nodes(fn))
 
     def collect(body, class_skipped=False):
         for stmt in body:
@@ -311,7 +316,16 @@ def infer_role(sources):
         return "actuator"
     for text in sources:
         for alias in TALOS_IMPORT_ALIAS.findall(text):
-            if re.search(rf"\b{re.escape(alias)}\.(?:devices\.)?{ACTUATORS}\b", text):
+            if re.search(
+                    rf"\b{re.escape(alias)}\."
+                    rf"(?:(?:devices\.)?{ACTUATORS}"
+                    rf"|(?:mechanisms\.)?{MECHANISMS})\b",
+                    text):
+                return "actuator"
+        for submod, alias in TALOS_SUBMODULE_IMPORT.findall(text):
+            name = alias or submod
+            symbols = ACTUATORS if submod == "devices" else MECHANISMS
+            if re.search(rf"\b{re.escape(name)}\.{symbols}\b", text):
                 return "actuator"
     if any(PRODUCER.search(text) for text in sources):
         return "producer"
@@ -322,9 +336,18 @@ def infer_role(sources):
 
 
 FUNCTION = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
-# unittest's skip decorators and TestCase.skipTest, pytest's skip marks and
-# pytest.skip.
-SKIPS = {"skip", "skipIf", "skipUnless", "skipif", "skipTest"}
+# unittest's skip decorators, TestCase.skipTest and SkipTest exception, plus
+# pytest's skip marks and pytest.skip.
+SKIPS = {"skip", "skipIf", "skipUnless", "skipif", "skipTest", "SkipTest"}
+
+
+def _is_skip_node(node):
+    """True for a skip helper/exception call or a bare `raise SkipTest`."""
+    if isinstance(node, ast.Call) and callee(node) in SKIPS:
+        return True
+    if isinstance(node, ast.Raise) and node.exc is not None:
+        return callee(node.exc) == "SkipTest"
+    return False
 
 
 def callee(node):
@@ -410,7 +433,7 @@ def scenario_steps(text):
         skipped += [node for scope in enclosing
                     if isinstance(scope, FUNCTION)
                     for node in own_nodes(scope)
-                    if isinstance(node, ast.Call) and callee(node) in SKIPS]
+                    if _is_skip_node(node)]
         if skipped:
             unread.append(f"line {call.lineno} is in a test skipped at line "
                           f"{min(n.lineno for n in skipped)}")

@@ -144,24 +144,30 @@ def collect_sources(src_dir, entries):
     return sources, missing
 
 
+def has_tool_error(output):
+    """True when clang-tidy output indicates a tool, config, driver, or
+    compiler parse error (even if clang-tidy exited 0)."""
+    if any(marker in output for marker in TOOL_ERROR_MARKERS):
+        return True
+    if DRIVER_ERROR_RE.search(output):
+        return True
+    checks = TIDY_DIAGNOSTIC_RE.findall(output)
+    return any('clang-diagnostic-error' in check for check in checks)
+
+
 def is_lint_finding_only(returncode, output):
-    """True only when clang-tidy exited 1 solely due to non-compiler lint hits.
+    """True only when clang-tidy exited 0 or 1 solely due to non-compiler lint hits.
 
     Any signal kill (returncode < 0), setup/CLI error (returncode > 1),
     compiler parse error, YAML config error, or output without a tidy
     diagnostic returns False so the caller fails closed (exit 2) even under
     --observe.
     """
-    if returncode != 1:
+    if returncode not in (0, 1):
         return False
-    if any(marker in output for marker in TOOL_ERROR_MARKERS):
+    if has_tool_error(output):
         return False
-    if DRIVER_ERROR_RE.search(output):
-        return False
-    checks = TIDY_DIAGNOSTIC_RE.findall(output)
-    return bool(checks) and all(
-        'clang-diagnostic-error' not in check for check in checks
-    )
+    return bool(TIDY_DIAGNOSTIC_RE.search(output))
 
 
 def run_one(tidy_bin, db_dir, source, header_filter=DEFAULT_HEADER_FILTER):
@@ -313,6 +319,16 @@ def main(argv=None):
                         print(out.rstrip())
                     else:
                         print(f'clang-tidy exited with code {rc} (no output)')
+                    print('::endgroup::')
+                elif has_tool_error(out):
+                    tool_errors += 1
+                    print(f'::group::{label}')
+                    print(out.rstrip())
+                    print('::endgroup::')
+                elif TIDY_DIAGNOSTIC_RE.search(out):
+                    findings += 1
+                    print(f'::group::{label}')
+                    print(out.rstrip())
                     print('::endgroup::')
 
     elapsed = time.monotonic() - t0
