@@ -230,7 +230,7 @@ void RecordHardwareDevices(HardwareRecord kind,
   }
 }
 
-std::size_t ChannelMetadataBytes(const Channel& channel) {
+std::size_t SessionChannelBytes(const Channel& channel) {
   std::size_t bytes = channel.name.size() + channel.unit.size();
   for (const std::string& label : channel.labels) {
     bytes += label.size();
@@ -736,7 +736,7 @@ class Indexer {
       }
       std::size_t topic_bytes = 0;
       for (const Channel& ch : topic.channels) {
-        const std::size_t ch_bytes = ChannelMetadataBytes(ch);
+        const std::size_t ch_bytes = SessionChannelBytes(ch);
         if (ch_bytes >
             kMaxSessionChannelBytes - total_channel_bytes - topic_bytes) {
           throw std::runtime_error("session exceeds channel byte cap (" +
