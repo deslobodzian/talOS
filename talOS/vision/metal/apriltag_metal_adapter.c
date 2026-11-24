@@ -685,8 +685,11 @@ static inline int detection_compare_function(const void* _a, const void* _b) {
 }
 
 // Lazily creates td->wp like apriltag_detector_detect does. Returns false
-// when creation fails, in which case callers fail gracefully.
+// when td is invalid or creation fails, in which case callers fail gracefully.
 static bool ensure_workerpool(apriltag_detector_t* td) {
+  if (td == NULL || td->nthreads < 1) {
+    return false;
+  }
   if (td->wp == NULL || td->nthreads != workerpool_get_nthreads(td->wp)) {
     workerpool_destroy(td->wp);
     td->wp = workerpool_create(td->nthreads);
@@ -714,7 +717,8 @@ static void destroy_clusters(zarray_t* clusters) {
 bool apriltag_image_dimensions_supported(const apriltag_detector_t* td,
                                          int width, int height) {
   if (td == NULL || width < 4 || height < 4 || width >= 32768 ||
-      height >= 32768) {
+      height >= 32768 || !isfinite(td->quad_decimate) ||
+      td->quad_decimate <= 0.0f) {
     return false;
   }
   int quad_w = width;
@@ -911,7 +915,8 @@ zarray_t* apriltag_quad_thresh_from_threshim(apriltag_detector_t* td,
 // kernel writes canonical roots (parent[root] == root, 0xFFFFFFFF for
 // ignored pixels) and sizes counting members INCLUDING the root, while the
 // CPU convention excludes the root; adjust accordingly. Returns NULL when
-// either input is NULL so callers transparently keep the CPU path.
+// either input is NULL or any parent entry is out-of-range, dangling, or
+// non-canonical so callers transparently keep the CPU path.
 static unionfind_t* unionfind_from_gpu_labels(int w, int h,
                                               const uint32_t* gpu_parents,
                                               const uint32_t* gpu_sizes) {
@@ -919,18 +924,32 @@ static unionfind_t* unionfind_from_gpu_labels(int w, int h,
     return NULL;
   }
   const uint64_t npix = (uint64_t)w * (uint64_t)h;
-  if (npix > UINT32_MAX) {
+  if (npix >= UINT32_MAX) {
     return NULL;
   }
-  unionfind_t* uf = unionfind_create((uint32_t)npix);
+  const uint32_t n32 = (uint32_t)npix;
+  const size_t n = (size_t)npix;
+  unionfind_t* uf = unionfind_create(n32);
   if (uf == NULL) {
     return NULL;
   }
-  const size_t n = (size_t)npix;
   memcpy(uf->parent, gpu_parents, n * sizeof(uint32_t));
   for (size_t i = 0; i < n; i++) {
-    uint32_t s = gpu_sizes[i];
-    uf->size[i] = (uf->parent[i] == 0xffffffff || s == 0) ? 0 : s - 1;
+    const uint32_t p = uf->parent[i];
+    if (p != 0xFFFFFFFFu && (p >= n32 || uf->parent[p] != p)) {
+      unionfind_destroy(uf);
+      return NULL;
+    }
+  }
+  for (size_t i = 0; i < n; i++) {
+    const uint32_t p = uf->parent[i];
+    const uint32_t s = gpu_sizes[i];
+    if (p == 0xFFFFFFFFu) {
+      uf->parent[i] = (uint32_t)i;
+      uf->size[i] = 0;
+    } else {
+      uf->size[i] = (s == 0) ? 0 : s - 1;
+    }
   }
   return uf;
 }
@@ -981,7 +1000,8 @@ static zarray_t* detect_with_external_stages(apriltag_detector_t* td,
     destroy_clusters(external_clusters);
     return NULL;
   }
-  if (im_orig->buf == NULL || im_orig->stride < im_orig->width ||
+  if (td->nthreads < 1 || im_orig->buf == NULL ||
+      im_orig->stride < im_orig->width ||
       !apriltag_image_dimensions_supported(td, im_orig->width,
                                            im_orig->height)) {
     destroy_clusters(external_clusters);
