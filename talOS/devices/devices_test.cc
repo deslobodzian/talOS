@@ -899,6 +899,95 @@ TEST(Devices, RezeroRefusesAPositionOlderThanTwoStatusPeriods) {
   EXPECT_DOUBLE_EQ(mech.b.position(), 1);
 }
 
+// REQ-SAFE-05: non-finite, disconnected, and stale-state rezero() calls on an
+// unzeroed rezero-frame motor leave zeroed() false and keep set_position and
+// set_motion_magic neutral.
+TEST(Devices, InvalidRezeroLeavesUnzeroedMotorNeutralInPositionModes) {
+  struct PositionMotor {
+    explicit PositionMotor(Node& n) : m{n, "b"} { AllowUntargetedOutputs(n); }
+    void update() {
+      if (mode == Mode::kPosition) {
+        m.set_position(1.0);
+      } else {
+        m.set_motion_magic(1.0);
+      }
+    }
+    Motor m;
+    Mode mode = Mode::kPosition;
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<PositionMotor>("mech");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_motor("mech", "b", 3.0, 0.0);
+  sim.step(10ms);
+  ASSERT_TRUE(mech.m.connected());
+  ASSERT_FALSE(mech.m.zeroed());
+
+  const auto expect_unzeroed_and_neutral = [&](const char* stage) {
+    EXPECT_FALSE(mech.m.zeroed()) << stage;
+    mech.mode = Mode::kPosition;
+    sim.step(10ms);
+    auto cmd = LastCommand(sim);
+    ASSERT_TRUE(cmd.has_value()) << stage;
+    EXPECT_EQ(cmd->motors[0].mode, Mode::kNeutral) << stage << " (position)";
+    mech.mode = Mode::kMotionMagic;
+    sim.step(10ms);
+    cmd = LastCommand(sim);
+    ASSERT_TRUE(cmd.has_value()) << stage;
+    EXPECT_EQ(cmd->motors[0].mode, Mode::kNeutral)
+        << stage << " (motion magic)";
+  };
+
+  mech.m.rezero(std::numeric_limits<double>::quiet_NaN());
+  expect_unzeroed_and_neutral("rezero(NaN)");
+
+  mech.m.rezero(std::numeric_limits<double>::infinity());
+  expect_unzeroed_and_neutral("rezero(+Inf)");
+
+  hw.set_connected("mech", "b", false);
+  sim.step(10ms);
+  ASSERT_FALSE(mech.m.connected());
+  mech.m.rezero(0.0);
+  EXPECT_FALSE(mech.m.zeroed());
+  hw.set_connected("mech", "b", true);
+  sim.step(10ms);
+  ASSERT_TRUE(mech.m.connected());
+  expect_unzeroed_and_neutral("rezero(0) while disconnected");
+
+  hw.lose_states(25);  // 125 ms > 100 ms command_timeout_us
+  sim.step(110ms);
+  ASSERT_FALSE(sim.node("mech").extension<HardwareLink>().fresh());
+  mech.m.rezero(0.0);
+  EXPECT_FALSE(mech.m.zeroed());
+  // Neutral while stale, and still unzeroed/neutral once fresh enabled
+  // /hw/state resumes (same boot, no device reset).
+  mech.mode = Mode::kPosition;
+  sim.step(5ms);
+  auto stale_cmd = LastCommand(sim);
+  ASSERT_TRUE(stale_cmd.has_value());
+  EXPECT_EQ(stale_cmd->motors[0].mode, Mode::kNeutral);
+  mech.mode = Mode::kMotionMagic;
+  sim.step(5ms);
+  stale_cmd = LastCommand(sim);
+  ASSERT_TRUE(stale_cmd.has_value());
+  EXPECT_EQ(stale_cmd->motors[0].mode, Mode::kNeutral);
+
+  sim.step(20ms);  // past the 25 lost ticks; /hw/state is fresh and enabled
+  ASSERT_TRUE(robot_enabled(sim.node("mech")));
+  expect_unzeroed_and_neutral("rezero(0) while /hw/state stale");
+
+  // Control: a valid rezero(0) now zeroes the motor and unlocks both modes.
+  mech.m.rezero(0.0);
+  EXPECT_TRUE(mech.m.zeroed());
+  mech.mode = Mode::kPosition;
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kPosition);
+  mech.mode = Mode::kMotionMagic;
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kMotionMagic);
+}
+
 // REQ-SAFE-05
 // A zero holds only in the hardware frame it was taken in: a node restart
 // (a new node) starts unzeroed, a disconnect keeps it, a reset seen in
@@ -2510,12 +2599,18 @@ TEST(Devices, DriverStationFollowsAGatewayRebootAndRetiresTheOldBoot) {
   EXPECT_TRUE(pilot.ds.autonomous());
   EXPECT_EQ(pilot.ds.data().boot_id, kBootB);
 
-  // Within boot B, ordering holds again.
+  // Within boot B, ordering holds again, including a delayed sample_time_us=0
+  // packet from the start of boot B.
   publish(kBootB, 21000, 1000, kAuto);
   EXPECT_EQ(pilot.packets, 3);
   publish(kBootB, 11000, 1000, kTeleop);
   EXPECT_EQ(pilot.packets, 3);
   EXPECT_TRUE(pilot.ds.autonomous());
+  publish(kBootB, 0, 0, kTeleop);
+  EXPECT_EQ(pilot.packets, 3);
+  EXPECT_TRUE(pilot.ds.autonomous());
+  EXPECT_EQ(pilot.ds.data().sample_time_us, 21000u);
+  EXPECT_EQ(pilot.ds.data().mode_since_us, 1000u);
 
   // Disabled in boot B reads disabled; silence reads disconnected.
   publish(kBootB, 41000, 41000, driver_station::kDsAttached);
