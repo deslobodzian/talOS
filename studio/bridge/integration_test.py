@@ -81,7 +81,7 @@ def darwin_rtms_segment(topic):
         ns = os.environ["TALOS_SHM_NAMESPACE"]
     else:
         ns = os.environ.get("TEST_TMPDIR", "")
-    segment = shm_name(topic, ns) if ns else "/" + topic.lstrip("/").replace("/", ".")
+    segment = shm_name(topic, ns)
     libc = ctypes.CDLL(None, use_errno=True)
     # Declare only the two fixed parameters: O_RDONLY never reads the variadic
     # mode_t argument, keeping arm64 macOS ABI exact.

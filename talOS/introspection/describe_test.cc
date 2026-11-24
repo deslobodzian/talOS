@@ -153,7 +153,53 @@ TEST(Describe, DeclaredGraphRoundTripsEveryNode) {
   ASSERT_TRUE(DescribeReader::ParseGraph(DeclaredGraphToJson({}), read, error))
       << error;
   EXPECT_TRUE(read.empty());
-  EXPECT_FALSE(DescribeReader::ParseGraph("not json", read, error));
+  EXPECT_TRUE(DescribeReader::ParseGraph("[]", read, error)) << error;
+  EXPECT_TRUE(read.empty());
+  EXPECT_TRUE(DescribeReader::ParseGraph("  [ \n\t ] \n", read, error))
+      << error;
+  EXPECT_TRUE(read.empty());
+  for (const char* bad :
+       {"not json", "[{\"bad\": 1}]", "[truncated", "[{}]", "[] trailing",
+        "[{\"name\": \"missing_version\"}]", "["}) {
+    EXPECT_FALSE(DescribeReader::ParseGraph(bad, read, error)) << bad;
+    EXPECT_FALSE(error.empty()) << bad;
+  }
+}
+
+// REQ-OPS-01: legal TIMER labels containing JSON delimiters (`]`, `}`, quotes)
+// must round-trip through DescribeToJson and DescribeReader::Parse without
+// terminating the `sources` array or source object early.
+TEST(Describe, RoundTripsTimerLabelsWithBracketsAndBraces) {
+  event::Manifest manifest;
+  manifest.push_back({.id = 0,
+                      .kind = event::SourceKind::TIMER,
+                      .name = "control[0]",
+                      .period_ns = 5'000'000});
+  manifest.push_back({.id = 1,
+                      .kind = event::SourceKind::TIMER,
+                      .name = "pid [200Hz]",
+                      .period_ns = 5'000'000});
+  manifest.push_back({.id = 2,
+                      .kind = event::SourceKind::TIMER,
+                      .name = "loop{1}",
+                      .period_ns = 5'000'000});
+  manifest.push_back({.id = 3,
+                      .kind = event::SourceKind::TIMER,
+                      .name = R"(tick\"}{])",
+                      .period_ns = 5'000'000});
+  manifest.push_back({.id = 4,
+                      .kind = event::SourceKind::SENDER,
+                      .name = "/arm/state",
+                      .message_bytes = 16,
+                      .alignment = 8,
+                      .schema = {"arm.State", 0x42ULL}});
+  const Description written =
+      DescribeManifest("arm", "//arm:node", manifest, kSlots);
+  Description read;
+  std::string error;
+  ASSERT_TRUE(DescribeReader::Parse(DescribeToJson(written), read, error))
+      << error;
+  ExpectSameDescription(written, read);
 }
 
 TEST(Describe, WritesTheKindNamesTheRegistryUses) {
@@ -393,13 +439,76 @@ TEST(Describe, AppendJsonStringEscapesInvalidUtf8AndPreservesValidUtf8) {
   // Invalid byte immediately followed by valid UTF-8 escapes only the bad byte.
   EXPECT_EQ(encode(std::string_view{"\xFF\xC3\xA9", 3}), "\"\\u00ff\xC3\xA9\"");
 
-  // DescribeToJson uses AppendJsonString and emits no raw invalid UTF-8 bytes.
+  // DescribeToJson uses AppendJsonString and emits no raw invalid UTF-8 bytes,
+  // and DescribeReader::Parse round-trips \u00XX escapes back to the exact
+  // original bytes (both control characters < 0x20 and invalid UTF-8 bytes).
   Description desc;
   desc.name = std::string{"bad\xFFname", 8};
-  desc.target = "//x:bad";
+  desc.target = std::string{"//x:bad\x01\t\n\x1f", 11};
   const std::string json = DescribeToJson(desc);
   EXPECT_NE(json.find("\"bad\\u00ffname\""), std::string::npos) << json;
   EXPECT_EQ(json.find('\xFF'), std::string::npos);
+
+  Description read;
+  std::string error;
+  ASSERT_TRUE(DescribeReader::Parse(json, read, error)) << error;
+  EXPECT_EQ(read.name, desc.name);
+  EXPECT_EQ(read.target, desc.target);
+
+  // Malformed \u escapes fail closed.
+  for (const char* bad_escape : {"\\u00", "\\u00zz", "\\u0100", "\\u"}) {
+    std::string bad_json = json;
+    const std::size_t pos = bad_json.find("\\u00ff");
+    ASSERT_NE(pos, std::string::npos);
+    bad_json.replace(pos, 6, bad_escape);
+    EXPECT_FALSE(DescribeReader::Parse(bad_json, read, error)) << bad_escape;
+  }
+}
+
+// REQ-CONTRACT-09, REQ-SAFE-14: source_id-scoped EndpointAttribute attaches
+// only to the matching manifest registration id without smearing onto another
+// source sharing the same topic, while topic-keyed attributes (nullopt) keep
+// matching every registration on that topic.
+TEST(Describe, SourceIdScopedAttributesDoNotSmearAcrossSameTopic) {
+  event::Manifest manifest;
+  manifest.push_back({.id = 0,
+                      .kind = event::SourceKind::WATCHER,
+                      .name = "/hw/state/driver_station",
+                      .message_bytes = 32,
+                      .alignment = 8,
+                      .schema = {"talos.hardware.DriverStation", 1}});
+  manifest.push_back({.id = 1,
+                      .kind = event::SourceKind::WATCHER,
+                      .name = "/hw/state/driver_station",
+                      .message_bytes = 32,
+                      .alignment = 8,
+                      .schema = {"talos.hardware.DriverStation", 1}});
+  manifest.push_back({.id = 2,
+                      .kind = event::SourceKind::WATCHER,
+                      .name = "/foo/state",
+                      .message_bytes = 16,
+                      .alignment = 8,
+                      .schema = {"foo.State", 2}});
+  manifest.push_back({.id = 3,
+                      .kind = event::SourceKind::WATCHER,
+                      .name = "/foo/state",
+                      .message_bytes = 16,
+                      .alignment = 8,
+                      .schema = {"foo.State", 2}});
+
+  const std::vector<EndpointAttribute> attributes = {
+      {"/hw/state/driver_station", naming::kSourceFlagObserver, 0u},
+      {"/foo/state", naming::kSourceFlagOptional, 2u},
+      {"/foo/state", naming::kSourceFlagExternal},
+  };
+  const Description desc =
+      DescribeManifest("driver", "//driver:node", manifest, kSlots, attributes);
+  ASSERT_EQ(desc.sources.size(), 4u);
+  EXPECT_EQ(desc.sources[0].flags, naming::kSourceFlagObserver);
+  EXPECT_EQ(desc.sources[1].flags, 0u);
+  EXPECT_EQ(desc.sources[2].flags,
+            naming::kSourceFlagOptional | naming::kSourceFlagExternal);
+  EXPECT_EQ(desc.sources[3].flags, naming::kSourceFlagExternal);
 }
 
 }  // namespace

@@ -1,6 +1,7 @@
 #include "udp.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -13,6 +14,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 
 #include "gtest/gtest.h"
 #include "udp_test_helpers.h"
@@ -616,6 +618,207 @@ TEST(RuntimeUdpTest, ConnectedPeerDropsFramesFromUnconnectedSender) {
       0);
   EXPECT_EQ(receiver.TryReceive(&received), UdpStatus::kWouldBlock);
   EXPECT_EQ(receiver.stats().received_frames, 1u);
+}
+
+// REQ-RT-22: opened and reopened UDP sockets carry FD_CLOEXEC so exec'd child
+// processes never inherit port 5802/5803 and block rebind across restart.
+TEST(RuntimeUdpTest, OpenedSocketIsCloseOnExec) {
+  const uint16_t remote = FreeLoopbackPort();
+  ASSERT_NE(remote, 0);
+  RuntimeUdpPeer peer;
+  ASSERT_EQ(peer.Open("127.0.0.1", 0, "127.0.0.1", remote), UdpStatus::kOk);
+  const int flags = ::fcntl(peer.NativeFd(), F_GETFD);
+  ASSERT_GE(flags, 0);
+  EXPECT_NE(flags & FD_CLOEXEC, 0);
+
+  ASSERT_EQ(peer.Reopen(), UdpStatus::kOk);
+  const int reopened_flags = ::fcntl(peer.NativeFd(), F_GETFD);
+  ASSERT_GE(reopened_flags, 0);
+  EXPECT_NE(reopened_flags & FD_CLOEXEC, 0);
+}
+
+// REQ-RT-22: moving a RuntimeUdpPeer clears opened_ on the moved-from instance
+// so Reopen() on it cannot steal the moved-to peer's ports.
+TEST(RuntimeUdpTest, MovedFromPeerCannotReopen) {
+  const uint16_t port = FreeLoopbackPort();
+  const uint16_t remote = FreeLoopbackPort();
+  ASSERT_NE(port, 0);
+  ASSERT_NE(remote, 0);
+
+  RuntimeUdpPeer first;
+  ASSERT_EQ(first.Open("127.0.0.1", port, "127.0.0.1", remote), UdpStatus::kOk);
+
+  RuntimeUdpPeer second{std::move(first)};
+  // NOLINTBEGIN(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+  EXPECT_FALSE(first.IsOpen());
+  EXPECT_EQ(first.Reopen(), UdpStatus::kInvalidArgument);
+  // NOLINTEND(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+  EXPECT_TRUE(second.IsOpen());
+  EXPECT_EQ(second.Reopen(), UdpStatus::kOk);
+
+  RuntimeUdpPeer third;
+  third = std::move(second);
+  // NOLINTBEGIN(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+  EXPECT_FALSE(second.IsOpen());
+  EXPECT_EQ(second.Reopen(), UdpStatus::kInvalidArgument);
+  // NOLINTEND(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+  EXPECT_TRUE(third.IsOpen());
+  EXPECT_EQ(third.Reopen(), UdpStatus::kOk);
+}
+
+// REQ-CONTRACT-01: Open() rejects remote_port == 0 when connect_peer is true,
+// while still allowing unconnected receivers to bind without a peer port.
+TEST(RuntimeUdpTest, OpenRejectsZeroRemotePortWhenConnected) {
+  RuntimeUdpPeer peer;
+  EXPECT_EQ(peer.Open("127.0.0.1", 0, "127.0.0.1", 0),
+            UdpStatus::kInvalidArgument);
+  EXPECT_FALSE(peer.IsOpen());
+  EXPECT_EQ(peer.Reopen(), UdpStatus::kInvalidArgument);
+
+  UdpSocketOptions unconnected;
+  unconnected.connect_peer = false;
+  EXPECT_EQ(peer.Open("127.0.0.1", 0, "127.0.0.1", 0, unconnected),
+            UdpStatus::kOk);
+  EXPECT_TRUE(peer.IsOpen());
+}
+
+// REQ-CONTRACT-01: MutablePayloadBuffer and SendBufferedFrame reject oversize
+// payloads and closed sockets without advancing next_send_sequence().
+TEST(RuntimeUdpTest, BufferedSendRejectsInvalidAndOversizePayloads) {
+  RuntimeUdpPeer peer;
+  EXPECT_NE(peer.MutablePayloadBuffer(0), nullptr);
+  EXPECT_NE(peer.MutablePayloadBuffer(kMaxPayloadSize), nullptr);
+  EXPECT_EQ(peer.MutablePayloadBuffer(kMaxPayloadSize + 1), nullptr);
+  EXPECT_EQ(peer.SendBufferedFrame(FrameType::kHardwareState, kFlagNone, 1, 0),
+            UdpStatus::kSocketError);
+
+  const uint16_t remote = FreeLoopbackPort();
+  ASSERT_NE(remote, 0);
+  ASSERT_EQ(peer.Open("127.0.0.1", 0, "127.0.0.1", remote), UdpStatus::kOk);
+  EXPECT_EQ(peer.next_send_sequence(), 1u);
+  EXPECT_EQ(peer.SendBufferedFrame(FrameType::kHardwareState, kFlagNone, 1,
+                                   kMaxPayloadSize + 1),
+            UdpStatus::kInvalidArgument);
+  EXPECT_EQ(peer.next_send_sequence(), 1u);
+  EXPECT_EQ(peer.stats().sent_frames, 0u);
+}
+
+// REQ-CONTRACT-01, REQ-RT-22: TryReceive records last_unsupported_version and
+// decode_failures when a frame carries an unsupported protocol version.
+TEST(RuntimeUdpTest, TryReceiveRecordsLastUnsupportedVersion) {
+  RuntimeUdpPeer receiver;
+  UdpSocketOptions unconnected;
+  unconnected.connect_peer = false;
+  ASSERT_EQ(receiver.Open("127.0.0.1", 0, "127.0.0.1", 0, unconnected),
+            UdpStatus::kOk);
+  const uint16_t rx_port = BoundPort(receiver);
+  ASSERT_NE(rx_port, 0);
+
+  const int raw_sender = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  ASSERT_GE(raw_sender, 0);
+  sockaddr_in dest{};
+  dest.sin_family = AF_INET;
+  dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dest.sin_port = htons(rx_port);
+
+  uint64_t expected_failures = 0;
+  for (const uint16_t bad_version :
+       {static_cast<uint16_t>(kProtocolVersion + 1),
+        static_cast<uint16_t>(kProtocolVersion - 1)}) {
+    SCOPED_TRACE(bad_version);
+    std::array<uint8_t, kFrameHeaderSize> wire{};
+    ASSERT_EQ(EncodeFrame(FrameType::kClockProbe, kFlagNone, 1, 100, nullptr, 0,
+                          wire.data(), wire.size()),
+              kFrameHeaderSize);
+    wire[8] = static_cast<uint8_t>(bad_version & 0xFF);
+    wire[9] = static_cast<uint8_t>(bad_version >> 8);
+    ASSERT_EQ(::sendto(raw_sender, wire.data(), wire.size(), 0,
+                       reinterpret_cast<const sockaddr*>(&dest), sizeof(dest)),
+              static_cast<ssize_t>(wire.size()));
+
+    DecodedFrame decoded;
+    EXPECT_EQ(testing::ReceiveFrame(receiver, &decoded),
+              UdpStatus::kDecodeError);
+    ++expected_failures;
+    EXPECT_EQ(receiver.stats().last_decode_status,
+              DecodeStatus::kUnsupportedVersion);
+    EXPECT_EQ(receiver.stats().last_unsupported_version, bad_version);
+    EXPECT_EQ(receiver.stats().decode_failures, expected_failures);
+    EXPECT_EQ(receiver.stats().received_frames, 0u);
+  }
+  ::close(raw_sender);
+}
+
+// REQ-RT-22: a non-blocking send that hits EAGAIN/EWOULDBLOCK returns
+// kWouldBlock, increments send_would_block, keeps next_send_sequence()
+// unchanged, and leaves last_send_error at 0.
+TEST(RuntimeUdpTest, NonBlockingSendWouldBlockPreservesSequenceAndSendError) {
+  const uint16_t remote = FreeLoopbackPort();
+  ASSERT_NE(remote, 0);
+  RuntimeUdpPeer peer;
+  ASSERT_EQ(peer.Open("127.0.0.1", 0, "127.0.0.1", remote), UdpStatus::kOk);
+
+  // Swap a filled non-blocking AF_UNIX SOCK_STREAM socketpair onto peer's fd
+  // so ::send() deterministically returns EAGAIN/EWOULDBLOCK on both Linux and
+  // macOS without depending on UDP loopback queuing quirks.
+  int sv[2] = {-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+  struct ClosePair {
+    int* fds;
+    ~ClosePair() {
+      if (fds[0] >= 0) ::close(fds[0]);
+      if (fds[1] >= 0) ::close(fds[1]);
+    }
+  } close_pair{sv};
+
+  for (const int fd : sv) {
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    ASSERT_GE(flags, 0);
+    ASSERT_EQ(::fcntl(fd, F_SETFL, flags | O_NONBLOCK), 0);
+  }
+  const int small_buf = 4096;
+  static_cast<void>(
+      ::setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small_buf, sizeof small_buf));
+  static_cast<void>(
+      ::setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &small_buf, sizeof small_buf));
+
+  std::array<uint8_t, 4096> filler{};
+  bool filled = false;
+  for (int i = 0; i < 4096; ++i) {
+    const ssize_t n = ::send(sv[0], filler.data(), filler.size(), 0);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      filled = true;
+      break;
+    }
+    ASSERT_GT(n, 0);
+  }
+  ASSERT_TRUE(filled);
+  ASSERT_EQ(::dup2(sv[0], peer.NativeFd()), peer.NativeFd());
+
+  EXPECT_EQ(peer.SendFrame(FrameType::kClockProbe, kFlagNone, 1, nullptr, 0),
+            UdpStatus::kWouldBlock);
+  EXPECT_EQ(peer.stats().send_would_block, 1u);
+  EXPECT_EQ(peer.next_send_sequence(), 1u);
+  EXPECT_EQ(peer.stats().last_send_error, 0);
+  EXPECT_EQ(peer.stats().sent_frames, 0u);
+
+  EXPECT_EQ(peer.SendBufferedFrame(FrameType::kClockProbe, kFlagNone, 2, 0),
+            UdpStatus::kWouldBlock);
+  EXPECT_EQ(peer.stats().send_would_block, 2u);
+  EXPECT_EQ(peer.next_send_sequence(), 1u);
+  EXPECT_EQ(peer.stats().last_send_error, 0);
+  EXPECT_EQ(peer.stats().sent_frames, 0u);
+
+  // Draining the peer end restores writability and sends sequence 1 cleanly.
+  std::array<uint8_t, 4096> drain{};
+  while (::recv(sv[1], drain.data(), drain.size(), 0) > 0) {
+  }
+  EXPECT_EQ(peer.SendFrame(FrameType::kClockProbe, kFlagNone, 3, nullptr, 0),
+            UdpStatus::kOk);
+  EXPECT_EQ(peer.next_send_sequence(), 2u);
+  EXPECT_EQ(peer.stats().sent_frames, 1u);
+  EXPECT_EQ(peer.stats().send_would_block, 2u);
+  EXPECT_EQ(peer.stats().last_send_error, 0);
 }
 
 }  // namespace

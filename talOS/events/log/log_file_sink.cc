@@ -131,6 +131,7 @@ void LogFileSink::open_file() noexcept {
 
 std::size_t LogFileSink::write_bytes(const void* data,
                                      std::size_t size) noexcept {
+  if (fd_ < 0) return 0;
   const auto* bytes = reinterpret_cast<const std::byte*>(data);
   std::size_t total = 0;
   while (total < size) {

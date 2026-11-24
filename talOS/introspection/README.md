@@ -26,7 +26,9 @@ Bazel's namespace (no `TALOS_SHM_NAMESPACE`), so a test run's lock files go
 with it instead of accumulating until reboot; otherwise `/dev/shm` on Linux,
 beside the segments, which a systemd `PrivateTmp=` service shares with
 everyone else, and `/tmp` on macOS. `/dev/shm` and `/tmp` are sticky and
-world-writable, so an existing lock file is opened without `O_CREAT`: Linux's
+world-writable, so an existing lock file is opened without `O_CREAT` and with
+`O_NONBLOCK`, verifying `S_ISREG` via `fstat` so a pre-existing FIFO or
+directory fails closed without blocking: Linux's
 `fs.protected_regular` refuses `O_CREAT` on another user's file there, even to root. Its creator gives it mode `0666`
 whatever its umask. A writer that locked a file something unlinked meanwhile
 (a `/tmp` cleaner) locks the file the path now names instead.
@@ -76,8 +78,8 @@ per-topic attributes. Graph lint rules are documented in
 The declaration comes from the node rather than the event loop, because the loop
 cannot know: a sender whose consumer is off-box is registered exactly like a
 sender whose consumer is the node next door. `Reporter::Options::endpoints`
-takes them keyed by topic name for the loop's own sources, and
-`ExtraSource::flags` carries one inline for a topic the node owns outside the
+takes them keyed by topic name (or scoped by manifest `source_id`) for the loop's own sources, and
+`ExtraSource::flags` carries one inline scoped to that extra source's id for a topic the node owns outside the
 loop. The same attributes appear in `--describe` output, so the declared graph
 the launcher checks and the live graph a viewer shows agree about which
 dead ends are designed.
@@ -302,8 +304,9 @@ The source records are published the other way round: they are written first and
 the count is stored with release ordering afterwards, so a reader that can see a
 count can see the records it describes.
 
-A registration releases its slot in its destructor, so a clean shutdown leaves
-no ghost row and a viewer sees the node disappear immediately. The released
+A registration releases its slot in its destructor under `RegistryLock` so a
+clean shutdown leaves no ghost row without risking overwriting a slot swept and
+reclaimed concurrently, and a viewer sees the node disappear immediately. The released
 slot keeps its last sample, sources and wake counters included, until a
 claim takes it (in the order above): the launcher reads a reaped run's final
 [wake loss](#wake-loss) there. A node that is

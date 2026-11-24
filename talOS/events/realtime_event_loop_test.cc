@@ -225,6 +225,54 @@ TEST(RealtimeEventLoop, ResamplesClockBetweenMessagesInOneDrain) {
   EXPECT_EQ(second_loop_now, second_now);
 }
 
+// A timer following a slow pre-timer message callback must sample a fresh
+// context.now after the message callback finished, never reusing the timestamp
+// taken before drain_messages() ran.
+// REQ-RT-03
+TEST(RealtimeEventLoop, ResamplesClockBetweenPreTimerMessageAndTimer) {
+  const std::string topic = "/tmtclk_" + std::to_string(::getpid());
+  RealtimeEventLoop<> loop;
+  loop.set_delivery(Delivery::BEFORE_TIMERS);
+
+  MonotonicTime message_now{};
+  MonotonicTime message_finished{};
+  MonotonicTime timer_now{};
+  MonotonicTime timer_loop_now{};
+  int messages = 0;
+  int timers = 0;
+
+  auto on_message = [&](const Context& context) {
+    ++messages;
+    message_now = context.now;
+    const MonotonicTime until = Poller::now() + 2ms;
+    while (Poller::now() < until) {
+    }
+    message_finished = Poller::now();
+  };
+  auto on_timer = [&](const Context& context) {
+    ++timers;
+    timer_now = context.now;
+    timer_loop_now = loop.monotonic_now();
+    loop.exit();
+  };
+
+  register_sensor_watcher(loop, topic, make_thunk(&on_message));
+  const auto timer_id = loop.register_timer("tick", make_thunk(&on_timer));
+  loop.arm_timer(timer_id, loop.monotonic_now(), Duration::zero());
+
+  SensorWriter writer{topic};
+  ASSERT_TRUE(writer.publish(1));
+
+  loop.run_for(kHangBound);  // Bound only; on_timer exits.
+
+  ASSERT_EQ(messages, 1);
+  ASSERT_EQ(timers, 1);
+  EXPECT_GT(message_finished, message_now);
+  EXPECT_GE(timer_now, message_finished)
+      << "timer reused stale pre-drain timestamp instead of resampling";
+  EXPECT_EQ(timer_loop_now, timer_now);
+}
+
 // A node builds its loop, then spends a while in setup (config, imports,
 // devices) before run(). Its schedule counts from the run's start, so the
 // worst lateness the loop reports is the run's own, not that setup.
@@ -279,6 +327,7 @@ TEST(RealtimeEventLoop, OverrunPeriodsCountAsTheTimersDrops) {
       (ticks[2].event_time - ticks[0].event_time).count() % kPeriod.count(), 0);
 }
 
+// REQ-RT-02
 TEST(RealtimeEventLoop, LatestBacklogDispatchesNewestWithPublicationAge) {
   const std::string topic = "/latest_" + std::to_string(::getpid());
   RealtimeEventLoop<> loop;
@@ -311,6 +360,7 @@ TEST(RealtimeEventLoop, LatestBacklogDispatchesNewestWithPublicationAge) {
   loop.run_for(100ms);
   ASSERT_EQ(observed.size(), 1u);
   EXPECT_EQ(observed.front().sequence, 129u);
+  EXPECT_EQ(observed.front().dropped, 129u);
   EXPECT_EQ(observed.front().publish_time, published);
   EXPECT_GE(observed.front().now - observed.front().publish_time, 100ms);
   EXPECT_EQ(loop.source_counters()[watcher].dropped.load(), 129u);
@@ -1431,6 +1481,7 @@ TEST(RealtimeEventLoop, DeliveryIsFixedOnceTheRunStarts) {
 // never actuate on stale state from message #64 when newer frames are already
 // in shared memory.
 // REQ-SAFE-01
+// REQ-RT-01
 // REQ-RT-04
 TEST(RealtimeEventLoop, TimerDrainsFullSequenceBacklogBeforeDispatching) {
   constexpr int kQueued = 80;  // over max_messages_per_tick (64), under ring
@@ -1689,6 +1740,270 @@ TEST(RealtimeEventLoop,
   const std::vector<std::string> expected{
       "w0", "w1", "w2", "t_early", "w0", "w2", "t_low", "w1", "w2", "t_high"};
   EXPECT_EQ(order, expected);
+}
+
+// An overrunning callback that pushes Poller::now() past run_until(end) must
+// not cause timers with deadline > end to be dispatched before run_until exits.
+TEST(RealtimeEventLoop, RunUntilDoesNotDispatchTimersPastEndAfterOverrun) {
+  RealtimeEventLoop<> loop;
+  loop.set_delivery(Delivery::BEFORE_TIMERS);
+
+  bool first_fired = false;
+  bool past_end_fired = false;
+  auto on_first = [&](const Context&) {
+    first_fired = true;
+    const MonotonicTime until = Poller::now() + 15ms;
+    while (Poller::now() < until) {
+    }
+  };
+  auto on_past_end = [&](const Context&) { past_end_fired = true; };
+
+  const auto first_id = loop.register_timer("first", make_thunk(&on_first));
+  const auto past_end_id =
+      loop.register_timer("past_end", make_thunk(&on_past_end));
+  const MonotonicTime origin = loop.monotonic_now();
+  loop.arm_timer(first_id, origin + 1ms, Duration::zero());
+  loop.arm_timer(past_end_id, origin + 10ms, Duration::zero());
+
+  loop.run_for(5ms);
+  EXPECT_TRUE(first_fired);
+  EXPECT_FALSE(past_end_fired)
+      << "timer with deadline > end fired after overrunning callback";
+}
+
+// Under Delivery::BEFORE_TIMERS (the delivery mode of callback-free control
+// nodes), the loop drains both callback-free and latest-only watchers right
+// before its timer fires, so the timer sees the newest published inputs on
+// its single drain without polling.
+// REQ-RT-01
+TEST(RealtimeEventLoop,
+     BeforeTimersDrainsCallbackFreeAndLatestWatchersBeforeTimer) {
+  const std::string pid = std::to_string(::getpid());
+  const std::string bare_topic = "/tbtb_" + pid;
+  const std::string latched_topic = "/tbtl_" + pid;
+
+  RealtimeEventLoop<> loop;
+  loop.set_delivery(Delivery::BEFORE_TIMERS);
+
+  // Callback-free watcher (implicit latest_only = true).
+  const auto bare_id = register_sensor_watcher(loop, bare_topic);
+
+  std::optional<std::int32_t> latched_value;
+  auto on_latched = [&](const Context&, std::span<const std::byte> bytes) {
+    ASSERT_EQ(bytes.size(), sizeof(EventsTest::SensorMessage));
+    EventsTest::SensorMessage msg{};
+    std::memcpy(&msg, bytes.data(), sizeof(msg));
+    latched_value = msg.sensor_id();
+  };
+  const auto latched_id = loop.register_watcher(
+      latched_topic, sizeof(EventsTest::SensorMessage),
+      alignof(EventsTest::SensorMessage),
+      talos::schema::Of<EventsTest::SensorMessage>(), make_thunk(&on_latched),
+      /*latest_only=*/true);
+
+  std::uint64_t bare_events_at_timer = 0;
+  std::uint64_t bare_seq_at_timer = 0;
+  std::uint64_t bare_dropped_at_timer = 0;
+  std::optional<std::int32_t> latched_at_timer;
+  auto on_timer = [&](const Context&) {
+    bare_events_at_timer = loop.source_counters()[bare_id].events.load();
+    bare_seq_at_timer = loop.source_counters()[bare_id].sequence.load();
+    bare_dropped_at_timer = loop.source_counters()[bare_id].dropped.load();
+    latched_at_timer = latched_value;
+    loop.exit();
+  };
+  const auto timer_id = loop.register_timer("tick", make_thunk(&on_timer));
+  loop.arm_timer(timer_id, loop.monotonic_now() + 2ms, Duration::zero());
+
+  SensorWriter bare_writer{bare_topic};
+  SensorWriter latched_writer{latched_topic};
+  ASSERT_TRUE(bare_writer.publish(10));
+  ASSERT_TRUE(bare_writer.publish(11));
+  ASSERT_TRUE(latched_writer.publish(20));
+  ASSERT_TRUE(latched_writer.publish(21));
+
+  loop.run_for(kHangBound);  // Bound only; on_timer exits.
+
+  EXPECT_EQ(loop.activity().drains, 1u);
+  EXPECT_EQ(bare_events_at_timer, 1u);
+  EXPECT_EQ(bare_seq_at_timer, 1u);
+  EXPECT_EQ(bare_dropped_at_timer, 1u);
+  ASSERT_TRUE(latched_at_timer.has_value());
+  EXPECT_EQ(*latched_at_timer, 21);
+  EXPECT_EQ(loop.source_counters()[latched_id].dropped.load(), 1u);
+}
+
+// Under Delivery::ON_PUBLISH, a new writer taking over a prompt topic wakes a
+// sleeping loop to drain even before publishing any message, without waiting
+// for the wake backstop.
+// REQ-RT-02
+TEST(RealtimeEventLoop, OnPublishWakesWhenAWriterTakesOverAPromptTopic) {
+  const std::string pid = std::to_string(::getpid());
+  const std::string prompt_topic = "/twkp_" + pid;
+  const std::string quiet_topic = "/twkq_" + pid;
+
+  RealtimeEventLoop<> loop{on_publish()};
+  loop.set_prompt(register_sensor_watcher(loop, prompt_topic));
+
+  bool woken_by_takeover = false;
+  auto on_quiet = [&](const Context&) {
+    woken_by_takeover = true;
+    loop.exit();
+  };
+  register_sensor_watcher(loop, quiet_topic, make_thunk(&on_quiet));
+
+  // First writer claims and releases the prompt topic cleanly, publishing
+  // nothing. A waiting message on the quiet topic observes the takeover drain.
+  { SensorWriter initial_writer{prompt_topic}; }
+  SensorWriter quiet_writer{quiet_topic};
+  ASSERT_TRUE(quiet_writer.publish(1));
+
+  SharedMemoryPtr mapping{prompt_topic, sizeof(RTMSHeader)};
+  const auto* header = static_cast<const RTMSHeader*>(mapping.ptr());
+  ASSERT_NE(header, nullptr);
+
+  std::thread taker{[&] {
+    if (!await([&] {
+          return header->writer.waiters.load(std::memory_order_acquire) != 0;
+        })) {
+      return;
+    }
+    // Constructing a publisher claims the writer slot and calls
+    // wake_all_readers() without writing any message.
+    SensorWriter takeover{prompt_topic};
+    (void)takeover;
+  }};
+
+  const MonotonicTime start = Poller::now();
+  loop.run_for(kHangBound);  // Bound only; on_quiet exits on takeover drain.
+  const Duration elapsed = Poller::now() - start;
+  taker.join();
+
+  EXPECT_TRUE(woken_by_takeover)
+      << "writer takeover did not wake the sleeping ON_PUBLISH loop";
+  EXPECT_EQ(loop.activity().drains, 1u);
+  EXPECT_EQ(loop.activity().wakeups, 1u);
+  EXPECT_LT(elapsed, Duration{5s});
+}
+
+// A timer that becomes due during consecutive post-timer backlog_ drains runs
+// between drains instead of being starved by an unbounded backlog loop.
+// REQ-RT-02
+TEST(RealtimeEventLoop, DueTimerRunsBetweenConsecutivePostTimerBacklogDrains) {
+  constexpr std::size_t kSlots = 32;
+  constexpr std::size_t kCap = 8;
+  constexpr std::size_t kMaxPasses = (kSlots - 1) / kCap + 2;  // 5 passes
+  // Drain 1 (woken): 8 msgs; Drain 2 (first backlog_ drain): 8 msgs (arms
+  // due timer); Timer pre-timer drain: kMaxPasses * kCap (40 msgs); then the
+  // timer must run before continuing to drain remaining backlog messages.
+  constexpr std::size_t kExpectedAtTimer = 2 * kCap + kMaxPasses * kCap;
+  constexpr std::size_t kSafetyCap = kExpectedAtTimer + 64;
+
+  const std::string pid = std::to_string(::getpid());
+  const std::string wake_topic = "/tbtbw_" + pid;
+  const std::string quiet_topic = "/tbtbq_" + pid;
+
+  RealtimeEventLoop<>::Options options = on_publish();
+  options.slots = kSlots;
+  options.max_messages_per_tick = kCap;
+
+  RealtimeEventLoop<> loop{options};
+  std::optional<RTMSQueue> quiet_pub;
+  std::uint16_t timer_id = 0;
+
+  bool timer_fired = false;
+  std::size_t delivered = 0;
+  std::size_t delivered_at_timer = 0;
+  std::uint64_t drains_at_timer = 0;
+  std::uint64_t drains_at_end = 0;
+
+  auto on_quiet = [&](const Context& context) {
+    ++delivered;
+    // Arm the timer on the first message of the first post-wake backlog_
+    // drain (drain #2) so it is already due before drain #3 would start.
+    if (delivered == kCap + 1) {
+      loop.arm_timer(timer_id, context.now, Duration::zero());
+    }
+    if (!timer_fired && delivered < kSafetyCap) {
+      const EventsTest::SensorMessage next{static_cast<std::int32_t>(delivered),
+                                           0.0F, 0.0F};
+      ASSERT_EQ(quiet_pub->write(std::as_bytes(
+                    std::span<const EventsTest::SensorMessage, 1>{&next, 1})),
+                WriteResult::SUCCESS);
+    }
+    if (timer_fired && delivered > delivered_at_timer) {
+      drains_at_end = loop.activity().drains;
+      loop.exit();
+    }
+  };
+  auto on_timer = [&](const Context&) {
+    timer_fired = true;
+    delivered_at_timer = delivered;
+    drains_at_timer = loop.activity().drains;
+  };
+
+  loop.set_prompt(register_sensor_watcher(loop, wake_topic));
+  register_sensor_watcher(loop, quiet_topic, make_thunk(&on_quiet));
+  timer_id = loop.register_timer("due_mid_backlog", make_thunk(&on_timer));
+
+  quiet_pub.emplace(quiet_topic, sizeof(EventsTest::SensorMessage),
+                    alignof(EventsTest::SensorMessage),
+                    talos::schema::Of<EventsTest::SensorMessage>(), kSlots,
+                    RTMSOptions{.publisher = true});
+  // Seed enough quiet messages to fill drain #1 and drain #2 (each capped at
+  // kCap), plus one more so drain #2 leaves backlog_ = true.
+  for (std::size_t i = 0; i < 2 * kCap + 1; ++i) {
+    const EventsTest::SensorMessage seed{static_cast<std::int32_t>(i), 0.0F,
+                                         0.0F};
+    ASSERT_EQ(quiet_pub->write(std::as_bytes(
+                  std::span<const EventsTest::SensorMessage, 1>{&seed, 1})),
+              WriteResult::SUCCESS);
+  }
+  RTMSQueue wake_pub{wake_topic,
+                     sizeof(EventsTest::SensorMessage),
+                     alignof(EventsTest::SensorMessage),
+                     talos::schema::Of<EventsTest::SensorMessage>(),
+                     kSlots,
+                     RTMSOptions{.publisher = true}};
+  const EventsTest::SensorMessage trigger{0, 0.0F, 0.0F};
+  ASSERT_EQ(wake_pub.write(std::as_bytes(
+                std::span<const EventsTest::SensorMessage, 1>{&trigger, 1})),
+            WriteResult::SUCCESS);
+
+  loop.run_for(kHangBound);  // Bound only; exits right after timer + next msg.
+
+  EXPECT_TRUE(timer_fired);
+  EXPECT_EQ(delivered_at_timer, kExpectedAtTimer)
+      << "due timer was starved across consecutive backlog_ drains";
+  EXPECT_EQ(drains_at_timer, 2u + kMaxPasses);
+  EXPECT_GT(drains_at_end, drains_at_timer);
+  EXPECT_EQ(loop.activity().wakeups, 0u);
+}
+
+// Calling run/run_for/run_until from a second thread while the loop is blocked
+// in wait_until() (not inside any callback) must be rejected by RunScope
+// without disturbing the running loop's in_run_ guard.
+// REQ-RT-04
+TEST(RealtimeEventLoop, ConcurrentRunFromAnotherThreadThrowsWhileBlocked) {
+  RealtimeEventLoop<> loop;
+  loop.set_delivery(Delivery::BEFORE_TIMERS);
+  const auto timer_id = loop.register_timer("idle", Thunk{});
+
+  std::thread runner{[&] { loop.run_for(kHangBound); }};
+  ASSERT_TRUE(await([&] { return loop.running(); }))
+      << "loop never entered run";
+
+  EXPECT_THROW(loop.run(), std::logic_error);
+  EXPECT_THROW(loop.run_for(1ms), std::logic_error);
+  EXPECT_THROW(loop.run_until(Poller::now() + 1ms), std::logic_error);
+  // Rejected concurrent run must leave in_run_ active so cross-thread timer
+  // mutations are still refused.
+  EXPECT_THROW(loop.arm_timer(timer_id, Poller::now() + 1ms, 1ms),
+               std::logic_error);
+  EXPECT_THROW(loop.disarm_timer(timer_id), std::logic_error);
+
+  loop.exit();
+  runner.join();
 }
 
 }  // namespace

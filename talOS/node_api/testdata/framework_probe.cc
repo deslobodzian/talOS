@@ -14,7 +14,17 @@ namespace {
 // Its update() is C++, which cpp_node_test's describe case reads back.
 struct Probe {
   explicit Probe(talos::Node&) {}
-  void update() {}
+  void update() { ++ticks; }
+  int ticks = 0;
+};
+
+// Always fails construction with a specific parameter diagnostic so
+// cpp_node_test can verify HostCppNode propagates e.what() via
+// talos_last_error.
+struct FailingProbe {
+  explicit FailingProbe(talos::Node& node) {
+    (void)node.param<double>("required_gain");
+  }
 };
 
 // A pointer to a non-virtual member function under the Itanium C++ ABI
@@ -27,6 +37,7 @@ struct MemberFunction {
 }  // namespace
 
 TALOS_EXPORT_NODE(probe, Probe)
+TALOS_EXPORT_NODE(failing_probe, FailingProbe)
 
 // The node and devices functions this library calls, as resolved from it.
 extern "C" const void* talos_probe_node_function() {

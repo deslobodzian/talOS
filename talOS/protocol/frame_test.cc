@@ -90,6 +90,30 @@ TEST(FrameTest, EncodesInPlaceAroundThePayloadAndZeroesReserved) {
   EXPECT_DOUBLE_EQ(decoded_value, 4.75);
 }
 
+// REQ-CONTRACT-01: EncodeFrameInPlace must reject null output buffers,
+// payloads larger than kMaxPayloadSize, and capacities shorter than header +
+// payload without writing past the buffer.
+TEST(FrameTest, EncodeFrameInPlaceRejectsInvalidArguments) {
+  std::array<uint8_t, kMaxFrameSize + 16> frame{};
+  frame.fill(0xCC);
+
+  EXPECT_EQ(EncodeFrameInPlace(FrameType::kHardwareState, kFlagNone, 1, 2,
+                               kMaxPayloadSize + 1, frame.data(), frame.size()),
+            0u);
+  EXPECT_EQ(EncodeFrameInPlace(FrameType::kHardwareState, kFlagNone, 1, 2, 0,
+                               nullptr, kMaxFrameSize),
+            0u);
+  EXPECT_EQ(EncodeFrameInPlace(FrameType::kHardwareState, kFlagNone, 1, 2, 0,
+                               frame.data(), kFrameHeaderSize - 1),
+            0u);
+  EXPECT_EQ(EncodeFrameInPlace(FrameType::kHardwareState, kFlagNone, 1, 2, 16,
+                               frame.data(), kFrameHeaderSize + 15),
+            0u);
+  for (const uint8_t byte : frame) {
+    EXPECT_EQ(byte, 0xCCu);
+  }
+}
+
 // REQ-CONTRACT-01
 TEST(FrameTest, RejectsInvalidHeaderVersionMagicAndSize) {
   std::array<uint8_t, kMaxFrameSize> valid{};

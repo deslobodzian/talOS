@@ -100,16 +100,19 @@ def _max_age_ns(max_age):
         ns = ((max_age.days * 86400 + max_age.seconds) * 1_000_000
               + max_age.microseconds) * 1000
         return None if ns < 0 else min(ns, _INT64_MAX)
+    if isinstance(max_age, bool) or not isinstance(max_age, (int, float)):
+        raise TypeError(
+            f"max_age must be a number, timedelta, or None, got "
+            f"{type(max_age).__name__}")
     if isinstance(max_age, int):
         if max_age < 0:
             return None
         return min(max_age * 1_000_000_000, _INT64_MAX)
-    seconds = float(max_age)
-    if math.isnan(seconds) or seconds < 0:
+    if math.isnan(max_age) or max_age < 0:
         return None
-    if math.isinf(seconds) or seconds >= _INT64_MAX / 1e9:
+    if math.isinf(max_age) or max_age >= _INT64_MAX / 1e9:
         return _INT64_MAX
-    return min(round(seconds * 1e9), _INT64_MAX)
+    return min(round(max_age * 1e9), _INT64_MAX)
 
 
 class HardwareLink(_OnNode):

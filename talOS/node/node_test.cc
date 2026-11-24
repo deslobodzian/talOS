@@ -23,10 +23,12 @@
 #include "node_test/node_test_message_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/configuration/config_parser.h"
+#include "talOS/events/log/log_writer.h"
 #include "talOS/events/realtime_event_loop.h"
 #include "talOS/events/simulated_event_loop.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/memory/shared_memory_ptr.h"
+#include "talOS/node/allocation_probe.h"
 #include "talOS/node/internal.h"
 #include "talOS/node/testing.h"
 #include "talOS/process/process.h"
@@ -531,10 +533,10 @@ TEST(Sim, RemoveAndMidRunAddRejectMissingDuplicateAndReentrantCalls) {
   // the Sim usable once step() unwinds.
   node.on_update = [&] { sim.remove("listener"); };
   EXPECT_THROW(sim.step(5ms), std::logic_error);
-  // Throwing inside Round(5ms) left sim.now() at 0 while the node's periodic
-  // timer already advanced to 10 ms, so step 10 ms to reach the next tick.
+  // Throwing inside Round(5ms) advanced sim.now() to 5 ms; the next tick is at
+  // 10 ms.
   node.on_update = [&] { sim.add<Empty>("talker"); };
-  EXPECT_THROW(sim.step(10ms), std::logic_error);
+  EXPECT_THROW(sim.step(5ms), std::logic_error);
   node.on_update = nullptr;
 
   node.on_wake = [&] { sim.remove("listener"); };
@@ -1416,8 +1418,13 @@ struct LateSubscriber {
 TEST(Node, RegistrationOutsideTheConstructorThrows) {
   auto sim = Sim::FromToml(kRobotToml);
   sim.add<LateSubscriber>("listener");
+  // Calling every() after NodeAccess::start() and before the loop's first
+  // run() must throw std::logic_error instead of mutating timers after start()
+  // already computed Delivery.
+  EXPECT_THROW(sim.node("listener").every(5ms, [] {}), std::logic_error);
   EXPECT_THROW(sim.step(10ms), std::logic_error);
   EXPECT_THROW(sim.node("listener").after_update([] {}), std::logic_error);
+  EXPECT_THROW(sim.node("listener").every(5ms, [] {}), std::logic_error);
 }
 
 // --- byte topics -----------------------------------------------------------
@@ -1652,9 +1659,10 @@ TEST(BytePublisher, ClaimsItsRtmsTopicWhenRegisteredAndDropsNewestWhenFull) {
   ::shm_unlink(ShmObjectName(topic).c_str());
 }
 
-// REQ-SAFE-27: NodeDetail::publisher_send (the public-API thunk backing
-// Publisher<M>::send) refuses to write into a hardware request slot registered
-// via NodeAccess::add_hardware_request; only NodeAccess::publisher_send may.
+// REQ-SAFE-27, REQ-SAFE-09, REQ-SAFE-14: NodeDetail::publisher_send (the
+// public-API thunk backing Publisher<M>::send and talos_publisher_send) refuses
+// to write into a hardware request slot or a TargetLane slot; only
+// NodeAccess::publisher_send may.
 TEST(NodeDetail, RefusesPublisherSendOnHardwareRequestSlot) {
   const std::string config_path = Runfile("TALOS_TEST_CONFIG");
   const auto robot_config = std::make_shared<const config::RobotConfig>(
@@ -1670,6 +1678,9 @@ TEST(NodeDetail, RefusesPublisherSendOnHardwareRequestSlot) {
   });
   const std::size_t hw_slot = detail::NodeAccess::add_hardware_request(
       *node, sizeof(Count), kMessageAlignment, schema::Of<Count>());
+  const std::size_t lane_slot = detail::NodeAccess::add_target_lane_publisher(
+      *node, "/arm/target/teleop", sizeof(Count), kMessageAlignment,
+      schema::Of<Count>(), /*operator_arming=*/true);
   const std::size_t normal_slot = detail::NodeDetail::add_publisher(
       *node, "/test_node/state", sizeof(Count), kMessageAlignment,
       schema::Of<Count>());
@@ -1679,8 +1690,13 @@ TEST(NodeDetail, RefusesPublisherSendOnHardwareRequestSlot) {
   EXPECT_THROW(
       detail::NodeDetail::publisher_send(*node, hw_slot, &msg, sizeof(msg)),
       std::logic_error);
+  EXPECT_THROW(
+      detail::NodeDetail::publisher_send(*node, lane_slot, &msg, sizeof(msg)),
+      std::logic_error);
   EXPECT_TRUE(
       detail::NodeAccess::publisher_send(*node, hw_slot, &msg, sizeof(msg)));
+  EXPECT_TRUE(
+      detail::NodeAccess::publisher_send(*node, lane_slot, &msg, sizeof(msg)));
   EXPECT_TRUE(detail::NodeDetail::publisher_send(*node, normal_slot, &msg,
                                                  sizeof(msg)));
 }
@@ -2002,6 +2018,70 @@ period_us = 10000000000000000
                std::invalid_argument);
 }
 
+// REQ-RT-05: Sim::resume() guards overdue callbacks against re-entrant Sim
+// mutation (preventing UAF) and settles prompt subscribers at sim.now() before
+// returning; Sim::Impl::Round() updates sim.now() before running node
+// dispatches so callbacks observe sim.now() == node.now().
+TEST(Sim, ResumeGuardsReentrancySettlesAndRoundUpdatesNowBeforeCallbacks) {
+  struct PromptReceiver {
+    explicit PromptReceiver(Node& n)
+        : node{n},
+          in{n.subscribe<Count>("/talker/state", [this](const Count& c) {
+            heard.emplace_back(c.tick_count(), node.now());
+          })} {}
+    Node& node;
+    Subscription<Count> in;
+    std::vector<std::pair<std::int64_t, Time>> heard;
+  };
+  struct PausablePublisher {
+    explicit PausablePublisher(Node& n)
+        : node{n}, out{n.publish<Count>("/talker/state")} {}
+    void update() {
+      if (sim != nullptr) {
+        sim_now_seen.push_back(sim->now());
+        node_now_seen.push_back(node.now());
+        if (check_reentrant) {
+          check_reentrant = false;
+          EXPECT_THROW(sim->remove("talker"), std::logic_error);
+          EXPECT_THROW(sim->step(1ms), std::logic_error);
+        }
+      }
+      out.send(
+          Count{static_cast<std::int64_t>(node.tick()), node.now().nanos()});
+    }
+    Node& node;
+    Publisher<Count> out;
+    Sim* sim = nullptr;
+    bool check_reentrant = false;
+    std::vector<Time> sim_now_seen;
+    std::vector<Time> node_now_seen;
+  };
+
+  auto sim = Sim::FromToml(kRobotToml);
+  // Add receiver BEFORE talker so settling requires an extra round at now().
+  auto& receiver = sim.add<PromptReceiver>("listener");
+  auto& talker = sim.add<PausablePublisher>("talker");  // 10 ms period
+  talker.sim = &sim;
+
+  sim.step(10ms);
+  ASSERT_EQ(talker.sim_now_seen.size(), 1u);
+  EXPECT_EQ(talker.sim_now_seen[0], talker.node_now_seen[0]);
+  EXPECT_EQ(talker.sim_now_seen[0], Time{} + 10ms);
+  ASSERT_EQ(receiver.heard.size(), 1u);
+
+  sim.pause("talker", 100ms);
+  sim.step(25ms);  // now = 35 ms; talker's 20 ms tick is overdue
+  EXPECT_EQ(receiver.heard.size(), 1u);
+
+  talker.check_reentrant = true;
+  sim.resume("talker");
+  EXPECT_FALSE(talker.check_reentrant);
+  // Settle() must have woken receiver at 35 ms during resume(), without
+  // needing another sim.step().
+  ASSERT_EQ(receiver.heard.size(), 2u);
+  EXPECT_EQ(receiver.heard.back().second, Time{} + 35ms);
+}
+
 // REQ-RT-02: a late Wake::kOnPublish callback subscription after start() fails
 // atomically without leaking a watcher onto the event loop.
 TEST(Node, LateOnPublishSubscribeFailsAtomicallyWithoutLeakingWatcher) {
@@ -2047,6 +2127,123 @@ TEST(Node, RunMainRejectsNullArgvAndMalformedNumericFlags) {
        }) {
     EXPECT_EQ(run_with(bad), 1) << bad.back();
   }
+}
+
+// REQ-RT-06: a C++ Node running on the real RealtimeEventLoop<LogWriter> +
+// RTMSQueue path allocates nothing on the loop thread in steady state across
+// update(), every(), latest-only + Wake::kAtDrain subscriptions,
+// Publisher::send(), record_read(), StateMachine::go(), and post-start param().
+TEST(Node, RealtimeLoopWithLogWriterAllocatesNothingInSteadyState) {
+  if (const auto why = testing::AllocationProbe::Unsupported(); !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  const std::string pid = std::to_string(::getpid());
+  const std::string latest_topic = "/t/rt06l_" + pid;
+  const std::string seq_topic = "/t/rt06s_" + pid;
+  const std::string out_topic = "/t/rt06o_" + pid;
+  const std::string log_path =
+      ::testing::TempDir() + "/node_rt06_" + pid + ".tlog";
+  struct Cleanup {
+    std::vector<std::string> topics;
+    std::string log;
+    ~Cleanup() {
+      for (const std::string& t : topics) {
+        ::shm_unlink(ShmObjectName(t).c_str());
+      }
+      ::unlink(log.c_str());
+    }
+  } cleanup{{latest_topic, seq_topic, out_topic}, log_path};
+
+  constexpr const char* kRt06Toml = R"(
+[robot]
+period_us = 1000
+command_timeout_us = 100000
+
+[subsystems.rt_zero]
+period_us = 1000
+gain = 2.5
+
+[subsystems.mechanism.motors.unused]
+can_id = 1
+)";
+  Sim config_holder = Sim::FromToml(kRt06Toml);
+  const std::string& config_path =
+      detail::SimAccess::config_path(config_holder);
+  const auto robot_config = std::make_shared<const config::RobotConfig>(
+      config::ParseRobotConfig(config_path));
+
+  using Loop = event::RealtimeEventLoop<event::log::LogWriter>;
+  event::log::LogWriterOptions log_options;
+  log_options.background = true;
+  Loop loop{event::log::LogWriter{log_path, "rt_zero", log_options}};
+  detail::LoopPortFor<Loop> port{loop};
+  auto node = detail::NodeAccess::create(detail::NodeSetup{
+      .name = "rt_zero",
+      .config_path = config_path,
+      .config = robot_config,
+      .loop = &port,
+  });
+
+  Subscription<Count> latest = node->subscribe<Count>(latest_topic);
+  int seq_callbacks = 0;
+  Subscription<Count> seq = node->subscribe<Count>(
+      seq_topic, [&](const Count&) { ++seq_callbacks; }, Wake::kAtDrain);
+  Publisher<Count> out = node->publish<Count>(out_topic);
+  StateMachine<Phase> sm{*node, Phase::kA};
+
+  int every_ticks = 0;
+  node->every(2ms, [&] { ++every_ticks; });
+
+  RTMSQueue latest_pub{latest_topic,      sizeof(Count),
+                       kMessageAlignment, schema::Of<Count>(),
+                       MAX_SLOTS,         RTMSOptions{.publisher = true}};
+  RTMSQueue seq_pub{seq_topic,         sizeof(Count),
+                    kMessageAlignment, schema::Of<Count>(),
+                    MAX_SLOTS,         RTMSOptions{.publisher = true}};
+
+  testing::AllocationProbe probe;
+  std::uint64_t steady_allocations = 0;
+  int steady_ticks = 0;
+  double param_sum = 0.0;
+  constexpr int kWarmupTicks = 5;
+  constexpr int kMeasuredTicks = 15;
+
+  detail::NodeAccess::set_update(*node, [&] {
+    const int tick = static_cast<int>(node->tick());
+    if (tick == kWarmupTicks) {
+      probe.start();
+    }
+    const Count in_msg{tick, node->now().nanos()};
+    (void)latest_pub.write(
+        std::as_bytes(std::span<const Count, 1>{&in_msg, 1}));
+    (void)seq_pub.write(std::as_bytes(std::span<const Count, 1>{&in_msg, 1}));
+
+    if (latest.has_value()) {
+      detail::NodeAccess::record_read(*node, 0);
+    }
+    sm.go((tick % 2 == 0) ? Phase::kB : Phase::kC);
+    param_sum += node->param<double>("gain", 0.0);
+    (void)out.send(
+        Count{latest->tick_count() + seq->tick_count(), node->now().nanos()});
+
+    if (tick >= kWarmupTicks) {
+      ++steady_ticks;
+    }
+    if (tick == kWarmupTicks + kMeasuredTicks - 1) {
+      steady_allocations = probe.stop();
+      loop.exit();
+    }
+  });
+  detail::NodeAccess::start(*node);
+  ASSERT_EQ(loop.delivery(), event::Delivery::BEFORE_TIMERS);
+
+  loop.run_for(10s);
+  EXPECT_EQ(steady_ticks, kMeasuredTicks);
+  EXPECT_GT(every_ticks, 0);
+  EXPECT_GT(seq_callbacks, 0);
+  EXPECT_GT(param_sum, 0.0);
+  EXPECT_EQ(steady_allocations, 0u) << probe.sites();
+  EXPECT_FALSE(loop.recorder().failed()) << loop.recorder().error();
 }
 
 }  // namespace

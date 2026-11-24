@@ -338,6 +338,11 @@ inline std::string DeclaredGraphToJson(const DeclaredGraph& graph) {
 struct EndpointAttribute {
   std::string_view topic;
   std::uint32_t flags{0};
+  // When set, applies only to the manifest registration with this source id
+  // rather than every source sharing `topic`. Leaves topic-keyed callers
+  // (nullopt) unchanged while preventing flag smearing across distinct
+  // endpoints on the same topic.
+  std::optional<std::uint32_t> source_id{std::nullopt};
 };
 
 // What only `loop` knows about its own sources, indexed by source id:
@@ -364,7 +369,11 @@ inline Description DescribeManifest(
   for (const auto& registration : manifest) {
     std::uint32_t flags = 0;
     for (const auto& attribute : attributes) {
-      if (attribute.topic == registration.name) flags |= attribute.flags;
+      if (attribute.source_id.has_value()) {
+        if (*attribute.source_id == registration.id) flags |= attribute.flags;
+      } else if (attribute.topic == registration.name) {
+        flags |= attribute.flags;
+      }
     }
     if (registration.id < source_flags.size()) {
       flags |= source_flags[registration.id];
@@ -454,12 +463,12 @@ class DescribeReader {
     // braces is what makes a missing field a missing field. The objects have no
     // nested braces by construction, which is why finding the next '}' is
     // enough.
-    const std::size_t array_begin = text.find('[', at);
+    const std::size_t array_begin = FindOutsideString(text, at, '[');
     if (array_begin == std::string_view::npos) {
       error = "sources is not an array";
       return false;
     }
-    const std::size_t array_end = text.find(']', array_begin);
+    const std::size_t array_end = FindOutsideString(text, array_begin + 1, ']');
     if (array_end == std::string_view::npos) {
       error = "sources array is not terminated";
       return false;
@@ -467,10 +476,10 @@ class DescribeReader {
 
     std::size_t cursor = array_begin + 1;
     for (;;) {
-      const std::size_t open = text.find('{', cursor);
-      if (open == std::string_view::npos || open > array_end) break;
-      const std::size_t close = text.find('}', open);
-      if (close == std::string_view::npos || close > array_end) {
+      const std::size_t open = FindOutsideString(text, cursor, '{');
+      if (open == std::string_view::npos || open >= array_end) break;
+      const std::size_t close = FindOutsideString(text, open + 1, '}');
+      if (close == std::string_view::npos || close >= array_end) {
         error = "source object is not terminated";
         return false;
       }
@@ -606,9 +615,18 @@ class DescribeReader {
       out.push_back(std::move(description));
       begin = next;
     }
-    if (out.empty() && text.find('[') == std::string_view::npos) {
-      error = "not a declared graph (no JSON array)";
-      return false;
+    if (out.empty()) {
+      std::size_t at = 0;
+      if (!Expect(text, at, '[') || !Expect(text, at, ']')) {
+        error = "not a declared graph (expected a JSON array of descriptions)";
+        return false;
+      }
+      SkipSpace(text, at);
+      if (at != text.size()) {
+        error =
+            "not a declared graph (unexpected content after empty JSON array)";
+        return false;
+      }
     }
     return true;
   }
@@ -700,13 +718,92 @@ class DescribeReader {
     return false;
   }
 
+  static int HexDigit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  }
+
+  // Finds the next occurrence of `target` in `text` at or after `from` outside
+  // any double-quoted JSON string literal (respecting `\` escapes). Returns
+  // npos on an unterminated string or if `target` is absent.
+  static std::size_t FindOutsideString(std::string_view text, std::size_t from,
+                                       char target) {
+    bool in_string = false;
+    for (std::size_t i = from; i < text.size(); ++i) {
+      const char c = text[i];
+      if (in_string) {
+        if (c == '\\') {
+          if (i + 1 >= text.size()) return std::string_view::npos;
+          ++i;
+        } else if (c == '"') {
+          in_string = false;
+        }
+        continue;
+      }
+      if (c == '"') {
+        in_string = true;
+      } else if (c == target) {
+        return i;
+      }
+    }
+    return std::string_view::npos;
+  }
+
   static bool String(std::string_view text, std::size_t& at, std::string& out) {
     if (at >= text.size() || text[at] != '"') return false;
     out.clear();
     std::size_t cursor = at + 1;
     while (cursor < text.size() && text[cursor] != '"') {
-      if (text[cursor] == '\\' && cursor + 1 < text.size()) ++cursor;
-      out += text[cursor++];
+      if (text[cursor] != '\\') {
+        out += text[cursor++];
+        continue;
+      }
+      ++cursor;
+      if (cursor >= text.size()) return false;
+      const char esc = text[cursor];
+      switch (esc) {
+        case '"':
+        case '\\':
+        case '/':
+          out += esc;
+          ++cursor;
+          break;
+        case 'b':
+          out += '\b';
+          ++cursor;
+          break;
+        case 'f':
+          out += '\f';
+          ++cursor;
+          break;
+        case 'n':
+          out += '\n';
+          ++cursor;
+          break;
+        case 'r':
+          out += '\r';
+          ++cursor;
+          break;
+        case 't':
+          out += '\t';
+          ++cursor;
+          break;
+        case 'u': {
+          if (cursor + 4 >= text.size()) return false;
+          const int h0 = HexDigit(text[cursor + 1]);
+          const int h1 = HexDigit(text[cursor + 2]);
+          const int h2 = HexDigit(text[cursor + 3]);
+          const int h3 = HexDigit(text[cursor + 4]);
+          if (h0 != 0 || h1 != 0 || h2 < 0 || h3 < 0) return false;
+          out += static_cast<char>((h2 << 4) | h3);
+          cursor += 5;
+          break;
+        }
+        default:
+          return false;
+      }
     }
     if (cursor >= text.size()) return false;
     at = cursor + 1;

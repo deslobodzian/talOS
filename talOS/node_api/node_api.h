@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 39u
+#define TALOS_NODE_ABI_VERSION 40u
 
 enum {
   TALOS_OK = 0,
@@ -501,6 +501,9 @@ int32_t talos_position_mechanism_hold(TalosNode* node, int64_t index,
 int32_t talos_position_mechanism_stop(TalosNode* node, int64_t index);
 int32_t talos_position_mechanism_update(TalosNode* node, int64_t index);
 int32_t talos_position_mechanism_clear_fault(TalosNode* node, int64_t index);
+// PositionMechanism::homed() live (queries the motor's current zero state even
+// before update() runs on a post-reset tick): 1 homed, 0 unhomed, TALOS_ERR.
+int32_t talos_position_mechanism_homed(TalosNode* node, int64_t index);
 int32_t talos_position_mechanism_state(TalosNode* node, int64_t index,
                                        TalosPositionMechanismState* out,
                                        void* message, uint32_t message_size);
