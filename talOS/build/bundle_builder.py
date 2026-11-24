@@ -527,21 +527,33 @@ def check_nodes(spec, resolved, canonical_to_apparent=None):
             [f"  in nodes but not launched: {label}" for label in extra]))
 
 
+def _is_safe_basename(name):
+    """True when `name` is a single safe path component (non-empty, no
+    separators or NUL, not '.' or '..')."""
+    return (isinstance(name, str) and bool(name) and "/" not in name
+            and "\\" not in name and os.sep not in name
+            and (os.altsep is None or os.altsep not in name)
+            and "\x00" not in name and name not in (os.curdir, os.pardir))
+
+
 def check_node_names(spec):
-    """Exits when any bundled node's name is empty, escapes `bin/`, or
-    duplicates another bundled node's name."""
+    """Exits when any bundled node's name or shared library name is empty,
+    escapes `bin/`/`lib/`, or when two bundled nodes share a name."""
     seen = {}
     for node in spec.get("nodes", []):
         name = node.get("name", "")
         label = node.get("label") or node.get("target") or "<unknown>"
-        if (not isinstance(name, str) or not name or "/" in name
-                or "\\" in name or os.sep in name or "\x00" in name
-                or name in (os.curdir, os.pardir)):
+        if not _is_safe_basename(name):
             sys.exit(f"bundle: invalid node name {name!r} for {label}")
         if name in seen:
             sys.exit(f"bundle: duplicate node name {name!r} "
                      f"({seen[name]} and {label})")
         seen[name] = label
+        for lib in node.get("shared_libs", []):
+            lib_name = lib.get("name", "")
+            if not _is_safe_basename(lib_name):
+                sys.exit(f"bundle: node '{name}': invalid shared library "
+                         f"name {lib_name!r}")
 
 
 def check_studio(spec, resolved, canonical_to_apparent=None):
@@ -677,6 +689,8 @@ def main():
     # ../lib from bin/). One file per name; two nodes may carry the same
     # library, but never two different libraries under one name.
     lib_dir = os.path.join(out_dir, "lib")
+    bin_root = bin_dir + os.sep
+    lib_root = lib_dir + os.sep
     staged_libs = {}
     # python/: each Python runtime file (and unresolved runtime symlink), with
     # its source/target and the first node that carried it, and the
@@ -690,7 +704,9 @@ def main():
         lang = node["language"]
         src_path = node["src_path"]
         bin_rel = f"bin/{name}"
-        bin_dest = os.path.join(out_dir, bin_rel)
+        bin_dest = os.path.normpath(os.path.join(bin_dir, name))
+        if not bin_dest.startswith(bin_root):
+            sys.exit(f"bundle: node '{name}': binary path escapes bin/")
         safe_copy(src_path, bin_dest)
         make_executable(bin_dest)
 
@@ -703,10 +719,12 @@ def main():
         # library are most of a bundle's bytes); the link's script execs it
         # there, and the interpreter finds its library beside it as before.
         rf_entries = node.get("runfiles", [])
-        if rf_entries:
-            rf_dir = os.path.join(bin_dir, f"{name}.runfiles")
+        repo_mapping_src = node.get("repo_mapping")
+        if rf_entries or repo_mapping_src:
+            rf_dir = os.path.normpath(os.path.join(bin_dir, f"{name}.runfiles"))
+            if not rf_dir.startswith(bin_root):
+                sys.exit(f"bundle: node '{name}': runfiles dir escapes bin/")
             os.makedirs(rf_dir, exist_ok=True)
-            repo_mapping_src = None
             files = {}
             links = []
             for rf in rf_entries:
@@ -750,7 +768,9 @@ def main():
                 if is_test_only_wheel_file(rf_rel, runtimes):
                     continue
                 safe_copy(rf_src, os.path.join(rf_dir, rf_rel))
-                if rf_rel.endswith(".repo_mapping") or rf_rel == "_repo_mapping":
+                if not repo_mapping_src and (
+                        rf_rel.endswith(".repo_mapping")
+                        or rf_rel == "_repo_mapping"):
                     repo_mapping_src = rf_src
             for rf_rel, link in links:
                 target = link_target(rf_rel, link)
@@ -786,19 +806,31 @@ def main():
                     interpreters.add(target_dest)
 
             if repo_mapping_src:
+                if not os.path.isfile(repo_mapping_src):
+                    sys.exit(f"bundle: node '{name}': repo_mapping is missing: "
+                             f"{repo_mapping_src}")
                 safe_copy(repo_mapping_src, os.path.join(rf_dir, "_repo_mapping"))
-                safe_copy(repo_mapping_src, os.path.join(bin_dir, f"{name}.repo_mapping"))
+                rm_dest = os.path.normpath(
+                    os.path.join(bin_dir, f"{name}.repo_mapping"))
+                if not rm_dest.startswith(bin_root):
+                    sys.exit(f"bundle: node '{name}': repo_mapping escapes bin/")
+                safe_copy(repo_mapping_src, rm_dest)
         for lib in node.get("shared_libs", []):
+            lib_name = lib["name"]
+            lib_dest = os.path.normpath(os.path.join(lib_dir, lib_name))
+            if not lib_dest.startswith(lib_root):
+                sys.exit(f"bundle: node '{name}': shared library {lib_name!r} "
+                         "escapes lib/")
             with open(lib["src_path"], "rb") as f:
                 digest = hashlib.sha256(f.read()).hexdigest()
-            seen = staged_libs.get(lib["name"])
+            seen = staged_libs.get(lib_name)
             if seen is None:
                 os.makedirs(lib_dir, exist_ok=True)
-                safe_copy(lib["src_path"], os.path.join(lib_dir, lib["name"]))
-                staged_libs[lib["name"]] = (digest, name)
+                safe_copy(lib["src_path"], lib_dest)
+                staged_libs[lib_name] = (digest, name)
             elif seen[0] != digest:
                 sys.exit(f"bundle: nodes '{seen[1]}' and '{name}' link different "
-                         f"shared libraries named {lib['name']}")
+                         f"shared libraries named {lib_name}")
         with open(bin_dest, "rb") as f:
             binary_sha256 = hashlib.sha256(f.read()).hexdigest()
         manifest_nodes.append({
@@ -902,7 +934,7 @@ done
 
 extra_args=()
 if [[ "$has_config" == "false" ]]; then
-  extra_args+=(--config "{config_rel}")
+  extra_args+=(--config {shlex.quote(config_rel)})
 fi
 if [[ "$has_output_dir" == "false" && -n "${{TALOS_LOG_DIR:-}}" ]]; then
   extra_args+=(--output-dir "${{TALOS_LOG_DIR}}")
