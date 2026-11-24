@@ -1220,6 +1220,11 @@ test('reconnecting to a restarted session resets rateWindow and decoder',
          sequenceId: 2n,
          timestampNs: 2_000_000_000n
        };
+       const header3: PageHeader = {
+         ...header1,
+         sequenceId: 3n,
+         timestampNs: 3_000_000_000n
+       };
        const dictPages = encodeDictionaryPages(header1, channels);
        const valPages1 = encodeValuePages(
            header1, pose, true,
@@ -1229,6 +1234,10 @@ test('reconnecting to a restarted session resets rateWindow and decoder',
            header2, pose, true,
            channels.map(
                (_, i): [number, bigint] => [i, rawFromDouble(i === 0 ? 42 : i)]));
+       const valPages3 = encodeValuePages(
+           header3, pose, true,
+           channels.map(
+               (_, i): [number, bigint] => [i, rawFromDouble(i === 0 ? 43 : i)]));
 
        const shiftWall = (raw: string, deltaNs: bigint) => {
          const doc = JSON.parse(raw);
@@ -1254,10 +1263,12 @@ test('reconnecting to a restarted session resets rateWindow and decoder',
            // Session 2 restarted with counters reset to 0.
            client.send(session2Graph1);
            client.send(session2Graph2);
-           // Orphan page 1 from session 1 must NOT stitch onto page 0; then a
-           // complete dictionary + 2-page keyframe must decode cleanly.
+           // Orphan page 1 from session 1 must NOT stitch onto page 0; then
+           // complete dictionary + 2-page keyframes must decode cleanly in order.
            client.send(valPages1[1], {binary: true});
-           client.send(concatPages([...dictPages, ...valPages2]), {binary: true});
+           client.send(
+               concatPages([...dictPages, ...valPages2, ...valPages3]),
+               {binary: true});
          }
        });
        server.listen(0, '127.0.0.1');
@@ -1271,11 +1282,9 @@ test('reconnecting to a restarted session resets rateWindow and decoder',
          for (const client of sockets.clients) client.terminate();
          await settle(() => agent.context().system?.wall_ns === expectedWallNs2,
                       'connection 2 never received restarted system graphs');
-         await settle(() => agent.timeline.frames.length >= 1,
-                      'connection 2 never decoded clean telemetry');
-         // Allow any buffered frame to flush so an erroneously stitched frame
-         // would also be visible.
-         await new Promise(r => setTimeout(r, 30));
+         await settle(
+             () => agent.timeline.frames.some(f => f.sequence_id === '3'),
+             'connection 2 never decoded clean telemetry');
 
          // RateWindow reset: valid positive rate on the 2nd graph of session 2.
          const graph =
@@ -1290,10 +1299,12 @@ test('reconnecting to a restarted session resets rateWindow and decoder',
              Math.abs(timer.events_per_second - expectedHz) < expectedHz * 0.05,
              `expected ~${expectedHz} Hz, got ${timer.events_per_second}`);
 
-         // Decoder reset: only session 2's clean frame landed (no stitched seq 1).
-         assert.equal(agent.timeline.frames.length, 1);
+         // Decoder reset: only session 2's clean frames landed (no stitched seq 1).
+         assert.equal(agent.timeline.frames.length, 2);
          assert.equal(agent.timeline.frames[0].sequence_id, '2');
          assert.equal(agent.timeline.frames[0].channels['ch_0'], 42);
+         assert.equal(agent.timeline.frames[1].sequence_id, '3');
+         assert.equal(agent.timeline.frames[1].channels['ch_0'], 43);
        } finally {
          agent.close();
          for (const client of sockets.clients) client.terminate();

@@ -25,6 +25,8 @@ clang18_setup() {
     # Run installation in a subshell so its lock/staging traps do not clobber
     # the caller's EXIT/signal traps.
     (
+      local self_pid="${BASHPID:-}"
+      [ -n "$self_pid" ] || self_pid="$(exec sh -c 'echo "$PPID"')"
       local lock="$cache_root/.clang-18.lock"
       local lock_held=0 staging="" old="" retake_held=0
       cleanup_clang18_install() {
@@ -66,7 +68,7 @@ clang18_setup() {
         waited=$((waited + 1))
       done
       lock_held=1
-      { printf '%s\n' "$$" > "$lock/pid.$$" && mv -f "$lock/pid.$$" "$lock/pid"; } ||
+      { printf '%s\n' "$self_pid" > "$lock/pid.$self_pid" && mv -f "$lock/pid.$self_pid" "$lock/pid"; } ||
         clang18_die "cannot write $lock/pid"
 
       if clang18_ready "$home"; then
@@ -121,7 +123,7 @@ if data.startswith(b"#!"):
       printf '%s\n' "$CLANG18_VERSION" > "$staging/version"
 
       if [ -e "$home" ]; then
-        old="$cache_root/.clang-18.old.$$"
+        old="$cache_root/.clang-18.old.$self_pid"
         rm -rf "$old"
         mv "$home" "$old" || clang18_die "cannot replace existing $home"
         if ! mv "$staging" "$home"; then
@@ -141,11 +143,13 @@ if data.startswith(b"#!"):
   # CI invokes the tools by their versioned names. Pre-populated caches (such as
   # test fixtures) may lack shim/; populate atomically to avoid concurrent races.
   if [ ! -x "$shim/clang-format-18" ] || [ ! -x "$shim/clang-tidy-18" ]; then
+    local shim_pid="${BASHPID:-}"
+    [ -n "$shim_pid" ] || shim_pid="$(exec sh -c 'echo "$PPID"')"
     mkdir -p "$shim"
-    ln -sf "$bin/clang-format" "$shim/.clang-format-18.$$" &&
-      mv -f "$shim/.clang-format-18.$$" "$shim/clang-format-18"
-    ln -sf "$bin/clang-tidy" "$shim/.clang-tidy-18.$$" &&
-      mv -f "$shim/.clang-tidy-18.$$" "$shim/clang-tidy-18"
+    ln -sf "$bin/clang-format" "$shim/.clang-format-18.$shim_pid" &&
+      mv -f "$shim/.clang-format-18.$shim_pid" "$shim/clang-format-18"
+    ln -sf "$bin/clang-tidy" "$shim/.clang-tidy-18.$shim_pid" &&
+      mv -f "$shim/.clang-tidy-18.$shim_pid" "$shim/clang-tidy-18"
   fi
   export PATH="$shim:$PATH"
   local v

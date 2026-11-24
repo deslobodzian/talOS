@@ -50,7 +50,6 @@ import socket
 import subprocess
 import sys
 import tempfile
-import time
 import tomllib
 import unittest
 import urllib.request
@@ -530,12 +529,8 @@ class BundleTest(unittest.TestCase):
                 marker = f"on http://localhost:{http_port}\n".encode()
                 buf = b""
                 fd = proc.stdout.fileno()
-                deadline = time.monotonic() + 30
-                while marker not in buf:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    ready, _, _ = select.select([fd], [], [], remaining)
+                while marker not in buf and len(buf) < (1 << 20):
+                    ready, _, _ = select.select([fd], [], [], 30)
                     if not ready:
                         break
                     chunk = os.read(fd, 4096)
