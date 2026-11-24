@@ -5,23 +5,16 @@ load("//talOS/build:contract.bzl", "talos_sim", "talos_sim_test")
 # The rig in simulation against the MuJoCo gateway (README.md):
 #   bazel run //examples/mujoco_rig:sim -- --duration-s 20 \
 #     --sim-gateway-arg --mode-schedule --sim-gateway-arg disabled:1,teleop:19 ...
-# `args` places the rig where the shot scores (README.md "The shot"); a
-# `bazel run` applies them, a test that runs the binary does not.
+# The rig's place on the field is robot_sim.toml's [simulation.start_pose].
 talos_sim(
     name = "sim",
-    args = [
-        "--sim-gateway-arg",
-        "--start-pose",
-        "--sim-gateway-arg",
-        "1.907,5.302,2.705",
-    ],
     config = "//examples/mujoco_rig/main_processor/configuration:robot_sim.toml",
     data = CONFIG_FILES + ["//talOS/simulation/mujoco:sim_gateway"],
     nodes = NODES,
 )
 
 # e2e: the simulated rig starts, runs and stops cleanly, every member once
-# (talos_sim_test; its start pose is the gateway's default).
+# (talos_sim_test).
 talos_sim_test(
     name = "sim_test",
     sim = ":sim",

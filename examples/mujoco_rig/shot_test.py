@@ -29,8 +29,9 @@ from python.runfiles import runfiles
 
 from talOS.build import sim_check
 
-# The rig's place on the field and the operator's schedule (README.md).
-START_POSE = "1.907,5.302,2.705"
+# The operator's schedule (README.md). The rig's place on the field is the
+# config's [simulation.start_pose], not passed here: a config without it
+# starts the rig at (2, 2, 0), where no shot scores.
 MODE_SCHEDULE = "disabled:1,teleop:60"
 SPIN_BUTTONS = 1 << 2  # button 3: the flywheel to the shot's speed
 FEED_BUTTONS = SPIN_BUTTONS | 1 << 3  # and button 4: the feeder
@@ -147,7 +148,6 @@ class ShotTest(unittest.TestCase):
             env.pop("TALOS_SHM_NAMESPACE", None)
 
             gateway_args = [
-                "--start-pose", START_POSE,
                 "--mode-schedule", MODE_SCHEDULE,
                 "--joystick-schedule", JOYSTICK_SCHEDULE,
                 "--schedule-start-file", start_file,

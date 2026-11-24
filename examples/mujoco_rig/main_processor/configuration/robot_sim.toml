@@ -10,9 +10,15 @@ simulation_only = true
 # world [simulation.mujoco] below names.
 sim_gateway = "//talOS/simulation/mujoco:sim_gateway"
 
+# The rig's place on the field, where the shot scores (README.md "The
+# shot"): 3.0 m from the blue HUB, its shooter toward it.
+[simulation.start_pose]
+x_m = 1.907
+y_m = 5.302
+yaw_rad = 2.705
+
 # The MuJoCo world: the rig's model on the 2026 field, whose game referees
-# the match and puts the eight preloads in the hopper. The rig's place on the
-# field is the gateway's --start-pose (README.md); no config key sets it.
+# the match and puts the eight preloads in the hopper.
 [simulation.mujoco]
 robot_model = "mujoco/robot.xml"
 field = "rebuilt_2026"
