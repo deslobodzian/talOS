@@ -326,7 +326,8 @@ cc_test(
 # field: /sim/state/match's periods in order and counting down, the Driver
 # Station's match time and game message, the live registry row against
 # --describe, and (REQ-DEV-43) /sim/telemetry/pieces every 50 ms. Integration lane: fork/exec, loopback UDP, shared memory; one
-# run of about 1.3 s of real time.
+# run the test stops once it holds its sample (about 1 s of real time; a
+# 30 s hang bound).
 cc_test(
     name = "match_state_test",
     size = "small",
