@@ -68,6 +68,84 @@ TEST(GateTest, FeedbackFreshBoundary) {
   EXPECT_FALSE(FeedbackFresh(kUnknown, uint64_t{kUnknown} + 1));
 }
 
+// REQ-SAFE-22
+TEST(GateTest, MotorFeedbackValidRequiresPresentValidRemoteCANcoder) {
+  MotorConfig motor;
+  motor.id = 1;
+  motor.feedback = Feedback::kRemoteCANcoder;
+  motor.feedback_sensor_id = 10;
+  const std::array<MotorConfig, 1> motors{motor};
+
+  State state;
+  state.motor_count = 1;
+  state.motors[0].id = 1;
+  state.motors[0].valid = true;
+
+  // No sensors reported at all: remote feedback cannot be verified.
+  state.sensor_count = 0;
+  EXPECT_FALSE(MotorFeedbackValid(motors, state, 0));
+
+  // Only an unrelated sensor ID is present and valid.
+  state.sensor_count = 1;
+  state.sensors[0] = {.id = 99, .valid = true};
+  EXPECT_FALSE(MotorFeedbackValid(motors, state, 0));
+
+  // Matching remote CANcoder present but invalid.
+  state.sensors[0] = {.id = 10, .valid = false};
+  EXPECT_FALSE(MotorFeedbackValid(motors, state, 0));
+
+  // Matching remote CANcoder present and valid.
+  state.sensors[0] = {.id = 10, .valid = true};
+  EXPECT_TRUE(MotorFeedbackValid(motors, state, 0));
+
+  // Motor's own sample invalid vetoes even with a valid remote CANcoder.
+  state.motors[0].valid = false;
+  EXPECT_FALSE(MotorFeedbackValid(motors, state, 0));
+}
+
+// REQ-SAFE-22
+TEST(GateTest, MotorMayDriveChecksMasterRemoteCANcoderForRotorFollower) {
+  for (const bool master_first : {true, false}) {
+    SCOPED_TRACE(master_first ? "master_first" : "follower_first");
+    MotorConfig master;
+    master.id = 1;
+    master.feedback = Feedback::kRemoteCANcoder;
+    master.feedback_sensor_id = 10;
+
+    MotorConfig follower;
+    follower.id = 2;
+    follower.feedback = Feedback::kRotor;
+    follower.master_id = master.id;
+
+    const std::size_t master_idx = master_first ? 0 : 1;
+    const std::size_t follower_idx = master_first ? 1 : 0;
+    std::array<MotorConfig, 2> motors{};
+    motors[master_idx] = master;
+    motors[follower_idx] = follower;
+
+    State state;
+    state.motor_count = 2;
+    state.motors[master_idx] = {.id = master.id, .valid = true};
+    state.motors[follower_idx] = {.id = follower.id, .valid = true};
+    state.sensor_count = 1;
+    state.sensors[0] = {.id = 10, .valid = true};
+
+    EXPECT_TRUE(MotorMayDrive(motors, state, master_idx));
+    EXPECT_TRUE(MotorMayDrive(motors, state, follower_idx));
+
+    // Master motor sample stays valid, but its remote CANcoder is invalid:
+    // neither the master nor its Rotor follower may drive.
+    state.sensors[0].valid = false;
+    EXPECT_FALSE(MotorMayDrive(motors, state, master_idx));
+    EXPECT_FALSE(MotorMayDrive(motors, state, follower_idx));
+
+    // Omitted remote CANcoder likewise blocks both.
+    state.sensor_count = 0;
+    EXPECT_FALSE(MotorMayDrive(motors, state, master_idx));
+    EXPECT_FALSE(MotorMayDrive(motors, state, follower_idx));
+  }
+}
+
 // The torque-current rule the gateway and the RoboRIO both hold: a foc motor
 // with a positive limit, |demand| within it (the limit itself included), and
 // a feedforward equal to 0 (-0.0 is 0); anything non-finite fails.
