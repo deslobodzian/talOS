@@ -58,12 +58,14 @@ The table below is ARCHITECTURE.md "Layers" and "Allowed dependencies"
   `//talOS/telemetry:{telemetry,channels}`, `//talOS/teleop:teleop`,
   `//talOS/node_api:node_api`, `//talOS/bridge:node_lib`,
   `//talOS/introspection:{registry,reporter}`, `//talOS/launcher:launcher_lib`,
-  `//talOS/hardware:hardware`, `//talOS/ipc:ipc`, and every `cc_library` under
-  `//talOS/simulation/mujoco/...`) are never `//visibility:public` or
-  `//:__subpackages__`, and are not visible to robot/example/bench node
-  packages (except `//talOS/hardware:hardware` and `//talOS/ipc:ipc` for
-  `//bench/main_processor/swerve_module` which hosts the standalone
-  `:send_target` CLI).
+  `//talOS/hardware:hardware`, `//talOS/ipc:ipc`, and every `cc_library`,
+  `cc_shared_library`, `cc_import`, or `alias` under
+  `//talOS/simulation/mujoco/...`) are never
+  `//visibility:public` or `//:__subpackages__`, MuJoCo confined targets are
+  never visible outside `//talOS/simulation/mujoco/...`, and none are visible
+  to robot/example/bench node packages (except `//talOS/hardware:hardware`
+  and `//talOS/ipc:ipc` for `//bench/main_processor/swerve_module` which hosts
+  the standalone `:send_target` CLI).
 
 The C++ source scan (also run standalone via `--source-only` in
 `tools/source_lints.sh`) walks every tracked file under `bench/`, `examples/`,
@@ -143,6 +145,7 @@ import posixpath
 import re
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 
 try:  # under Bazel the workspace root is on sys.path
     from tools import bazel_query
@@ -217,6 +220,16 @@ NODE_GENERATORS = ("talos_cc_node", "talos_py_node", "talos_cc_shared_node")
 # RULES.md 2 direct-dependency check.
 CC_NODE_DEP_ROOTS = ("bench", "examples", "tools/scaffold_testdata")
 CC_NODE_GENERATORS = ("talos_cc_node", "talos_cc_shared_node")
+
+# Rule kinds under talOS/simulation/mujoco/... whose linkage and visibility are
+# confined to talOS/simulation/mujoco/... (prevents cc_library, cc_import, and
+# alias wrappers from leaking @mujoco outside the package).
+MUJOCO_CONFINED_KINDS = (
+    "cc_library",
+    "cc_shared_library",
+    "cc_import",
+    "alias",
+)
 
 # Privileged framework libraries outside the stack's transport layers: no
 # node depends on one directly, and none is visible to a node package. Both
@@ -599,7 +612,7 @@ def checks(node_packages):
         "outside-mujoco",
         ("talOS/simulation/mujoco/...",),
         kind="direct",
-        only_kinds=("cc_library",),
+        only_kinds=MUJOCO_CONFINED_KINDS,
         source=Set(
             ("talOS/...",) + tuple(recursive(p) for p in OUTSIDE_TALOS),
             exclude=("talOS/simulation/mujoco/...",),
@@ -725,7 +738,7 @@ def run(backend, out=sys.stdout):
         for label in public:
             print(f"  {label}", file=out)
     if mujoco_libs:
-        exposed_mujoco = backend.visible_to("//talOS/node:node", mujoco_libs)
+        exposed_mujoco = backend.mujoco_external_visibility(mujoco_libs)
         if exposed_mujoco:
             failures += 1
             print("VIOLATION talOS/simulation/mujoco C++ libraries must not "
@@ -862,10 +875,48 @@ class Bazel:
         return sorted(self.node_sample_targets().keys())
 
     def mujoco_cc_libraries(self):
-        """Every `cc_library` rule under `//talOS/simulation/mujoco/...`."""
+        """Every `cc_library`, `cc_import`, or `alias` rule under
+        `//talOS/simulation/mujoco/...`."""
+        kinds = "|".join(f"^{k} rule$" for k in MUJOCO_CONFINED_KINDS)
         return sorted(self.query(
-            'kind("^cc_library rule$", //talOS/simulation/mujoco/...)',
+            f'kind("{kinds}", //talOS/simulation/mujoco/...)',
             output="label", allow_external_exit_3=False))
+
+    def mujoco_external_visibility(self, targets):
+        """Returns any target in `targets` whose Bazel visibility grants
+        access outside `//talOS/simulation/mujoco/...` (including opaque
+        `package_group` targets)."""
+        if not targets:
+            return []
+        expr = " + ".join(f"//{t}" for t in targets)
+        xml_text = "\n".join(self.query(
+            expr, output="xml", allow_external_exit_3=False))
+        root = ET.fromstring(xml_text)
+        expected = {f"//{t}" for t in targets}
+        seen = set()
+        exposed = []
+        for rule in root.findall("rule"):
+            label = rule.get("name", "")
+            seen.add(label)
+            vis_list = None
+            for child in rule:
+                if child.tag == "list" and child.get("name") == "visibility":
+                    vis_list = child
+                    break
+            if vis_list is None:
+                continue
+            for item in vis_list:
+                if (item.tag != "label" or
+                        not _is_allowed_mujoco_visibility(
+                            item.get("value", ""))):
+                    exposed.append(label)
+                    break
+        if seen != expected:
+            missing = sorted(expected - seen)
+            raise RuntimeError(
+                f"bazel query --output=xml did not return all MuJoCo "
+                f"targets (missing: {missing})")
+        return sorted(exposed)
 
     def public_targets(self, targets):
         if not targets:
@@ -891,6 +942,20 @@ class Bazel:
         source = render(frm)
         return self.query(f"(deps({source}, 1) except ({source})) "
                           f"intersect ({render(to)})")
+
+
+def _is_allowed_mujoco_visibility(vis_label):
+    """True only for `//visibility:private` or package/subpackage visibility
+    strictly within `//talOS/simulation/mujoco/...`."""
+    if vis_label == "//visibility:private":
+        return True
+    if not vis_label.startswith("//talOS/simulation/mujoco"):
+        return False
+    pkg, sep, name = vis_label.partition(":")
+    if not sep or name not in ("__pkg__", "__subpackages__"):
+        return False
+    return (pkg == "//talOS/simulation/mujoco" or
+            pkg.startswith("//talOS/simulation/mujoco/"))
 
 
 def _is_ascii_digit(ch):
@@ -2329,11 +2394,13 @@ def _scan_module_bazel(path, tree):
             continue
         func_id = getattr(node.func, "id", "")
         if func_id == "bazel_dep":
-            if any(k.arg is None for k in node.keywords):
+            if (any(k.arg is None for k in node.keywords) or
+                    any(isinstance(a, ast.Starred) for a in node.args)):
                 found.setdefault(
                     node.lineno,
-                    "bazel_dep uses **kwargs splat; cannot verify statically "
-                    "that mujoco has no repo_name alias (fail closed)")
+                    "bazel_dep uses *args or **kwargs splat; cannot verify "
+                    "statically that mujoco has no repo_name alias "
+                    "(fail closed)")
                 continue
             kw = {k.arg: k.value for k in node.keywords}
             name_node = kw.get("name", node.args[0] if node.args else None)
@@ -2352,6 +2419,12 @@ def _scan_module_bazel(path, tree):
                     "mujoco's bazel_dep sets a repo_name (or dynamic name); "
                     "the @mujoco check would not see its labels")
         elif func_id == "use_repo":
+            if any(isinstance(a, ast.Starred) for a in node.args):
+                found.setdefault(
+                    node.lineno,
+                    "use_repo uses *args splat; cannot verify statically "
+                    "that mujoco is not aliased (fail closed)")
+                continue
             for k in node.keywords:
                 if k.arg is None:
                     found.setdefault(
@@ -2360,7 +2433,13 @@ def _scan_module_bazel(path, tree):
                         "statically that mujoco is not aliased (fail closed)")
                     continue
                 val = _eval_starlark_str(k.value, bindings)
-                if val == "mujoco" and k.arg != "mujoco":
+                if val is None:
+                    found.setdefault(
+                        node.lineno,
+                        f"use_repo keyword `{k.arg}` has non-static value; "
+                        f"cannot verify statically that mujoco is not aliased "
+                        f"(fail closed)")
+                elif val == "mujoco" and k.arg != "mujoco":
                     found.setdefault(
                         node.lineno,
                         f"use_repo aliases `mujoco` as `{k.arg}`; the "
@@ -2425,6 +2504,9 @@ def run_mujoco_checks(files, read, out=sys.stdout, is_symlink=None):
                       f"@mujoco: {exc} (fail closed)", file=out)
                 continue
             for line, detail in _scan_module_bazel(path, tree):
+                failures += 1
+                print(f"VIOLATION {path}:{line}: {detail}", file=out)
+            for line, detail in scan_mujoco_labels(path, tree):
                 failures += 1
                 print(f"VIOLATION {path}:{line}: {detail}", file=out)
             continue
