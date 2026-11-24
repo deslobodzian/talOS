@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -17,6 +18,7 @@
 #include "talOS/devices/devices.h"
 #include "talOS/devices/testing.h"
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/hardware/gateway.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/node/access.h"
 #include "talOS/node/sim_access.h"
@@ -484,6 +486,134 @@ TEST_F(TargetTest, RobotDisabledIsNull) {
   hw.enable(false);
   Hold("teleop", 1.0, 20ms);
   EXPECT_EQ(Seen(), std::nullopt);
+  EXPECT_EQ(lift.source, "");
+}
+
+// REQ-SAFE-07: Target::get() returns nullptr whenever robot_enabled(node) is
+// false — including stale /hw/state, kEnabled without kConfigured, and
+// kHardwareFault — even while /hw/state/driver_station stays fresh and enabled
+// in teleop and a fresh target matches the current generation.
+TEST(Target, HardwareStateNotReadyIsNullWithFreshTeleopAndTarget) {
+  struct ConsumerWithDs {
+    explicit ConsumerWithDs(Node& node) : target{node}, ds{node} {}
+    void update() {
+      const Goal* t = target.get();
+      seen = t != nullptr ? std::optional<Goal>{*t} : std::nullopt;
+      source = std::string{target.source()};
+    }
+    Target<Goal> target;
+    DriverStation ds;
+    std::optional<Goal> seen;
+    std::string source;
+  };
+
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& lift = sim.add<ConsumerWithDs>("lift");
+  Node& node = sim.node("lift");
+  auto hw = std::make_unique<SimHardware>(sim);
+  hw->enable();
+  hw->set_driver_station(DsPacket(kTeleop));
+  sim.step(10ms);
+
+  const std::uint64_t gen = DriverStationGeneration(sim);
+  ASSERT_NE(gen, 0u);
+  PublishTarget(sim, "lift", "teleop", Goal{1.0}, gen);
+  sim.step(5ms);
+  ASSERT_TRUE(robot_enabled(node));
+  ASSERT_TRUE(lift.ds.teleop());
+  ASSERT_TRUE(lift.seen.has_value());
+  ASSERT_DOUBLE_EQ(lift.seen->position_rot(), 1.0);
+
+  const auto latest_ds_packet =
+      sim.latest<hardware::Packet>(hardware::kDriverStationTopic);
+  ASSERT_TRUE(latest_ds_packet.has_value());
+  ds::DriverStationData ds_data{};
+  ASSERT_TRUE(ds::Decode(latest_ds_packet->bytes(), ds_data));
+  ASSERT_EQ(ds_data.mode_since_us, gen);
+  const auto publish_ds = [&] {
+    ds_data.sample_time_us += 5000;
+    hardware::Packet packet{};
+    packet.size = static_cast<std::uint32_t>(ds::Encode(ds_data, packet.data));
+    sim.publish(hardware::kDriverStationTopic, packet);
+  };
+
+  // (a) /hw/state stale past command_timeout_us while DS and target stay fresh.
+  hw->lose_states(25);  // 125 ms > 100 ms command_timeout_us
+  for (int i = 0; i < 22; ++i) {
+    publish_ds();
+    PublishTarget(sim, "lift", "teleop", Goal{1.0}, gen);
+    sim.step(5ms);
+  }
+  ASSERT_FALSE(node.extension<HardwareLink>().fresh());
+  ASSERT_FALSE(robot_enabled(node));
+  ASSERT_TRUE(lift.ds.teleop());
+  EXPECT_EQ(lift.seen, std::nullopt);
+  EXPECT_EQ(lift.target.get(), nullptr);
+  EXPECT_EQ(lift.source, "");
+
+  // Drop SimHardware so we control /hw/state flags directly.
+  const auto latest_state_packet =
+      sim.latest<hardware::Packet>(hardware::kStateTopic);
+  ASSERT_TRUE(latest_state_packet.has_value());
+  hardware::State last_state{};
+  ASSERT_TRUE(hardware::Decode(latest_state_packet->bytes(), last_state));
+  const std::uint64_t config_id = last_state.config_id;
+  hw.reset();
+  const auto publish_state = [&](std::uint64_t sample_time_us,
+                                 std::uint32_t flags) {
+    hardware::State state{};
+    state.config_id = config_id;
+    state.boot_id = 0x55;
+    state.sample_time_us = sample_time_us;
+    state.flags = flags;
+    hardware::Packet packet{};
+    packet.size =
+        static_cast<std::uint32_t>(hardware::Encode(state, packet.data));
+    sim.publish(hardware::kStateTopic, packet);
+  };
+
+  // Control: fresh kConfigured | kEnabled selects the target again.
+  publish_state(1000, hardware::kConfigured | hardware::kEnabled);
+  publish_ds();
+  PublishTarget(sim, "lift", "teleop", Goal{2.0}, gen);
+  sim.step(5ms);
+  ASSERT_TRUE(robot_enabled(node));
+  ASSERT_TRUE(lift.ds.teleop());
+  ASSERT_TRUE(lift.seen.has_value());
+  ASSERT_DOUBLE_EQ(lift.seen->position_rot(), 2.0);
+
+  // (b) kEnabled without kConfigured.
+  publish_state(2000, hardware::kEnabled);
+  publish_ds();
+  PublishTarget(sim, "lift", "teleop", Goal{2.0}, gen);
+  sim.step(5ms);
+  ASSERT_TRUE(node.extension<HardwareLink>().fresh());
+  ASSERT_FALSE(robot_enabled(node));
+  ASSERT_TRUE(lift.ds.teleop());
+  EXPECT_EQ(lift.seen, std::nullopt);
+  EXPECT_EQ(lift.target.get(), nullptr);
+  EXPECT_EQ(lift.source, "");
+
+  // Control: restore kConfigured | kEnabled.
+  publish_state(3000, hardware::kConfigured | hardware::kEnabled);
+  publish_ds();
+  PublishTarget(sim, "lift", "teleop", Goal{2.5}, gen);
+  sim.step(5ms);
+  ASSERT_TRUE(robot_enabled(node));
+  ASSERT_TRUE(lift.seen.has_value());
+  ASSERT_DOUBLE_EQ(lift.seen->position_rot(), 2.5);
+
+  // (c) kConfigured | kEnabled | kHardwareFault.
+  publish_state(4000, hardware::kConfigured | hardware::kEnabled |
+                          hardware::kHardwareFault);
+  publish_ds();
+  PublishTarget(sim, "lift", "teleop", Goal{2.5}, gen);
+  sim.step(5ms);
+  ASSERT_TRUE(node.extension<HardwareLink>().fresh());
+  ASSERT_FALSE(robot_enabled(node));
+  ASSERT_TRUE(lift.ds.teleop());
+  EXPECT_EQ(lift.seen, std::nullopt);
+  EXPECT_EQ(lift.target.get(), nullptr);
   EXPECT_EQ(lift.source, "");
 }
 
