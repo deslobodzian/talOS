@@ -29,6 +29,7 @@ import argparse
 import difflib
 import math
 import os
+import shlex
 import sys
 import tomllib
 import xml.etree.ElementTree as ET
@@ -177,19 +178,35 @@ def _check_number(value, key, *, above=None, minimum=None, below=None,
     return value
 
 
+def _invalid_xml_char(c):
+    code = ord(c)
+    return (code < 0x20 or code == 0x7F or 0xD800 <= code <= 0xDFFF or
+            code in (0xFFFE, 0xFFFF))
+
+
+def _comment_safe(text):
+    """Sanitizes `text` for inclusion in a single-line XML 1.0 comment:
+    replaces control and illegal XML characters, and breaks any `--`
+    sequence so the comment cannot be malformed or closed early."""
+    safe = "".join(" " if _invalid_xml_char(c) else c for c in str(text))
+    while "--" in safe:
+        safe = safe.replace("--", "- -")
+    return safe
+
+
 def _check_name(value, key):
     """A device name as a hardware config accepts it: a non-empty string of
-    at most 63 bytes. A control character is refused too: XML cannot carry
-    most of them, and a parser turns a tab or newline in an attribute into
-    a space, so the model would name a different device."""
+    at most 63 bytes. Control characters and XML 1.0 non-characters are
+    refused too: XML cannot carry them, and a parser turns a tab or newline
+    in an attribute into a space, so the model would name a different device."""
     if not isinstance(value, str) or not value:
         raise ParameterError(key, "is not a non-empty string")
     if len(value.encode("utf-8")) > _MAX_NAME_BYTES:
         raise ParameterError(key, f"is longer than {_MAX_NAME_BYTES} bytes, "
                              "a hardware config's limit on a device name")
-    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
-        raise ParameterError(key, "holds a control character, which the "
-                             "model's XML cannot carry unchanged")
+    if any(_invalid_xml_char(c) for c in value):
+        raise ParameterError(key, "holds a control or non-XML character, "
+                             "which the model's XML cannot carry unchanged")
     return value
 
 
@@ -223,7 +240,8 @@ def read_parameters(data):
     p["frame"] = {
         "length_m": length,
         "width_m": width,
-        "belly_clearance_m": t.number("belly_clearance_m", minimum=0),
+        "belly_clearance_m": t.number("belly_clearance_m", minimum=0,
+                                      below=0.30),
         "rail_height_m": t.number("rail_height_m", above=0),
         "rail_width_m": t.number("rail_width_m", above=0,
                                  below=min(length, width) / 2),
@@ -358,7 +376,7 @@ def read_parameters(data):
     beams = []
     for b in top.tables("beam_breaks", optional=True):
         direction = b.vector("direction")
-        if math.hypot(*direction) == 0:
+        if max(abs(v) for v in direction) == 0.0:
             raise ParameterError(b.key("direction"), "is the zero vector")
         beams.append({
             "name": b.name("name"), "key": b.path,
@@ -507,14 +525,41 @@ class _Solid:
         return outside + min(max(gaps), 0.0)
 
 
-def _num(x):
+def _num(x, key="model"):
+    if not math.isfinite(x):
+        raise ParameterError(key, "produces a non-finite number")
     if abs(x) < 1e-12:
         x = 0.0
     return "%.6g" % x
 
 
-def _nums(*values):
-    return " ".join(_num(v) for v in values)
+def _pos_num(x, key):
+    """Formats a strictly positive finite value without snapping tiny
+    positives (< 1e-12) to zero."""
+    if not (math.isfinite(x) and x > 0.0):
+        raise ParameterError(key, "produces a non-positive or non-finite value")
+    return "%.6g" % x
+
+
+def _nonzero_num(x, key):
+    """Formats a non-zero finite value without snapping tiny values to zero."""
+    if not (math.isfinite(x) and x != 0.0):
+        raise ParameterError(key, "produces a zero or non-finite value")
+    return "%.6g" % x
+
+
+def _nums(*values, key="model"):
+    return " ".join(_num(v, key) for v in values)
+
+
+def _rotor_armature(motor_p, key):
+    try:
+        armature = motor_p["gear"] ** 2 * motor_p["rotor_inertia_kg_m2"]
+    except OverflowError as err:
+        raise ParameterError(key, "rotor armature overflows") from err
+    if not (math.isfinite(armature) and armature > 0.0):
+        raise ParameterError(key, "rotor armature is not positive and finite")
+    return armature
 
 
 def _axis_sign(centre, contact, travel):
@@ -539,6 +584,7 @@ class _Builder:
         self.solids = []
         self.moving = []    # (solid, the part's key, body) of moving parts
         self.hopper_volume = None
+        self.hopper_floor = None  # (gate_x, gate_z, tan_slope)
         self.moving_mass = 0.0
         self.actuated = {}  # motor -> actuated joint name
         self.inlets = []    # (centre, half size) of each inlet box
@@ -576,13 +622,13 @@ class _Builder:
         self.claim("body", name, key)
         if parent is not self.world:
             ET.SubElement(self.contact, "exclude", body1="chassis", body2=name)
-        return ET.SubElement(parent, "body", name=name, pos=_nums(*pos))
+        return ET.SubElement(parent, "body", name=name, pos=_nums(*pos, key=key))
 
     def hinge(self, body, name, key, axis, armature=0.0):
         self.claim("joint", name, key)
-        attributes = {"name": name, "type": "hinge", "axis": _nums(*axis)}
+        attributes = {"name": name, "type": "hinge", "axis": _nums(*axis, key=key)}
         if armature:
-            attributes["armature"] = _num(armature)
+            attributes["armature"] = _pos_num(armature, key)
         ET.SubElement(body, "joint", attributes)
 
     def geom(self, body, name, key, kind, centre, size, rotation=_IDENTITY,
@@ -593,12 +639,12 @@ class _Builder:
         self.claim("geom", name, key)
         attributes = {"name": name, "type": kind}
         if any(centre):
-            attributes["pos"] = _nums(*centre)
-        attributes["size"] = _nums(*size)
+            attributes["pos"] = _nums(*centre, key=key)
+        attributes["size"] = " ".join(_pos_num(s, key) for s in size)
         if rotation != _IDENTITY:
             attributes["xyaxes"] = _nums(
                 rotation[0][0], rotation[1][0], rotation[2][0],
-                rotation[0][1], rotation[1][1], rotation[2][1])
+                rotation[0][1], rotation[1][1], rotation[2][1], key=key)
         attributes.update(extra)
         ET.SubElement(body, "geom", attributes)
         root_centre = tuple(body_pos[i] + centre[i] for i in range(3))
@@ -617,6 +663,9 @@ class _Builder:
         (x right, z up), so the surface faces left."""
         dx, dz = p1[0] - p0[0], p1[1] - p0[1]
         length = math.hypot(dx, dz)
+        if not (length > 0.0 and math.isfinite(length)):
+            raise ParameterError(key, f"plate '{name}' has non-positive or "
+                                 "non-finite length")
         nx, nz = -dz / length, dx / length
         centre = ((p0[0] + p1[0]) / 2 - nx * _PLATE_M / 2, 0.0,
                   (p0[1] + p1[1]) / 2 - nz * _PLATE_M / 2)
@@ -633,17 +682,17 @@ class _Builder:
             joint = motor + "_joint"
             motor_p = self.p["motors"][motor]
             self.hinge(body, joint, key, (0, sign, 0),
-                       motor_p["gear"] ** 2 * motor_p["rotor_inertia_kg_m2"])
+                       _rotor_armature(motor_p, f"motors.{motor}"))
             self.actuated[motor] = joint
         else:
             joint = name + "_joint"
             self.hinge(body, joint, key, (0, sign, 0))
             ET.SubElement(self.equality, "joint", joint1=joint, joint2=driver,
-                          polycoef=_nums(0, ratio, 0, 0, 0),
+                          polycoef=f"0 {_nonzero_num(ratio, key)} 0 0 0",
                           solref=_BELT_SOLREF)
         self.geom(body, name + "_geom", key, "cylinder", (0.0, 0.0, 0.0),
                   (radius, length / 2), _rx(math.pi / 2), body_pos=pos,
-                  part=key, mass=_num(mass), **_ROLLER_CONTACT)
+                  part=key, mass=_pos_num(mass, key), **_ROLLER_CONTACT)
         self.moving_mass += mass
         return joint
 
@@ -684,7 +733,8 @@ class _Builder:
             if len(section) == 0:
                 self.root.remove(section)
         ET.indent(self.root, space="  ")
-        return (f"<!-- Generated by generate_robot.py from {self.source}; do "
+        safe_source = _comment_safe(self.source)
+        return (f"<!-- Generated by generate_robot.py from {safe_source}; do "
                 "not edit (talOS/simulation/mujoco/robots/README.md). -->\n" +
                 ET.tostring(self.root, encoding="unicode") + "\n")
 
@@ -726,18 +776,20 @@ class _Builder:
                           pos)
         self.hinge(steer, m["steer_motor"] + "_joint", key + ".steer_motor",
                    (0, 0, 1),
-                   steer_p["gear"] ** 2 * steer_p["rotor_inertia_kg_m2"])
+                   _rotor_armature(steer_p, f"motors.{m['steer_motor']}"))
         ET.SubElement(steer, "inertial", pos="0 0 0.05",
-                      mass=_num(s["module_mass_kg"]),
+                      mass=_pos_num(s["module_mass_kg"],
+                                    "swerve.module_mass_kg"),
                       diaginertia="0.004 0.004 0.004")
         wheel = self.body(steer, m["name"] + "_wheel", key + ".name",
                           (0.0, 0.0, 0.0))
         self.hinge(wheel, m["drive_motor"] + "_joint", key + ".drive_motor",
                    (0, 1, 0),
-                   drive_p["gear"] ** 2 * drive_p["rotor_inertia_kg_m2"])
+                   _rotor_armature(drive_p, f"motors.{m['drive_motor']}"))
         self.geom(wheel, m["name"] + "_wheel_geom", key + ".name", "sphere",
                   (0.0, 0.0, 0.0), (r,), body_pos=pos, part=key,
-                  mass=_num(s["wheel_mass_kg"]), **_WHEEL_CONTACT)
+                  mass=_pos_num(s["wheel_mass_kg"], "swerve.wheel_mass_kg"),
+                  **_WHEEL_CONTACT)
         self.moving_mass += s["module_mass_kg"] + s["wheel_mass_kg"]
         self.motor(m["drive_motor"], m["drive_motor"] + "_joint")
         self.motor(m["steer_motor"], m["steer_motor"] + "_joint")
@@ -753,8 +805,11 @@ class _Builder:
         if rise <= 0:
             raise ParameterError("intake.lip_height_m",
                                  "is not below the ramp's top")
-        lip = (top[0] + rise / math.tan(math.radians(it["ramp_angle_deg"])),
-               it["lip_height_m"])
+        tan_ramp = math.tan(math.radians(it["ramp_angle_deg"]))
+        if not (tan_ramp > 0.0 and math.isfinite(tan_ramp)):
+            raise ParameterError("intake.ramp_angle_deg",
+                                 "is too close to 0 or 90 degrees")
+        lip = (top[0] + rise / tan_ramp, it["lip_height_m"])
         self.intake_top = top
         width = it["width_m"]
         self.plate("intake_ramp", "intake", top, lip, width)
@@ -798,21 +853,30 @@ class _Builder:
         # Positive rotation moves the front (+x) surface up: about -y.
         joint = motor + "_joint"
         self.hinge(body, joint, "flywheel.motor", (0, -1, 0),
-                   motor_p["gear"] ** 2 * motor_p["rotor_inertia_kg_m2"])
+                   _rotor_armature(motor_p, f"motors.{motor}"))
         self.actuated[motor] = joint
         self.geom(body, "shooter_flywheel_geom", "flywheel", "cylinder",
                   (0.0, 0.0, 0.0), (fw["radius_m"], fw["width_m"] / 2),
                   _rx(math.pi / 2), body_pos=pos, part="flywheel",
                   **_ROLLER_CONTACT)
         inertia = fw["inertia_kg_m2"]
-        ET.SubElement(body, "inertial", pos="0 0 0", mass=_num(fw["mass_kg"]),
-                      diaginertia=_nums(inertia / 2 + 0.001, inertia,
-                                        inertia / 2 + 0.001))
+        ET.SubElement(
+            body, "inertial", pos="0 0 0",
+            mass=_pos_num(fw["mass_kg"], "flywheel.mass_kg"),
+            diaginertia=" ".join((
+                _pos_num(inertia / 2 + 0.001, "flywheel.inertia_kg_m2"),
+                _pos_num(inertia, "flywheel.inertia_kg_m2"),
+                _pos_num(inertia / 2 + 0.001, "flywheel.inertia_kg_m2"),
+            )))
         self.moving_mass += fw["mass_kg"]
         self.motor(motor, joint)
         # Hood: an arc about the axle, on the inside of radius `hood`, from
         # hood_start_deg to where the exit tangent has the exit elevation.
         hood = fw["radius_m"] + d - fw["compression_m"]
+        if fw["hood_start_deg"] >= 90.0 - fw["exit_elevation_deg"]:
+            raise ParameterError(
+                "flywheel.hood_start_deg",
+                "must be below 90 - flywheel.exit_elevation_deg")
         a0 = math.radians(fw["hood_start_deg"])
         a1 = math.radians(90.0 - fw["exit_elevation_deg"])
         points = [(ax + hood * math.cos(a0 + (a1 - a0) * i / _HOOD_SEGMENTS),
@@ -832,11 +896,14 @@ class _Builder:
         self.exit_axis = (tx, 0.0, tz)
         self.claim("site", motor + "_exit", "flywheel.motor")
         ET.SubElement(self.chassis, "site", name=motor + "_exit",
-                      pos=_nums(*self.exit), xyaxes=_nums(tx, 0, tz, 0, 1, 0),
+                      pos=_nums(*self.exit, key="flywheel"),
+                      xyaxes=_nums(tx, 0, tz, 0, 1, 0, key="flywheel"),
                       size="0.02", rgba="0 1 0 1", group="4")
         self.claim("numeric", motor + "_shooter", "flywheel.motor")
-        ET.SubElement(self.custom, "numeric", name=motor + "_shooter",
-                      data=_nums(fw["efficiency"], fw["radius_m"]))
+        ET.SubElement(
+            self.custom, "numeric", name=motor + "_shooter",
+            data=(f"{_pos_num(fw['efficiency'], 'flywheel.efficiency')} "
+                  f"{_pos_num(fw['radius_m'], 'flywheel.radius_m')}"))
 
     def hopper(self, a):
         """The hopper's floor falls toward the rear across its full width to
@@ -849,6 +916,9 @@ class _Builder:
         hp, fw, fd = p["hopper"], p["flywheel"], p["feeder"]
         d, r = self.diameter, self.radius
         width = hp["width_m"]
+        if width <= 0.01:
+            raise ParameterError("hopper.width_m", "must be above 0.01 m for "
+                                 "the feeder roller")
         b = p["frame"]["width_m"] / 2
         if width / 2 + 0.01 > b:
             raise ParameterError("hopper.width_m", "is wider than the frame "
@@ -866,7 +936,8 @@ class _Builder:
             raise ParameterError("feeder.x_m", "leaves no hopper floor in "
                                  "front of the roller")
         slope = math.radians(hp["floor_slope_deg"])
-        gate_z = front_z - (front_x - gate_x) * math.tan(slope)
+        tan_slope = math.tan(slope)
+        gate_z = front_z - (front_x - gate_x) * tan_slope
         belly_top = p["frame"]["belly_clearance_m"] + 0.006
         if gate_z - _PLATE_M < belly_top:
             raise ParameterError("hopper.floor_slope_deg", "puts the floor at "
@@ -875,6 +946,9 @@ class _Builder:
         if not hp["wall_top_m"] > roller_z + rr + 0.02:
             raise ParameterError("hopper.wall_top_m", "is not above the "
                                  "feeder's roller")
+        if not hp["wall_top_m"] > front_z:
+            raise ParameterError("hopper.wall_top_m", "is not above the "
+                                 "hopper floor's front")
         if not fw["axle_z_m"] - fw["radius_m"] > gate_z + d + 0.02:
             raise ParameterError("flywheel.axle_z_m", "puts the flywheel "
                                  "within reach of a piece in the pocket")
@@ -938,25 +1012,31 @@ class _Builder:
         half = ((gate_x - back_x) / 2, width / 2, r)
         self.claim("site", motor + "_inlet", "hopper")
         ET.SubElement(self.chassis, "site", name=motor + "_inlet", type="box",
-                      pos=_nums(*inlet), size=_nums(*half),
+                      pos=_nums(*inlet, key="hopper"),
+                      size=" ".join(_pos_num(v, "hopper") for v in half),
                       rgba="0 0 1 0.3", group="4")
         self.inlets.append((inlet, half))
         # Where a preload may sit: in front of the roller, between the side
-        # walls, below their top.
+        # walls, above the sloped floor and below the walls' top.
         self.hopper_volume = ((gate_x + rr, front_x), (-width / 2, width / 2),
-                              (0.0, wall_top))
+                              (gate_z, wall_top))
+        self.hopper_floor = (gate_x, gate_z, tan_slope)
 
     def beam(self, beam):
         key = beam["key"]
         self.claim("site", beam["name"], key + ".name")
         self.claim("sensor", beam["name"], key + ".name")
-        norm = math.hypot(*beam["direction"])
+        scale = max(abs(v) for v in beam["direction"])
+        scaled = tuple(v / scale for v in beam["direction"])
+        norm = math.hypot(*scaled)
         ET.SubElement(self.chassis, "site", name=beam["name"],
-                      pos=_nums(*beam["position_m"]),
-                      zaxis=_nums(*(v / norm for v in beam["direction"])),
+                      pos=_nums(*beam["position_m"], key=key + ".position_m"),
+                      zaxis=_nums(*(v / norm for v in scaled),
+                                  key=key + ".direction"),
                       size="0.01", rgba="1 0 0 1")
         ET.SubElement(self.sensors, "rangefinder", name=beam["name"],
-                      site=beam["name"], cutoff=_num(beam["cutoff_m"]))
+                      site=beam["name"],
+                      cutoff=_pos_num(beam["cutoff_m"], key + ".cutoff_m"))
 
     def chassis_inertia(self, a, b):
         p = self.p
@@ -969,11 +1049,22 @@ class _Builder:
         t = p["bumpers"]["thickness_m"]
         h0, h1 = p["frame"]["belly_clearance_m"], 0.30
         lx, ly, lz = 2 * a + 2 * t, 2 * b + 2 * t, h1 - h0
-        inertial = ET.Element("inertial", pos=_nums(0, 0, (h0 + h1) / 2),
-                              mass=_num(mass),
-                              diaginertia=_nums(mass * (ly**2 + lz**2) / 12,
-                                                mass * (lx**2 + lz**2) / 12,
-                                                mass * (lx**2 + ly**2) / 12))
+        try:
+            ix = mass * (ly ** 2 + lz ** 2) / 12
+            iy = mass * (lx ** 2 + lz ** 2) / 12
+            iz = mass * (lx ** 2 + ly ** 2) / 12
+        except OverflowError as err:
+            raise ParameterError("robot.mass_kg",
+                                 "chassis inertia overflows") from err
+        inertial = ET.Element(
+            "inertial",
+            pos=_nums(0, 0, (h0 + h1) / 2, key="frame.belly_clearance_m"),
+            mass=_pos_num(mass, "robot.mass_kg"),
+            diaginertia=" ".join((
+                _pos_num(ix, "robot.mass_kg"),
+                _pos_num(iy, "robot.mass_kg"),
+                _pos_num(iz, "robot.mass_kg"),
+            )))
         # MuJoCo wants a body's inertial before its children.
         position = 1 if self.p["robot"]["root"] == "free" else 0
         self.chassis.insert(position, inertial)
@@ -1007,6 +1098,11 @@ class _Builder:
     def check_exit(self):
         if "flywheel" not in self.p:
             return
+        for centre, half in self.inlets:
+            if all(abs(self.exit[k] - centre[k]) <= half[k] for k in range(3)):
+                raise ParameterError(
+                    "flywheel.exit_offset_m",
+                    "places the exit inside the flywheel's inlet")
         steps = round(_EXIT_CHECK_M / _EXIT_CHECK_STEP_M)
         for i in range(steps + 1):
             s = i * _EXIT_CHECK_STEP_M
@@ -1034,17 +1130,20 @@ class _Builder:
                     raise ParameterError(key, f"overlaps preload {j}")
             if self.hopper_volume is None:
                 raise ParameterError(key, "has no [hopper] to sit in")
-            (x0, x1), (y0, y1), (z0, z1) = self.hopper_volume
+            (x0, x1), (y0, y1), (_, z1) = self.hopper_volume
+            gate_x, gate_z, tan_slope = self.hopper_floor
+            floor_z = gate_z + (point[0] - gate_x) * tan_slope
             if not (x0 + self.radius <= point[0] <= x1 and
                     y0 + self.radius <= point[1] <= y1 - self.radius and
-                    point[2] <= z1):
+                    floor_z <= point[2] <= z1):
                 raise ParameterError(key, "is outside the hopper")
             for centre, half in self.inlets:
                 if all(abs(point[k] - centre[k]) <= half[k] for k in range(3)):
                     raise ParameterError(key, "is inside the flywheel's inlet")
             name = self.claim("site", f"preload_{i}", key)
             ET.SubElement(self.chassis, "site", name=name, type="sphere",
-                          pos=_nums(*point), size=_num(self.radius),
+                          pos=_nums(*point, key=key),
+                          size=_pos_num(self.radius, "game_piece.radius_m"),
                           rgba="1 1 0 0.3", group="4")
 
 
@@ -1127,13 +1226,25 @@ def main(argv=None):
         print(f"generate_robot: {args.parameters}: {err}", file=sys.stderr)
         return 1
     fix = (f"Regenerate it with:\n    {command(args.talos_repository)} "
-           f"--parameters {args.parameters} --out {args.out}\n")
+           f"--parameters {shlex.quote(args.parameters)} "
+           f"--out {shlex.quote(args.out)}\n")
+    invalid_utf8 = False
     try:
         with open(out, encoding="utf-8", newline="") as f:
             current = f.read()
-    except OSError:
+    except FileNotFoundError:
         current = None
+    except UnicodeDecodeError:
+        current = None
+        invalid_utf8 = True
+    except OSError as err:
+        print(f"generate_robot: --out {args.out}: {err.strerror}",
+              file=sys.stderr)
+        return 1
     if args.check:
+        if invalid_utf8:
+            print(f"{args.out} is not valid UTF-8. {fix}", file=sys.stderr)
+            return 1
         if current is None:
             print(f"{args.out} is missing. {fix}", file=sys.stderr)
             return 1

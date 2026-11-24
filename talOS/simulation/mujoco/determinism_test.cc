@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -121,16 +122,33 @@ std::vector<mjtNum> State(const Sim& sim, int signature) {
 }
 
 bool SameBytes(const std::vector<mjtNum>& a, const std::vector<mjtNum>& b) {
-  return a.size() == b.size() &&
-         std::memcmp(a.data(), b.data(), a.size() * sizeof(mjtNum)) == 0;
+  if (a.size() != b.size()) return false;
+  if (a.empty()) return true;
+  return std::memcmp(a.data(), b.data(), a.size() * sizeof(mjtNum)) == 0;
+}
+
+bool AllFinite(const std::vector<mjtNum>& state) {
+  return std::all_of(state.begin(), state.end(),
+                     [](mjtNum v) { return std::isfinite(v); });
+}
+
+void ExpectHealthy(const Sim& sim) {
+  EXPECT_GT(sim.data->time, 0.0);
+  for (const int warning :
+       {mjWARN_CONTACTFULL, mjWARN_CNSTRFULL, mjWARN_BADQPOS, mjWARN_BADQVEL,
+        mjWARN_BADQACC, mjWARN_BADCTRL}) {
+    EXPECT_EQ(sim.data->warning[warning].number, 0)
+        << "MuJoCo warning " << warning;
+  }
 }
 
 // Two compiles of one scene, stepped from one initial state, end in the same
 // integration state (mjSTATE_INTEGRATION: time, qpos, qvel, act, history,
 // controls and applied forces, warm start) to the last bit, and, with
-// sleeping on, the same trees asleep. Sleeping is off in the gateway; the
-// sleep-on case is kept as the harder variant, since sleeping adds state
-// (which trees sleep, and when) that mjSTATE_INTEGRATION does not carry.
+// sleeping on, the same trees asleep. Sleeping is off by default in the
+// gateway; the sleep-on case is kept as the harder variant, since sleeping
+// adds state (which trees sleep, and when) that mjSTATE_INTEGRATION does not
+// carry.
 TEST(MujocoDeterminism, TwoCompilesStepIdentically) {
   for (const bool sleep : {false, true}) {
     SCOPED_TRACE(sleep ? "sleep on" : "sleep off");
@@ -141,20 +159,28 @@ TEST(MujocoDeterminism, TwoCompilesStepIdentically) {
     constexpr int kSteps = 1000;
     Step(first, kSteps);
     Step(second, kSteps);
+    ExpectHealthy(first);
+    ExpectHealthy(second);
     // Without a collision the comparison proves only free flight; with
     // sleeping on, without a sleeping tree it proves nothing about sleeping.
     ASSERT_GT(first.most_contacts, 6)
         << "no collision in " << kSteps << " steps";
     if (sleep) {
+      ASSERT_GT(first.model->ntree, 0);
+      ASSERT_EQ(first.model->ntree, second.model->ntree);
       ASSERT_LT(first.fewest_awake_trees, first.model->ntree)
           << "no tree slept in " << kSteps << " steps";
-      EXPECT_EQ(std::memcmp(first.data->tree_asleep, second.data->tree_asleep,
-                            sizeof(int) * first.model->ntree),
-                0)
+      EXPECT_EQ(
+          std::memcmp(first.data->tree_asleep, second.data->tree_asleep,
+                      sizeof(int) * static_cast<size_t>(first.model->ntree)),
+          0)
           << "sleep state differs after " << kSteps << " steps";
     }
-    EXPECT_TRUE(SameBytes(State(first, mjSTATE_INTEGRATION),
-                          State(second, mjSTATE_INTEGRATION)))
+    const std::vector<mjtNum> first_state = State(first, mjSTATE_INTEGRATION);
+    ASSERT_FALSE(first_state.empty());
+    ASSERT_TRUE(AllFinite(first_state))
+        << "non-finite integration state after " << kSteps << " steps";
+    EXPECT_TRUE(SameBytes(first_state, State(second, mjSTATE_INTEGRATION)))
         << "integration state differs after " << kSteps << " steps";
   }
 }
@@ -178,6 +204,8 @@ TEST(MujocoDeterminism, RestartFromIntegrationStateContinuesIdentically) {
   ASSERT_GT(original.data->ncon, 6) << "no collision in " << before << " steps";
   const std::vector<mjtNum> saved = State(original, mjSTATE_INTEGRATION);
   const std::vector<mjtNum> physics = State(original, mjSTATE_PHYSICS);
+  ASSERT_FALSE(saved.empty());
+  ASSERT_TRUE(AllFinite(saved));
 
   Sim restarted = Start(false);
   Sim physics_only = Start(false);
@@ -191,7 +219,11 @@ TEST(MujocoDeterminism, RestartFromIntegrationStateContinuesIdentically) {
   Step(original, kAfter);
   Step(restarted, kAfter);
   Step(physics_only, kAfter);
+  ExpectHealthy(original);
+  ExpectHealthy(restarted);
   const std::vector<mjtNum> expected = State(original, mjSTATE_INTEGRATION);
+  ASSERT_FALSE(expected.empty());
+  ASSERT_TRUE(AllFinite(expected));
   EXPECT_TRUE(SameBytes(State(restarted, mjSTATE_INTEGRATION), expected))
       << "restart from mjSTATE_INTEGRATION diverged after " << kAfter
       << " steps";

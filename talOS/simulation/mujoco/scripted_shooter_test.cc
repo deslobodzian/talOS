@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <numbers>
 #include <span>
@@ -620,6 +621,151 @@ TEST(ScriptedShooter, StepAllocatesNothing) {
   EXPECT_EQ(probe.stop(), 0u) << probe.sites();
   EXPECT_GE(scenario.shooters->shots(), 3u);
   EXPECT_TRUE(scenario.plant->failure().empty()) << scenario.plant->failure();
+}
+
+// REQ-DEV-39: non-finite positions, quaternions, or flywheel speeds never
+// falsely trigger InsideBox or write NaN/inf into mjData, and step 0 is not
+// confused with "never launched".
+TEST(ScriptedShooter, IgnoresNonFiniteStateAndLaunchesAtStepZero) {
+  auto plant =
+      Make("nonfinite", Robot(false), Field(Ball("ball", {0.0, 0.0, 0.8})));
+  std::unique_ptr<WorldRules> rules;
+  ScriptedShooters& shooters = Attach(*plant, rules);
+  mjModel* m = const_cast<mjModel*>(plant->model());
+  mjData* d = Writable(*plant);
+  const int wheel = Dof(m, "flywheel_joint");
+  const int ball_jnt = m->body_jntadr[mj_name2id(m, mjOBJ_BODY, "ball")];
+  const int ball_qpos = m->jnt_qposadr[ball_jnt];
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+
+  // NaN position must never be treated as inside the inlet box.
+  d->qvel[wheel] = 300.0;
+  d->qpos[ball_qpos] = nan;
+  d->qpos[ball_qpos + 1] = nan;
+  d->qpos[ball_qpos + 2] = nan;
+  EXPECT_TRUE(shooters.AfterStep(*m, *d, 1, MatchInput{}));
+  EXPECT_EQ(shooters.shots(), 0u);
+  EXPECT_EQ(d->qvel[wheel], 300.0);
+
+  // Restore position inside inlet; +inf and NaN flywheel speed must not launch.
+  d->qpos[ball_qpos] = 0.0;
+  d->qpos[ball_qpos + 1] = 0.0;
+  d->qpos[ball_qpos + 2] = 0.8;
+  for (const double bad_speed : {inf, nan}) {
+    d->qvel[wheel] = bad_speed;
+    EXPECT_TRUE(shooters.AfterStep(*m, *d, 1, MatchInput{}));
+    EXPECT_EQ(shooters.shots(), 0u);
+    ExpectNear(StateOf(*plant, "ball").position, {0.0, 0.0, 0.8}, "unchanged");
+  }
+
+  // NaN quaternion on the body must abort launch before mutating state.
+  d->qvel[wheel] = 300.0;
+  d->qpos[ball_qpos + 3] = nan;
+  EXPECT_TRUE(shooters.AfterStep(*m, *d, 1, MatchInput{}));
+  EXPECT_EQ(shooters.shots(), 0u);
+  EXPECT_EQ(d->qvel[wheel], 300.0);
+
+  // Valid state at step 0 must launch once (not be skipped as "never
+  // launched"), and must not launch a second time in the same step 0.
+  d->qpos[ball_qpos + 3] = 1.0;
+  EXPECT_TRUE(shooters.AfterStep(*m, *d, 0, MatchInput{}));
+  EXPECT_EQ(shooters.shots(), 1u);
+  d->qpos[ball_qpos] = 0.0;
+  d->qpos[ball_qpos + 1] = 0.0;
+  d->qpos[ball_qpos + 2] = 0.8;
+  d->qvel[wheel] = 300.0;
+  EXPECT_TRUE(shooters.AfterStep(*m, *d, 0, MatchInput{}));
+  EXPECT_EQ(shooters.shots(), 1u);
+}
+
+// REQ-DEV-39: re-attaching resets shots and per-body state, and Attach refuses
+// out-of-bounds indices or non-positive/non-finite shooter parameters.
+TEST(ScriptedShooter, ReAttachResetsStateAndValidatesShooterBounds) {
+  auto plant =
+      Make("reattach", Robot(false), Field(Ball("ball", {0.0, 0.0, 0.8})));
+  std::unique_ptr<WorldRules> rules;
+  ScriptedShooters& shooters = Attach(*plant, rules);
+  const mjModel* m = plant->model();
+  mjData* d = Writable(*plant);
+  const int wheel = Dof(m, "flywheel_joint");
+  const int ball_jnt = m->body_jntadr[mj_name2id(m, mjOBJ_BODY, "ball")];
+  const int ball_qpos = m->jnt_qposadr[ball_jnt];
+
+  d->qvel[wheel] = 300.0;
+  ASSERT_TRUE(plant->Step(1, {}));
+  ASSERT_EQ(shooters.shots(), 1u);
+
+  // Place the ball back in the inlet and re-attach: shots_ resets to 0.
+  d->qpos[ball_qpos] = 0.0;
+  d->qpos[ball_qpos + 1] = 0.0;
+  d->qpos[ball_qpos + 2] = 0.8;
+  for (int k = 0; k < 6; ++k) d->qvel[m->jnt_dofadr[ball_jnt] + k] = 0.0;
+  d->qvel[wheel] = 300.0;
+  shooters.Attach(*m, *d);
+  EXPECT_EQ(shooters.shots(), 0u);
+  EXPECT_TRUE(
+      shooters.AfterStep(*const_cast<mjModel*>(m), *d, 1, MatchInput{}));
+  EXPECT_EQ(shooters.shots(), 1u);
+
+  ASSERT_EQ(shooters.shooters().size(), 1u);
+  const ScriptedShooters::Shooter valid = shooters.shooters()[0];
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  auto with = [&](auto mutate) {
+    ScriptedShooters::Shooter s = valid;
+    mutate(s);
+    return s;
+  };
+  const std::vector<ScriptedShooters::Shooter> invalid = {
+      with([](auto& s) { s.inlet = -1; }),
+      with([m](auto& s) { s.inlet = static_cast<int>(m->nsite); }),
+      with([m](auto& s) { s.exit = static_cast<int>(m->nsite); }),
+      with([m](auto& s) { s.dof = static_cast<int>(m->nv); }),
+      with([m](auto& s) { s.robot_root = static_cast<int>(m->nbody); }),
+      with([](auto& s) { s.inertia_kg_m2 = 0.0; }),
+      with([](auto& s) { s.inertia_kg_m2 = -0.1; }),
+      with([nan](auto& s) { s.inertia_kg_m2 = nan; }),
+      with([nan](auto& s) { s.efficiency = nan; }),
+      with([inf](auto& s) { s.contact_radius_m = inf; }),
+  };
+  for (std::size_t idx = 0; idx < invalid.size(); ++idx) {
+    SCOPED_TRACE(idx);
+    ScriptedShooters bad(std::vector<ScriptedShooters::Shooter>{invalid[idx]});
+    EXPECT_THROW(bad.Attach(*m, *d), std::invalid_argument);
+  }
+}
+
+// REQ-DEV-39: a body that re-enters its own shooter's inlet within 0.5 s is
+// not spaced against itself in flight, even when the inlet lies along the
+// exit's launch ray.
+TEST(ScriptedShooter, SameBodyReenteringInletDoesNotBlockItself) {
+  // Root at (0, 0, 0.5), exit at (0.3, 0, 0.7) pitched 0.7 rad; inlet at
+  // (0.49, 0, 0.86) in world frame sits 0.25 m along the launch ray, outside
+  // the exit clearance and outside the exit-in-inlet check.
+  auto plant = Make("self_reenter", Robot(false, "0.49 0 0.36"),
+                    Field(Ball("ball", {0.49, 0.0, 0.86})));
+  std::unique_ptr<WorldRules> rules;
+  ScriptedShooters& shooters = Attach(*plant, rules);
+  const mjModel* m = plant->model();
+  mjData* d = Writable(*plant);
+  const int wheel = Dof(m, "flywheel_joint");
+  const int ball_jnt = m->body_jntadr[mj_name2id(m, mjOBJ_BODY, "ball")];
+  const int ball_qpos = m->jnt_qposadr[ball_jnt];
+  const int ball_dof = m->jnt_dofadr[ball_jnt];
+
+  d->qvel[wheel] = 300.0;
+  ASSERT_TRUE(plant->Step(1, {}));
+  ASSERT_EQ(shooters.shots(), 1u);
+
+  // Immediately place the same body back in the inlet along the launch ray.
+  d->qpos[ball_qpos] = 0.49;
+  d->qpos[ball_qpos + 1] = 0.0;
+  d->qpos[ball_qpos + 2] = 0.86;
+  for (int k = 0; k < 6; ++k) d->qvel[ball_dof + k] = 0.0;
+  d->qvel[wheel] = 300.0;
+  ASSERT_TRUE(plant->Step(1, {}));
+  EXPECT_EQ(shooters.shots(), 2u);
 }
 
 }  // namespace

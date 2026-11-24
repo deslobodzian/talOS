@@ -50,8 +50,9 @@ inline constexpr uint32_t kMaxGamePieces = 640;
 // and 16.7 to 25 Hz over the gateway's 1 to 20 ms periods.
 constexpr uint32_t PiecesEveryTicks(uint32_t period_us) {
   if (period_us == 0) return 1;
-  const uint32_t every = (50'000 + period_us / 2) / period_us;
-  return every == 0 ? 1 : every;
+  const uint64_t every =
+      (uint64_t{50'000} + static_cast<uint64_t>(period_us) / 2) / period_us;
+  return every == 0 ? 1 : static_cast<uint32_t>(every);
 }
 
 // The match input a tick shows the world rules: the Driver Station's mode
@@ -162,6 +163,7 @@ class MujocoGatewayExtension final : public GatewayExtension {
   bool dilation_logged_{false};
   bool overspeed_logged_{false};
   bool table_printed_{false};
+  bool in_hook_{false};
 };
 
 }  // namespace talos::simulation::mujoco
