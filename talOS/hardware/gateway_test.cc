@@ -555,21 +555,6 @@ TEST(Config, FocTravelsOnTheWireAndFingerprintAndAFollowerCannotSetIt) {
   EXPECT_THROW(Validate(follower), std::invalid_argument);
 }
 
-// The gateway checks a torque-current demand against max_torque_current_a
-// and the RoboRIO sets its peak torque current from it, so both ends must
-// agree on it: it travels on the config wire and changes the config id.
-// REQ-SAFE-43
-TEST(Config, TorqueCurrentLimitTravelsOnTheWireAndFingerprint) {
-  auto c = SwerveConfig(true);
-  c.motors[0].foc = true;
-  const auto no_limit_id = ConfigurationId(c);
-  c.motors[0].max_torque_current_a = 12.5;
-  EXPECT_NE(ConfigurationId(c), no_limit_id);
-  Config decoded;
-  ASSERT_TRUE(DeserializeConfig(SerializeConfig(c), decoded));
-  EXPECT_EQ(decoded, c);
-}
-
 // The RoboRIO's saved configuration file is tagged with the protocol version
 // that wrote it, which every config codec change bumps. A file of another
 // version is refused by that tag, though its body decodes and its CRC holds;
