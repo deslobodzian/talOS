@@ -941,5 +941,187 @@ TEST(SimulatedEventLoop,
   }
 }
 
+// A timer that becomes due during consecutive post-timer or post-wake backlog
+// drains runs between capped drains instead of being starved, across
+// BEFORE_TIMERS at-drain, ON_PUBLISH at-drain, and ON_PUBLISH waking delivery,
+// and all remaining backlog drains finish at the same instant without waiting
+// for a far-future timer.
+// REQ-RT-02
+TEST(SimulatedEventLoop, DueTimerRunsBetweenConsecutivePostTimerBacklogDrains) {
+  constexpr std::size_t kCap = 16;
+  constexpr std::size_t kMaxPasses = (MAX_SLOTS - 1) / kCap + 2;  // 65 passes
+  constexpr std::size_t kPostTimerMessages = 2 * kCap;            // 32 msgs
+
+  struct Case {
+    const char* name;
+    Delivery delivery;
+    bool prompt_data;
+    std::size_t arm_on_msg;
+    std::size_t expected_drains_at_timer;
+  };
+  const Case cases[] = {
+      {"before_timers", Delivery::BEFORE_TIMERS, false, kMaxPasses * kCap + 1,
+       2 * kMaxPasses + 1},
+      {"on_publish_at_drain", Delivery::ON_PUBLISH, false, kCap + 1,
+       kMaxPasses + 2},
+      {"on_publish_waking", Delivery::ON_PUBLISH, true, 1, kMaxPasses + 1},
+  };
+
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    const std::size_t expected_at_timer = c.expected_drains_at_timer * kCap;
+    const std::size_t expected_total = expected_at_timer + kPostTimerMessages;
+    const std::size_t safety_cap = expected_total + 64;
+
+    SimulationEnvironment environment;
+    SimulatedEventLoop<>::Options options;
+    options.delivery = c.delivery;
+    options.max_messages_per_tick = kCap;
+    SimulatedEventLoop<> loop{environment, options};
+
+    const std::uint16_t data_sender = SendSensor(loop, "/backlog_data");
+    std::uint16_t mid_timer_id = 0;
+
+    bool mid_timer_fired = false;
+    bool far_timer_fired = false;
+    std::size_t delivered = 0;
+    std::size_t delivered_at_timer = 0;
+    std::uint64_t drains_at_timer = 0;
+    MonotonicTime mid_timer_time{};
+    MonotonicTime last_delivery_time{};
+
+    auto on_data = [&](const Context& context, std::span<const std::byte>) {
+      ++delivered;
+      last_delivery_time = context.now;
+      if (delivered == c.arm_on_msg) {
+        loop.arm_timer(mid_timer_id, context.now, Duration::zero());
+      }
+      if (!mid_timer_fired && delivered < safety_cap) {
+        Send(loop, data_sender, static_cast<int>(delivered));
+      }
+      if (mid_timer_fired && delivered == expected_total) {
+        loop.exit();
+      }
+    };
+    auto on_mid_timer = [&](const Context& context) {
+      mid_timer_fired = true;
+      mid_timer_time = context.now;
+      delivered_at_timer = delivered;
+      drains_at_timer = loop.drains();
+      if (delivered > expected_at_timer) {
+        loop.exit();
+      }
+    };
+    auto on_far_timer = [&](const Context&) {
+      far_timer_fired = true;
+      loop.exit();
+    };
+
+    const auto data_id =
+        WatchSensor(loop, "/backlog_data", make_thunk(&on_data));
+    if (c.delivery == Delivery::ON_PUBLISH) {
+      if (c.prompt_data) {
+        loop.set_prompt(data_id);
+      } else {
+        loop.set_prompt(WatchSensor(loop, "/backlog_wake", Thunk{}));
+      }
+    }
+
+    const MonotonicTime origin{};
+    if (c.delivery == Delivery::BEFORE_TIMERS) {
+      const auto start_id = loop.register_timer("start", Thunk{});
+      loop.arm_timer(start_id, origin, Duration::zero());
+    }
+    mid_timer_id =
+        loop.register_timer("due_mid_backlog", make_thunk(&on_mid_timer));
+    const auto far_id =
+        loop.register_timer("far_guard", make_thunk(&on_far_timer));
+    loop.arm_timer(far_id, origin + 10s, Duration::zero());
+
+    for (std::size_t i = 0; i < kPostTimerMessages; ++i) {
+      loop.inject("/backlog_data",
+                  Sensor{static_cast<std::int32_t>(i), 0.0F, 0.0F});
+    }
+    if (c.delivery == Delivery::ON_PUBLISH && !c.prompt_data) {
+      loop.inject("/backlog_wake", Sensor{0, 0.0F, 0.0F});
+    }
+
+    loop.run_until(origin + 10s);
+
+    EXPECT_TRUE(mid_timer_fired);
+    EXPECT_FALSE(far_timer_fired);
+    EXPECT_EQ(delivered_at_timer, expected_at_timer)
+        << "due timer was starved across consecutive backlog drains";
+    EXPECT_EQ(drains_at_timer, c.expected_drains_at_timer);
+    EXPECT_EQ(delivered, expected_total);
+    EXPECT_EQ(loop.drains(), c.expected_drains_at_timer + 2);
+    EXPECT_EQ(mid_timer_time, origin);
+    EXPECT_EQ(last_delivery_time, origin);
+  }
+}
+
+// Under ON_PUBLISH, when a quiet sequence watcher's cap triggers an immediate
+// backlog drain alongside a concurrent prompt watcher's remaining backlog, the
+// prompt watcher keeps publish-time event_time (preserving latency()) while the
+// quiet watcher keeps drain time.
+// REQ-RT-19
+// REQ-RT-02
+TEST(SimulatedEventLoop,
+     QuietBacklogPreservesPublishEventTimeForConcurrentPromptBacklog) {
+  constexpr std::size_t kCap = 16;
+  constexpr std::size_t kMessages = 2 * kCap;
+
+  SimulationEnvironment environment;
+  SimulatedEventLoop<>::Options options;
+  options.delivery = Delivery::ON_PUBLISH;
+  options.max_messages_per_tick = kCap;
+  SimulatedEventLoop<> loop{environment, options};
+
+  std::vector<Context> quiet;
+  std::vector<Context> prompt;
+  auto on_quiet = [&](const Context& context, std::span<const std::byte>) {
+    quiet.push_back(context);
+  };
+  auto on_prompt = [&](const Context& context, std::span<const std::byte>) {
+    prompt.push_back(context);
+  };
+
+  const auto quiet_id = WatchSensor(loop, "/quiet", make_thunk(&on_quiet));
+  const auto prompt_id = WatchSensor(loop, "/prompt", make_thunk(&on_prompt));
+  loop.set_prompt(prompt_id);
+
+  const MonotonicTime origin{};
+  const MonotonicTime t0 = origin + 1ms;
+  const MonotonicTime t1 = origin + 10ms;
+
+  loop.advance_until(t0);
+  for (std::size_t i = 0; i < kMessages; ++i) {
+    loop.inject("/quiet", Sensor{static_cast<std::int32_t>(i), 0.0F, 0.0F});
+    loop.inject("/prompt", Sensor{static_cast<std::int32_t>(i), 0.0F, 0.0F});
+  }
+
+  // Wake at t1 > t0 so publish-to-dispatch latency is nonzero.
+  loop.advance_until(t1);
+  loop.run_until(t1);
+
+  ASSERT_EQ(quiet.size(), kMessages);
+  ASSERT_EQ(prompt.size(), kMessages);
+  EXPECT_EQ(loop.drains(), 3u);  // 16 + 16 + confirming empty drain
+  for (std::size_t i = 0; i < kMessages; ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(prompt[i].publish_time, t0);
+    EXPECT_EQ(prompt[i].event_time, t0);
+    EXPECT_EQ(prompt[i].now, t1);
+    EXPECT_EQ(prompt[i].latency(), t1 - t0);
+    EXPECT_EQ(quiet[i].publish_time, t0);
+    EXPECT_EQ(quiet[i].event_time, t1);
+    EXPECT_EQ(quiet[i].now, t1);
+    EXPECT_EQ(quiet[i].latency(), 0ns);
+  }
+  EXPECT_EQ(loop.source_counters()[prompt_id].max_latency_ns.load(),
+            (t1 - t0).count());
+  EXPECT_EQ(loop.source_counters()[quiet_id].max_latency_ns.load(), 0);
+}
+
 }  // namespace
 }  // namespace talos::event

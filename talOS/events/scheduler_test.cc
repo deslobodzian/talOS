@@ -156,7 +156,16 @@ TEST(Scheduler, DisablingAPeriodicTimerStopsIt) {
   EXPECT_FALSE(scheduler.pop_expired(at(10'000), expiration));
 }
 
+// REQ-RT-04
+// REQ-OPS-14
 TEST(Scheduler, ShiftSaturatesAtTimeBoundsAndPreservesHeapOrder) {
+  {
+    Scheduler at_max;
+    at_max.schedule(1, MonotonicTime::max());
+    at_max.shift(1ms);
+    EXPECT_EQ(at_max.next_deadline(), MonotonicTime::max());
+  }
+
   Scheduler upper;
   upper.schedule(2, MonotonicTime::max() - Duration{5});
   upper.schedule(1, MonotonicTime::max() - Duration{1});
@@ -176,7 +185,25 @@ TEST(Scheduler, ShiftSaturatesAtTimeBoundsAndPreservesHeapOrder) {
             (std::vector<std::uint16_t>{1}));
 }
 
+// REQ-RT-04
+// REQ-OPS-14
 TEST(Scheduler, PeriodicTimerNearMaxStopsRearmingInsteadOfOverflowing) {
+  {
+    // Firing on time at INT64_MAX - 500 with period 1000 must not overflow
+    // deadline + period into a negative deadline and loop forever.
+    Scheduler scheduler;
+    const MonotonicTime deadline = MonotonicTime::max() - Duration{500};
+    scheduler.schedule(1, deadline, Duration{1000});
+
+    Expiration expiration{};
+    ASSERT_TRUE(scheduler.pop_expired(deadline, expiration));
+    EXPECT_EQ(expiration.id, 1u);
+    EXPECT_EQ(expiration.deadline, deadline);
+    EXPECT_EQ(expiration.cycles, 1u);
+    EXPECT_TRUE(scheduler.empty());
+    EXPECT_FALSE(scheduler.pop_expired(MonotonicTime::max(), expiration));
+  }
+
   {
     Scheduler scheduler;
     const MonotonicTime deadline = MonotonicTime::max() - Duration{5};
@@ -207,6 +234,19 @@ TEST(Scheduler, PeriodicTimerNearMaxStopsRearmingInsteadOfOverflowing) {
     ASSERT_TRUE(scheduler.pop_expired(MonotonicTime::max(), expiration));
     EXPECT_EQ(expiration.deadline, MonotonicTime::max());
     EXPECT_EQ(expiration.cycles, 1u);
+    EXPECT_TRUE(scheduler.empty());
+  }
+
+  {
+    // Negative deadline to MonotonicTime::max() spans more than INT64_MAX
+    // nanoseconds; unsigned arithmetic must compute exact cycles without UB.
+    Scheduler scheduler;
+    scheduler.schedule(1, at(-1000), Duration{1000});
+
+    Expiration expiration{};
+    ASSERT_TRUE(scheduler.pop_expired(MonotonicTime::max(), expiration));
+    EXPECT_EQ(expiration.deadline, at(-1000));
+    EXPECT_EQ(expiration.cycles, 9'223'372'036'854'777u);
     EXPECT_TRUE(scheduler.empty());
   }
 
