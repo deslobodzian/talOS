@@ -2,11 +2,13 @@
 
 #include <mujoco/mujoco.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -70,6 +72,14 @@ std::string BodyName(const mjModel& model, int body) {
                                             : "body " + std::to_string(body);
 }
 
+struct ScopedHook {
+  explicit ScopedHook(bool& active) : active_(active) { active_ = true; }
+  ~ScopedHook() { active_ = false; }
+  ScopedHook(const ScopedHook&) = delete;
+  ScopedHook& operator=(const ScopedHook&) = delete;
+  bool& active_;
+};
+
 }  // namespace
 
 std::span<const FieldEntry> GatewayFields() { return kFields; }
@@ -117,6 +127,15 @@ void MujocoGatewayExtension::Configure(
     const config::RobotConfig& config,
     const hardware::sim::PhysicsOptions& options,
     hardware::sim::PhysicsSimBackend& backend) {
+  if (in_hook_) {
+    throw std::logic_error(
+        "MujocoGatewayExtension::Configure called reentrantly");
+  }
+  if (plant_ != nullptr) {
+    throw std::logic_error(
+        "MujocoGatewayExtension::Configure: already configured");
+  }
+  ScopedHook guard(in_hook_);
   if (!config.simulation.mujoco) {
     throw std::invalid_argument(
         "[simulation.mujoco] robot_model: the config sets no robot model; "
@@ -124,6 +143,10 @@ void MujocoGatewayExtension::Configure(
         "[simulation.mujoco])");
   }
   const config::SimulationMujocoConfig& model = *config.simulation.mujoco;
+  if (!model.field.empty() && !options_.field) {
+    throw std::invalid_argument("[simulation.mujoco] field = '" + model.field +
+                                "': no field resolver was configured");
+  }
 
   // The motors as the backend will bind them (config.hardware carries the
   // same local motor types the gateway hands SetLocalMotorTypes): one source
@@ -135,15 +158,23 @@ void MujocoGatewayExtension::Configure(
 
   const std::string field_xml =
       model.field.empty() ? std::string() : options_.field(model.field);
-  plant_ = MakePlant(PlantModel{.field_xml = field_xml,
-                                .robot_xml = model.robot_model,
-                                .start_x_m = options.start_x_m,
-                                .start_y_m = options.start_y_m,
-                                .start_yaw_rad = options.start_yaw_rad,
-                                .sleeping = model.sleeping},
-                     motors);
 
-  if (plant_->chassis()) {
+  // Build all owned state in locals first (new_plant declared after new_rules
+  // and new_game so exception unwind destroys new_plant before the rules it
+  // references), and commit only once every check and publisher succeeds.
+  std::vector<std::unique_ptr<WorldRules>> new_rules;
+  std::unique_ptr<GameRules> new_game;
+  const ScriptedShooters* new_shooters = nullptr;
+  std::unique_ptr<MujocoPlant> new_plant =
+      MakePlant(PlantModel{.field_xml = field_xml,
+                           .robot_xml = model.robot_model,
+                           .start_x_m = options.start_x_m,
+                           .start_y_m = options.start_y_m,
+                           .start_yaw_rad = options.start_yaw_rad,
+                           .sleeping = model.sleeping},
+                motors);
+
+  if (new_plant->chassis()) {
     const toml::node_view<const toml::node> simulation =
         config.toml_data["simulation"];
     if (simulation["wheel_radius_m"]) {
@@ -166,40 +197,54 @@ void MujocoGatewayExtension::Configure(
   // The game pieces: every free body but the robot's root (the robot's
   // other bodies hang below it and have no free joint), in body order, at
   // most kMaxGamePieces, all of one bounding radius.
-  const mjModel& compiled = *plant_->model();
+  std::vector<int> new_piece_bodies;
+  const mjModel& compiled = *new_plant->model();
   for (int body = 1; body < compiled.nbody; ++body) {
-    if (body == plant_->robot_root_body() || compiled.body_jntnum[body] < 1 ||
-        compiled.jnt_type[compiled.body_jntadr[body]] != mjJNT_FREE) {
+    if (body == new_plant->robot_root_body() ||
+        compiled.body_jntnum[body] < 1) {
       continue;
     }
-    piece_bodies_.push_back(body);
+    const int jnt = compiled.body_jntadr[body];
+    if (jnt < 0 || jnt >= compiled.njnt ||
+        compiled.jnt_type[jnt] != mjJNT_FREE) {
+      continue;
+    }
+    new_piece_bodies.push_back(body);
   }
-  if (piece_bodies_.size() > kMaxGamePieces) {
+  if (new_piece_bodies.size() > kMaxGamePieces) {
     throw std::invalid_argument(
         "[simulation.mujoco] field = '" + model.field + "': the model has " +
-        std::to_string(piece_bodies_.size()) +
+        std::to_string(new_piece_bodies.size()) +
         " game pieces (free bodies besides the robot), more than the " +
         std::to_string(kMaxGamePieces) + " /sim/telemetry/pieces carries");
   }
   const auto radius_of = [&compiled](int body) {
-    return compiled.body_geomnum[body] > 0
-               ? static_cast<float>(
-                     compiled.geom_rbound[compiled.body_geomadr[body]])
-               : 0.0F;
+    if (compiled.body_geomnum[body] <= 0) return 0.0F;
+    const int geom = compiled.body_geomadr[body];
+    if (geom < 0 || geom >= compiled.ngeom) return 0.0F;
+    return static_cast<float>(compiled.geom_rbound[geom]);
   };
-  for (const int body : piece_bodies_) {
-    if (radius_of(body) != radius_of(piece_bodies_.front())) {
+  const float first_radius =
+      new_piece_bodies.empty() ? 0.0F : radius_of(new_piece_bodies.front());
+  for (const int body : new_piece_bodies) {
+    const float radius = radius_of(body);
+    if (!std::isfinite(radius) || radius < 0.0F) {
+      throw std::invalid_argument(
+          "[simulation.mujoco] field = '" + model.field + "': game piece " +
+          BodyName(compiled, body) + " has a non-finite or negative radius");
+    }
+    if (radius != first_radius) {
       throw std::invalid_argument(
           "[simulation.mujoco] field = '" + model.field + "': game pieces " +
-          BodyName(compiled, piece_bodies_.front()) + " and " +
+          BodyName(compiled, new_piece_bodies.front()) + " and " +
           BodyName(compiled, body) +
           " differ in radius; /sim/telemetry/pieces carries one");
     }
   }
-  pieces_ = ::sim::GamePieces{};
-  pieces_.mutate_pieces_count(static_cast<uint32_t>(piece_bodies_.size()));
-  pieces_.mutate_radius_m(
-      piece_bodies_.empty() ? 0.0F : radius_of(piece_bodies_.front()));
+  ::sim::GamePieces new_pieces{};
+  new_pieces.mutate_pieces_count(
+      static_cast<uint32_t>(new_piece_bodies.size()));
+  new_pieces.mutate_radius_m(first_radius);
 
   std::vector<hardware::sim::PhysicsSimBackend::WorldInput> inputs;
   for (const hardware::DigitalInputConfig& input :
@@ -213,42 +258,58 @@ void MujocoGatewayExtension::Configure(
   // shooters, then the field's game, so a FUEL a shooter launches in a step
   // is judged at its exit in that step. A bad contract throws
   // std::invalid_argument naming the element: a config refusal.
-  std::unique_ptr<WorldRules> shooters = MakeScriptedShooters(*plant_->model());
+  std::unique_ptr<WorldRules> shooters =
+      MakeScriptedShooters(*new_plant->model());
   if (shooters != nullptr) {
-    shooters_ = dynamic_cast<ScriptedShooters*>(shooters.get());
-    plant_->AddRules(*shooters);
-    rules_.push_back(std::move(shooters));
+    auto* typed = dynamic_cast<ScriptedShooters*>(shooters.get());
+    new_plant->AddRules(*shooters);
+    new_rules.push_back(std::move(shooters));
+    new_shooters = typed;
   }
   if (const FieldEntry* field = FindField(model.field);
       field != nullptr && field->make_rules != nullptr) {
-    game_ = field->make_rules(GameOptions{.seed = model.seed});
-    plant_->AddRules(*game_);
+    new_game = field->make_rules(GameOptions{.seed = model.seed});
+    new_plant->AddRules(*new_game);
   }
-  pieces_every_ = PiecesEveryTicks(config.hardware.period_us);
+  const uint32_t new_pieces_every = PiecesEveryTicks(config.hardware.period_us);
+  std::optional<ipc::Publisher<::sim::MatchState>> new_publisher;
+  std::optional<ipc::Publisher<::sim::GamePieces>> new_pieces_publisher;
   if (!options_.tests_only_skip_writes) {
-    publisher_.emplace(::sim::topics::kMatchState);
-    pieces_publisher_.emplace(
+    new_publisher.emplace(::sim::topics::kMatchState);
+    new_pieces_publisher.emplace(
         ::sim::topics::kPieces,
         RTMSOptions{.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
                     .read_mode = ReadMode::SEQUENCE},
         hardware::sim::kPiecesSlots);
   }
 
-  backend.SetPlant(plant_.get());
+  // Commit: nothing below throws.
+  backend.SetPlant(new_plant.get());
   backend.SetWorldInputs(std::move(inputs));
+  rules_ = std::move(new_rules);
+  game_ = std::move(new_game);
+  shooters_ = new_shooters;
+  plant_ = std::move(new_plant);
+  piece_bodies_ = std::move(new_piece_bodies);
+  pieces_ = new_pieces;
+  pieces_every_ = new_pieces_every;
+  publisher_ = std::move(new_publisher);
+  pieces_publisher_ = std::move(new_pieces_publisher);
   // The gateway's Reconfigure binds the plant next; a refusal there exits 1
   // naming the key and the motor or input.
   backend_ = &backend;
 }
 
 void MujocoGatewayExtension::ReportClock(std::string_view why) {
+  if (options_.log == nullptr || backend_ == nullptr) return;
   const auto& time = backend_->plant_time();
   char line[256];
+  const char* ptr = why.empty() ? "" : why.data();
+  const int len = static_cast<int>(std::min(why.size(), sizeof(line)));
   std::snprintf(line, sizeof(line),
                 "mujoco_gateway: %.*s: plant time %.3f s stepped, %.3f s "
                 "dropped in %llu ticks\n",
-                static_cast<int>(why.size()), why.data(),
-                static_cast<double>(time.stepped_us) * 1e-6,
+                len, ptr, static_cast<double>(time.stepped_us) * 1e-6,
                 static_cast<double>(time.dropped_us) * 1e-6,
                 static_cast<unsigned long long>(time.dropped_ticks));
   *options_.log << line << std::flush;
@@ -278,18 +339,24 @@ uint32_t MujocoGatewayExtension::TopicSlots(std::size_t index) const {
 }
 
 void MujocoGatewayExtension::Counts(std::span<TopicCount> out) const {
-  out[0] = match_count_;
-  out[1] = pieces_count_;
+  if (!out.empty()) out[0] = match_count_;
+  if (out.size() > 1) out[1] = pieces_count_;
 }
 
 void MujocoGatewayExtension::BeforeTick(const TickInput& tick) {
+  if (in_hook_) {
+    throw std::logic_error(
+        "MujocoGatewayExtension::BeforeTick called reentrantly");
+  }
+  ScopedHook guard(in_hook_);
   if (plant_ != nullptr) plant_->SetMatchInput(MatchInputOf(tick));
 }
 
 void MujocoGatewayExtension::Stamp(FmsStamp& fms) {
   if (game_ == nullptr) return;
   const FmsReport report = game_->Fms();
-  fms.match_time_s = report.match_time_s;
+  fms.match_time_s =
+      std::isfinite(report.match_time_s) ? report.match_time_s : 0.0F;
   static_assert(sizeof(report.game_specific_message) ==
                 sizeof(fms.game_specific_message));
   fms.game_specific_message = report.game_specific_message;
@@ -320,9 +387,16 @@ MatchInput MatchInputOf(const TickInput& tick) {
 }
 
 void MujocoGatewayExtension::AfterTick(uint64_t now_us) {
+  if (in_hook_) {
+    throw std::logic_error(
+        "MujocoGatewayExtension::AfterTick called reentrantly");
+  }
   if (plant_ == nullptr || backend_ == nullptr) return;
+  ScopedHook guard(in_hook_);
   if (!table_printed_) {  // the first tick, after the gateway bound the plant
-    *options_.log << plant_->binding_table() << std::flush;
+    if (options_.log != nullptr) {
+      *options_.log << plant_->binding_table() << std::flush;
+    }
     table_printed_ = true;
   }
   if (const std::string_view failure = plant_->failure(); !failure.empty()) {
@@ -334,8 +408,11 @@ void MujocoGatewayExtension::AfterTick(uint64_t now_us) {
   ++ticks_;
   const auto& time = backend_->plant_time();
   if (time.dropped_us > reported_dropped_us_) {
-    const int64_t now_ns = options_.wall_clock_ns();
-    if (!dilation_logged_ || now_ns - dilation_logged_ns_ >= kReportPeriodNs) {
+    const int64_t now_ns =
+        options_.wall_clock_ns ? options_.wall_clock_ns() : int64_t{0};
+    if (!dilation_logged_ ||
+        (now_ns >= dilation_logged_ns_ &&
+         now_ns - dilation_logged_ns_ >= kReportPeriodNs)) {
       ReportClock("time dilation, the host ran slower than real time");
       reported_dropped_us_ = time.dropped_us;
       dilation_logged_ns_ = now_ns;
@@ -344,14 +421,18 @@ void MujocoGatewayExtension::AfterTick(uint64_t now_us) {
   }
   const uint64_t excursions = plant_->overspeed_excursions();
   if (excursions > reported_excursions_) {
-    const int64_t now_ns = options_.wall_clock_ns();
+    const int64_t now_ns =
+        options_.wall_clock_ns ? options_.wall_clock_ns() : int64_t{0};
     if (!overspeed_logged_ ||
-        now_ns - overspeed_logged_ns_ >= kReportPeriodNs) {
-      *options_.log << "mujoco_gateway: " << excursions
-                    << " overspeed excursions so far (a bound rotor above "
-                    << hardware::Gateway::kMaxRotorRps
-                    << " rps; check the model's inertia and gear)\n"
-                    << std::flush;
+        (now_ns >= overspeed_logged_ns_ &&
+         now_ns - overspeed_logged_ns_ >= kReportPeriodNs)) {
+      if (options_.log != nullptr) {
+        *options_.log << "mujoco_gateway: " << excursions
+                      << " overspeed excursions so far (a bound rotor above "
+                      << hardware::Gateway::kMaxRotorRps
+                      << " rps; check the model's inertia and gear)\n"
+                      << std::flush;
+      }
       reported_excursions_ = excursions;
       overspeed_logged_ns_ = now_ns;
       overspeed_logged_ = true;
@@ -363,15 +444,17 @@ void MujocoGatewayExtension::PublishMatch(uint64_t now_us) {
   match_ = ::sim::MatchState{};
   if (game_ != nullptr) game_->Report(match_);
   // The tick's node-clock time, the clock /sim/state is stamped on.
-  match_.mutate_sample_time_ns(now_us * 1000);
-  match_.mutate_shots_count(
-      shooters_ != nullptr ? static_cast<uint32_t>(shooters_->shots()) : 0);
+  const uint64_t sample_time_ns = now_us * 1000;
+  match_.mutate_sample_time_ns(sample_time_ns);
+  const uint64_t shots = shooters_ != nullptr ? shooters_->shots() : 0;
+  match_.mutate_shots_count(static_cast<uint32_t>(
+      std::min<uint64_t>(shots, std::numeric_limits<uint32_t>::max())));
   if (!publisher_) return;
   const auto status = publisher_->write(match_);
   if (status == WriteResult::SUCCESS) {
     ++match_count_.samples;
     match_count_.sequence = status.sequence;
-    match_count_.last_ns = static_cast<int64_t>(now_us) * 1000;
+    match_count_.last_ns = static_cast<int64_t>(sample_time_ns);
   } else {
     ++match_count_.dropped;
   }
@@ -379,14 +462,15 @@ void MujocoGatewayExtension::PublishMatch(uint64_t now_us) {
 
 void MujocoGatewayExtension::PublishPieces(uint64_t now_us) {
   const mjData& data = *plant_->data();
-  pieces_.mutate_sample_time_ns(now_us * 1000);
+  const uint64_t sample_time_ns = now_us * 1000;
+  pieces_.mutate_sample_time_ns(sample_time_ns);
   auto& x = *pieces_.mutable_x_m();
   auto& y = *pieces_.mutable_y_m();
   auto& z = *pieces_.mutable_z_m();
   auto& in_play = *pieces_.mutable_in_play();
   for (std::size_t i = 0; i < piece_bodies_.size(); ++i) {
     const int body = piece_bodies_[i];
-    const mjtNum* at = data.xpos + static_cast<std::ptrdiff_t>(3 * body);
+    const mjtNum* at = data.xpos + static_cast<std::ptrdiff_t>(body) * 3;
     const auto index = static_cast<flatbuffers::uoffset_t>(i);
     x.Mutate(index, static_cast<float>(at[0]));
     y.Mutate(index, static_cast<float>(at[1]));
@@ -398,15 +482,18 @@ void MujocoGatewayExtension::PublishPieces(uint64_t now_us) {
   if (status == WriteResult::SUCCESS) {
     ++pieces_count_.samples;
     pieces_count_.sequence = status.sequence;
-    pieces_count_.last_ns = static_cast<int64_t>(now_us) * 1000;
+    pieces_count_.last_ns = static_cast<int64_t>(sample_time_ns);
   } else {
     ++pieces_count_.dropped;
   }
 }
 
 void MujocoGatewayExtension::Finish() {
-  if (plant_ == nullptr || backend_ == nullptr) return;
+  if (plant_ == nullptr || backend_ == nullptr || options_.summary == nullptr) {
+    return;
+  }
   const auto& time = backend_->plant_time();
+  const char* period = ::sim::EnumNameMatchPeriod(match_.period());
   char line[256];
   std::snprintf(line, sizeof(line),
                 "mujoco_gateway: stepped_s=%.3f dropped_s=%.3f "
@@ -416,7 +503,7 @@ void MujocoGatewayExtension::Finish() {
                 static_cast<double>(time.dropped_us) * 1e-6,
                 static_cast<unsigned long long>(time.dropped_ticks),
                 static_cast<unsigned long long>(plant_->overspeed_excursions()),
-                ::sim::EnumNameMatchPeriod(match_.period()),
+                period != nullptr ? period : "Unknown",
                 match_.blue_points_count(), match_.red_points_count(),
                 match_.shots_count());
   *options_.summary << line << std::flush;
