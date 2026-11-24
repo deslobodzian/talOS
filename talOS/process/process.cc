@@ -237,6 +237,11 @@ void LockMemory(Problems& problems) {
   LockStack(problems);
 }
 
+// XNU's admissible THREAD_TIME_CONSTRAINT_POLICY computation quantum bounds
+// [50 us, 50 ms] (osfmk/kern/thread_policy.c).
+constexpr std::chrono::nanoseconds kMinRtQuantum{std::chrono::microseconds{50}};
+constexpr std::chrono::nanoseconds kMaxRtQuantum{std::chrono::milliseconds{50}};
+
 #if defined(__APPLE__)
 
 void SetThreadPolicy(const LoopPolicy& loop, Problems& problems) {
@@ -264,7 +269,8 @@ void SetThreadPolicy(const LoopPolicy& loop, Problems& problems) {
   };
   thread_time_constraint_policy_data_t policy{};
   policy.period = to_abs(loop.period);
-  policy.computation = to_abs(loop.computation);
+  policy.computation = std::clamp(to_abs(loop.computation),
+                                  to_abs(kMinRtQuantum), to_abs(kMaxRtQuantum));
   policy.constraint = std::max(to_abs(loop.constraint), policy.computation);
   policy.period = std::max(policy.period, policy.constraint);
   policy.preemptible = TRUE;
@@ -491,10 +497,6 @@ LoopPolicy PolicyFor(const RealtimeOptions& options) noexcept {
   // Up to half the period of work, which must finish within the period,
   // clamped to XNU's admissible RT quantum bounds [50 us, 50 ms] while keeping
   // computation <= constraint <= period.
-  constexpr std::chrono::nanoseconds kMinRtQuantum{
-      std::chrono::microseconds{50}};
-  constexpr std::chrono::nanoseconds kMaxRtQuantum{
-      std::chrono::milliseconds{50}};
   policy.time_constraint = true;
   const std::chrono::nanoseconds requested_period =
       options.period.count() > 0
