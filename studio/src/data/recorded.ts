@@ -145,30 +145,8 @@ type PoseChannels = {x: string; y: string; yaw: string; valid: string};
 // sessions match live telemetry's SetupPoseExtraction.
 function resolvePoseChannels(channels: ChannelInfo[],
                              poseTopic?: string): PoseChannels|null {
-  if (poseTopic) {
-    const names = new Set(channels.map(c => c.name));
-    const base = poseTopic.replace(/^\/+/, '');
-    if (base) {
-      const prefix = `${base}/`;
-      const valid = `${prefix}valid`;
-      const preferred = `${prefix}pose/x_m`;
-      const candidates = names.has(preferred) ?
-          [preferred] :
-          channels.filter(c => c.name.startsWith(prefix) && c.name.endsWith('/x_m'))
-              .map(c => c.name);
-      for (const x of candidates) {
-        const stem = x.slice(0, -'x_m'.length);
-        const y = `${stem}y_m`, yaw = `${stem}yaw_rad`;
-        if (names.has(y) && names.has(yaw)) return {x, y, yaw, valid};
-      }
-    }
-  }
-  const est = discoverEstimate(channels);
-  if (!est) return null;
-  return {
-    x: est.x, y: est.y, yaw: est.yaw,
-    valid: est.x.replace(/pose\/x_m$/, 'valid')
-  };
+  const est = discoverEstimate(channels, poseTopic);
+  return est ? {x: est.x, y: est.y, yaw: est.yaw, valid: est.valid} : null;
 }
 
 export class RecordedSource implements DataSource {

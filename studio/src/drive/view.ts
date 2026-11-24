@@ -32,7 +32,7 @@ function read(s: Snapshot|null, name: string|undefined): Reading {
   return {value, text: channelDisplay(s, name), unit: s.units[name] ?? '',
           labelled, exact: !Number.isSafeInteger(value) && s.exact?.[name] !== undefined};
 }
-const on = (r: Reading) => r !== null && r.value !== 0 && !Number.isNaN(r.value);
+const on = (r: Reading) => r !== null && Number.isFinite(r.value) && r.value !== 0;
 
 // A number at `precision` places with its unit; a label or a non-finite or
 // huge integer reading as its own text.
@@ -257,6 +257,7 @@ function numberWidget(s: Snapshot|null, w: Widget&{kind: 'number'}): string {
 function booleanWidget(s: Snapshot|null, w: Widget&{kind: 'boolean'}): string {
   const r = read(s, w.channels.channel);
   if (r === null) return `<div class="big">${ABSENT}</div>`;
+  if (!Number.isFinite(r.value)) return '<div class="big"><span class="absent">—</span></div>';
   const value = on(r);
   return `<div class="big flag ${value === w.good ? 'good' : 'bad'}">${value ? 'YES' : 'NO'}</div>`;
 }
@@ -314,6 +315,7 @@ function graphWidget(model: DriveModel, w: Widget&{kind: 'graph'}): string {
 export function checkPasses(s: Snapshot|null, item: CheckItem): boolean|null {
   const r = read(s, item.channel);
   if (r === null) return null;
+  if (!Number.isFinite(r.value)) return false;
   if (item.equals !== null) {
     if (typeof item.equals === 'boolean' && on(r) !== item.equals) return false;
     if (typeof item.equals === 'number' && r.value !== item.equals) return false;

@@ -15,6 +15,7 @@ import {
   useAlertLatch,
   useDictionary,
   useEvents,
+  useRecorded,
   useRobotStatus,
   useSeries,
   useSnapshot,
@@ -24,6 +25,7 @@ import type {DriverStationMode, RobotEvent, Series} from '../../data/types';
 import {
   discoverCameras,
   discoverEstimators,
+  discoverPoseTopic,
   discoverSubsystems,
   type Camera,
   type Subsystem
@@ -235,6 +237,7 @@ function RobotPanel() {
   const snapshot = useSnapshot();
   const dictionary = useDictionary();
   const system = useSystem();
+  const recorded = useRecorded();
   const status = useRobotStatus();
   const events = useEvents();
   const actions = useActions();
@@ -306,15 +309,31 @@ function RobotPanel() {
   const acceptancePct = acceptedTotal !== null && acceptedTotal > 0 ?
       accepted.delta! / acceptedTotal * 100 : null;
 
-  // Estimator pose (owner-agnostic): the discoverEstimators owner's pose and
-  // sim ground truth, for the pose/heading error.
-  const posePrefix = estimator ? `${estimator.name}/state/pose` : null;
-  const poseX = posePrefix ? channels[`${posePrefix}/x_m`] : undefined;
-  const poseY = posePrefix ? channels[`${posePrefix}/y_m`] : undefined;
-  const poseYaw = posePrefix ? channels[`${posePrefix}/yaw_rad`] : undefined;
+  // Estimator pose (owner-agnostic): prefers `[studio] pose_topic` when
+  // configured on a recorded session, else the discoverEstimators owner's pose,
+  // paired with sim ground truth for the pose/heading error.
+  const poseTopic = recorded?.bounds.pose_topic;
+  const configuredPose = useMemo(
+      () => discoverPoseTopic(dictionary, poseTopic), [dictionary, poseTopic]);
+  const poseXChannel = configuredPose ? configuredPose.x :
+      estimator ? `${estimator.name}/state/pose/x_m` : null;
+  const poseYChannel = configuredPose ? configuredPose.y :
+      estimator ? `${estimator.name}/state/pose/y_m` : null;
+  const poseYawChannel = configuredPose ? configuredPose.yaw :
+      estimator ? `${estimator.name}/state/pose/yaw_rad` : null;
+  const poseValidChannel = configuredPose ? configuredPose.valid :
+      estimator ? `${estimator.name}/state/valid` : null;
+  const poseX = poseXChannel ? channels[poseXChannel] : undefined;
+  const poseY = poseYChannel ? channels[poseYChannel] : undefined;
+  const poseYaw = poseYawChannel ? channels[poseYawChannel] : undefined;
+  const poseValid = configuredPose ?
+      (poseValidChannel ? asBool(channels[poseValidChannel]) : null) :
+      (status.estimator?.valid ?? null);
   const truth = simTruthPose(snapshot);
   const poseErrorValue =
-      poseX !== undefined && poseY !== undefined && poseYaw !== undefined && truth ?
+      poseX !== undefined && Number.isFinite(poseX) &&
+      poseY !== undefined && Number.isFinite(poseY) &&
+      poseYaw !== undefined && Number.isFinite(poseYaw) && truth ?
       poseError({x: poseX, y: poseY, yaw: poseYaw}, truth) :
       null;
 
@@ -424,18 +443,17 @@ function RobotPanel() {
       </Card>
 
       <Card title="Pose" eyebrow="ESTIMATOR">
-        {estimator === null ?
+        {estimator === null && configuredPose === null ?
              <EmptyState>no estimator discovered</EmptyState> :
              <div className="pose-card">
                <StatList>
-                 <Stat label="X" channel={`${posePrefix}/x_m`}>{poseX === undefined ? '—' : number(poseX, 3) + ' m'}</Stat>
-                 <Stat label="Y" channel={`${posePrefix}/y_m`}>{poseY === undefined ? '—' : number(poseY, 3) + ' m'}</Stat>
-                 <Stat label="Heading" channel={`${posePrefix}/yaw_rad`}>{poseYaw === undefined || !Number.isFinite(poseYaw) ? '—' :
+                 <Stat label="X" channel={poseXChannel ?? undefined}>{poseX === undefined || !Number.isFinite(poseX) ? '—' : number(poseX, 3) + ' m'}</Stat>
+                 <Stat label="Y" channel={poseYChannel ?? undefined}>{poseY === undefined || !Number.isFinite(poseY) ? '—' : number(poseY, 3) + ' m'}</Stat>
+                 <Stat label="Heading" channel={poseYawChannel ?? undefined}>{poseYaw === undefined || !Number.isFinite(poseYaw) ? '—' :
                      `${number(poseYaw * 180 / Math.PI, 1)}°`}</Stat>
-                 <Stat label="Valid" channel={`${estimator.name}/state/valid`} tone={
-                     status.estimator !== null && status.estimator.valid === false ? 'warn' : undefined}>
-                   {status.estimator === null || status.estimator.valid === null ? '—' :
-                       status.estimator.valid ? 'yes' : 'no'}
+                 <Stat label="Valid" channel={poseValidChannel ?? undefined} tone={
+                     poseValid === false ? 'warn' : undefined}>
+                   {poseValid === null ? '—' : poseValid ? 'yes' : 'no'}
                  </Stat>
                  <Stat label="Accepted (10 s)" channel={estimatorAccepted ?? undefined} tone={rejected.delta !== null && rejected.delta > 0 ? 'warn' : undefined}>
                    {accepted.delta === null ? '—' : accepted.delta}

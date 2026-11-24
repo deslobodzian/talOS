@@ -13,7 +13,7 @@ import {AlertLevel, ChannelKind, type ChannelSpec, dictionaryId, encodeDictionar
 import {CONNECTING_GRACE_MS, DEAD_AFTER_MS, DECODE_RETRY_MS, DriveModel, type DriveSocket, type Link, RECONNECT_MS, RENDER_MS, REPLACED_CODE, SILENCE_MS, STALE_MS} from '../src/drive/feed';
 import {type Layout, layoutsEqual, parseLayout, trackedChannels} from '../src/drive/layout';
 import {fetchAndParseLayout, type LayoutFetchResult, LayoutReloader} from '../src/drive/reload';
-import {DrawSchedule, esc, GLYPH_PX, gridStyle, listColumns, listRowsFit, METRICS, nameCharsShown, NODE_STATE, outOfView, outOfViewText, Painter, renderDashboard, renderGridWidgets, renderStatus, STALE_DRAW_LAG_MS, type Surface, type Timers} from '../src/drive/view';
+import {checkPasses, DrawSchedule, esc, GLYPH_PX, gridStyle, listColumns, listRowsFit, METRICS, nameCharsShown, NODE_STATE, outOfView, outOfViewText, Painter, renderDashboard, renderGridWidgets, renderStatus, renderWidget, STALE_DRAW_LAG_MS, type Surface, type Timers} from '../src/drive/view';
 
 const LAYOUT = parseLayout(JSON.parse(
     readFileSync(new URL('./drive_layout_2026.json', import.meta.url), 'utf8')));
@@ -1939,4 +1939,89 @@ test('ignores stale out-of-order layout fetch responses and aborts on disconnect
   await flushMicrotasks();
   assert.equal(activeTitle, 'V2', 'stale fetch overwrote newer layout');
   assert.equal(reloader.error, null);
+});
+
+// REQ-OPS-37, REQ-OPS-39: non-finite values (NaN, +/-Infinity) must never read
+// as NO/YES in booleanWidget or pass equals:false / bounds in checkPasses.
+test('booleanWidget renders non-finite values as unknown and checkPasses fails them', () => {
+  const layout = parseLayout({columns: 4, rows: 2, widgets: [
+    {kind: 'boolean', at: [0, 0, 2, 1], title: 'Ready', good: false,
+     channels: {channel: 'test/state/flag'}},
+    {kind: 'checks', at: [2, 0, 2, 1], title: 'Checks', channels: {}, items: [
+      {label: 'Not faulted', channel: 'test/state/flag', equals: false},
+      {label: 'Armed', channel: 'test/state/flag', equals: true},
+      {label: 'Voltage ok', channel: 'test/state/flag', at_least: 12}
+    ]}
+  ]});
+  const boolWidget = layout.widgets[0];
+  for (const bad of [NaN, Infinity, -Infinity]) {
+    const h = harness();
+    h.connect(0);
+    h.model.latest = {
+      ...h.model.latest!,
+      channels: {...h.model.latest!.channels, 'test/state/flag': bad},
+      units: {...h.model.latest!.units, 'test/state/flag': ''}
+    };
+    const boolHtml = renderWidget(boolWidget, h.model, h.clock.now);
+    assert.match(boolHtml, /class="absent">—<\/span>/, `booleanWidget for ${bad}: ${boolHtml}`);
+    assert.doesNotMatch(boolHtml, />(YES|NO)</, `booleanWidget rendered YES/NO for ${bad}`);
+    assert.doesNotMatch(boolHtml, /flag (good|bad)/, `booleanWidget styled good/bad for ${bad}`);
+
+    assert.equal(
+        checkPasses(h.model.latest, {label: 'f', channel: 'test/state/flag',
+                                     equals: false, at_least: null, at_most: null}),
+        false, `equals:false passed on ${bad}`);
+    assert.equal(
+        checkPasses(h.model.latest, {label: 't', channel: 'test/state/flag',
+                                     equals: true, at_least: null, at_most: null}),
+        false, `equals:true passed on ${bad}`);
+    assert.equal(
+        checkPasses(h.model.latest, {label: 'min', channel: 'test/state/flag',
+                                     equals: null, at_least: 12, at_most: null}),
+        false, `at_least passed on ${bad}`);
+    assert.equal(
+        checkPasses(h.model.latest, {label: 'max', channel: 'test/state/flag',
+                                     equals: null, at_least: null, at_most: 15}),
+        false, `at_most passed on ${bad}`);
+  }
+});
+
+// REQ-OPS-36, REQ-OPS-37: a reconnect keyframe on the same stream_id with
+// sequence_id <= held.sequence_id (equal or older) must keep values STALE,
+// never roll latest backward, and never let a heartbeat repeat of held look fresh.
+test('reconnect keyframe on same stream with sequence_id <= held stays stale and never rolls back', () => {
+  for (const keyframeSeq of [10, 8]) {
+    const h = harness();
+    h.connect(0, {...NOMINAL, 'shooter/state/flywheel_velocity_rps': 52.34}, 10);
+    assert.equal(h.model.fresh(h.clock.now), true);
+    h.socket().onclose!({code: 1006, reason: ''});
+    for (let t = 100; h.sockets.length < 2; t += 100) h.at(t);
+    const reconnectedAt = h.clock.now;
+    h.socket().onopen!();
+    h.socket().send(
+        ...encodeDictionaryPages(header(keyframeSeq), CHANNELS),
+        ...update(keyframeSeq, {...NOMINAL, 'shooter/state/flywheel_velocity_rps': 11.1}, true));
+    assert.equal(h.model.fresh(reconnectedAt), false, `keyframe seq ${keyframeSeq} read fresh`);
+    assert.match(widgetHtml(render(h), 'Flywheel'), /STALE/);
+    if (keyframeSeq < 10) {
+      assert.equal(h.model.latest?.sequence_id, '10',
+                   'older reconnect keyframe rolled latest backward');
+      assert.match(widgetHtml(render(h), 'Flywheel'), /52\.3/,
+                   'older reconnect keyframe overwrote newer displayed value');
+    }
+
+    // A heartbeat repeat of the previously held seq 10 must NOT make values fresh.
+    h.at(reconnectedAt + 100);
+    h.socket().send(...update(10, {}, false));
+    assert.equal(h.model.fresh(h.clock.now), false,
+                 `repeat of held seq 10 after keyframe ${keyframeSeq} falsely read fresh`);
+    assert.match(widgetHtml(render(h), 'Flywheel'), /STALE/);
+
+    // Only a strictly newer tick (seq 11) makes values fresh again.
+    h.at(reconnectedAt + 200);
+    h.socket().send(...update(11, {'shooter/state/flywheel_velocity_rps': 60.5}, false));
+    assert.equal(h.model.fresh(h.clock.now), true);
+    assert.doesNotMatch(widgetHtml(render(h), 'Flywheel'), /STALE/);
+    assert.match(widgetHtml(render(h), 'Flywheel'), /60\.5/);
+  }
 });

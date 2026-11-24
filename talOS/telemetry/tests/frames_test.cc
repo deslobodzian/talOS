@@ -104,5 +104,147 @@ TEST(DictionaryPages, EntryBoundHoldsWithEveryFieldSet) {
   }
 }
 
+// REQ-CONTRACT-28: EncodeValuePages rejects mismatched channels/values without
+// emitting any page, and emits exactly one valid empty page when nothing is
+// carried.
+TEST(ValuePages, ErrorAndEmptyPaths) {
+  flatbuffers::FlatBufferBuilder builder{2048};
+  const PageHeader header{7, 11, 1000, 42, 4};
+  const Talos::Telemetry::Pose chassis{0, 0, 0, 0, 0, 0};
+
+  // Mismatched channels vs values lengths: returns false and emits nothing.
+  {
+    const std::vector<std::uint32_t> channels{0, 1};
+    const std::vector<std::uint64_t> values{10};
+    std::size_t emitted = 0;
+    EXPECT_FALSE(EncodeValuePages(
+        builder, header, chassis, true, channels, values, {},
+        [&](std::span<const std::uint8_t>, const PageSpan&) { ++emitted; }));
+    EXPECT_EQ(emitted, 0u);
+  }
+
+  // Empty update still emits one valid page (page 0 of 1).
+  {
+    std::size_t emitted = 0;
+    ASSERT_TRUE(EncodeValuePages(
+        builder, header, chassis, false, {}, {}, {},
+        [&](std::span<const std::uint8_t> page, const PageSpan& span) {
+          ++emitted;
+          EXPECT_LE(page.size(), telemetry_wire::kMaxValueFrameBytes);
+          EXPECT_EQ(span.sample_count, 0u);
+          EXPECT_EQ(span.absent_count, 0u);
+          const auto* frame =
+              Talos::Telemetry::GetSizePrefixedFrame(page.data());
+          ASSERT_NE(frame, nullptr);
+          EXPECT_EQ(frame->page(), 0u);
+          EXPECT_EQ(frame->page_count(), 1u);
+          EXPECT_EQ(frame->channels(), nullptr);
+          EXPECT_EQ(frame->absent(), nullptr);
+        }));
+    EXPECT_EQ(emitted, 1u);
+  }
+}
+
+// REQ-CONTRACT-28: EncodeDictionaryPages handles empty dictionaries (1 empty
+// page), exact single-entry room boundary (accepted on 1 page), 1-byte over
+// single-entry room (throws std::runtime_error naming the channel), and
+// multi-page splits with exact first_channel/page/page_count invariants.
+TEST(DictionaryPages, NearLimitAndErrorPaths) {
+  flatbuffers::FlatBufferBuilder builder{4096};
+  DictionaryScratch scratch;
+  const PageHeader header{9, 0, 2000, 99, 0};
+
+  // Empty dictionary emits one empty page.
+  {
+    std::size_t pages = 0;
+    EncodeDictionaryPages(
+        builder, scratch, header, {}, [&](std::span<const std::uint8_t> page) {
+          ++pages;
+          EXPECT_LE(page.size(), telemetry_wire::kMaxDictionaryPageBytes);
+          const auto* frame =
+              Talos::Telemetry::GetSizePrefixedFrame(page.data());
+          ASSERT_NE(frame, nullptr);
+          EXPECT_EQ(frame->page(), 0u);
+          EXPECT_EQ(frame->page_count(), 1u);
+          EXPECT_EQ(frame->first_channel(), 0u);
+          ASSERT_NE(frame->dictionary(), nullptr);
+          EXPECT_EQ(frame->dictionary()->size(), 0u);
+        });
+    EXPECT_EQ(pages, 1u);
+  }
+
+  // Construct one channel whose DictionaryEntryBytes equals `room` exactly, and
+  // another 1 byte past `room`.
+  const std::size_t room = telemetry_wire::kMaxDictionaryPageBytes -
+                           detail::DictionaryPageOverhead();
+  ChannelDef at_limit;
+  at_limit.name = "demo/state/exact";
+  at_limit.kind = Talos::Telemetry::ChannelKind_UInt;
+  // Base size with 0 labels is 48 + name.size() + 8 + 0 + 8.
+  // Adding labels adds 4 + 4*N + sum(label.size() + 8).
+  const std::size_t base_with_vec = detail::DictionaryEntryBytes(at_limit) + 4;
+  ASSERT_LT(base_with_vec, room);
+  const std::size_t remaining = room - base_with_vec;
+  // Each 100-byte label costs 4 + 100 + 8 = 112 bytes; adjust the last label
+  // so DictionaryEntryBytes(at_limit) == room exactly.
+  const std::size_t full_labels = remaining / 112;
+  const std::size_t rem = remaining % 112;
+  // Ensure remainder >= 12 (minimum cost of a 0-byte label: 4 + 0 + 8 = 12) by
+  // borrowing one full label when rem < 12.
+  const std::size_t count_100 = rem < 12 ? full_labels - 1 : full_labels;
+  const std::size_t last_len = (rem < 12 ? rem + 112 : rem) - 12;
+  at_limit.labels.assign(count_100, std::string(100, 'a'));
+  at_limit.labels.emplace_back(last_len, 'b');
+  ASSERT_EQ(detail::DictionaryEntryBytes(at_limit), room);
+
+  {
+    std::size_t pages = 0;
+    EncodeDictionaryPages(builder, scratch, header, std::span{&at_limit, 1},
+                          [&](std::span<const std::uint8_t> page) {
+                            ++pages;
+                            EXPECT_LE(page.size(),
+                                      telemetry_wire::kMaxDictionaryPageBytes);
+                          });
+    EXPECT_EQ(pages, 1u);
+  }
+
+  // Two at_limit channels must split cleanly into 2 pages with exact
+  // first_channel and page_count.
+  {
+    const std::vector<ChannelDef> two{at_limit, at_limit};
+    std::vector<std::uint32_t> firsts;
+    std::vector<std::uint16_t> indices;
+    EncodeDictionaryPages(
+        builder, scratch, header, two, [&](std::span<const std::uint8_t> page) {
+          EXPECT_LE(page.size(), telemetry_wire::kMaxDictionaryPageBytes);
+          const auto* frame =
+              Talos::Telemetry::GetSizePrefixedFrame(page.data());
+          ASSERT_NE(frame, nullptr);
+          EXPECT_EQ(frame->page_count(), 2u);
+          indices.push_back(frame->page());
+          firsts.push_back(frame->first_channel());
+          ASSERT_NE(frame->dictionary(), nullptr);
+          EXPECT_EQ(frame->dictionary()->size(), 1u);
+        });
+    EXPECT_EQ(indices, (std::vector<std::uint16_t>{0, 1}));
+    EXPECT_EQ(firsts, (std::vector<std::uint32_t>{0, 1}));
+  }
+
+  // 1 byte past `room` throws std::runtime_error naming the channel.
+  ChannelDef over_limit = at_limit;
+  over_limit.name = "demo/state/too_big";
+  over_limit.labels.back().push_back('z');
+  ASSERT_GT(detail::DictionaryEntryBytes(over_limit), room);
+  try {
+    EncodeDictionaryPages(builder, scratch, header, std::span{&over_limit, 1},
+                          [](std::span<const std::uint8_t>) {});
+    ADD_FAILURE() << "encoded channel past single dictionary page room";
+  } catch (const std::runtime_error& error) {
+    EXPECT_NE(std::string{error.what()}.find("'demo/state/too_big'"),
+              std::string::npos)
+        << error.what();
+  }
+}
+
 }  // namespace
 }  // namespace talos::telemetry

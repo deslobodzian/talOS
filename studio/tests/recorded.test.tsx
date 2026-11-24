@@ -45,6 +45,7 @@ import type {ChannelInfo} from '../src/data/types';
 import {demoDeclaredGraph, demoSystemGraph} from '../src/demo';
 import {panelNode} from '../src/layout/tree';
 import {eventsPanel} from '../src/panels/events';
+import {fieldPanel} from '../src/panels/field';
 import {framesPanel} from '../src/panels/frames';
 import {hardwarePanel} from '../src/panels/hardware';
 import {healthPanel} from '../src/panels/health';
@@ -52,6 +53,7 @@ import {inspectorPanel, MAX_RECORDED_SPARKLINE_CHANNELS} from '../src/panels/ins
 import {plotColumn} from '../src/panels/plot';
 import {pose3dPanel} from '../src/panels/pose3d';
 import {PANELS} from '../src/panels/registry';
+import {robotPanel} from '../src/panels/robot';
 import {sessionPanel} from '../src/panels/session';
 import {subsystemsPanel} from '../src/panels/subsystems';
 import {visionPanel} from '../src/panels/vision';
@@ -1005,6 +1007,123 @@ test('RecordedSource prefers bounds.pose_topic over discoverEstimate', async () 
   assert.equal(fallback.chassis()?.pose.x, 1);
   assert.equal(fallback.chassis()?.pose.y, 2);
   fallback.close();
+});
+
+// REQ-OPS-41: FieldPanel (trail, velocity, freshness owner) and RobotPanel
+// (pose readout and poseErrorValue vs sim truth) follow bounds.pose_topic
+// ([studio] pose_topic) so they stay aligned with RecordedSource.chassis().
+test('FieldPanel and RobotPanel honor bounds.pose_topic for trail, velocity, freshness, and pose error', async () => {
+  const channels = [
+    'pose_estimator/state/pose/x_m',
+    'pose_estimator/state/pose/y_m',
+    'pose_estimator/state/pose/yaw_rad',
+    'pose_estimator/state/velocity/vx_mps',
+    'pose_estimator/state/velocity/vy_mps',
+    'pose_estimator/state/valid',
+    'pose_estimator/state/observation_accepted_count',
+    'alt_odom/state/robot_pose/x_m',
+    'alt_odom/state/robot_pose/y_m',
+    'alt_odom/state/robot_pose/yaw_rad',
+    'alt_odom/state/velocity/vx_mps',
+    'alt_odom/state/velocity/vy_mps',
+    'alt_odom/state/valid',
+    'sim/state/pose/x_m',
+    'sim/state/pose/y_m',
+    'sim/state/pose/yaw_rad'
+  ].map(info);
+  const at = START + 5_000_000_000n;
+  // alt_odom is fresh at `at` (and 0.5 m from sim truth at (7.5, 8, 0));
+  // pose_estimator is 2 s stale (and 6.5 m away at (1, 2, 0)).
+  const staleNs = (at - 2_000_000_000n).toString();
+  const freshNs = at.toString();
+  const seriesRequests: string[] = [];
+  const server = fakeServer(url => {
+    if (url.pathname.endsWith('/snapshot')) {
+      const fresh = (value: number) => ({value, sample_ns: freshNs});
+      const stale = (value: number) => ({value, sample_ns: staleNs});
+      return json({t_ns: freshNs, channels: {
+        'pose_estimator/state/pose/x_m': stale(1),
+        'pose_estimator/state/pose/y_m': stale(2),
+        'pose_estimator/state/pose/yaw_rad': stale(0),
+        'pose_estimator/state/velocity/vx_mps': stale(3),
+        'pose_estimator/state/velocity/vy_mps': stale(0),
+        'pose_estimator/state/valid': stale(1),
+        'pose_estimator/state/observation_accepted_count': stale(10),
+        'alt_odom/state/robot_pose/x_m': fresh(7),
+        'alt_odom/state/robot_pose/y_m': fresh(8),
+        'alt_odom/state/robot_pose/yaw_rad': fresh(0),
+        'alt_odom/state/velocity/vx_mps': fresh(0),
+        'alt_odom/state/velocity/vy_mps': fresh(2),
+        'alt_odom/state/valid': fresh(1),
+        'sim/state/pose/x_m': fresh(7.5),
+        'sim/state/pose/y_m': fresh(8),
+        'sim/state/pose/yaw_rad': fresh(0)
+      }});
+    }
+    if (url.pathname.endsWith('/series')) {
+      const requested = url.searchParams.get('c') ?? '';
+      seriesRequests.push(requested);
+      const cols = requested.split(',').map(name => {
+        if (name === 'alt_odom/state/robot_pose/x_m') {
+          return {t: [Number(at) - 1e9, Number(at)], min: [6, 7], max: [6, 7],
+                  last: [6, 7], count: [1, 1]};
+        }
+        if (name === 'alt_odom/state/robot_pose/y_m') {
+          return {t: [Number(at) - 1e9, Number(at)], min: [7, 8], max: [7, 8],
+                  last: [7, 8], count: [1, 1]};
+        }
+        return {t: [Number(at) - 1e9, Number(at)], min: [0, 0], max: [0, 0],
+                last: [0, 0], count: [1, 1]};
+      });
+      return new Response(seriesBuffer(cols), {status: 200});
+    }
+    return undefined;
+  });
+
+  const configuredBounds = parseBounds({...BOUNDS, pose_topic: '/alt_odom/state'});
+  const rec = new RecordedSource(SERVER, 's1', channels, configuredBounds,
+                                 server.fetchFn, fakeClock().clock);
+  rec.seek(freshNs);
+  await settle();
+
+  const studio = createStaticStudio();
+  studio.openRecorded(rec);
+  const renderField = () => renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <fieldPanel.component config={fieldPanel.defaultConfig}
+                              setConfig={() => {}} instanceId="test"/>
+      </StudioProvider>);
+  const renderRobot = () => renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <robotPanel.component config={robotPanel.defaultConfig}
+                              setConfig={() => {}} instanceId="test"/>
+      </StudioProvider>);
+
+  // First render queues the trail series fetch; settle then re-render.
+  renderField();
+  await settle();
+  const fieldHtml = renderField();
+  assert.ok(seriesRequests.some(r => r.includes('alt_odom/state/robot_pose/x_m')),
+            `expected trail request for alt_odom, got: ${JSON.stringify(seriesRequests)}`);
+  assert.ok(!seriesRequests.some(r => r.includes('pose_estimator/state/pose/x_m')),
+            `trail requested pose_estimator instead of alt_odom: ${JSON.stringify(seriesRequests)}`);
+  // Velocity vector should use alt_odom (vx=0, vy=2 -> vertical line from (350, 3.45) to (350, -96.55)),
+  // not pose_estimator (vx=3, vy=0 -> x2=500).
+  assert.match(fieldHtml, /<line x1="350"[^>]*x2="350"[^>]*marker-end="url\(#velocity-arrow\)"/,
+               fieldHtml);
+  // FreshnessNotice prefix must be alt_odom/ (fresh), not pose_estimator/ (stale).
+  assert.doesNotMatch(fieldHtml, /freshness-notice/,
+                      `alt_odom is fresh so FieldPanel must not show pose_estimator staleness: ${fieldHtml}`);
+
+  const robotHtml = renderRobot();
+  const robotText = robotHtml.replace(/<[^>]*>/g, '|');
+  // Pose error vs sim truth (7.5, 8, 0): alt_odom (7, 8, 0) has error 0.500 m,
+  // whereas pose_estimator (1, 2, 0) would have error ~8.846 m.
+  assert.match(robotText, /X\|+7\.000 m/, robotText);
+  assert.match(robotText, /Y\|+8\.000 m/, robotText);
+  assert.match(robotText, /error 0\.500 m · 0\.0°/, robotText);
+
+  studio.closeRecorded();
 });
 
 // REQ-OPS-23, REQ-OPS-41: bucketSeries inserts explicit NaN (count = 1 ->
