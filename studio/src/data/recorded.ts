@@ -527,7 +527,9 @@ export class RecordedSource implements DataSource {
                         this.start, this.end);
       return {start: this.start, end, points, from: this.start, to: c};
     }
-    const width = BigInt(Math.max(1, Math.round(window.seconds * 1e9)));
+    const rawNs = Number.isFinite(window.seconds) && window.seconds > 0 ?
+        Math.round(window.seconds * 1e9) : 1;
+    const width = Number.isFinite(rawNs) ? BigInt(Math.max(1, rawNs)) : (span > 0n ? span : 1n);
     const grid = width / GRID_DIVISIONS > MIN_GRID_NS ? width / GRID_DIVISIONS : MIN_GRID_NS;
     const end = clamp(this.start + (ceilDiv(c - this.start, grid) || 1n) * grid,
                       this.start, this.end);
