@@ -188,6 +188,7 @@ _PRIVILEGED_FRAMEWORK_LIBRARIES = (
     "talOS/introspection:reporter",
     "talOS/launcher:launcher_lib",
     "talOS/simulation:schedules",
+    "talOS/simulation:gateway_main",
 )
 FORBIDDEN_NODE_DEPS = (
     "talOS/rtms/...",
@@ -380,6 +381,7 @@ FORBIDDEN_INCLUDE_EXACT = frozenset({
     "talOS/events/simulated_event_loop.h",
     "talOS/events/wake_channel_wait.h",
     "talOS/simulation/schedules.h",
+    "talOS/simulation/gateway_main.h",
     "talOS/telemetry/channels.h",
     "talOS/telemetry/node.h",
     "talOS/teleop/node.h",

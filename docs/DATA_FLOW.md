@@ -102,7 +102,7 @@ Timing sources: `bench/main_processor/configuration/robot.toml`, its
 `CommandDueUs`), `talOS/hardware/endpoint.h` (`Endpoint::Tick`),
 `controller_processor/rio/src/main/cpp/Robot.cpp`
 (`Robot::StartCompetition`), and
-`talOS/simulation/sim_gateway.cc`.
+`talOS/simulation/gateway_main.cc`.
 
 Phoenix 26.3.0 `CoreTalonFX.hpp` / `SpnValue.hpp` identify stator current,
 supply current and device temperature as `PRO_SupplyAndTemp` SPNs 1779–1783.
@@ -346,7 +346,7 @@ each size is the `message_bytes` the `--describe-only` graph (`graph.json`)
 of the bench's and examples' configs reports. Struct sizes include alignment
 padding: they must not be inferred by simply adding scalar field widths.
 The `/sim/state` payload is pinned by `static_assert(sizeof(geometry::OdometrySample)
-== 56)` in `talOS/simulation/sim_gateway.cc`; RTMS adds its 8 B publication timestamp.
+== 56)` in `talOS/simulation/gateway_main.cc`; RTMS adds its 8 B publication timestamp.
 This truth topic is local to the main processor and never crosses hardware UDP.
 
 The live node registry ([talOS/introspection](../talOS/introspection/README.md))

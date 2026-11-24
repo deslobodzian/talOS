@@ -156,8 +156,8 @@ class Session:
         # Each member that binds an explicit port, the port, and what its log
         # says when the bind fails (studio/bridge/main.cc, which
         # studio/bridge/listen_test.py holds to naming the port;
-        # sim_gateway.cc; talOS/bridge/main.cc). HeldHttpPortIsNamedAtOnce
-        # below proves the bridge's still matches.
+        # talOS/simulation/gateway_main.cc; talOS/bridge/main.cc).
+        # HeldHttpPortIsNamedAtOnce below proves the bridge's still matches.
         binds = []
         if http_port is not None:
             binds.append(("studio_bridge", http_port,
