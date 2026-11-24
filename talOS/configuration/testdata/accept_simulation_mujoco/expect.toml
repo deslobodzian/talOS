@@ -1,7 +1,7 @@
 # [simulation.mujoco] paths resolve against the file that sets them (here the
 # include), and the model and each listed file are dependencies of the
 # config, so the bundle and talos_sim carry them; robot.toml overrides only
-# `field`.
+# `field` and `seed`.
 accept = true
 nodes = ["//a:node"]
 files = [
