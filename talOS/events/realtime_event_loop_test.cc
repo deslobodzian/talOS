@@ -1691,5 +1691,34 @@ TEST(RealtimeEventLoop,
   EXPECT_EQ(order, expected);
 }
 
+// An overrunning callback that pushes Poller::now() past run_until(end) must
+// not cause timers with deadline > end to be dispatched before run_until exits.
+TEST(RealtimeEventLoop, RunUntilDoesNotDispatchTimersPastEndAfterOverrun) {
+  RealtimeEventLoop<> loop;
+  loop.set_delivery(Delivery::BEFORE_TIMERS);
+
+  bool first_fired = false;
+  bool past_end_fired = false;
+  auto on_first = [&](const Context&) {
+    first_fired = true;
+    const MonotonicTime until = Poller::now() + 15ms;
+    while (Poller::now() < until) {
+    }
+  };
+  auto on_past_end = [&](const Context&) { past_end_fired = true; };
+
+  const auto first_id = loop.register_timer("first", make_thunk(&on_first));
+  const auto past_end_id =
+      loop.register_timer("past_end", make_thunk(&on_past_end));
+  const MonotonicTime origin = loop.monotonic_now();
+  loop.arm_timer(first_id, origin + 1ms, Duration::zero());
+  loop.arm_timer(past_end_id, origin + 10ms, Duration::zero());
+
+  loop.run_for(5ms);
+  EXPECT_TRUE(first_fired);
+  EXPECT_FALSE(past_end_fired)
+      << "timer with deadline > end fired after overrunning callback";
+}
+
 }  // namespace
 }  // namespace talos::event

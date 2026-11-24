@@ -902,6 +902,34 @@ TEST(SimulatedEventLoop,
     EXPECT_EQ(quiet_count, 40u);
     EXPECT_EQ(loop.drains(), 3u);
   }
+
+  // A periodic timer armed within one period of MonotonicTime::max() must fire
+  // once and terminate cleanly rather than overflowing signed int64_t and
+  // spinning forever.
+  {
+    SimulationEnvironment environment;
+    SimulatedEventLoop<> loop{environment};
+    loop.set_delivery(Delivery::BEFORE_TIMERS);
+    std::vector<Context> firings;
+    auto on_timer = [&](const Context& context) {
+      firings.push_back(context);
+      if (firings.size() > 5u) {
+        ADD_FAILURE() << "periodic timer near max() wrapped and spun";
+        loop.exit();
+      }
+    };
+    const auto timer_id =
+        loop.register_timer("near_max", make_thunk(&on_timer));
+    const MonotonicTime deadline = MonotonicTime::max() - 5ms;
+    loop.arm_timer(timer_id, deadline, 10ms);
+
+    loop.run_until(MonotonicTime::max());
+    ASSERT_EQ(firings.size(), 1u);
+    EXPECT_EQ(firings[0].event_time, deadline);
+    EXPECT_EQ(firings[0].now, deadline);
+    EXPECT_EQ(firings[0].sequence, 1u);
+    EXPECT_EQ(loop.monotonic_now(), MonotonicTime::max());
+  }
 }
 
 }  // namespace
