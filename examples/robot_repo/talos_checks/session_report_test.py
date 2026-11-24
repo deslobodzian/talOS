@@ -18,10 +18,14 @@ class SessionReportTest(unittest.TestCase):
         files = runfiles.Create()
         fixture = files.Rlocation(os.environ["SESSION_REPORT_FIXTURE"])
         report = files.Rlocation(os.environ["SESSION_REPORT"])
-        with tempfile.TemporaryDirectory() as session:
-            subprocess.run([fixture, session], check=True)
+        self.assertTrue(fixture and os.path.isfile(fixture), fixture)
+        self.assertTrue(report and os.path.isfile(report), report)
+        with tempfile.TemporaryDirectory(
+                dir=os.environ.get("TEST_TMPDIR")) as session:
+            subprocess.run([fixture, session], check=True, timeout=60)
             result = subprocess.run([report, "--json", session],
-                                    capture_output=True, text=True)
+                                    capture_output=True, text=True,
+                                    timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         nodes = [node["name"] for node in json.loads(result.stdout)["nodes"]]
         self.assertIn("fixture", nodes)
