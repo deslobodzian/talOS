@@ -220,6 +220,76 @@ Any other sensor, or a missing one, is refused. An input reads the world as
 of the start of the last 5 ms step (MuJoCo computes sensors before it
 integrates), one step behind the rotors and the chassis.
 
+**Scripted shooter.** A flywheel launches by rule, not by contact, which at
+5 ms is not predictive (REQ-DEV-39). The model carries, per flywheel motor
+`<motor>` (a `<motor>` actuator of that name on a hinge):
+
+- a box site `<motor>_inlet`, the trigger volume;
+- a site `<motor>_exit`, where a launched body's centre reappears, its +x
+  axis the launch direction, outside the inlet and clear of robot geoms by
+  the body's radius;
+- `<numeric name="<motor>_shooter" data="efficiency contact_radius_m"/>`:
+  the launched body's speed over the flywheel's surface speed, in (0, 1],
+  and the flywheel's radius where it touches the body.
+
+The joint's positive direction shoots, and the actuator's `gear` is
+positive. `MakeScriptedShooters`
+(`scripted_shooter.h`) finds every such motor in a compiled model and
+returns them as one world rule (below), or none when no actuator carries any
+part of the contract. It refuses, naming the motor and the element, a
+missing site or numeric, a numeric without exactly two values, an
+efficiency outside (0, 1] or a contact radius that is not positive, an inlet
+that is not a box, a flywheel that is a slide or a tendon or whose
+actuator's gear is not positive, a site that is
+not on the flywheel's robot, a `*_inlet` site or `*_shooter` numeric with no
+actuator of its motor's name (the suffixes are the contract's), and, when
+attached, an exit inside its own inlet.
+
+After each MuJoCo step it launches every free body outside the flywheel's
+robot whose centre is inside the inlet, one shooter after another in
+actuator order, bodies in index order:
+
+- the body rolls between the flywheel and a fixed hood, so the flywheel's
+  share of the impulse is (1 + β)/2 · m · v with β = I/(m r²), I the mean of
+  the body's principal inertias and r below, and the flywheel joint's speed
+  w drops by k·v, k = (1 + β)/2 · m · r_c / J, r_c the contact radius and J
+  the joint's inertia (its subtree about the axis at the reference pose,
+  plus the joint's armature and its actuator's armature times gear²,
+  MuJoCo's `dof_M0`);
+- the body leaves at the speed the launch leaves the flywheel with: v = η ·
+  r_c · (w − k·v), so v = η · r_c · w / (1 + η · r_c · k), η the
+  efficiency. The flywheel never reverses, the momentum the launch carries
+  is what the flywheel loses, and the body's energy is at most η times what
+  the flywheel loses;
+- the body's centre moves to the exit; its linear velocity becomes the
+  exit's own velocity (the robot may be moving and turning) plus v along
+  the exit's +x; its angular velocity becomes the exit's plus v/r about the
+  exit's +y (rolling), r its first geom's bounding radius (a sphere's
+  radius; no geom: no rolling spin);
+- a flywheel at rest or turning backward launches nothing: the body stays
+  where the contacts hold it and goes once the flywheel turns forward, as a
+  ball fed to a stopped wheel does;
+- one body at a time: a body waits in the inlet while another body's centre
+  is nearer the exit than their two radii;
+- a body is launched at most once per step, whichever shooter took it.
+
+A body of the flywheel's own robot (its free root) is never launched, and
+the shooter changes nothing but the launched body and the flywheel's speed.
+
+**World rules.** What changes the world after a step besides physics is a
+`WorldRules` (`world_rules.h`), added to the plant with
+`MujocoPlant::AddRules` before its first `Step`. After each MuJoCo step that
+passes the failure check below, the plant brings positions and velocities
+up to the step's end (`mj_kinematics`, `mj_comPos`, `mj_comVel`; not
+`mj_forward`, whose collision and constraint stages cost far more) and runs
+every rule in the order added, with the match input last given to
+`SetMatchInput`. A rule may write free joints' positions and velocities,
+the velocity of a joint it names and the collision bits of geoms its README
+names. A rule that reports a failure or throws stops the world for good, as
+an unstable step does, with the rule's text. A rule's `Attach` that leaves
+the world unstable (a bad position, velocity or acceleration, a full arena)
+is refused by `AddRules`, naming the warning, and fails the plant.
+
 **Solver.** The robot's whole `<option>` and `<size>` are dropped when it is
 attached: the field's win, MuJoCo prints a warning naming each field the
 robot authored, and the robot's `<flag>`s are dropped without one. Then one
@@ -236,7 +306,12 @@ stderr only, never to `MUJOCO_LOG.TXT`.
 
 ### Tests
 
-`plant_test` covers the plant alone. `gateway_differential_test` runs a
+`plant_test` covers the plant alone, world rules' order, step numbers,
+match input and failure included. `scripted_shooter_test` (REQ-DEV-39)
+launches from a robot at rest and from one moving and turning, with the
+flywheel's loss; never launches the robot; waits for a forward flywheel and
+a clear exit; refuses each partial contract; and repeats bit for bit with
+no allocation. `gateway_differential_test` runs a
 bound motor against the analytic model, tick for tick through two
 `Gateway`s, with the bounds above. `gateway_bit_identity_test` (REQ-DEV-37)
 assembles the world twice as the program does and ticks both at the same
