@@ -532,6 +532,7 @@ def cpp_node(library_path, name="main"):
     class CppNode:
         def __init__(self, node):
             if fn(node._handle, None) < 0:
-                raise TalosError("C++ node initialization failed")
+                err = lib.talos_last_error().decode()
+                raise TalosError(err or "C++ node initialization failed")
 
     return CppNode

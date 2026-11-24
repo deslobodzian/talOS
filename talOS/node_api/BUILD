@@ -149,6 +149,7 @@ cc_test(
     deps = [
         ":node_api_testing",
         "//talOS/hardware",
+        "//talOS/node",
         "@googletest//:gtest_main",
     ],
 )

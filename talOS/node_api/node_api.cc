@@ -338,6 +338,27 @@ void SetError(std::string message) { g_last_error = std::move(message); }
 void ClearError() { g_last_error.clear(); }
 const std::string& LastError() { return g_last_error; }
 
+namespace {
+void ForwardHostError(const char* message) noexcept {
+  try {
+    if (message == nullptr || message[0] == '\0') {
+      ClearError();
+    } else {
+      SetError(message);
+    }
+  } catch (...) {
+    ClearError();
+  }
+}
+
+struct HostErrorRegistrar {
+  HostErrorRegistrar() {
+    NodeAccess::set_host_error_callback(&ForwardHostError);
+  }
+};
+const HostErrorRegistrar kHostErrorRegistrar{};
+}  // namespace
+
 }  // namespace talos::node_api
 
 using namespace talos::node_api;

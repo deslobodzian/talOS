@@ -640,6 +640,52 @@ class SafetyParityTest(unittest.TestCase):
         with self.assertRaises(talos.TalosError):
             hw.motor_request("roller", "wheel")
 
+    # REQ-RT-05: Sim.resume() rejects re-entrant Sim.remove() inside overdue
+    # callbacks and settles prompt subscribers at sim.now() before returning.
+    def test_sim_resume_rejects_reentrant_remove_and_settles(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        reenter_errors = []
+        heard = []
+
+        class Receiver:
+            def __init__(self, node):
+                self.node = node
+                node.subscribe(
+                    Goal, "/planner/goal",
+                    callback=lambda g: heard.append(
+                        (g.tick_count, node.now_ns)))
+
+        class Talker:
+            def __init__(self, node):
+                self.node = node
+                self.pub = node.publish(Goal, "/planner/goal")
+                self.check_remove = False
+
+            def update(self):
+                if self.check_remove:
+                    self.check_remove = False
+                    try:
+                        sim.remove("planner")
+                    except talos.TalosError as err:
+                        reenter_errors.append(str(err))
+                self.pub.send(
+                    height_rot=1.0, enabled=True, tick_count=self.node.tick)
+
+        sim.add(Receiver, "roller")
+        talker = sim.add(Talker, "planner")
+        sim.step(0.01)
+        self.assertEqual(len(heard), 1)
+
+        sim.pause("planner", 0.1)
+        sim.step(0.025)
+        self.assertEqual(len(heard), 1)
+
+        talker.check_remove = True
+        sim.resume("planner")
+        self.assertEqual(len(reenter_errors), 1)
+        self.assertEqual(len(heard), 2)
+        self.assertEqual(heard[-1][1], 35_000_000)
+
 
 if __name__ == "__main__":
     unittest.main()

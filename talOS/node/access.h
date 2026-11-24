@@ -263,6 +263,10 @@ struct NodeAccess : NodeDetail {
                                                         std::size_t index);
   // The last set_selected() value of `index`. Safe to call from any thread.
   static std::int32_t selected(const Node& node, std::size_t index);
+
+  // Hook for node_api to forward HostCppNode<T> errors into talos_last_error().
+  using HostErrorCallback = void (*)(const char* message) noexcept;
+  static void set_host_error_callback(HostErrorCallback callback) noexcept;
 };
 
 }  // namespace talos::detail

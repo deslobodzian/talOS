@@ -9,6 +9,7 @@
 
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/node/node.h"
 #include "talOS/node_api/node_api.h"
 
 namespace {
@@ -356,6 +357,112 @@ TEST_F(SafetyAbiTest, SimAndHardwareRejectOverflowAndReentrantPauseResume) {
       talos_sim_hardware_lose_states(hw_, std::numeric_limits<int32_t>::max()),
       TALOS_OK);
   EXPECT_EQ(talos_sim_hardware_lose_states(hw_, 1), TALOS_ERR);
+}
+
+// REQ-DEV-09: HostCppNode<T> checks for duplicate extension before
+// constructing/installing update() (preventing UAF if add_extension throws)
+// and propagates e.what() into talos_last_error().
+TEST_F(SafetyAbiTest, HostCppNodeGuardsDuplicateUafAndPropagatesLastError) {
+  struct HostedCounter {
+    explicit HostedCounter(talos::Node&) : canary{0x12345678u} {}
+    ~HostedCounter() { canary = 0; }
+    void update() {
+      EXPECT_EQ(canary, 0x12345678u);
+      ++ticks;
+    }
+    uint32_t canary;
+    int ticks = 0;
+  };
+  struct ThrowingHosted {
+    explicit ThrowingHosted(talos::Node&) {
+      throw std::invalid_argument("boom from C++ constructor");
+    }
+  };
+
+  struct State {
+    int32_t first_rc = -1;
+    int32_t second_rc = 0;
+    std::string second_err;
+    int32_t throw_rc = 0;
+    std::string throw_err;
+  } state;
+
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    auto& s = *static_cast<State*>(user);
+    s.first_rc = talos::detail::HostCppNode<HostedCounter>(node);
+    s.second_rc = talos::detail::HostCppNode<HostedCounter>(node);
+    s.second_err = talos_last_error();
+    s.throw_rc = talos::detail::HostCppNode<ThrowingHosted>(node);
+    s.throw_err = talos_last_error();
+    return s.first_rc == 0 ? 0 : 1;
+  };
+
+  ASSERT_NE(talos_sim_add(sim_, "roller", build, &state), nullptr)
+      << talos_last_error();
+  EXPECT_EQ(state.first_rc, 0);
+  EXPECT_EQ(state.second_rc, -1);
+  EXPECT_NE(state.second_err.find("extension added twice"), std::string::npos)
+      << state.second_err;
+  EXPECT_EQ(state.throw_rc, -1);
+  EXPECT_NE(state.throw_err.find("boom from C++ constructor"),
+            std::string::npos)
+      << state.throw_err;
+
+  // Stepping runs HostedCounter::update(); under ASan this catches UAF if the
+  // failed second HostCppNode overwrote update() with a freed instance.
+  ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(talos_node_tick(talos_sim_node(sim_, "roller")), 3u);
+}
+
+// REQ-RT-05: talos_sim_resume guards overdue callbacks with Stepping so
+// re-entrant remove/add/step/pause/resume return TALOS_ERR instead of causing
+// a use-after-free while run_until() is on the stack.
+TEST_F(SafetyAbiTest, SimResumeRejectsReentrantMutations) {
+  struct ResumeProbe {
+    TalosSim* sim = nullptr;
+    bool armed = false;
+    bool ran = false;
+    int32_t remove_rc = TALOS_OK;
+    TalosNode* add_rc = nullptr;
+    int32_t step_rc = TALOS_OK;
+    int32_t pause_rc = TALOS_OK;
+    int32_t resume_rc = TALOS_OK;
+  } probe{sim_};
+
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    return talos_node_set_update(
+        node,
+        [](void* ctx) -> int32_t {
+          auto& p = *static_cast<ResumeProbe*>(ctx);
+          if (!p.armed || p.ran) return 0;
+          p.ran = true;
+          p.remove_rc = talos_sim_remove(p.sim, "roller");
+          p.add_rc = talos_sim_add(
+              p.sim, "extra", [](TalosNode*, void*) { return 0; }, nullptr);
+          p.step_rc = talos_sim_step(p.sim, 1 * kMs);
+          p.pause_rc = talos_sim_pause(p.sim, "roller", 1 * kMs);
+          p.resume_rc = talos_sim_resume(p.sim, "roller");
+          return 0;
+        },
+        user);
+  };
+
+  ASSERT_NE(talos_sim_add(sim_, "roller", build, &probe), nullptr)
+      << talos_last_error();
+  ASSERT_EQ(talos_sim_step(sim_, 10 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_sim_pause(sim_, "roller", 100 * kMs), TALOS_OK)
+      << talos_last_error();
+  ASSERT_EQ(talos_sim_step(sim_, 20 * kMs), TALOS_OK) << talos_last_error();
+
+  probe.armed = true;
+  ASSERT_EQ(talos_sim_resume(sim_, "roller"), TALOS_OK) << talos_last_error();
+  EXPECT_TRUE(probe.ran);
+  EXPECT_EQ(probe.remove_rc, TALOS_ERR);
+  EXPECT_EQ(probe.add_rc, nullptr);
+  EXPECT_EQ(probe.step_rc, TALOS_ERR);
+  EXPECT_EQ(probe.pause_rc, TALOS_ERR);
+  EXPECT_EQ(probe.resume_rc, TALOS_ERR);
+  EXPECT_NE(talos_sim_node(sim_, "roller"), nullptr);
 }
 
 }  // namespace
