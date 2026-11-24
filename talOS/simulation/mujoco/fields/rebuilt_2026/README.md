@@ -196,3 +196,101 @@ tape, human players, and the hub's interior between its scoring site and its
 exits (not dimensioned in any source; the field model keeps scored fuel in
 the bin, and fuel returns to the field by a release at an exit), its fuel
 counter and its exit randomness.
+
+## Rules
+
+`:rules` (`rules.h`, `MakeRebuilt2026Rules`) is the 2026 game on this
+model: a `GameRules` ([`game.h`](../../game.h)), the
+[world rule](../../world_rules.h) a `MujocoPlant` runs after every MuJoCo
+step once a program adds it (`MujocoPlant::AddRules`), REQ-DEV-40. It reads
+only this model's contract: the FUEL range numerics above, `*_hub_score`,
+`*_hub_exit_0..3`, and a robot model's sites `preload_0` to `preload_7`;
+`Attach` refuses a model without one of them, naming it. Each step it sees
+the plant's `MatchInput` (Driver Station mode and enable, and the schedule
+clock's time once it has started) and the plant's step count, and nothing
+else: no clock, and no allocation after `Attach`. A FUEL is in play, held
+(scored and parked, waiting for its HUB to return it) or reserve (in the
+reserve row, never placed).
+
+- **Scoring.** A FUEL that is not held, whose centre is inside a
+  `*_hub_score` cylinder with any downward velocity at the end of a step,
+  scores for that HUB's alliance: it counts once in `<alliance>_scored`,
+  and earns a point if the HUB counts then (below). In the same step it is
+  held: parked with no velocity at slot k, its index, at
+  (0.5 + 0.2 (k mod 80), -2.5 - 0.2 floor(k / 80), radius + 0.0005) m,
+  beyond the guardrail, clear of the reserve row and of every other slot.
+  The rule judges the position and velocity a rule before it in the step
+  left (a FUEL the scripted shooter launched that step is judged at its
+  exit). FUEL are checked in index order.
+- **Returning.** Each HUB keeps its held FUEL in score order. 200 steps
+  (1.0 s) after a FUEL was scored, the HUB releases it, as soon as one of
+  its four exit pockets is empty (no FUEL centre within a ball diameter of
+  `*_hub_exit_N`): at that site, unrotated, at a speed and
+  heading drawn as the release contract above says, with no spin, from an
+  exit drawn among its empty ones. At most one FUEL leaves an exit in a
+  step; with no empty pocket the HUB waits. The delay counts plant steps,
+  not schedule time, so a HUB returns FUEL before the schedule clock
+  starts, and when the gateway drops time (its physics falls behind the
+  schedule clock) the delay lasts longer than 1.0 s of schedule time.
+- **Preloads.** At `Attach`, the reserve FUEL in index order go to the
+  robot model's `preload_0` to `preload_7` that exist, in that order, at
+  rest and in play; the rest of the reserve stays in its row. A robot with
+  no such site has no preloads.
+- **Periods**, on the schedule clock. The match starts at the first step
+  that is enabled, on the schedule clock and in autonomous (AUTO) or teleop
+  (TELEOP without AUTO, AUTO's points 0-0); test mode starts nothing. AUTO
+  ends at the first step out of autonomous, or 20 s after it started; a
+  disable or e-stop does not end it. TELEOP starts at the first enabled
+  teleop step after that and lasts 140 s whatever the mode: TRANSITION
+  10 s, SHIFTS 1 to 4 of 25 s, END GAME 30 s. The match has then Ended,
+  for the rest of the run: nothing restarts it. Every period and stage
+  starts at its first step at or after its start time and ends before its
+  end time: a step exactly 10 s after TELEOP starts is in SHIFT 1, AUTO's
+  last step is the one before 20 s, and one exactly 140 s into TELEOP is
+  Ended.
+- **When a HUB counts.** Both HUBs count in AUTO, TRANSITION and END GAME.
+  In SHIFTS 1 to 4 the alliance with more AUTO points is inactive in 1 and
+  3 and active in 2 and 4, the other alliance the reverse; on a tie one
+  draw at TELEOP start decides (below 0.5: blue inactive first). A HUB also
+  counts for the 3 s after it deactivates (when AUTO ends, when its
+  inactive shift begins, when TELEOP ends): a FUEL scored 3 s or later
+  after that earns nothing. Points scored in AUTO, or in its 3 s before
+  TELEOP starts, are AUTO points. A real match's delay between AUTO and
+  TELEOP is longer than 3 s; a schedule with a shorter gap ends AUTO's
+  assessment at TELEOP start, so a FUEL landing after that is a TELEOP
+  point and does not count toward the shift order.
+  Before the match and between AUTO's 3 s and TELEOP, no HUB counts.
+- **Draws**, from one splitmix64 stream seeded by `[simulation.mujoco]
+  seed` (`SplitMix64`, a uniform double the top 53 bits times 2^-53), in
+  the order the steps make them: the tie at TELEOP start; per release,
+  blue's HUB before red's, the exit (the empty pockets in exit order,
+  uniform), the speed (uniform in 3 to 5 m/s), the heading (uniform within
+  20 degrees either side of the exit's +x, in the horizontal plane).
+  Changing this order changes every seeded run.
+
+`Report` fills `sim.MatchState`: the period (None before the match and
+between AUTO and TELEOP), the time left in AUTO or TELEOP (0 otherwise),
+the stage (0 TRANSITION, 1 to 4 SHIFT, 5 END GAME; 0 outside TELEOP), the
+points, AUTO points and scored count per alliance, whether each HUB counts
+now (`*_scoring_active`, its 3 s included), the shift order and whether it
+was drawn (false before TELEOP), and the FUEL in play and held.
+`shots_count` is the scripted shooter's, not the game's: `Report` writes 0.
+`Fms` is the Driver Station stamp: the match time is the same time left,
+and from TELEOP start the game data is `B` or `R`, the alliance inactive
+in SHIFT 1.
+
+| Rule | Number | Tag | Source or reason |
+|---|---|---|---|
+| AUTO; TELEOP: TRANSITION, SHIFTS 1 to 4, END GAME | 20 s; 10 s, 4 x 25 s, 30 s | QUOTED | GM 6.4 Table 6-2 |
+| HUB states by shift, tie drawn | - | QUOTED | GM 6.4 Table 6-3 |
+| a HUB counts on after it deactivates | 3 s | QUOTED | GM 6.5 |
+| points per FUEL in a HUB that counts | 1 | QUOTED | GM Table 6-4 |
+| preloads at most | 8 | QUOTED | GM G303 |
+| a HUB's delay from scoring to release | 1.0 s | ESTIMATED | no source gives a HUB's rate |
+| release speed and heading | 3 to 5 m/s, +-20 degrees | ESTIMATED | the release contract above |
+| game data | `B` or `R` | ESTIMATED | GM 6.4 has the FMS send the alliance inactive first at TELEOP start; its format is not in the manual |
+| parking slots | 0.2 m pitch, 80 a row, from (0.5, -2.5) m | ESTIMATED | out of the field and clear of the reserve row at y = -2.0 m; parked FUEL keep their collisions and rest on `carpet_fuel` |
+
+Not refereed: the chute doors (closed), the corral, human players, TOWER
+climbs and their points, fouls, pins, opponents, ranking points and HUB
+lights. A FUEL that leaves the field stays where it lands.
