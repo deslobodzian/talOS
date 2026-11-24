@@ -449,6 +449,8 @@ tasks.register("rioBuildStampTest") {
         check(text.contains('kBuildCommit = "0123456789abcdef";'),
                 'the -PtalosRevision commit is not in the header')
         check(text.contains('kBuildDirty = true;'), 'a -PtalosDirty=true build is reported clean')
+        check(text.contains('kCompanionAddress = "10.0.0.5";'),
+                'the -Pcompanion address is not in the header')
         def (cleanCommit, cleanDirty) = rioBuildStamp('0123456789abcdef', 'false', noWorkTree, expectedRoot)
         check(cleanCommit == '0123456789abcdef' && !cleanDirty,
                 'a -PtalosDirty=false build is not reported clean')
@@ -531,9 +533,11 @@ tasks.register("rioBuildStampTest") {
         // (no default on buildRio, refusal of ORG_GRADLE_PROJECT_companion and
         // gradle.properties, refusal of empty -Pcompanion=, diagnostic print
         // when supplied, and desktop tasks allowed without -Pcompanion).
-        // Runs with --no-daemon --offline and an isolated --project-cache-dir
-        // under temporaryDir so it neither contends with this build's .gradle
-        // lock, mutates a read-only checkout, nor leaves a child daemon behind.
+        // Runs with --no-daemon (passing --offline only when
+        // gradle.startParameter.offline is set) and an isolated
+        // --project-cache-dir under temporaryDir so it neither contends with
+        // this build's .gradle lock, mutates a read-only checkout, nor leaves
+        // a child daemon behind.
         def gradlewBin = OperatingSystem.current().isWindows() ?
                 file('gradlew.bat').absolutePath : file('gradlew').absolutePath
         def workRoot = new File(temporaryDir, 'companion-policy')

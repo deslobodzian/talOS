@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -15,6 +16,7 @@
 #include <string_view>
 #include <thread>
 
+#include "RioLog.h"
 #include "hardware/config.h"
 #include "hardware/messages.h"
 
@@ -373,6 +375,48 @@ class CanBusHealth {
   bool polled_{false};
   uint64_t first_poll_us_{0};
 };
+
+// Posts a CAN bus's slot leaving or returning to OK. Loop thread: a bounded
+// format into the event, no allocation. Keyed per (bus, failing/recovered)
+// under LogKind::kCanBusStatus so multi-bus faults and a bus's own
+// failing <-> recovered transitions never suppress or overwrite each other.
+inline void LogCanBusStatus(RioLog& log, std::string_view bus,
+                            uint64_t stale_us,
+                            const CanBusHealth::Change& change) {
+  static_assert(hardware::kMaxCanBuses * 2 <= RioLog::kKeysPerKind,
+                "two RioLog keys (failing, recovered) per CAN bus");
+  LogEvent event;
+  event.kind = LogKind::kCanBusStatus;
+  const std::size_t bus_slot =
+      std::min(change.bus, CanBusHealth::kMaxBuses - 1);
+  event.index = static_cast<uint16_t>(
+      bus_slot * 2 +
+      (change.event == CanBusHealth::Event::kRecovered ? 1u : 0u));
+  const int bus_length =
+      static_cast<int>(std::min<std::size_t>(bus.size(), 63));
+  const char* bus_data = bus.empty() ? "" : bus.data();
+  const char* status = change.status != nullptr ? change.status : "none";
+  if (change.event == CanBusHealth::Event::kRecovered) {
+    std::snprintf(event.text, sizeof event.text,
+                  "[phoenix] CAN bus %.*s status read again (%llu failed "
+                  "reads in the spell); /hw/status reads it OK",
+                  bus_length, bus_data,
+                  static_cast<unsigned long long>(change.spell_failures));
+  } else if (change.stale) {
+    std::snprintf(event.text, sizeof event.text,
+                  "[phoenix] CAN bus %.*s status not read for %llu ms (last "
+                  "status %s); /hw/status reads it STALE until it reads "
+                  "again",
+                  bus_length, bus_data,
+                  static_cast<unsigned long long>(stale_us / 1000), status);
+  } else {
+    std::snprintf(event.text, sizeof event.text,
+                  "[phoenix] CAN bus %.*s status read failing: %s; "
+                  "/hw/status reads it FAILED until it reads again",
+                  bus_length, bus_data, status);
+  }
+  log.Post(event);
+}
 
 // The reader thread that reads the configured buses for CanBusHealth.
 //

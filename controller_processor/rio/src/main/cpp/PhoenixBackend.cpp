@@ -243,7 +243,6 @@ constexpr double kFollowerSignalMinHz = 20.0;
 // motor (16 to 31),
 // so the logger coalesces no motor's line into another's.
 constexpr uint16_t kConfigureFailedMessage = 0;
-constexpr uint16_t kCanBusStatusMessage = 7;
 constexpr uint16_t kCanBusReaderMessage = 8;
 constexpr uint16_t kRestoreFailedMessage = 13;
 constexpr uint16_t kProLicenceRefusedMessage = 16;
@@ -279,38 +278,6 @@ talos::rio::CanBusHealth::Sample ReadCanBus(std::string_view bus) {
 }
 
 uint64_t SteadyUs() { return NowNs() / 1000; }
-
-// Posts a CAN bus's slot leaving or returning to OK. Loop thread: a bounded
-// format into the event, no allocation.
-void LogCanBusStatus(talos::rio::RioLog& log, std::string_view bus,
-                     uint64_t stale_us,
-                     const talos::rio::CanBusHealth::Change& change) {
-  talos::rio::LogEvent event;
-  event.index = kCanBusStatusMessage;
-  const int bus_length =
-      static_cast<int>(std::min<std::size_t>(bus.size(), 63));
-  const char* status = change.status != nullptr ? change.status : "none";
-  if (change.event == talos::rio::CanBusHealth::Event::kRecovered) {
-    std::snprintf(event.text, sizeof event.text,
-                  "[phoenix] CAN bus %.*s status read again (%llu failed "
-                  "reads in the spell); /hw/status reads it OK",
-                  bus_length, bus.data(),
-                  static_cast<unsigned long long>(change.spell_failures));
-  } else if (change.stale) {
-    std::snprintf(event.text, sizeof event.text,
-                  "[phoenix] CAN bus %.*s status not read for %llu ms (last "
-                  "status %s); /hw/status reads it STALE until it reads "
-                  "again",
-                  bus_length, bus.data(),
-                  static_cast<unsigned long long>(stale_us / 1000), status);
-  } else {
-    std::snprintf(event.text, sizeof event.text,
-                  "[phoenix] CAN bus %.*s status read failing: %s; "
-                  "/hw/status reads it FAILED until it reads again",
-                  bus_length, bus.data(), status);
-  }
-  log.Post(event);
-}
 
 // Records an exception from Configure() or its future as a failed configure
 // without letting a secondary exception escape onto the SCHED_FIFO loop thread.
@@ -1063,8 +1030,9 @@ bool PhoenixBackend::Read(hw::State& s) {
   // here); State carries the slot the gateway asked for.
   can_health_.Poll(read_start_ns / 1000,
                    [this](const talos::rio::CanBusHealth::Change& change) {
-                     LogCanBusStatus(*log_, can_health_.bus(change.bus),
-                                     can_health_.StaleUs(), change);
+                     talos::rio::LogCanBusStatus(*log_,
+                                                 can_health_.bus(change.bus),
+                                                 can_health_.StaleUs(), change);
                    });
   s.health.valid = true;
   s.health.battery_v = frc::RobotController::GetBatteryVoltage().value();
@@ -1537,15 +1505,17 @@ bool PhoenixBackend::ApplyOutputs(
     std::span<const hw::DigitalOutputRequest> digital_outputs,
     std::span<const hw::PwmRequest> pwm_outputs) {
   const PhaseTimer timer{*log_, talos::rio::TickPhase::kOther};
-  for (std::size_t i = 0;
-       i < digital_outputs.size() && i < digital_outputs_.size(); ++i) {
+  if (digital_outputs.size() != digital_outputs_.size() ||
+      pwm_outputs.size() != pwm_outputs_.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < digital_outputs_.size(); ++i) {
     digital_outputs_[i]->Set(digital_outputs[i].value);
   }
   // Off is the output's neutral, no pulse; SetSpeed(0) would be the 1.5 ms
   // centre pulse, which drives a servo to its centre. The gateway has refused
   // any other mode.
-  for (std::size_t i = 0; i < pwm_outputs.size() && i < pwm_outputs_.size();
-       ++i) {
+  for (std::size_t i = 0; i < pwm_outputs_.size(); ++i) {
     const auto& request = pwm_outputs[i];
     if (request.mode == hw::PwmMode::kPulse && std::isfinite(request.output) &&
         request.output >= -1.0 && request.output <= 1.0) {
