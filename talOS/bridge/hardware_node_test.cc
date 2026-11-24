@@ -2736,6 +2736,115 @@ TEST(HardwareNodeTest, PushConfigDuringTickDoesNotAllocate) {
   EXPECT_EQ(allocations, 0u) << probe.sites();
 }
 
+// REQ-OPS-20: /hw/status publishes on the first tick and then at 50 Hz
+// (kStatusPeriodUs = 20 ms — neither suppressed to a slower cadence nor
+// published on intermediate <20 ms ticks), and carries non-zero, accurate
+// clock_offset_us and clock_offset_uncertainty_us once converged.
+TEST(HardwareNodeTest, PublishesStatusAt50HzWithConvergedClockOffset) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
+  ipc::Subscriber<bridge::BridgeStatus> status_sub{
+      bridge::topics::kStatus,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::SEQUENCE}};
+
+  constexpr uint64_t kStartUs = 2'000'000;
+  constexpr uint64_t kStatusPeriodUs = 20'000;
+  constexpr int64_t kTrueOffsetUs = 1'500'000;
+  constexpr uint64_t kBootId = 11;
+
+  // Initial tick publishes /hw/status #0 (not yet converged) and sends probe 1.
+  node.Tick(kStartUs);
+  const auto initial = status_sub.read();
+  ASSERT_TRUE(initial.has_value());
+  EXPECT_FALSE(status_sub.read().has_value());
+  EXPECT_FALSE(initial->clock_offset_valid());
+  EXPECT_EQ(initial->clock_offset_us(), 0);
+  EXPECT_EQ(initial->clock_offset_uncertainty_us(), 0u);
+
+  auto pending_probe = NextProbeUs(gateway);
+  ASSERT_TRUE(pending_probe.has_value());
+  ASSERT_EQ(*pending_probe, kStartUs);
+
+  State state = TrustState(config_id, kBootId, 1, 0);
+  state.flags = kConfigured;
+  std::vector<bridge::BridgeStatus> published;
+
+  // Drive 6 consecutive 20 ms intervals (120 ms total) with intermediate 5 ms
+  // ticks and a 1 us pre-boundary tick in each interval.
+  for (uint64_t k = 1; k <= 6; ++k) {
+    SCOPED_TRACE(k);
+    const uint64_t interval_start = kStartUs + (k - 1) * kStatusPeriodUs;
+    const uint64_t interval_end = kStartUs + k * kStatusPeriodUs;
+
+    // +5 ms: echo the interval's clock probe (t1 = interval_start,
+    // t2 = interval_start + 5 ms - kTrueOffsetUs); no status published yet.
+    const uint64_t t_echo = interval_start + 5'000;
+    state.sample_time_us = t_echo - static_cast<uint64_t>(kTrueOffsetUs);
+    state.clock_probe_time_us = *pending_probe;
+    ASSERT_TRUE(InjectState(node, gateway, state, t_echo));
+    EXPECT_FALSE(status_sub.read().has_value())
+        << "early /hw/status at " << t_echo;
+
+    // +6 ms: complete the causal two-way exchange (t4 = interval_start + 6 ms,
+    // RTT = 6 ms -> midpoint offset = 1'498'000 us, half-RTT = 3'000 us).
+    const uint64_t t_complete = interval_start + 6'000;
+    node.Tick(t_complete);
+    EXPECT_FALSE(status_sub.read().has_value())
+        << "early /hw/status at " << t_complete;
+
+    // +10 ms and +15 ms: intermediate hardware ticks inject States without
+    // publishing /hw/status.
+    for (const uint64_t offset_us : {10'000u, 15'000u}) {
+      const uint64_t t = interval_start + offset_us;
+      state.sample_time_us = t - static_cast<uint64_t>(kTrueOffsetUs);
+      state.clock_probe_time_us = 0;
+      ASSERT_TRUE(InjectState(node, gateway, state, t));
+      EXPECT_FALSE(status_sub.read().has_value())
+          << "early /hw/status at " << t;
+    }
+
+    // 1 us before the 20 ms cadence boundary: still no status publication.
+    node.Tick(interval_end - 1);
+    EXPECT_FALSE(status_sub.read().has_value())
+        << "1 us early /hw/status at " << (interval_end - 1);
+
+    // At exactly +20 ms: publishes exactly one /hw/status and the next probe.
+    node.Tick(interval_end);
+    const auto status = status_sub.read();
+    ASSERT_TRUE(status.has_value())
+        << "missing 50 Hz /hw/status at " << interval_end;
+    EXPECT_FALSE(status_sub.read().has_value())
+        << "duplicate /hw/status at " << interval_end;
+    published.push_back(*status);
+
+    pending_probe = NextProbeUs(gateway);
+    ASSERT_TRUE(pending_probe.has_value());
+    EXPECT_EQ(*pending_probe, interval_end);
+  }
+
+  ASSERT_EQ(published.size(), 6u);
+  // Intervals 1 and 2 have 3 and 6 States (< kConvergedSamples = 8).
+  EXPECT_FALSE(published[0].clock_offset_valid());
+  EXPECT_FALSE(published[1].clock_offset_valid());
+  // Intervals 3..6 have >= 8 States and fresh 6 ms two-way exchanges.
+  for (std::size_t i = 2; i < published.size(); ++i) {
+    SCOPED_TRACE(i);
+    const bridge::BridgeStatus& s = published[i];
+    EXPECT_TRUE(s.clock_offset_valid());
+    EXPECT_EQ(s.clock_boot_id(), kBootId);
+    EXPECT_EQ(s.clock_offset_us(), 1'498'000);
+    EXPECT_EQ(s.clock_min_round_trip_us(), 6'000u);
+    EXPECT_GE(s.clock_offset_uncertainty_us(), 3'000u);
+    EXPECT_LE(s.clock_offset_uncertainty_us(), 4'000u);
+    EXPECT_LE(std::abs(s.clock_offset_us() - kTrueOffsetUs),
+              static_cast<int64_t>(s.clock_offset_uncertainty_us()));
+  }
+}
+
 // Guards RT-29: a corrupt or spoofed far-future State sample_time_us within an
 // active boot (including UINT64_MAX) is dropped at the ordering gate (counted
 // in /hw/status clock_ignored_count) without advancing last_sample_time_us_,

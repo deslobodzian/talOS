@@ -2,11 +2,14 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -738,36 +741,456 @@ TEST(SimHardwareTotalLoss, LosingEveryFeedbackSampleFaultsAndNeutralizesAll) {
   expect_outputs(true);
 }
 
-// REQ-SAFE-22: as on the gateway (hardware::ReplaceNonFinite), a motor whose
-// position is not finite reads invalid, and only that motor: the State still
-// decodes, the other motor keeps its values (a non-finite temperature reads
-// 0) and the node stays enabled, where one NaN on the wire would read as a
-// lost link.
-TEST(SimHardwareNonFinite, ANonFinitePositionInvalidatesOnlyThatMotor) {
+// Whether every floating-point field encoded in a hardware::State is finite.
+bool AllFinite(const hardware::State& state) {
+  const auto finite = [](std::initializer_list<double> values) {
+    return std::all_of(values.begin(), values.end(),
+                       [](double x) { return std::isfinite(x); });
+  };
+  for (std::size_t i = 0; i < state.motor_count; ++i) {
+    const auto& m = state.motors[i];
+    if (!finite({m.position_rot, m.velocity_rps, m.voltage, m.stator_current_a,
+                 m.temperature_c, m.supply_current_a})) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < state.sensor_count; ++i) {
+    if (!finite(
+            {state.sensors[i].position_rot, state.sensors[i].velocity_rps})) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < state.analog_input_count; ++i) {
+    if (!finite({state.analog_inputs[i].voltage})) return false;
+  }
+  for (std::size_t i = 0; i < state.encoder_count; ++i) {
+    if (!finite(
+            {state.encoders[i].position_rot, state.encoders[i].velocity_rps})) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < state.pwm_output_count; ++i) {
+    if (!finite({state.pwm_outputs[i].output})) return false;
+  }
+  return finite(
+      {state.health.battery_v, state.health.can_bus.utilization_frac});
+}
+
+// REQ-SAFE-22, REQ-CONTRACT-32, REQ-CONTRACT-43: as on the gateway
+// (hardware::ReplaceNonFinite), no State SimHardware publishes carries a
+// non-finite value (NaN, +Inf, -Inf) across motors, CANcoders, Pigeon2 gyros,
+// analog inputs or encoders. A non-finite reading invalidates and zeroes only
+// its sample (plus dependent followers / remote-CANcoder motors, or total loss
+// when every motor and CAN sensor is non-finite), while non-finite motor
+// effort/temperature fields read 0 without invalidating motion feedback; the
+// State still decodes and unaffected devices stay valid and driving.
+TEST(SimHardwareNonFinite,
+     NonFiniteFeedbackSanitizesOnlyAffectedSamplesAcrossAllDevices) {
+  constexpr std::string_view kAllDevicesToml = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 50000
+
+[subsystems.mech.motors.braked]
+can_id = 1
+brake = true
+[subsystems.mech.motors.coasting]
+can_id = 2
+brake = false
+[subsystems.mech.motors.remote]
+can_id = 5
+feedback = "RemoteCANcoder"
+feedback_sensor = "angle"
+[subsystems.mech.motors.follower]
+can_id = 6
+follow = "braked"
+[subsystems.mech.sensors.angle]
+type = "CANcoder"
+can_id = 4
+[subsystems.mech.sensors.gyro]
+type = "Pigeon2"
+can_id = 7
+[subsystems.mech.analog_inputs.pressure]
+channel = 0
+[subsystems.mech.encoders.wheel]
+type = "DutyCycleEncoder"
+dio = 2
+[subsystems.mech.pwm_outputs.servo]
+channel = 0
+)";
   struct Mech {
     explicit Mech(Node& n)
-        : node{n}, braked{n, "braked"}, coasting{n, "coasting"} {}
-    void update() { enabled = robot_enabled(node); }
+        : node{n},
+          braked{n, "braked"},
+          coasting{n, "coasting"},
+          remote{n, "remote"},
+          follower{n, "follower"},
+          angle{n, "angle"},
+          gyro{n, "gyro"},
+          pressure{n, "pressure"},
+          wheel{n, "wheel"},
+          servo{n, "servo"} {
+      AllowUntargetedOutputs(n);
+    }
+    void update() {
+      enabled = robot_enabled(node);
+      braked.set_duty_cycle(0.4);
+      coasting.set_duty_cycle(0.3);
+      remote.set_duty_cycle(0.2);
+      servo.set(0.5);
+    }
     Node& node;
-    Motor braked, coasting;
+    Motor braked, coasting, remote, follower;
+    CANcoder angle;
+    Gyro gyro;
+    AnalogInput pressure;
+    Encoder wheel;
+    PwmOutput servo;
     bool enabled = false;
   };
-  constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
-  auto sim = Sim::FromToml(kRobotToml);
-  auto& mech = sim.add<Mech>("mech");
-  SimHardware hw{sim};
-  hw.enable();
-  sim.step(20ms);
-  ASSERT_TRUE(mech.enabled);
-  hw.set_motor("mech", "braked", kNaN, 2.0);
-  hw.set_motor("mech", "coasting", 1.5, -0.5, 0, 0, kNaN);
-  sim.step(100ms);  // twice command_timeout_us
-  EXPECT_TRUE(mech.enabled);
-  EXPECT_FALSE(mech.braked.connected());
-  EXPECT_TRUE(mech.coasting.connected());
-  EXPECT_EQ(mech.coasting.position(), 1.5);
-  EXPECT_EQ(mech.coasting.velocity(), -0.5);
-  EXPECT_EQ(mech.coasting.temperature_c(), 0.0);
+
+  constexpr std::array<std::pair<const char*, double>, 3> kSentinels = {{
+      {"NaN", std::numeric_limits<double>::quiet_NaN()},
+      {"+Inf", std::numeric_limits<double>::infinity()},
+      {"-Inf", -std::numeric_limits<double>::infinity()},
+  }};
+
+  enum class Case {
+    kMotorPosition,
+    kMotorVelocity,
+    kMotorEffortAndTemp,
+    kCANcoderPosition,
+    kCANcoderVelocity,
+    kPigeon2Yaw,
+    kPigeon2YawRate,
+    kAnalogInput,
+    kEncoderPosition,
+    kEncoderVelocity,
+    kAllMotionTotalLoss,
+  };
+  constexpr std::array<std::pair<const char*, Case>, 11> kCases = {{
+      {"motor position", Case::kMotorPosition},
+      {"motor velocity", Case::kMotorVelocity},
+      {"motor effort/temp", Case::kMotorEffortAndTemp},
+      {"CANcoder position", Case::kCANcoderPosition},
+      {"CANcoder velocity", Case::kCANcoderVelocity},
+      {"Pigeon2 yaw", Case::kPigeon2Yaw},
+      {"Pigeon2 yaw_rate", Case::kPigeon2YawRate},
+      {"analog input", Case::kAnalogInput},
+      {"encoder position", Case::kEncoderPosition},
+      {"encoder velocity", Case::kEncoderVelocity},
+      {"every motor and CAN sensor", Case::kAllMotionTotalLoss},
+  }};
+
+  for (const auto& [sentinel_name, bad] : kSentinels) {
+    SCOPED_TRACE(sentinel_name);
+    for (const auto& [case_name, test_case] : kCases) {
+      SCOPED_TRACE(case_name);
+      auto sim = Sim::FromToml(kAllDevicesToml);
+      const auto config =
+          config::ParseRobotConfig(detail::SimAccess::config_path(sim));
+      auto& mech = sim.add<Mech>("mech");
+      SimHardware hw{sim};
+      hw.enable();
+      hw.set_motor("mech", "braked", 2.0, 3.0, 0, 0, 30.0, 4.0, 5.0);
+      hw.set_motor("mech", "coasting", 1.5, -0.5, 0, 0, 28.0, 2.0, 3.0);
+      hw.set_motor("mech", "remote", 0.5, 1.0, 0, 0, 25.0, 1.0, 1.5);
+      hw.set_motor("mech", "follower", 2.0, 3.0, 0, 0, 29.0, 3.5, 4.5);
+      hw.set_cancoder("mech", "angle", 0.25, 0.75);
+      hw.set_gyro("mech", "gyro", 1.25, -0.25);
+      hw.set_analog_input("mech", "pressure", 2.5);
+      hw.set_encoder("mech", "wheel", 4.0, 1.5);
+      sim.step(20ms);
+      ASSERT_TRUE(mech.enabled);
+      ASSERT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kDutyCycle);
+      ASSERT_EQ(hw.applied_motor("mech", "coasting").mode, Mode::kDutyCycle);
+      ASSERT_EQ(hw.applied_motor("mech", "remote").mode, Mode::kDutyCycle);
+      ASSERT_EQ(hw.applied_pwm("mech", "servo"), 0.5);
+
+      const auto id_of = [&](Kind kind, std::string_view device) {
+        return detail::HardwareAccess::device_id(config, "mech", kind, device);
+      };
+      const auto motor_sample = [&](const hardware::State& s,
+                                    std::string_view device) {
+        const auto id = id_of(Kind::kMotor, device);
+        for (std::size_t i = 0; i < s.motor_count; ++i) {
+          if (s.motors[i].id == id) return s.motors[i];
+        }
+        ADD_FAILURE() << "missing motor sample " << device;
+        return hardware::MotorSample{};
+      };
+      const auto sensor_sample = [&](const hardware::State& s, Kind kind,
+                                     std::string_view device) {
+        const auto id = id_of(kind, device);
+        for (std::size_t i = 0; i < s.sensor_count; ++i) {
+          if (s.sensors[i].id == id) return s.sensors[i];
+        }
+        ADD_FAILURE() << "missing sensor sample " << device;
+        return hardware::SensorSample{};
+      };
+
+      switch (test_case) {
+        case Case::kMotorPosition:
+          hw.set_motor("mech", "braked", bad, 3.0, 0, 0, 30.0, 4.0, 5.0);
+          break;
+        case Case::kMotorVelocity:
+          hw.set_motor("mech", "braked", 2.0, bad, 0, 0, 30.0, 4.0, 5.0);
+          break;
+        case Case::kMotorEffortAndTemp:
+          hw.set_motor("mech", "coasting", 1.5, -0.5, 0, 0, bad, bad, bad);
+          break;
+        case Case::kCANcoderPosition:
+          hw.set_cancoder("mech", "angle", bad, 0.75);
+          break;
+        case Case::kCANcoderVelocity:
+          hw.set_cancoder("mech", "angle", 0.25, bad);
+          break;
+        case Case::kPigeon2Yaw:
+          hw.set_gyro("mech", "gyro", bad, -0.25);
+          break;
+        case Case::kPigeon2YawRate:
+          hw.set_gyro("mech", "gyro", 1.25, bad);
+          break;
+        case Case::kAnalogInput:
+          hw.set_analog_input("mech", "pressure", bad);
+          break;
+        case Case::kEncoderPosition:
+          hw.set_encoder("mech", "wheel", bad, 1.5);
+          break;
+        case Case::kEncoderVelocity:
+          hw.set_encoder("mech", "wheel", 4.0, bad);
+          break;
+        case Case::kAllMotionTotalLoss:
+          hw.set_motor("mech", "braked", bad, 3.0);
+          hw.set_motor("mech", "coasting", 1.5, bad);
+          hw.set_motor("mech", "remote", bad, 1.0);
+          hw.set_motor("mech", "follower", 2.0, bad);
+          hw.set_cancoder("mech", "angle", bad, 0.75);
+          hw.set_gyro("mech", "gyro", 1.25, bad);
+          break;
+      }
+
+      // Step twice command_timeout_us: a State that failed to decode would drop
+      // robot_enabled() rather than keeping unaffected devices live.
+      sim.step(100ms);
+      const hardware::State state = LatestState(sim);
+      EXPECT_TRUE(AllFinite(state));
+
+      if (test_case == Case::kAllMotionTotalLoss) {
+        EXPECT_NE(state.flags & hardware::kHardwareFault, 0u);
+        for (std::size_t i = 0; i < state.motor_count; ++i) {
+          EXPECT_FALSE(state.motors[i].valid);
+          EXPECT_DOUBLE_EQ(state.motors[i].position_rot, 0.0);
+          EXPECT_DOUBLE_EQ(state.motors[i].velocity_rps, 0.0);
+          EXPECT_DOUBLE_EQ(state.motors[i].stator_current_a, 0.0);
+          EXPECT_DOUBLE_EQ(state.motors[i].supply_current_a, 0.0);
+        }
+        for (std::size_t i = 0; i < state.sensor_count; ++i) {
+          EXPECT_FALSE(state.sensors[i].valid);
+          EXPECT_DOUBLE_EQ(state.sensors[i].position_rot, 0.0);
+          EXPECT_DOUBLE_EQ(state.sensors[i].velocity_rps, 0.0);
+        }
+        EXPECT_FALSE(mech.enabled);
+        EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
+        EXPECT_EQ(hw.applied_motor("mech", "coasting").mode, Mode::kNeutral);
+        EXPECT_EQ(hw.applied_motor("mech", "remote").mode, Mode::kNeutral);
+        EXPECT_EQ(hw.applied_pwm("mech", "servo"), std::nullopt);
+        continue;
+      }
+
+      EXPECT_EQ(state.flags & hardware::kHardwareFault, 0u);
+      EXPECT_TRUE(mech.enabled);
+
+      const bool bad_braked = test_case == Case::kMotorPosition ||
+                              test_case == Case::kMotorVelocity;
+      const auto braked_s = motor_sample(state, "braked");
+      const auto follower_s = motor_sample(state, "follower");
+      EXPECT_EQ(braked_s.valid, !bad_braked);
+      EXPECT_EQ(follower_s.valid, !bad_braked);
+      EXPECT_EQ(mech.braked.connected(), !bad_braked);
+      EXPECT_EQ(mech.follower.connected(), !bad_braked);
+      if (bad_braked) {
+        EXPECT_DOUBLE_EQ(braked_s.position_rot, 0.0);
+        EXPECT_DOUBLE_EQ(braked_s.velocity_rps, 0.0);
+        EXPECT_DOUBLE_EQ(braked_s.voltage, 0.0);
+        EXPECT_DOUBLE_EQ(braked_s.stator_current_a, 0.0);
+        EXPECT_DOUBLE_EQ(braked_s.supply_current_a, 0.0);
+        EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
+      } else {
+        EXPECT_DOUBLE_EQ(braked_s.position_rot, 2.0);
+        EXPECT_DOUBLE_EQ(braked_s.velocity_rps, 3.0);
+        EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kDutyCycle);
+      }
+
+      const auto coasting_s = motor_sample(state, "coasting");
+      EXPECT_TRUE(coasting_s.valid);
+      EXPECT_TRUE(mech.coasting.connected());
+      EXPECT_DOUBLE_EQ(coasting_s.position_rot, 1.5);
+      EXPECT_DOUBLE_EQ(coasting_s.velocity_rps, -0.5);
+      EXPECT_EQ(hw.applied_motor("mech", "coasting").mode, Mode::kDutyCycle);
+      if (test_case == Case::kMotorEffortAndTemp) {
+        EXPECT_DOUBLE_EQ(coasting_s.temperature_c, 0.0);
+        EXPECT_DOUBLE_EQ(coasting_s.supply_current_a, 0.0);
+        EXPECT_DOUBLE_EQ(coasting_s.stator_current_a, 0.0);
+        EXPECT_DOUBLE_EQ(mech.coasting.temperature_c(), 0.0);
+        EXPECT_DOUBLE_EQ(mech.coasting.supply_current_a(), 0.0);
+        EXPECT_DOUBLE_EQ(mech.coasting.current(), 0.0);
+      }
+
+      const bool bad_cancoder = test_case == Case::kCANcoderPosition ||
+                                test_case == Case::kCANcoderVelocity;
+      const auto angle_s = sensor_sample(state, Kind::kCANcoder, "angle");
+      EXPECT_EQ(angle_s.valid, !bad_cancoder);
+      EXPECT_EQ(mech.angle.connected(), !bad_cancoder);
+      if (bad_cancoder) {
+        EXPECT_DOUBLE_EQ(angle_s.position_rot, 0.0);
+        EXPECT_DOUBLE_EQ(angle_s.velocity_rps, 0.0);
+        EXPECT_EQ(hw.applied_motor("mech", "remote").mode, Mode::kNeutral);
+      } else {
+        EXPECT_DOUBLE_EQ(angle_s.position_rot, 0.25);
+        EXPECT_DOUBLE_EQ(angle_s.velocity_rps, 0.75);
+        EXPECT_EQ(hw.applied_motor("mech", "remote").mode, Mode::kDutyCycle);
+      }
+
+      const bool bad_gyro =
+          test_case == Case::kPigeon2Yaw || test_case == Case::kPigeon2YawRate;
+      const auto gyro_s = sensor_sample(state, Kind::kGyro, "gyro");
+      EXPECT_EQ(gyro_s.valid, !bad_gyro);
+      EXPECT_EQ(mech.gyro.connected(), !bad_gyro);
+      if (bad_gyro) {
+        EXPECT_DOUBLE_EQ(gyro_s.position_rot, 0.0);
+        EXPECT_DOUBLE_EQ(gyro_s.velocity_rps, 0.0);
+      } else {
+        EXPECT_DOUBLE_EQ(gyro_s.position_rot, 1.25);
+        EXPECT_DOUBLE_EQ(gyro_s.velocity_rps, -0.25);
+      }
+
+      const bool bad_analog = test_case == Case::kAnalogInput;
+      ASSERT_EQ(state.analog_input_count, 1u);
+      EXPECT_EQ(state.analog_inputs[0].valid, !bad_analog);
+      EXPECT_EQ(mech.pressure.connected(), !bad_analog);
+      EXPECT_DOUBLE_EQ(state.analog_inputs[0].voltage, bad_analog ? 0.0 : 2.5);
+      EXPECT_DOUBLE_EQ(mech.pressure.voltage(), bad_analog ? 0.0 : 2.5);
+
+      const bool bad_encoder = test_case == Case::kEncoderPosition ||
+                               test_case == Case::kEncoderVelocity;
+      ASSERT_EQ(state.encoder_count, 1u);
+      EXPECT_EQ(state.encoders[0].valid, !bad_encoder);
+      EXPECT_EQ(mech.wheel.connected(), !bad_encoder);
+      EXPECT_DOUBLE_EQ(state.encoders[0].position_rot, bad_encoder ? 0.0 : 4.0);
+      EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, bad_encoder ? 0.0 : 1.5);
+    }
+  }
+}
+
+// REQ-SAFE-03, REQ-SAFE-04, REQ-CONTRACT-43: non-finite motor duty-cycle and
+// PWM outputs (NaN, +Inf, -Inf) fail closed on SimHardware: node setters
+// neutralize only the affected motor / turn off only the affected PWM, raw
+// Command packets carrying non-finite demands or PWM pulses are rejected on
+// decode, and every published State remains finite and decodable.
+TEST(SimHardwareNonFinite,
+     NonFiniteMotorDutyCycleAndPwmCommandsFailClosedAndKeepStateFinite) {
+  struct Outputs {
+    explicit Outputs(Node& n)
+        : braked{n, "braked"}, coasting{n, "coasting"}, servo{n, "servo"} {
+      AllowUntargetedOutputs(n);
+    }
+    void update() {
+      braked.set_duty_cycle(0.4);
+      coasting.set_duty_cycle(coasting_duty);
+      servo.set(servo_output);
+    }
+    Motor braked, coasting;
+    PwmOutput servo;
+    double coasting_duty = 0.3;
+    double servo_output = 0.5;
+  };
+
+  constexpr std::array<std::pair<const char*, double>, 3> kSentinels = {{
+      {"NaN", std::numeric_limits<double>::quiet_NaN()},
+      {"+Inf", std::numeric_limits<double>::infinity()},
+      {"-Inf", -std::numeric_limits<double>::infinity()},
+  }};
+
+  for (const auto& [name, bad] : kSentinels) {
+    SCOPED_TRACE(name);
+    // Node handle path: non-finite duty cycle neutralizes only that motor and
+    // non-finite PWM turns off only that PWM, keeping the published State
+    // finite.
+    {
+      auto sim = Sim::FromToml(kRobotToml);
+      auto& out = sim.add<Outputs>("mech");
+      SimHardware hw{sim};
+      hw.enable();
+      sim.step(20ms);
+      ASSERT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kDutyCycle);
+      ASSERT_EQ(hw.applied_motor("mech", "coasting").mode, Mode::kDutyCycle);
+      ASSERT_EQ(hw.applied_pwm("mech", "servo"), 0.5);
+
+      out.coasting_duty = bad;
+      out.servo_output = bad;
+      sim.step(15ms);
+      EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kDutyCycle);
+      EXPECT_DOUBLE_EQ(hw.applied_motor("mech", "braked").demand, 0.4);
+      EXPECT_EQ(hw.applied_motor("mech", "coasting").mode, Mode::kNeutral);
+      EXPECT_EQ(hw.applied_pwm("mech", "servo"), std::nullopt);
+
+      const hardware::State state = LatestState(sim);
+      EXPECT_TRUE(AllFinite(state));
+      ASSERT_GE(state.pwm_output_count, 1u);
+      EXPECT_DOUBLE_EQ(state.pwm_outputs[0].output, 0.0);
+    }
+
+    // Raw Command path: a packet carrying a non-finite motor duty-cycle demand
+    // or PWM pulse is refused on decode by SimHardware::Collect so it never
+    // enters applied outputs or the published State.
+    {
+      auto sim = Sim::FromToml(kRobotToml);
+      const auto config =
+          config::ParseRobotConfig(detail::SimAccess::config_path(sim));
+      const auto& devices = config.subsystems.at("mech");
+      SimHardware hw{sim};
+      hw.enable();
+      sim.step(5ms);
+
+      const hardware::State baseline = LatestState(sim);
+      SendRequest(sim, "mech", DriveAll(baseline, devices));
+      sim.step(5ms);
+      ASSERT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kVelocity);
+      ASSERT_EQ(hw.applied_pwm("mech", "servo"), 0.75);
+
+      const hardware::State active = LatestState(sim);
+      hardware::Command bad_motor = DriveAll(active, devices);
+      bad_motor.motors[0].mode = Mode::kDutyCycle;
+      bad_motor.motors[0].demand = bad;
+      SendRequest(sim, "mech", bad_motor);
+
+      hardware::Command bad_pwm = DriveAll(active, devices);
+      bad_pwm.pwm_outputs[0].mode = hardware::PwmMode::kPulse;
+      bad_pwm.pwm_outputs[0].output = bad;
+      SendRequest(sim, "mech", bad_pwm);
+
+      sim.step(5ms);
+      EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kVelocity);
+      EXPECT_DOUBLE_EQ(hw.applied_motor("mech", "braked").demand, 40.0);
+      EXPECT_EQ(hw.applied_pwm("mech", "servo"), 0.75);
+      const hardware::State state = LatestState(sim);
+      EXPECT_TRUE(AllFinite(state));
+      ASSERT_GE(state.pwm_output_count, 1u);
+      EXPECT_DOUBLE_EQ(state.pwm_outputs[0].output, 0.75);
+
+      // The rejected non-finite commands did not renew the owner's deadline:
+      // once the owner timeout elapses from the last valid request, outputs
+      // neutralize and the published State remains finite.
+      sim.step(25ms);
+      EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
+      EXPECT_EQ(hw.applied_pwm("mech", "servo"), std::nullopt);
+      const hardware::State expired = LatestState(sim);
+      EXPECT_TRUE(AllFinite(expired));
+      ASSERT_GE(expired.pwm_output_count, 1u);
+      EXPECT_DOUBLE_EQ(expired.pwm_outputs[0].output, 0.0);
+    }
+  }
 }
 
 // A simulated robot has no CAN bus to read: SimHardware's /hw/status lists

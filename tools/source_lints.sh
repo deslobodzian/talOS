@@ -13,6 +13,10 @@
 #                code, no test retries (docs/TESTING.md §6.1, §8.1;
 #                exceptions in tools/lint_test_time_allowlist.txt, which
 #                may only shrink)
+#   testing-rules  tools/check_testing_rules.py: every perf target carries
+#                host qualification (docs/TESTING.md §6.7) and every e2e/soak
+#                target preserves failure artifacts under
+#                TEST_UNDECLARED_OUTPUTS_DIR (docs/TESTING.md §8.2)
 #   links        tools/check_links.py: every relative markdown link and
 #                anchor resolves
 #   trace        tools/trace.py --check: every SAFE, CONTRACT and P0
@@ -70,6 +74,7 @@ lint() {  # lint NAME COMMAND...
 }
 
 lint test-time python3 tools/lint_test_time.py
+lint testing-rules python3 tools/check_testing_rules.py
 lint links python3 tools/check_links.py
 lint trace python3 tools/trace.py --check
 lint node-matrix python3 tools/check_node_matrix.py \
