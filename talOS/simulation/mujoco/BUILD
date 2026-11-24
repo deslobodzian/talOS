@@ -184,9 +184,9 @@ cc_test(
 # with the same commands and faults, give identical encoded States; a 1 us
 # change at one tick does not; with sleeping on, two game runs end in the
 # same world. Five shards, so each has its own timeout under
-# --config=tsan: gtest gives case i to shard i % 5, which runs the two
-# 2 s game runs of GameRunsGiveIdenticalStatesAndMatches beside only the
-# cheap first case.
+# --config=tsan: gtest gives case i, in the file's order, to shard i % 5,
+# which leaves GameRunsGiveIdenticalStatesAndMatches (two game runs) alone
+# in its shard. A case added above it moves every later one.
 cc_test(
     name = "gateway_bit_identity_test",
     size = "small",
