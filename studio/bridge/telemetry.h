@@ -111,6 +111,8 @@ struct TelemetryState {
   struct {
     bool active{false};
     std::uint64_t sequence_id{0};
+    std::uint64_t timestamp_ns{0};
+    bool keyframe{false};
     std::uint32_t page_count{0};
     std::uint32_t next_page{0};
     std::vector<std::uint64_t> values;
@@ -143,21 +145,46 @@ inline bool DecodeDictionary(const std::vector<std::string>& pages,
   for (const std::string& bytes : pages) {
     const auto* frame = Talos::Telemetry::GetSizePrefixedFrame(bytes.data());
     if (frame->first_channel() != out.size()) return false;
+    // The producer writes every dictionary string once, so their text fits in
+    // the page; shared-offset DAGs that multiply strings past bytes.size() are
+    // refused (matching studio/src/core.ts, REQ-CONTRACT-28).
+    std::size_t text_budget = bytes.size();
+    const auto consume_string =
+        [&text_budget](const flatbuffers::String* str) -> bool {
+      if (str == nullptr) return false;
+      const std::size_t len = str->size();
+      if (len > talos::telemetry_wire::kMaxDictionaryStringBytes ||
+          len + 1 > text_budget) {
+        return false;
+      }
+      text_budget -= len + 1;
+      return true;
+    };
     for (const auto* info : *frame->dictionary()) {
+      if (info == nullptr || !consume_string(info->name())) return false;
       TelemetryChannelInfo channel;
       channel.name = info->name()->str();
-      if (!names.insert(channel.name).second ||
+      if (channel.name.empty() || !names.insert(channel.name).second ||
           channel.name.starts_with("derived/") ||
           info->kind() > Talos::Telemetry::ChannelKind_MAX ||
           info->alert() > Talos::Telemetry::AlertLevel_MAX) {
         return false;
       }
-      channel.unit = info->unit() != nullptr ? info->unit()->str() : "";
+      if (info->unit() != nullptr) {
+        if (!consume_string(info->unit())) return false;
+        channel.unit = info->unit()->str();
+      }
       channel.kind = info->kind();
       channel.alert = info->alert();
       if (info->labels() != nullptr) {
+        if (info->labels()->size() > talos::telemetry_wire::kMaxEnumLabels ||
+            info->labels()->size() > text_budget) {
+          return false;
+        }
+        channel.labels.reserve(info->labels()->size());
         for (const auto* label : *info->labels()) {
-          channel.labels.push_back(label != nullptr ? label->str() : "");
+          if (!consume_string(label)) return false;
+          channel.labels.push_back(label->str());
         }
       }
       out.push_back(std::move(channel));
@@ -175,8 +202,8 @@ inline bool DecodeDictionary(const std::vector<std::string>& pages,
 // latest. Returns false for bytes that are not a valid v3 page, a dictionary
 // past telemetry_wire::kMaxChannels, or a dictionary whose pages do not
 // decode; such bytes never change the cached dictionary or the latest tick
-// (a dictionary being assembled from them is discarded). A valid page that
-// cannot be used yet returns true.
+// (a dictionary or tick being assembled from them is discarded). A valid page
+// that cannot be used yet returns true.
 inline bool IngestTelemetry(TelemetryState& state, std::string_view payload,
                             std::int64_t monotonic_ns) {
   flatbuffers::Verifier verifier{
@@ -198,6 +225,7 @@ inline bool IngestTelemetry(TelemetryState& state, std::string_view payload,
       pending.received_channels = 0;
     };
     if (frame->values() != nullptr || frame->channels() != nullptr ||
+        frame->absent() != nullptr ||
         payload.size() > talos::telemetry_wire::kMaxDictionaryPageBytes) {
       return false;
     }
@@ -282,50 +310,74 @@ inline bool IngestTelemetry(TelemetryState& state, std::string_view payload,
   }
 
   // A value page.
-  const auto* chassis = frame->chassis();
-  if (chassis == nullptr || !detail::FinitePose(*chassis)) return false;
-  const auto* channels = frame->channels();
-  const auto* values = frame->values();
-  const std::size_t carried = channels != nullptr ? channels->size() : 0;
-  if ((values != nullptr ? values->size() : 0) != carried) return false;
+  auto& tick = state.pending_tick;
   const std::uint32_t count = frame->channel_count();
-  for (std::size_t i = 0; i < carried; ++i) {
-    if (channels->Get(i) >= count) return false;
-  }
-  if (frame->absent() != nullptr) {
-    for (const std::uint32_t channel : *frame->absent()) {
-      if (channel >= count) return false;
-    }
-  }
   const bool aligns = state.has_dictionary &&
                       frame->stream_id() == state.stream_id &&
                       frame->dictionary_id() == state.dictionary_id &&
                       count == state.dictionary.size();
+  const bool same_pending_slot = aligns && tick.active && frame->page() > 0 &&
+                                 tick.sequence_id == frame->sequence_id() &&
+                                 tick.next_page == frame->page();
+  const bool matches_pending = same_pending_slot &&
+                               tick.timestamp_ns == frame->timestamp_ns() &&
+                               tick.keyframe == frame->keyframe() &&
+                               tick.page_count == frame->page_count();
+  const auto reject_value_page = [&] {
+    if (same_pending_slot) {
+      ++state.incomplete_ticks;
+      tick.active = false;
+    }
+    return false;
+  };
+
+  const auto* chassis = frame->chassis();
+  if (chassis == nullptr || !detail::FinitePose(*chassis)) {
+    return reject_value_page();
+  }
+  const auto* channels = frame->channels();
+  const auto* values = frame->values();
+  const std::size_t carried = channels != nullptr ? channels->size() : 0;
+  if ((values != nullptr ? values->size() : 0) != carried) {
+    return reject_value_page();
+  }
+  for (std::size_t i = 0; i < carried; ++i) {
+    if (channels->Get(i) >= count) return reject_value_page();
+  }
+  if (frame->absent() != nullptr) {
+    for (const std::uint32_t channel : *frame->absent()) {
+      if (channel >= count) return reject_value_page();
+    }
+  }
   if (!aligns) return true;  // Well-formed; just not usable yet.
   for (std::size_t i = 0; i < carried; ++i) {
     if (!detail::ValidSample(state.dictionary[channels->Get(i)].kind,
                              values->Get(i))) {
-      return false;
+      return reject_value_page();
     }
   }
 
-  auto& tick = state.pending_tick;
   if (frame->page() == 0) {
-    if (tick.active) ++state.incomplete_ticks;
+    if (tick.active) {
+      ++state.incomplete_ticks;
+      tick.active = false;
+    }
+    if (!frame->keyframe() && !state.has_frame) return true;
     tick.active = true;
     tick.sequence_id = frame->sequence_id();
+    tick.timestamp_ns = frame->timestamp_ns();
+    tick.keyframe = frame->keyframe();
     tick.page_count = frame->page_count();
     tick.next_page = 0;
-    if (frame->keyframe() || !state.has_frame) {
+    if (frame->keyframe()) {
       tick.values.assign(count, 0);
       tick.present.assign(count, 0);
     } else {
       tick.values = state.values;
       tick.present = state.present;
     }
-  } else if (!tick.active || tick.sequence_id != frame->sequence_id() ||
-             tick.page_count != frame->page_count() ||
-             tick.next_page != frame->page()) {
+  } else if (!matches_pending) {
+    if (same_pending_slot) return reject_value_page();
     if (tick.active) ++state.incomplete_ticks;
     tick.active = false;
     return true;

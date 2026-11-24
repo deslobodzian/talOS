@@ -1971,6 +1971,314 @@ TEST(TelemetryPages, RejectsEmptyMultiPageAndOversizedPendingDictionary) {
   }
 }
 
+// REQ-CONTRACT-28, REQ-OPS-23
+// Dictionary ingestion enforces Studio's wire caps (non-empty names,
+// kMaxDictionaryStringBytes, kMaxEnumLabels, no `absent` vector on dictionary
+// pages, and a per-page text budget bounded by the page's wire size against
+// FlatBuffers shared-offset DAG decode bombs) without mutating cached state.
+TEST(TelemetryPages, RejectsDictionaryCapsAbsentAndSharedOffsetDagBomb) {
+  const auto raw_dict_page = [](std::span<const ChannelDef> entries,
+                                std::uint32_t dict_id = 777) {
+    flatbuffers::FlatBufferBuilder builder;
+    talos::telemetry::DictionaryScratch scratch;
+    talos::telemetry::detail::FinishDictionaryPage(
+        builder, scratch,
+        PageHeader{kStream, 0, 1, dict_id,
+                   static_cast<std::uint32_t>(entries.size())},
+        0, 1, 0, entries);
+    return std::string{
+        reinterpret_cast<const char*>(builder.GetBufferPointer()),
+        builder.GetSize()};
+  };
+
+  // Boundary acceptance: strings at kMaxDictionaryStringBytes and enums at
+  // kMaxEnumLabels are accepted.
+  {
+    const std::string max_str(talos::telemetry_wire::kMaxDictionaryStringBytes,
+                              'a');
+    std::vector<std::string> max_labels(talos::telemetry_wire::kMaxEnumLabels,
+                                        "x");
+    const std::vector<ChannelDef> at_limits{
+        {max_str, max_str, {max_str}, Talos::Telemetry::ChannelKind_UInt},
+        {"test/max_labels", "", max_labels, Talos::Telemetry::ChannelKind_UInt},
+    };
+    const std::string page = raw_dict_page(at_limits, 1001);
+    ASSERT_LE(page.size(), talos::telemetry_wire::kMaxDictionaryPageBytes);
+    TelemetryState state;
+    EXPECT_TRUE(IngestTelemetry(state, page, 0));
+    EXPECT_TRUE(state.has_dictionary);
+    ASSERT_EQ(state.dictionary.size(), 2u);
+    EXPECT_EQ(state.dictionary[0].name.size(),
+              talos::telemetry_wire::kMaxDictionaryStringBytes);
+    EXPECT_EQ(state.dictionary[1].labels.size(),
+              talos::telemetry_wire::kMaxEnumLabels);
+  }
+
+  // Build adversarial dictionary pages that must each be rejected without
+  // mutating cached state.
+  std::vector<std::pair<std::string, std::string>> invalid_pages;
+
+  // 1. Dictionary page carrying a non-null `absent` vector.
+  {
+    flatbuffers::FlatBufferBuilder builder;
+    const auto name = builder.CreateString("test/with_absent");
+    const auto entry = Talos::Telemetry::CreateChannelInfo(
+        builder, name, 0, 0, Talos::Telemetry::ChannelKind_Double,
+        Talos::Telemetry::AlertLevel_None);
+    const std::vector<flatbuffers::Offset<Talos::Telemetry::ChannelInfo>>
+        entries{entry};
+    const auto dict = builder.CreateVector(entries);
+    const std::uint32_t absent_channel = 0;
+    const auto absent = builder.CreateVector(&absent_channel, 1);
+    Talos::Telemetry::FrameBuilder frame{builder};
+    frame.add_stream_id(kStream);
+    frame.add_dictionary_id(1002);
+    frame.add_page(0);
+    frame.add_page_count(1);
+    frame.add_channel_count(1);
+    frame.add_first_channel(0);
+    frame.add_dictionary(dict);
+    frame.add_absent(absent);
+    Talos::Telemetry::FinishSizePrefixedFrameBuffer(builder, frame.Finish());
+    invalid_pages.emplace_back(
+        "dictionary_with_absent",
+        std::string{reinterpret_cast<const char*>(builder.GetBufferPointer()),
+                    builder.GetSize()});
+  }
+
+  // 2. Empty channel name.
+  invalid_pages.emplace_back(
+      "empty_name", raw_dict_page(
+                        std::vector<ChannelDef>{
+                            {"", "", {}, Talos::Telemetry::ChannelKind_Double}},
+                        1003));
+
+  // 3. Name, unit, and label exceeding kMaxDictionaryStringBytes (256).
+  const std::string too_long(
+      talos::telemetry_wire::kMaxDictionaryStringBytes + 1, 'z');
+  invalid_pages.emplace_back(
+      "name_too_long",
+      raw_dict_page(
+          std::vector<ChannelDef>{
+              {too_long, "", {}, Talos::Telemetry::ChannelKind_Double}},
+          1004));
+  invalid_pages.emplace_back(
+      "unit_too_long",
+      raw_dict_page(
+          std::vector<ChannelDef>{{"test/unit_long",
+                                   too_long,
+                                   {},
+                                   Talos::Telemetry::ChannelKind_Double}},
+          1005));
+  invalid_pages.emplace_back(
+      "label_too_long",
+      raw_dict_page(
+          std::vector<ChannelDef>{{"test/label_long",
+                                   "",
+                                   {too_long},
+                                   Talos::Telemetry::ChannelKind_UInt}},
+          1006));
+
+  // 4. Enum channel exceeding kMaxEnumLabels (1024).
+  {
+    std::vector<std::string> too_many_labels(
+        talos::telemetry_wire::kMaxEnumLabels + 1, "a");
+    const std::string page = raw_dict_page(
+        std::vector<ChannelDef>{{"test/too_many_labels", "",
+                                 std::move(too_many_labels),
+                                 Talos::Telemetry::ChannelKind_UInt}},
+        1007);
+    ASSERT_LE(page.size(), talos::telemetry_wire::kMaxDictionaryPageBytes);
+    invalid_pages.emplace_back("too_many_labels", page);
+  }
+
+  // 5. Shared-offset FlatBuffers DAG decode bomb: every string is <= 256 B and
+  //    labels->size() <= 1024, and the wire page is ~2 KiB, yet sharing one
+  //    256 B label string across 200 entries and 20 channels expands to >1 MiB
+  //    of text (far exceeding bytes.size()).
+  {
+    flatbuffers::FlatBufferBuilder builder;
+    const auto shared_label = builder.CreateString(
+        std::string(talos::telemetry_wire::kMaxDictionaryStringBytes, 'x'));
+    const std::vector<flatbuffers::Offset<flatbuffers::String>> label_offsets(
+        200, shared_label);
+    const auto shared_labels = builder.CreateVector(label_offsets);
+    std::vector<flatbuffers::Offset<Talos::Telemetry::ChannelInfo>> entries;
+    constexpr std::uint32_t kChannels = 20;
+    entries.reserve(kChannels);
+    for (std::uint32_t i = 0; i < kChannels; ++i) {
+      const auto name = builder.CreateString("test/dag_" + std::to_string(i));
+      entries.push_back(Talos::Telemetry::CreateChannelInfo(
+          builder, name, 0, shared_labels, Talos::Telemetry::ChannelKind_UInt,
+          Talos::Telemetry::AlertLevel_None));
+    }
+    const auto dict = builder.CreateVector(entries);
+    Talos::Telemetry::FrameBuilder frame{builder};
+    frame.add_stream_id(kStream);
+    frame.add_dictionary_id(1008);
+    frame.add_page(0);
+    frame.add_page_count(1);
+    frame.add_channel_count(kChannels);
+    frame.add_first_channel(0);
+    frame.add_dictionary(dict);
+    Talos::Telemetry::FinishSizePrefixedFrameBuffer(builder, frame.Finish());
+    const std::string dag_page{
+        reinterpret_cast<const char*>(builder.GetBufferPointer()),
+        builder.GetSize()};
+    ASSERT_LE(dag_page.size(), talos::telemetry_wire::kMaxDictionaryPageBytes);
+    flatbuffers::Verifier verifier{
+        reinterpret_cast<const std::uint8_t*>(dag_page.data()),
+        dag_page.size()};
+    ASSERT_TRUE(Talos::Telemetry::VerifySizePrefixedFrameBuffer(verifier));
+    invalid_pages.emplace_back("shared_offset_dag_bomb", dag_page);
+  }
+
+  for (const auto& [label, page] : invalid_pages) {
+    SCOPED_TRACE(label);
+    TelemetryState state = SmallState();
+    const std::string before = TelemetryJson(state, 10);
+    EXPECT_FALSE(IngestTelemetry(state, page, 20));
+    EXPECT_EQ(TelemetryJson(state, 10), before);
+    EXPECT_EQ(state.dictionary_id, kDictionaryId);
+    ASSERT_TRUE(IngestAll(state, SmallTick(2.5, 0), 30));
+    EXPECT_EQ(state.values[0], RawFromDouble(2.5));
+  }
+}
+
+// REQ-OPS-23, REQ-CONTRACT-28
+// Delta value pages arriving before any keyframe are ignored rather than
+// promoted into a keyframe, multi-page ticks validate timestamp_ns and
+// keyframe consistency across pages, and a failing continuation page clears
+// pending_tick.active so no later page can stitch onto the aborted tick.
+TEST(TelemetryPages, RejectsDeltaBeforeKeyframeAndValidatesPendingTickPages) {
+  const auto raw_value_page = [](std::uint64_t sequence,
+                                 std::uint64_t timestamp_ns, bool keyframe,
+                                 std::uint16_t page, std::uint16_t page_count,
+                                 const std::vector<std::uint32_t>& channels,
+                                 const std::vector<std::uint64_t>& values,
+                                 double yaw = 0.5) {
+    flatbuffers::FlatBufferBuilder builder;
+    const Talos::Telemetry::Pose chassis{1.5, 2.5, 0, 0, 0, yaw};
+    talos::telemetry::detail::FinishValuePage(
+        builder, PageHeader{kStream, sequence, timestamp_ns, kDictionaryId, 4},
+        chassis, keyframe, page, page_count, channels, values, {});
+    return std::string{
+        reinterpret_cast<const char*>(builder.GetBufferPointer()),
+        builder.GetSize()};
+  };
+
+  TelemetryState state;
+  ASSERT_TRUE(IngestAll(state, DictionaryPages(SmallDictionary())));
+  ASSERT_FALSE(state.has_frame);
+
+  // 1. Single-page and multi-page delta updates before any keyframe never
+  //    establish a frame or leave a pending tick active.
+  EXPECT_TRUE(IngestTelemetry(
+      state, raw_value_page(1, 1000, false, 0, 1, {0}, {RawFromDouble(1.25)}),
+      10));
+  EXPECT_FALSE(state.has_frame);
+  EXPECT_FALSE(state.pending_tick.active);
+
+  EXPECT_TRUE(IngestTelemetry(
+      state, raw_value_page(2, 2000, false, 0, 2, {0}, {RawFromDouble(1.5)}),
+      20));
+  EXPECT_TRUE(IngestTelemetry(
+      state, raw_value_page(2, 2000, false, 1, 2, {1}, {1}), 21));
+  EXPECT_FALSE(state.has_frame);
+  EXPECT_FALSE(state.pending_tick.active);
+
+  // Establish a baseline keyframe (tick 3) and verify a subsequent delta
+  // (tick 4) preserves unchanged channels.
+  ASSERT_TRUE(
+      IngestTelemetry(state,
+                      raw_value_page(3, 3000, true, 0, 1, {0, 1, 2, 3},
+                                     {RawFromDouble(1.0), 1, 1, kBeyondDouble}),
+                      30));
+  ASSERT_TRUE(state.has_frame);
+  EXPECT_EQ(state.sequence_id, 3u);
+  ASSERT_TRUE(IngestTelemetry(
+      state, raw_value_page(4, 4000, false, 0, 1, {0}, {RawFromDouble(2.0)}),
+      40));
+  EXPECT_EQ(state.sequence_id, 4u);
+  EXPECT_EQ(state.values[0], RawFromDouble(2.0));
+  EXPECT_EQ(state.present[1], 1);
+  EXPECT_EQ(state.values[1], 1u);
+
+  // 2. Invalid continuation page (bad bool) aborts pending_tick and increments
+  //    incomplete_ticks, so a later valid page 1 cannot stitch onto it.
+  ASSERT_TRUE(IngestTelemetry(
+      state, raw_value_page(5, 5000, true, 0, 2, {0}, {RawFromDouble(5.0)}),
+      50));
+  ASSERT_TRUE(state.pending_tick.active);
+  EXPECT_FALSE(IngestTelemetry(
+      state, raw_value_page(5, 5000, true, 1, 2, {2}, {2}), 51));
+  EXPECT_FALSE(state.pending_tick.active);
+  EXPECT_EQ(state.incomplete_ticks, 1u);
+  EXPECT_EQ(state.sequence_id, 4u);
+  EXPECT_TRUE(IngestTelemetry(
+      state, raw_value_page(5, 5000, true, 1, 2, {2}, {1}), 52));
+  EXPECT_EQ(state.sequence_id, 4u);
+  EXPECT_EQ(state.values[0], RawFromDouble(2.0));
+
+  // 3. Invalid continuation page (non-finite chassis) also aborts pending_tick.
+  ASSERT_TRUE(IngestTelemetry(
+      state, raw_value_page(6, 6000, true, 0, 2, {0}, {RawFromDouble(6.0)}),
+      60));
+  ASSERT_TRUE(state.pending_tick.active);
+  EXPECT_FALSE(
+      IngestTelemetry(state,
+                      raw_value_page(6, 6000, true, 1, 2, {2}, {1},
+                                     std::numeric_limits<double>::quiet_NaN()),
+                      61));
+  EXPECT_FALSE(state.pending_tick.active);
+  EXPECT_EQ(state.incomplete_ticks, 2u);
+  EXPECT_EQ(state.sequence_id, 4u);
+
+  // 4. Continuation page with mismatched timestamp_ns aborts pending_tick and
+  //    prevents later stitching.
+  ASSERT_TRUE(IngestTelemetry(
+      state, raw_value_page(7, 7000, true, 0, 2, {0}, {RawFromDouble(7.0)}),
+      70));
+  ASSERT_TRUE(state.pending_tick.active);
+  EXPECT_FALSE(IngestTelemetry(
+      state, raw_value_page(7, 7999, true, 1, 2, {2}, {1}), 71));
+  EXPECT_FALSE(state.pending_tick.active);
+  EXPECT_EQ(state.incomplete_ticks, 3u);
+  EXPECT_EQ(state.sequence_id, 4u);
+  EXPECT_TRUE(IngestTelemetry(
+      state, raw_value_page(7, 7000, true, 1, 2, {2}, {1}), 72));
+  EXPECT_EQ(state.sequence_id, 4u);
+
+  // 5. Continuation page with mismatched keyframe flag aborts pending_tick and
+  //    prevents later stitching.
+  ASSERT_TRUE(IngestTelemetry(
+      state, raw_value_page(8, 8000, true, 0, 2, {0}, {RawFromDouble(8.0)}),
+      80));
+  ASSERT_TRUE(state.pending_tick.active);
+  EXPECT_FALSE(IngestTelemetry(
+      state, raw_value_page(8, 8000, false, 1, 2, {2}, {1}), 81));
+  EXPECT_FALSE(state.pending_tick.active);
+  EXPECT_EQ(state.incomplete_ticks, 4u);
+  EXPECT_EQ(state.sequence_id, 4u);
+  EXPECT_TRUE(IngestTelemetry(
+      state, raw_value_page(8, 8000, true, 1, 2, {2}, {1}), 82));
+  EXPECT_EQ(state.sequence_id, 4u);
+
+  // 6. A subsequent consistent 2-page delta tick completes and commits cleanly.
+  ASSERT_TRUE(IngestTelemetry(
+      state, raw_value_page(9, 9000, false, 0, 2, {0}, {RawFromDouble(9.5)}),
+      90));
+  ASSERT_TRUE(IngestTelemetry(
+      state, raw_value_page(9, 9000, false, 1, 2, {2}, {0}), 91));
+  EXPECT_FALSE(state.pending_tick.active);
+  EXPECT_EQ(state.sequence_id, 9u);
+  EXPECT_EQ(state.timestamp_ns, 9000u);
+  EXPECT_EQ(state.values[0], RawFromDouble(9.5));
+  EXPECT_EQ(state.values[2], 0u);
+  EXPECT_EQ(state.present[1], 1);
+  EXPECT_EQ(state.values[1], 1u);
+}
+
 // REQ-OPS-23, REQ-OPS-30, REQ-OPS-36
 // A one-shot deadline timer that fires even 1 ns before its recorded due_ns
 // (e.g. timer coalescing or clock slack) must clear due_ns in OnFired() so the
