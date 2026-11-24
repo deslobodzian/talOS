@@ -40,8 +40,9 @@ JOYSTICK_SCHEDULE = "|".join([
     f"4:axes=0;buttons={FEED_BUTTONS};pov=-1",
 ])
 PRELOADS = 8
-# Every one of 45 measured sessions launched and scored all 8; one piece of
-# margin, the twin's bound (rig_shot_test).
+# Every one of 90 measured runs of the scene without processes scored all 8
+# (README.md "The shot"); one piece of margin, the twin's bound
+# (rig_shot_test).
 MIN_POINTS = 7
 # Schedule-clock seconds: after the last launch, for its flight; and the
 # latest the session runs, inside SHIFT 1 (TELEOP starts at 1 s, TRANSITION

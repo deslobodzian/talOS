@@ -24,7 +24,7 @@ framework's `teleop` node turns two joystick buttons into their targets.
 
 ## Run it
 
-Button 3 spins the flywheel to 41 rps, button 4 runs the feeder at 30 rps.
+Button 3 spins the flywheel to 43 rps, button 4 runs the feeder at 30 rps.
 The rig's place on the field is the gateway's `--start-pose`: `:sim` passes
 it in its `args`, and `./sim.sh` takes it as a gateway argument, because no
 config key holds it yet (TODO.md SIM-18). Disabled for 1 s, then TELEOP,
@@ -68,52 +68,42 @@ then choose "Load field GLB" in the 3D Viewport panel and pick
 
 ## The rig
 
-This rig is a test fixture for the chain (nodes, launcher, bridge, MuJoCo
-gateway, game rules), not a robot to copy dimensions from. Its 1.6 m frame,
-single-file chute and 2.0 kg, 0.01 kg·m² flywheel are chosen to work around
-the scripted shooter launching pieces too close together (TODO.md SIM-17):
-a 1.6 m frame is not a legal FRC frame, and 0.01 kg·m² is more than a pair
-of 4 in wheels can have (about 0.001 to 0.005 kg·m²). From the generator's
-`shooter_rig` example, with what the shot needed changed:
+The generator's `shooter_rig` example with the subsystem files' names: a
+0.6985 m (27.5 in) square frame welded to the field, a hopper 0.56 m wide
+whose floor slopes to the feeder's roller, a pocket behind the roller that
+holds three FUEL abreast, and a flywheel launching at 60° backward over the
+rear. Every number is an estimate (`mujoco/robot_params.toml`):
 
-- **A single-file chute.** The hopper is 0.17 m wide, one FUEL, and the frame
-  1.6 m long, so the eight preloads lie in one row on its floor in front of
-  the feeder. `shooter_rig`'s pocket holds three FUEL abreast; the scripted
-  shooter launches the next as soon as the last is its two radii from the
-  exit, so they leave touching, the second catches the first (gravity has
-  slowed it along the launch axis) and their spin throws both off their
-  paths: in the 30 perturbed runs below, `shooter_rig` at 42 rps scored 2 of
-  8 in 28 and 3 in 2. Stacked in a narrow hopper (two columns of four, 0.17
-  to 0.24 m wide), the FUEL arch over the feeder and jam: 5 to 25 % of
-  perturbed runs launched only 2 to 5.
-- **A heavier flywheel**, 2.0 kg and 0.01 kg·m² (`shooter_rig`: 0.8 kg,
-  0.0025 kg·m²): a launch takes about 0.8 rps from it instead of 3. It
-  coasts in neutral (`brake = false`).
-- **Beam breaks**, `feeder_beam` across the chute where a FUEL waits for the
-  feeder, `shooter_beam` under the feeder's roller (a beam across the pocket
-  would read nothing: the flywheel takes a FUEL in the step it enters).
-  Each reads false while closed (`sim_closed_reads` is false).
+- **The preloads** are `shooter_rig`'s: two rows of three on the floor in
+  front of the feeder and two resting on them, none above the roller, a
+  layout the generator's hopper feeds every time (`robot_model_test`).
+- **The flywheel** is a pair of 4 in wheels (about 0.2 kg and
+  0.00026 kg·m² each) and a 1.0 kg steel flywheel weight 5 in across
+  (0.0020 kg·m²) on one shaft: 1.4 kg and 0.0025 kg·m². A launch takes
+  about 3 rps from it; the velocity loop restores it. It coasts in neutral
+  (`brake = false`).
+- **Beam breaks**, `feeder_beam` across the hopper where a FUEL waits for
+  the feeder, `shooter_beam` under the feeder's roller, at a FUEL centre's
+  height. Each reads false while closed (`sim_closed_reads` is false).
 - Motor and beam names are the subsystem files'.
 
 ## The shot
 
-The start pose `1.907,5.302,2.705` puts the rig 3.0 m from the blue HUB's
-scoring site, 25° toward the DEPOT side of straight on, its rear (the
+The start pose `1.907,5.302,2.705` puts the rig's exit 3.0 m from the blue
+HUB's scoring site, 25° toward the DEPOT side of straight on, its rear (the
 shooter's side) toward the HUB, clear of the TOWER and DEPOT. Measured with
-the rig's model assembled as the gateway assembles it, no processes, flywheel
-in velocity mode with the config's gains, feeder at 3.6 V (30 rps × 0.12 V
-per rps):
+the rig's model assembled as the gateway assembles it, no processes,
+flywheel in velocity mode with the config's gains, feeder at 30 rps:
 
-| Flywheel (rps) | 37 | 38 | 39 | 40 | 41 | 42 | 43 | 44 |
-|---|---|---|---|---|---|---|---|---|
-| Scored of 8 | 0 | 2 | 8 | 8 | 8 | 8 | 8 | 0 |
+| Flywheel (rps) | 39 | 40 | 41 | 42 | 43 | 44 | 45 | 46 | 47 |
+|---|---|---|---|---|---|---|---|---|---|
+| Scored of 8 | 0 | 2 | 8 | 8 | 8 | 8 | 8 | 5 | 5 |
 
-41 rps is the middle of the window. 30 runs with the pose moved up to 2 cm
-in x and y and 0.01 rad in yaw, the speed up to 2 % either way, the seed
-drawn and each tick up to 200 µs off its 5 ms scored 240 of 240, and so did
-the same runs with the feeder at 2.5 V and at 6 V. Seed 1 draws red
-inactive first at TELEOP's tie, so the blue HUB counts through SHIFT 1 as
-well as TRANSITION.
+43 rps is the middle of the window. 30 runs with the pose moved up to 2 cm
+in x and y and 0.01 rad in yaw, the speed up to 2 % either way and the seed
+drawn scored 240 of 240, and so did the same runs with the feeder at 20.8
+and at 50 rps (2.5 and 6 V). Seed 1 draws red inactive first at TELEOP's
+tie, so the blue HUB counts through SHIFT 1 as well as TRANSITION.
 
 ## Tests
 

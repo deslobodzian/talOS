@@ -15,8 +15,9 @@ mass_kg = 40.0
 [game_piece]
 radius_m = 0.07506  # the 2026 FUEL
 
+# A 27.5 in square frame, as shooter_rig's.
 [frame]
-length_m = 1.6
+length_m = 0.6985
 width_m = 0.6985
 belly_clearance_m = 0.035
 rail_height_m = 0.0508
@@ -36,32 +37,29 @@ rotor_inertia_kg_m2 = 1.0e-4
 gear = 1.0
 rotor_inertia_kg_m2 = 1.0e-4
 
-# A single-file chute: one piece wide, so the pocket behind the feeder holds
-# one piece at a time, and long enough (with the 1.6 m frame) for the eight
-# preloads in one layer. Measured: pieces stacked in a hopper arch over the
-# feeder and jam, and pieces abreast in the pocket launch back to back and
-# collide in flight (examples/mujoco_rig/README.md).
+# shooter_rig's hopper: three FUEL abreast in the pocket behind the feeder.
 [hopper]
-width_m = 0.17
-floor_front_m = 0.36
+width_m = 0.56
+floor_front_m = 0.20
 floor_slope_deg = 12.0
-wall_top_m = 0.61
+wall_top_m = 0.70
 
 [feeder]
 motor = "feeder_motor"
-x_m = -0.59
+x_m = -0.12
 roller_radius_m = 0.0254
 roller_mass_kg = 0.3
-compression_m = 0.005
+compression_m = 0.01
 
-# shooter_rig's flywheel at 2.5 times its mass and 4 times its inertia: it
-# loses 2 % of its speed per launch instead of 7 %.
+# A pair of 4 in wheels (about 0.2 kg and 0.00026 kg·m² each) and a 1.0 kg
+# steel flywheel weight 5 in across (0.0020 kg·m²) on one shaft: 1.4 kg and
+# 0.0025 kg·m², shooter_rig's inertia.
 [flywheel]
 motor = "flywheel_motor"
 radius_m = 0.0508
 width_m = 0.12
-mass_kg = 2.0
-inertia_kg_m2 = 0.01
+mass_kg = 1.4
+inertia_kg_m2 = 0.0025
 axle_x_m = -0.336
 axle_z_m = 0.55
 compression_m = 0.02
@@ -70,33 +68,31 @@ exit_elevation_deg = 60.0
 exit_offset_m = 0.15
 efficiency = 0.5
 
-# Across the chute where a FUEL waits against the feeder, at its centre.
+# Across the hopper where a FUEL waits against the feeder, at its centre.
 [[beam_breaks]]
 name = "feeder_beam"
-position_m = [-0.48, -0.1, 0.171]
+position_m = [-0.06, -0.27, 0.195]
 direction = [0.0, 1.0, 0.0]
-cutoff_m = 0.2
+cutoff_m = 0.54
 
-# Across the chute under the feeder's roller, at a FUEL centre's height:
-# closed while a FUEL is held at or rolls under the roller. (A beam across
-# the pocket would see nothing: the flywheel takes a FUEL in the step it
-# enters the pocket.)
+# Across the hopper under the feeder's roller, at a FUEL centre's height:
+# closed while a FUEL rolls under the roller into the pocket.
 [[beam_breaks]]
 name = "shooter_beam"
-position_m = [-0.59, -0.1, 0.144]
+position_m = [-0.12, -0.27, 0.1796]
 direction = [0.0, 1.0, 0.0]
-cutoff_m = 0.2
+cutoff_m = 0.54
 
-# Eight FUEL in a row on the chute's floor, the first 1 cm in front of the
-# feeder's roller, each 1 cm clear of the next.
+# shooter_rig's eight FUEL: two rows of three on the floor in front of the
+# feeder, two more resting on them, each 5 mm or more clear of what it meets.
 [preload]
 positions_m = [
-  [-0.48, 0.0, 0.171],
-  [-0.32, 0.0, 0.205],
-  [-0.16, 0.0, 0.239],
-  [0.0, 0.0, 0.273],
-  [0.16, 0.0, 0.307],
-  [0.32, 0.0, 0.341],
-  [0.48, 0.0, 0.375],
-  [0.64, 0.0, 0.409],
+  [-0.015, -0.16, 0.211],
+  [-0.015, 0.0, 0.211],
+  [-0.015, 0.16, 0.211],
+  [0.145, -0.16, 0.245],
+  [0.145, 0.0, 0.245],
+  [0.145, 0.16, 0.245],
+  [0.065, -0.08, 0.353],
+  [0.065, 0.08, 0.353],
 ]

@@ -20,6 +20,11 @@ namespace {
 constexpr std::string_view kInlet = "_inlet";
 constexpr std::string_view kExit = "_exit";
 constexpr std::string_view kNumeric = "_shooter";
+// Launch spacing (README.md "Scripted shooter"): the clearance beyond two
+// radii a launch keeps from the shooter's previous body in flight, and the
+// longest a launch waits after that body's.
+constexpr double kSpacingMarginM = 0.01;
+constexpr double kMaxSpacingWaitS = 0.5;
 
 // The `index`th group of `stride` entries of a MuJoCo array.
 template <typename T>
@@ -141,10 +146,52 @@ ScriptedShooters::Shooter FindShooter(const mjModel& m, int actuator,
   return shooter;
 }
 
+// Whether a body launched from `exit` at `velocity` would come within
+// `clearance` of `leader`, launched earlier, before the leader falls back to
+// the exit's height. Both move under gravity alone, which cancels in their
+// difference: the gap is linear in time, its closest approach closed-form.
+bool MeetsInFlight(const mjModel& m, const mjData& d, int leader_qpos,
+                   int leader_dof, const mjtNum* exit,
+                   const std::array<mjtNum, 3>& velocity, double clearance) {
+  const mjtNum* at = d.qpos + leader_qpos;
+  const mjtNum* moving = d.qvel + leader_dof;  // world frame
+  std::array<mjtNum, 3> gap{};
+  std::array<mjtNum, 3> closing{};
+  for (int k = 0; k < 3; ++k) {
+    gap[k] = exit[k] - at[k];
+    closing[k] = velocity[k] - moving[k];
+  }
+  // How long the leader stays above the exit's height; without gravity it
+  // never falls back.
+  double horizon_s = mjMAXVAL;
+  const double g = mju_norm3(m.opt.gravity);
+  if (g > 0.0) {
+    double height = 0.0;  // the leader's, over the exit, and its rise rate
+    double rising = 0.0;
+    for (int k = 0; k < 3; ++k) {
+      height += gap[k] * m.opt.gravity[k] / g;
+      rising -= moving[k] * m.opt.gravity[k] / g;
+    }
+    const double discriminant = rising * rising + 2.0 * g * height;
+    if (discriminant < 0.0) return false;
+    horizon_s = (rising + std::sqrt(discriminant)) / g;
+    if (!(horizon_s > 0.0)) return false;
+  }
+  const double rate = mju_dot3(closing.data(), closing.data());
+  double when_s = 0.0;
+  if (rate > 0.0) {
+    when_s = -mju_dot3(gap.data(), closing.data()) / rate;
+    when_s = when_s < 0.0 ? 0.0 : (when_s > horizon_s ? horizon_s : when_s);
+  }
+  std::array<mjtNum, 3> nearest{};
+  for (int k = 0; k < 3; ++k) nearest[k] = gap[k] + closing[k] * when_s;
+  return mju_dot3(nearest.data(), nearest.data()) < clearance * clearance;
+}
+
 }  // namespace
 
 ScriptedShooters::ScriptedShooters(std::vector<Shooter> shooters)
-    : shooters_(std::move(shooters)) {}
+    : shooters_(std::move(shooters)), last_(shooters_.size()) {}
 
 void ScriptedShooters::Attach(const mjModel& model, mjData& data) {
   bodies_.clear();
@@ -171,6 +218,7 @@ void ScriptedShooters::Attach(const mjModel& model, mjData& data) {
     bodies_.push_back(body);
   }
   launched_step_.assign(bodies_.size(), 0);
+  last_.assign(shooters_.size(), Last{});
   for (const Shooter& shooter : shooters_) {
     if (InsideBox(model, data, shooter.inlet,
                   At(data.site_xpos, 3, shooter.exit))) {
@@ -185,7 +233,8 @@ void ScriptedShooters::Attach(const mjModel& model, mjData& data) {
 
 bool ScriptedShooters::AfterStep(mjModel& model, mjData& data, uint64_t step,
                                  const MatchInput& /*input*/) {
-  for (const Shooter& shooter : shooters_) {
+  for (std::size_t s = 0; s < shooters_.size(); ++s) {
+    const Shooter& shooter = shooters_[s];
     for (std::size_t i = 0; i < bodies_.size(); ++i) {
       const Body& body = bodies_[i];
       // A body launched this step (by any shooter) waits for the next.
@@ -195,8 +244,14 @@ bool ScriptedShooters::AfterStep(mjModel& model, mjData& data, uint64_t step,
       if (!InsideBox(model, data, shooter.inlet, data.qpos + body.qpos)) {
         continue;
       }
-      if (Launch(model, data, shooter, body)) {
+      const double since_s =
+          last_[s].body < 0
+              ? kMaxSpacingWaitS
+              : static_cast<double>(step - last_[s].step) * model.opt.timestep;
+      if (Launch(model, data, shooter, body,
+                 since_s < kMaxSpacingWaitS ? last_[s].body : -1)) {
         launched_step_[i] = step;
+        last_[s] = Last{static_cast<int>(i), step};
         ++shots_;
       }
     }
@@ -205,7 +260,8 @@ bool ScriptedShooters::AfterStep(mjModel& model, mjData& data, uint64_t step,
 }
 
 bool ScriptedShooters::Launch(const mjModel& model, mjData& data,
-                              const Shooter& shooter, const Body& body) {
+                              const Shooter& shooter, const Body& body,
+                              int leader) {
   // A flywheel at rest or turning backward launches nothing: the body stays
   // where the contacts hold it, and goes when the flywheel turns forward.
   // Forward is the joint's positive direction, the motor's too: an actuator
@@ -245,11 +301,26 @@ bool ScriptedShooters::Launch(const mjModel& model, mjData& data,
   mj_objectVelocity(&model, &data, mjOBJ_SITE, shooter.exit,
                     exit_velocity.data(), 0);
 
+  std::array<mjtNum, 3> leaves{};
+  for (int k = 0; k < 3; ++k) {
+    leaves[k] = exit_velocity[3 + k] + launch_mps * x_axis[k];
+  }
+  // Spaced from the shooter's previous launch: it waits while the two would
+  // meet in flight (on one arc, near the apex, where the first moves at only
+  // v·cos(theta)).
+  if (leader >= 0) {
+    const Body& first = bodies_[static_cast<std::size_t>(leader)];
+    if (MeetsInFlight(model, data, first.qpos, first.dof, exit, leaves,
+                      first.radius_m + body.radius_m + kSpacingMarginM)) {
+      return false;
+    }
+  }
+
   mjtNum* position = data.qpos + body.qpos;
   mjtNum* velocity = data.qvel + body.dof;
   for (int k = 0; k < 3; ++k) {
     position[k] = exit[k];
-    velocity[k] = exit_velocity[3 + k] + launch_mps * x_axis[k];
+    velocity[k] = leaves[k];
   }
   // Rolling spin about the exit's y axis on top of the exit's own turn; a
   // free joint's angular velocity is in the body's frame.

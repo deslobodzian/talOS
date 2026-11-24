@@ -1,13 +1,15 @@
 // The scripted shooter (REQ-DEV-39) on MujocoPlant, on inline MJCF: where
 // and how fast a launch leaves, what it takes from the flywheel, which
-// bodies it launches and when, the contract's refusals, and that it is
-// repeatable and allocates nothing.
+// bodies it launches and when, how far apart in flight and how long a body
+// waits, the contract's refusals, and that it is repeatable and allocates
+// nothing.
 
 #include "talOS/simulation/mujoco/scripted_shooter.h"
 
 #include <gtest/gtest.h>
 #include <mujoco/mujoco.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -15,6 +17,7 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <numbers>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -79,16 +82,17 @@ std::unique_ptr<MujocoPlant> Make(const std::string& name,
 // A robot whose root, at height 0.5, holds the flywheel on its z axis
 // through the root's origin, so the robot's centre of mass stays there and a
 // free root's twist is constant; the inlet is a 0.2 m box at `inlet_pos`, the
-// exit at (0.3, 0, 0.2) pitched up by kExitPitch.
+// exit at (0.3, 0, 0.2) pitched up by `exit_pitch`.
 std::string Robot(bool free_root, std::string_view inlet_pos = "0 0 0.3",
-                  const Wheel& wheel = kWheel) {
+                  const Wheel& wheel = kWheel, double exit_pitch = kExitPitch) {
   return std::string(R"(<mujoco><compiler angle="radian"/><worldbody>
   <body name="frame" pos="0 0 0.5">)") +
          (free_root ? R"(<freejoint name="root"/>)" : "") +
          R"(<inertial pos="0 0 0" mass="10" diaginertia="1 1 2"/>
     <site name="flywheel_inlet" type="box" size="0.1 0.1 0.1" pos=")" +
          std::string(inlet_pos) + R"("/>
-    <site name="flywheel_exit" pos="0.3 0 0.2" euler="0 -0.7 0"/>
+    <site name="flywheel_exit" pos="0.3 0 0.2" euler="0 )" +
+         std::to_string(-exit_pitch) + R"( 0"/>
     <body name="wheel"><joint name="flywheel_joint" axis="0 0 1" armature=")" +
          std::to_string(wheel.joint_armature) + R"("/>
       <inertial pos="0 0 0" mass="1" diaginertia="0.002 0.002 )" +
@@ -289,7 +293,8 @@ TEST(ScriptedShooter, NeverLaunchesTheRobot) {
 
 // A flywheel at rest or turning backward launches nothing; turning forward
 // it launches one body at a time, the next only once the last is clear of the
-// exit by their two radii, and each body once.
+// exit by their two radii (here, without gravity, by two radii and the
+// spacing's 1 cm), and each body once.
 TEST(ScriptedShooter, LaunchesOneBodyAtATimeOnlyWhenTurningForward) {
   auto plant = Make("one_at_a_time", Robot(false),
                     Field(Ball("first", {0.0, 0.0, 0.78}) +
@@ -311,7 +316,7 @@ TEST(ScriptedShooter, LaunchesOneBodyAtATimeOnlyWhenTurningForward) {
   ExpectNear(StateOf(*plant, "second").position, {0.0, 0.0, 0.82},
              "second, while the first is at the exit");
   // The first leaves at 7.17 m/s, 0.0359 m a step: 0.179 m, past the two
-  // radii, after five steps (0.143 m after four).
+  // radii and 1 cm, after five steps (0.143 m after four).
   for (int step = 1; step <= 4; ++step) {
     ASSERT_TRUE(plant->Step(1, {}));
     EXPECT_EQ(shooters.shots(), 1u) << "step " << step;
@@ -320,6 +325,107 @@ TEST(ScriptedShooter, LaunchesOneBodyAtATimeOnlyWhenTurningForward) {
   EXPECT_EQ(shooters.shots(), 2u);
   ASSERT_TRUE(plant->Step(40, {}));
   EXPECT_EQ(shooters.shots(), 2u);
+}
+
+// REQ-DEV-39: two bodies in the inlet together leave far enough apart not
+// to meet in flight. On one arc the two are closest near the apex, where the
+// first moves at only v·cos(theta): at 60 degrees, launched as soon as the
+// first is its two radii from the exit, the second comes within 0.08 m of it
+// there. With gravity, a 60 degree exit and a flywheel heavy enough that both
+// leave at one speed, their centres stay more than two radii plus 1 cm apart
+// from the second's launch until the first has fallen back to the exit's
+// height, and the second waits no more than the spacing needs.
+TEST(ScriptedShooter, SecondLaunchDoesNotMeetTheFirstInFlight) {
+  constexpr Wheel kHeavyWheel{0.0025, 1.0, 0.0};  // armature 1 kg·m²
+  constexpr double kPitch = std::numbers::pi / 3.0;
+  constexpr double kClearance = 2.0 * kBallRadius + 0.01;
+  auto plant = Make(
+      "in_flight", Robot(false, "0 0 0.3", kHeavyWheel, kPitch),
+      Field(Ball("first", {0.0, 0.0, 0.78}) + Ball("second", {0.0, 0.0, 0.86}),
+            true));
+  std::unique_ptr<WorldRules> rules;
+  ScriptedShooters& shooters = Attach(*plant, rules);
+  Writable(*plant)->qvel[Dof(plant->model(), "flywheel_joint")] = 300.0;
+  constexpr double kExitZ = 0.7;  // the exit's height, root at 0.5
+  int second_at = 0;
+  double closest = 1e9;
+  for (int step = 1; step <= 400; ++step) {
+    ASSERT_TRUE(plant->Step(1, {}));
+    if (step == 1) {
+      ASSERT_EQ(shooters.shots(), 1u);
+    }
+    if (second_at == 0 && shooters.shots() == 2) second_at = step;
+    if (second_at == 0) continue;
+    const BodyState first = StateOf(*plant, "first");
+    const BodyState second = StateOf(*plant, "second");
+    if (first.position[2] < kExitZ && first.velocity[2] < 0.0) break;
+    closest =
+        std::min(closest, std::hypot(first.position[0] - second.position[0],
+                                     first.position[1] - second.position[1],
+                                     first.position[2] - second.position[2]));
+  }
+  ASSERT_GT(second_at, 0) << "the second body was never launched";
+  EXPECT_GT(closest, kClearance) << "the second launch, at step " << second_at
+                                 << ", meets the first in flight";
+  // Both leave at 7.6 m/s, 3.8 m/s across the ground: the spacing needs
+  // 0.16 / 3.8 = 42 ms, nine steps after the first's.
+  EXPECT_LE(second_at, 10) << "the second waits longer than the spacing needs";
+}
+
+// REQ-DEV-39: the spacing never stalls a shooter: a body waits at most
+// 0.5 s after the shooter's last launch, even while that body stands still
+// in its path.
+TEST(ScriptedShooter, WaitsAtMostHalfASecondForTheLastLaunch) {
+  auto plant = Make("stalled", Robot(false),
+                    Field(Ball("first", {0.0, 0.0, 0.78}) +
+                          Ball("second", {0.0, 0.0, 0.82})));
+  std::unique_ptr<WorldRules> rules;
+  ScriptedShooters& shooters = Attach(*plant, rules);
+  const mjModel* m = plant->model();
+  mjData* d = Writable(*plant);
+  d->qvel[Dof(m, "flywheel_joint")] = 300.0;
+  ASSERT_TRUE(plant->Step(1, {}));
+  ASSERT_EQ(shooters.shots(), 1u);
+  // The first stops 0.2 m along the exit's axis from the exit (0.3, 0, 0.7):
+  // clear of the exit by more than two radii, in the second's path.
+  const int first = m->body_jntadr[mj_name2id(m, mjOBJ_BODY, "first")];
+  mjtNum* at = d->qpos + m->jnt_qposadr[first];
+  at[0] = 0.3 + 0.2 * std::cos(kExitPitch);
+  at[2] = 0.7 + 0.2 * std::sin(kExitPitch);
+  for (int k = 0; k < 6; ++k) d->qvel[m->jnt_dofadr[first] + k] = 0.0;
+  ASSERT_TRUE(plant->Step(90, {}));  // 0.45 s after the first's launch
+  EXPECT_EQ(shooters.shots(), 1u) << "launched into the first";
+  ASSERT_TRUE(plant->Step(11, {}));  // 0.505 s
+  EXPECT_EQ(shooters.shots(), 2u) << "still waiting 0.5 s after the first";
+}
+
+// REQ-DEV-39: the spacing looks at the last launch only until it falls back
+// to the exit's height: a leader parked below the exit, on the straight line
+// of a launch pitched 0.3 rad down and 0.3 m from the exit (clear of it by
+// more than two radii), does not delay the next launch, which leaves on the
+// first step the exit is clear.
+TEST(ScriptedShooter, ALeaderBelowTheExitDoesNotDelayTheNextLaunch) {
+  constexpr double kPitch = -0.3;
+  auto plant = Make(
+      "below", Robot(false, "0 0 0.3", kWheel, kPitch),
+      Field(Ball("first", {0.0, 0.0, 0.78}) + Ball("second", {0.0, 0.0, 0.86}),
+            true));
+  std::unique_ptr<WorldRules> rules;
+  ScriptedShooters& shooters = Attach(*plant, rules);
+  const mjModel* m = plant->model();
+  mjData* d = Writable(*plant);
+  d->qvel[Dof(m, "flywheel_joint")] = 300.0;
+  ASSERT_TRUE(plant->Step(1, {}));
+  ASSERT_EQ(shooters.shots(),
+            1u);  // the second waits: the first is at the exit
+  const int first = m->body_jntadr[mj_name2id(m, mjOBJ_BODY, "first")];
+  mjtNum* at = d->qpos + m->jnt_qposadr[first];
+  at[0] = 0.3 + 0.3 * std::cos(kPitch);
+  at[2] = 0.7 + 0.3 * std::sin(kPitch);
+  for (int k = 0; k < 6; ++k) d->qvel[m->jnt_dofadr[first] + k] = 0.0;
+  ASSERT_TRUE(plant->Step(1, {}));
+  EXPECT_EQ(shooters.shots(), 2u)
+      << "waited for a leader already below the exit's height";
 }
 
 // REQ-DEV-39: a contract with a part missing or malformed is refused,

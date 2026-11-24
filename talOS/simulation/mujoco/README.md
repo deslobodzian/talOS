@@ -331,6 +331,18 @@ actuator order, bodies in index order:
   ball fed to a stopped wheel does;
 - one body at a time: a body waits in the inlet while another body's centre
   is nearer the exit than their two radii;
+- launches spaced in flight: a body also waits while, leaving at its launch
+  velocity, it would come within their two radii plus 1 cm of the body this
+  shooter launched last (moving on from its present position and velocity,
+  both under gravity alone) before that body falls back to the exit's
+  height, but never more than 0.5 s after that launch; on one arc this
+  spaces launches at least (r₁ + r₂ + 1 cm) / (v·cos θ) apart, θ the exit's
+  elevation, since the two are closest near the apex. Meanwhile the body
+  rests in the inlet on the robot's contacts. The rule spaces a launch only
+  from the same shooter's last launch (not from an earlier one, nor from
+  another shooter's on the same robot), looks at that body only until it
+  falls back to the exit's height, and after 0.5 s launches even while that
+  body still blocks the path;
 - a body is launched at most once per step, whichever shooter took it.
 
 A body of the flywheel's own robot (its free root) is never launched, and
