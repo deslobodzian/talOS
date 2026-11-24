@@ -4,15 +4,21 @@
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <format>
 #include <latch>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -76,6 +82,10 @@ class RegistrationPeer {
 
   static void SetOnReclaimWait(void (*callback)(std::uint64_t, int)) {
     RTMSQueue::on_reclaim_wait_ = callback;
+  }
+
+  static void SetOnUnlinkVerified(void (*callback)(std::uint64_t)) {
+    RTMSQueue::on_unlink_verified_ = callback;
   }
 };
 
@@ -600,7 +610,7 @@ TEST(RingRegistration,
 }
 
 // REQ-OPS-03: concurrent openers racing to reclaim a kLifetimeClosing segment
-// must elect a single reclaimer and converge on one fresh segment without
+// must elect a single claimant and converge on one fresh segment without
 // split-brain unlinking.
 TEST(RingRegistration, ConcurrentOpenersReclaimingClosingSegmentShareOne) {
   constexpr std::size_t kSlots = 4;
@@ -634,10 +644,9 @@ TEST(RingRegistration, ConcurrentOpenersReclaimingClosingSegmentShareOne) {
     }
 
     const auto* old_header = static_cast<const RTMSHeader*>(old_mapping.ptr());
-    EXPECT_NE(old_header->lifetime.load(std::memory_order_acquire) &
-                  kLifetimeReclaiming,
-              0U)
-        << "round " << round;
+    EXPECT_EQ(old_header->lifetime.load(std::memory_order_acquire),
+              kLifetimeClosing | talos::OwnProcessWord())
+        << "round " << round << ": the old segment's claimant";
 
     const RTMSHeader* shared_header = RegistrationPeer::Header(*queues[0]);
     ASSERT_NE(shared_header->segment_id, old_segment_id);
@@ -671,163 +680,378 @@ TEST(RingRegistration, ConcurrentOpenersReclaimingClosingSegmentShareOne) {
   }
 }
 
-// REQ-OPS-03: an opener encountering a closing segment whose reclamation is
-// already claimed (kLifetimeReclaiming):
-// (a) yields to a live/recent claim rather than racing into UnlinkIfSame()
-//     immediately, attaching to the winner's replacement segment once ready;
-// (b) eventually supersedes and reclaims an abandoned/stalled claim whose
-//     winner died before UnlinkIfSame() instead of wedging permanently; and
-// (c) resets its wait budget if a different closing segment_id appears
-// mid-loop.
-TEST(RingRegistration, OpenerDoesNotUnlinkAlreadyClaimedClosingSegment) {
+RTMSQueue OpenPublisher(const std::string& path, std::size_t slots) {
+  return RTMSQueue{
+      path,
+      sizeof(DropNewestPayload),
+      alignof(DropNewestPayload),
+      kDropNewestSchema,
+      slots,
+      RTMSOptions{.overflow_policy = OverflowPolicy::DROP_NEWEST,
+                  .read_mode = ReadMode::SEQUENCE,
+                  .publisher = true},
+  };
+}
+
+// Every queue in `queues` is attached to one segment other than
+// `old_segment_id`, which counts exactly them, and each reads the publication
+// of a publisher opened on `path` afterwards (on whatever segment the name
+// then holds).
+void ExpectOneSegmentDelivering(const std::string& path, std::size_t slots,
+                                const std::vector<RTMSQueue*>& queues,
+                                std::uint64_t old_segment_id) {
+  ASSERT_FALSE(queues.empty());
+  const RTMSHeader* shared_header = RegistrationPeer::Header(*queues[0]);
+  EXPECT_NE(shared_header->segment_id, old_segment_id);
+  for (std::size_t i = 1; i < queues.size(); ++i) {
+    EXPECT_EQ(RegistrationPeer::Header(*queues[i])->segment_id,
+              shared_header->segment_id)
+        << "queue " << i << " is on another segment";
+  }
+  EXPECT_EQ(shared_header->lifetime.load(std::memory_order_acquire) &
+                kLifetimeCountMask,
+            queues.size());
+
+  std::vector<std::size_t> reader_ids(queues.size());
+  for (std::size_t i = 0; i < queues.size(); ++i) {
+    const auto reg = queues[i]->register_reader();
+    ASSERT_TRUE(reg.has_value()) << "queue " << i;
+    reader_ids[i] = *reg;
+  }
+  RTMSQueue publisher = OpenPublisher(path, slots);
+  ASSERT_NO_FATAL_FAILURE(WriteSequences(publisher, 0, 1));
+  for (std::size_t i = 0; i < queues.size(); ++i) {
+    DropNewestPayload copy{};
+    MessageInfo info{};
+    EXPECT_EQ(queues[i]->read_next(
+                  reader_ids[i], std::as_writable_bytes(std::span{copy}), info),
+              ReadResult::OK)
+        << "queue " << i << " missed the publication";
+    EXPECT_EQ(FirstForeignWord(copy, 0), kDropNewestWords) << "queue " << i;
+  }
+}
+
+// More waits for a live claimant than the 200 after which an opener once
+// took over from it: a claimant held this long is held past that wait.
+constexpr int kWaitsPastSupersede = 250;
+
+// Holds the first unlink of a closing segment (the claimant's, between its
+// check of the name and its shm_unlink) until either every other opener's
+// open has returned, or an opener has waited kWaitsPastSupersede times for
+// the held claimant. Later unlinks pass.
+struct UnlinkHold {
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::atomic<bool> taken{false};
+  bool entered{false};
+  bool released{false};
+  std::size_t returned{0};
+  int max_wait{0};
+};
+UnlinkHold* g_hold = nullptr;
+
+void HoldFirstUnlink(std::uint64_t /*segment_id*/) {
+  if (g_hold->taken.exchange(true)) return;
+  std::unique_lock lock{g_hold->mutex};
+  g_hold->entered = true;
+  g_hold->changed.notify_all();
+  g_hold->changed.wait(lock, [] { return g_hold->released; });
+}
+
+void ReleaseAfterLongWait(std::uint64_t /*segment_id*/, int wait_count) {
+  const std::lock_guard lock{g_hold->mutex};
+  g_hold->max_wait = std::max(g_hold->max_wait, wait_count);
+  if (wait_count > kWaitsPastSupersede) {
+    g_hold->released = true;
+    g_hold->changed.notify_all();
+  }
+}
+
+// An opener's open() returned; once `others` have, the hold is released.
+void OpenerReturned(std::size_t others) {
+  const std::lock_guard lock{g_hold->mutex};
+  if (++g_hold->returned >= others) {
+    g_hold->released = true;
+    g_hold->changed.notify_all();
+  }
+}
+
+struct HoldGuard {
+  explicit HoldGuard(UnlinkHold& hold) {
+    g_hold = &hold;
+    RegistrationPeer::SetOnUnlinkVerified(HoldFirstUnlink);
+    RegistrationPeer::SetOnReclaimWait(ReleaseAfterLongWait);
+  }
+  ~HoldGuard() { Clear(); }
+  HoldGuard(const HoldGuard&) = delete;
+  HoldGuard& operator=(const HoldGuard&) = delete;
+  static void Clear() {
+    RegistrationPeer::SetOnUnlinkVerified(nullptr);
+    RegistrationPeer::SetOnReclaimWait(nullptr);
+    g_hold = nullptr;
+  }
+};
+
+// REQ-OPS-03: eight openers find an abandoned closing segment with no
+// claimant; one claims it and is descheduled between checking that the name
+// still holds it and unlinking it (held in the hook). The others wait for
+// that live claimant however long it takes and never unlink in its place, so
+// its unlink cannot remove a segment one of them created meanwhile: all eight
+// end on one fresh segment. Seen in the Cloud Build stress lane (run
+// 45133738392): seven openers on one segment, one alone on another.
+TEST(RingRegistration, LiveReclaimerHeldPastTheWaitIsNotSuperseded) {
   constexpr std::size_t kSlots = 4;
+  constexpr std::size_t kOpeners = 8;
+  const std::string path = MakeUniquePath("/ring_reclaim_held");
+  auto [old_mapping, old_segment_id] =
+      MakeAbandonedClosingSegment(path, kSlots, kLifetimeClosing);
+
+  UnlinkHold hold;
+  HoldGuard guard{hold};
+  std::latch ready{static_cast<std::ptrdiff_t>(kOpeners)};
+  std::vector<std::optional<RTMSQueue>> queues(kOpeners);
+  std::vector<std::string> errors(kOpeners);
+  std::vector<std::thread> threads;
+  threads.reserve(kOpeners);
+  for (std::size_t i = 0; i < kOpeners; ++i) {
+    threads.emplace_back([&, i] {
+      ready.arrive_and_wait();
+      try {
+        queues[i].emplace(OpenSubscriber(path, kSlots));
+      } catch (const std::exception& e) {
+        errors[i] = e.what();
+      }
+      OpenerReturned(kOpeners - 1);
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  const int max_wait = hold.max_wait;
+  HoldGuard::Clear();
+
+  ASSERT_TRUE(hold.taken.load()) << "no opener unlinked the closing segment";
+  std::vector<RTMSQueue*> opened;
+  for (std::size_t i = 0; i < kOpeners; ++i) {
+    ASSERT_TRUE(errors[i].empty()) << "opener " << i << ": " << errors[i];
+    ASSERT_TRUE(queues[i].has_value());
+    opened.push_back(&*queues[i]);
+  }
+  SCOPED_TRACE(std::format("most waits by one opener for the held claimant: {}",
+                           max_wait));
+  ASSERT_NO_FATAL_FAILURE(
+      ExpectOneSegmentDelivering(path, kSlots, opened, old_segment_id));
+}
+
+// REQ-OPS-03: the only queue of a segment closes, marks it closing and is
+// descheduled between checking that the name still holds it and unlinking it
+// (held in the hook). Four openers that arrive meanwhile wait for that live
+// closer and never unlink in its place, so its unlink cannot remove the
+// segment one of them created: they and a subscriber that opens after
+// everything has finished share one segment.
+TEST(RingRegistration, LiveCloserHeldBeforeUnlinkIsNotSuperseded) {
+  constexpr std::size_t kSlots = 4;
+  constexpr std::size_t kOpeners = 4;
+  const std::string path = MakeUniquePath("/ring_closer_held");
+  ::shm_unlink(ShmObjectName(path).c_str());
+
+  UnlinkHold hold;
+  HoldGuard guard{hold};
+  std::optional<RTMSQueue> only;
+  only.emplace(OpenSubscriber(path, kSlots));
+  const std::uint64_t old_segment_id =
+      RegistrationPeer::Header(*only)->segment_id;
+  std::thread closer{[&] { only.reset(); }};
+  {
+    std::unique_lock lock{hold.mutex};
+    hold.changed.wait(lock, [&] { return hold.entered; });
+  }
+
+  std::vector<std::optional<RTMSQueue>> queues(kOpeners);
+  std::vector<std::string> errors(kOpeners);
+  std::vector<std::thread> threads;
+  threads.reserve(kOpeners);
+  for (std::size_t i = 0; i < kOpeners; ++i) {
+    threads.emplace_back([&, i] {
+      try {
+        queues[i].emplace(OpenSubscriber(path, kSlots));
+      } catch (const std::exception& e) {
+        errors[i] = e.what();
+      }
+      OpenerReturned(kOpeners);
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  closer.join();
+  const int max_wait = hold.max_wait;
+  HoldGuard::Clear();
+
+  RTMSQueue late = OpenSubscriber(path, kSlots);
+  std::vector<RTMSQueue*> opened;
+  for (std::size_t i = 0; i < kOpeners; ++i) {
+    ASSERT_TRUE(errors[i].empty()) << "opener " << i << ": " << errors[i];
+    ASSERT_TRUE(queues[i].has_value());
+    opened.push_back(&*queues[i]);
+  }
+  opened.push_back(&late);
+  SCOPED_TRACE(std::format(
+      "queue {} opened last; most waits by one opener for the held closer: {}",
+      kOpeners, max_wait));
+  ASSERT_NO_FATAL_FAILURE(
+      ExpectOneSegmentDelivering(path, kSlots, opened, old_segment_id));
+}
+
+// Forks a child that runs `in_child` and sends back what it returns (a
+// trivially copyable report), then exits; waits for the child and stores the
+// report in `report`.
+template <typename Report, typename F>
+void RunChild(F&& in_child, Report& report) {
+  static_assert(std::is_trivially_copyable_v<Report>);
+  std::array<int, 2> pipe_fds{};
+  ASSERT_EQ(::pipe(pipe_fds.data()), 0);
+  const pid_t child = ::fork();
+  ASSERT_NE(child, -1);
+  if (child == 0) {
+    ::close(pipe_fds[0]);
+    const Report sent = in_child();
+    const bool ok = ::write(pipe_fds[1], &sent, sizeof(sent)) ==
+                    static_cast<ssize_t>(sizeof(sent));
+    ::_exit(ok ? 0 : 1);
+  }
+  ::close(pipe_fds[1]);
+  report = Report{};
+  const ssize_t got = ::read(pipe_fds[0], &report, sizeof(report));
+  ::close(pipe_fds[0]);
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  ASSERT_EQ(got, static_cast<ssize_t>(sizeof(report)));
+}
+
+// REQ-OPS-03: an opener that finds a closing segment whose claimant died
+// before unlinking it (a child process that recorded itself and exited)
+// claims the segment in its place without waiting, unlinks it, and reopens
+// the name on a fresh segment.
+TEST(RingRegistration, OpenerClaimsAClosingSegmentFromADeadClaimant) {
+  constexpr std::size_t kSlots = 4;
+  std::uint64_t dead_word = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RunChild([] { return talos::OwnProcessWord(); }, dead_word));
+
+  const std::string path = MakeUniquePath("/ring_reclaim_dead");
+  auto [old_mapping, old_segment_id] =
+      MakeAbandonedClosingSegment(path, kSlots, kLifetimeClosing | dead_word);
 
   struct HookGuard {
     ~HookGuard() { RegistrationPeer::SetOnReclaimWait(nullptr); }
   } guard;
+  static int dead_waits = 0;
+  dead_waits = 0;
+  RegistrationPeer::SetOnReclaimWait(
+      [](std::uint64_t /*segment_id*/, int /*wait_count*/) { ++dead_waits; });
 
-  // (a) Live/recent claim: loser yields while winner finishes UnlinkIfSame()
-  // and creates a fresh segment; loser then attaches to that winner segment.
-  {
-    const std::string path = MakeUniquePath("/ring_reclaim_live");
-    auto [old_mapping, old_segment_id] = MakeAbandonedClosingSegment(
-        path, kSlots, kLifetimeClosing | kLifetimeReclaiming);
+  RTMSQueue reopened = OpenSubscriber(path, kSlots);
+  RegistrationPeer::SetOnReclaimWait(nullptr);
 
-    struct LiveState {
-      std::string path;
-      std::size_t slots{0};
-      std::uint64_t old_segment_id{0};
-      int wait_calls{0};
-      bool untouched_on_first_wait{false};
-      std::optional<RTMSQueue> winner;
-      std::uint64_t winner_segment_id{0};
-    };
-    static LiveState* live = nullptr;
-    LiveState state{path, kSlots, old_segment_id};
-    live = &state;
-    RegistrationPeer::SetOnReclaimWait(
-        [](std::uint64_t segment_id, int wait_count) {
-          ++live->wait_calls;
-          if (wait_count == 1) {
-            SharedMemoryPtr probe{live->path, sizeof(RTMSHeader)};
-            const auto* hdr = static_cast<const RTMSHeader*>(probe.ptr());
-            live->untouched_on_first_wait =
-                probe.mode() == SharedMemoryMode::ATTACH &&
-                segment_id == live->old_segment_id &&
-                hdr->segment_id == live->old_segment_id;
-          } else if (wait_count == 2) {
-            ::shm_unlink(ShmObjectName(live->path).c_str());
-            live->winner.emplace(OpenSubscriber(live->path, live->slots));
-            live->winner_segment_id =
-                RegistrationPeer::Header(*live->winner)->segment_id;
+  EXPECT_EQ(dead_waits, 0) << "a dead claimant must not be waited for";
+  const auto* old_header = static_cast<const RTMSHeader*>(old_mapping.ptr());
+  EXPECT_EQ(old_header->lifetime.load(std::memory_order_acquire),
+            kLifetimeClosing | talos::OwnProcessWord())
+      << "the opener claims the segment in the dead claimant's place";
+  EXPECT_NE(RegistrationPeer::Header(reopened)->segment_id, old_segment_id);
+  EXPECT_EQ(RegistrationPeer::Header(reopened)->lifetime.load(
+                std::memory_order_acquire) &
+                kLifetimeCountMask,
+            1U);
+  EXPECT_EQ(reopened.writer_sequence(), 0U);
+}
+
+// What the child of ClaimantWhoseUnlinkFailedGivesTheClaimUp saw.
+struct GiveUpReport {
+  int failed_step{0};  // 0 when every step ran
+  std::array<char, 200> error{};
+  std::uint64_t old_segment_id{0};
+  std::uint64_t lifetime_after_close{0};
+  std::uint64_t reopened_segment_id{0};
+  std::uint64_t reopened_count{0};
+};
+
+// REQ-OPS-03: the last queue of a segment closes, marking it closing and
+// claiming it, but cannot check the name before unlinking (its process is
+// out of file descriptors, so shm_open fails with EMFILE). It gives the claim
+// up, leaving the segment closing with no claimant, so the next open of the
+// name, once descriptors are available again, claims and unlinks it at once
+// rather than wait for the still-live process and fail. Runs in a child, whose
+// descriptor limit it lowers. (An open under the lowered limit fails in
+// SharedMemoryPtr's own shm_open before it reaches the closing segment, so
+// this does not reach an opener's own failed unlink.)
+TEST(RingRegistration, ClaimantWhoseUnlinkFailedGivesTheClaimUp) {
+  constexpr std::size_t kSlots = 4;
+  const std::string path = MakeUniquePath("/ring_unlink_failed");
+  ::shm_unlink(ShmObjectName(path).c_str());
+
+  GiveUpReport report{};
+  ASSERT_NO_FATAL_FAILURE(RunChild(
+      [&path] {
+        GiveUpReport seen{};
+        int step = 1;
+        try {
+          // Computed now: the process word is read from /proc, which needs a
+          // descriptor.
+          (void)talos::OwnProcessWord();
+          std::optional<RTMSQueue> queue;
+          queue.emplace(OpenSubscriber(path, kSlots));
+          seen.old_segment_id = RegistrationPeer::Header(*queue)->segment_id;
+          SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
+          const auto* header = static_cast<const RTMSHeader*>(mapping.ptr());
+
+          step = 2;  // every descriptor below the limit in use
+          rlimit original{};
+          if (::getrlimit(RLIMIT_NOFILE, &original) != 0) {
+            throw std::runtime_error("getrlimit failed");
           }
-        });
+          const int lowest_free = ::open("/dev/null", O_RDONLY);
+          if (lowest_free < 0) throw std::runtime_error("open failed");
+          ::close(lowest_free);
+          rlimit lowered = original;
+          lowered.rlim_cur = static_cast<rlim_t>(lowest_free);
+          if (::setrlimit(RLIMIT_NOFILE, &lowered) != 0) {
+            throw std::runtime_error("setrlimit failed");
+          }
+          const int refused = ::open("/dev/null", O_RDONLY);
+          if (refused != -1 || errno != EMFILE) {
+            throw std::runtime_error("the lowered limit did not refuse");
+          }
 
-    RTMSQueue loser = OpenSubscriber(path, kSlots);
-    RegistrationPeer::SetOnReclaimWait(nullptr);
-    live = nullptr;
+          step = 3;  // the close whose unlink cannot check the name
+          queue.reset();
+          seen.lifetime_after_close =
+              header->lifetime.load(std::memory_order_acquire);
 
-    EXPECT_EQ(state.wait_calls, 2);
-    EXPECT_TRUE(state.untouched_on_first_wait)
-        << "loser must yield on kLifetimeReclaiming rather than unlink "
-           "immediately";
-    ASSERT_TRUE(state.winner.has_value());
-    ASSERT_NE(state.winner_segment_id, old_segment_id);
-    EXPECT_EQ(RegistrationPeer::Header(loser)->segment_id,
-              state.winner_segment_id);
-    EXPECT_EQ(RegistrationPeer::Header(loser)->lifetime.load(
+          step = 4;  // the name reopened with descriptors available
+          if (::setrlimit(RLIMIT_NOFILE, &original) != 0) {
+            throw std::runtime_error("restoring the limit failed");
+          }
+          RTMSQueue reopened = OpenSubscriber(path, kSlots);
+          seen.reopened_segment_id =
+              RegistrationPeer::Header(reopened)->segment_id;
+          seen.reopened_count =
+              RegistrationPeer::Header(reopened)->lifetime.load(
                   std::memory_order_acquire) &
-                  kLifetimeCountMask,
-              2U);
-  }
+              kLifetimeCountMask;
+        } catch (const std::exception& e) {
+          seen.failed_step = step;
+          std::strncpy(seen.error.data(), e.what(), seen.error.size() - 1);
+        }
+        return seen;
+      },
+      report));
 
-  // (b) Abandoned/stalled claim: winner died before UnlinkIfSame(). After
-  // exhausting its reclaim wait budget, the opener supersedes and reclaims the
-  // segment rather than failing permanently.
-  {
-    const std::string path = MakeUniquePath("/ring_reclaim_stalled");
-    auto [old_mapping, old_segment_id] = MakeAbandonedClosingSegment(
-        path, kSlots, kLifetimeClosing | kLifetimeReclaiming);
-
-    struct StalledState {
-      std::uint64_t expected_segment_id{0};
-      int max_wait_count{0};
-      bool segment_matched_every_wait{true};
-    };
-    static StalledState* stalled = nullptr;
-    StalledState state{old_segment_id};
-    stalled = &state;
-    RegistrationPeer::SetOnReclaimWait(
-        [](std::uint64_t segment_id, int wait_count) {
-          stalled->max_wait_count = wait_count;
-          if (segment_id != stalled->expected_segment_id) {
-            stalled->segment_matched_every_wait = false;
-          }
-        });
-
-    RTMSQueue reopened = OpenSubscriber(path, kSlots);
-    RegistrationPeer::SetOnReclaimWait(nullptr);
-    stalled = nullptr;
-
-    EXPECT_GT(state.max_wait_count, 1)
-        << "opener must exhaust reclaim wait budget before superseding";
-    EXPECT_TRUE(state.segment_matched_every_wait);
-    EXPECT_NE(RegistrationPeer::Header(reopened)->segment_id, old_segment_id);
-    EXPECT_EQ(RegistrationPeer::Header(reopened)->lifetime.load(
-                  std::memory_order_acquire) &
-                  kLifetimeCountMask,
-              1U);
-    EXPECT_EQ(reopened.writer_sequence(), 0U);
-  }
-
-  // (c) Segment rotation mid-retry: if a second closing segment replaces the
-  // first right as reclaim_waits reaches its budget, per-segment wait counters
-  // reset so the new segment receives its full reclaim wait budget too.
-  {
-    const std::string path = MakeUniquePath("/ring_reclaim_rotated");
-    auto [seg1_mapping, seg1_id] = MakeAbandonedClosingSegment(
-        path, kSlots, kLifetimeClosing | kLifetimeReclaiming);
-
-    struct RotatedState {
-      std::string path;
-      std::size_t slots{0};
-      std::uint64_t seg1_id{0};
-      std::uint64_t seg2_id{0};
-      std::optional<SharedMemoryPtr> seg2_mapping;
-      int seg1_waits{0};
-      int seg2_waits{0};
-    };
-    static RotatedState* rotated = nullptr;
-    RotatedState state{path, kSlots, seg1_id};
-    rotated = &state;
-    RegistrationPeer::SetOnReclaimWait(
-        [](std::uint64_t segment_id, int wait_count) {
-          if (segment_id == rotated->seg1_id) {
-            rotated->seg1_waits = wait_count;
-            if (wait_count == 1) {
-              auto [mapping, id] = MakeAbandonedClosingSegment(
-                  rotated->path, rotated->slots,
-                  kLifetimeClosing | kLifetimeReclaiming);
-              rotated->seg2_mapping.emplace(std::move(mapping));
-              rotated->seg2_id = id;
-            }
-          } else if (segment_id == rotated->seg2_id) {
-            rotated->seg2_waits = wait_count;
-          }
-        });
-
-    RTMSQueue reopened = OpenSubscriber(path, kSlots);
-    RegistrationPeer::SetOnReclaimWait(nullptr);
-    rotated = nullptr;
-
-    ASSERT_NE(state.seg2_id, 0U);
-    ASSERT_NE(state.seg2_id, seg1_id);
-    EXPECT_EQ(state.seg1_waits, 1);
-    EXPECT_EQ(state.seg2_waits, 200)
-        << "rotated closing segment must get a full reset reclaim wait budget";
-    EXPECT_NE(RegistrationPeer::Header(reopened)->segment_id, seg1_id);
-    EXPECT_NE(RegistrationPeer::Header(reopened)->segment_id, state.seg2_id);
-  }
+  ASSERT_EQ(report.failed_step, 0)
+      << "the child failed at step " << report.failed_step << ": "
+      << report.error.data();
+  EXPECT_EQ(report.lifetime_after_close, kLifetimeClosing)
+      << "the close whose unlink failed must give its claim up";
+  EXPECT_NE(report.reopened_segment_id, report.old_segment_id);
+  EXPECT_EQ(report.reopened_count, 1U);
 }
 
 }  // namespace
