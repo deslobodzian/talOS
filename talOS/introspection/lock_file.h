@@ -73,17 +73,30 @@ inline std::string LockFilePath(std::string_view mapped) {
 // still open it.
 inline int OpenLockFile(const std::string& path, int access) {
   for (int attempt = 0; attempt < 100; ++attempt) {
-    int fd = ::open(path.c_str(), access | O_CLOEXEC | O_NOFOLLOW);
+    int fd = ::open(path.c_str(), access | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0 && errno == ENOENT) {
-      fd = ::open(path.c_str(),
-                  access | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-                  kLockFileMode);
+      fd = ::open(
+          path.c_str(),
+          access | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK,
+          kLockFileMode);
       // Created by someone else in between, or removed again: open it anew.
       if (fd < 0 && errno == EEXIST) continue;
     }
     if (fd < 0) return -1;
     struct stat status {};
-    if (::fstat(fd, &status) == 0 && status.st_uid == ::geteuid() &&
+    if (::fstat(fd, &status) < 0) {
+      const int error = errno;
+      ::close(fd);
+      errno = error;
+      return -1;
+    }
+    if (!S_ISREG(status.st_mode)) {
+      const bool is_dir = S_ISDIR(status.st_mode);
+      ::close(fd);
+      errno = is_dir ? EISDIR : EINVAL;
+      return -1;
+    }
+    if (status.st_uid == ::geteuid() &&
         (status.st_mode & 07777) != kLockFileMode) {
       // Best effort: a mode this cannot fix is reported by whoever it stops.
       (void)::fchmod(fd, kLockFileMode);
