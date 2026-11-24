@@ -7,6 +7,7 @@ unsuffixed struct: a file answers for its own declarations only.
 """
 
 import ast
+import json
 import os
 import re
 import shutil
@@ -60,14 +61,59 @@ class _ElemsToList(ast.NodeTransformer):
 
 
 def _load_contract_bzl():
-    """Evaluates talOS/build/contract.bzl with lightweight Starlark stubs so
-    talos_messages and _talos_bfbs_impl can be executed directly."""
+    """Evaluates talOS/build/contract.bzl (and real tools/sync_manifest.bzl)
+    with lightweight Starlark stubs so macros and rule implementations can be
+    executed directly."""
     recorded = {}
 
     def make_recorder(kind):
         def _record(**kwargs):
             recorded.setdefault(kind, []).append(kwargs)
         return _record
+
+    class _Depset(list):
+        def to_list(self):
+            return list(self)
+
+    def _make_depset(direct=(), transitive=()):
+        items = _Depset(direct)
+        for dep in transitive:
+            items.extend(dep)
+        return items
+
+    class _FakeLabel(str):
+        def __new__(cls, raw, package="test_pkg", name=None, repo_name="",
+                    workspace_root=""):
+            obj = super().__new__(cls, raw)
+            obj.package = package
+            obj.name = name if name is not None else raw.rsplit(":", 1)[-1]
+            obj.repo_name = repo_name
+            obj.workspace_root = workspace_root
+            return obj
+
+        def same_package_label(self, name):
+            return _FakeLabel(
+                f"//{self.package}:{name}",
+                package=self.package,
+                name=name,
+                repo_name=self.repo_name,
+                workspace_root=self.workspace_root,
+            )
+
+    def _parse_label(raw):
+        if raw.startswith("//"):
+            body = raw[2:]
+            pkg, _, name = body.partition(":")
+            if not name:
+                name = pkg.rsplit("/", 1)[-1]
+            return _FakeLabel(raw, package=pkg, name=name)
+        if raw.startswith("@"):
+            repo, _, rest = raw.lstrip("@").partition("//")
+            pkg, _, name = rest.partition(":")
+            if not name:
+                name = pkg.rsplit("/", 1)[-1] or repo
+            return _FakeLabel(raw, package=pkg, name=name, repo_name=repo)
+        return _FakeLabel(f"//test_pkg:{raw}", package="test_pkg", name=raw)
 
     class _Rule:
         def __init__(self, implementation, attrs):
@@ -86,17 +132,18 @@ def _load_contract_bzl():
             return "test_pkg"
 
         def package_relative_label(self, name):
-            return f"//test_pkg:{name}"
+            return _parse_label(name)
 
         def genrule(self, **kwargs):
             recorded.setdefault("genrule", []).append(kwargs)
 
     env = {
         "DefaultInfo": lambda **kwargs: types.SimpleNamespace(**kwargs),
-        "Label": lambda s: s,
+        "Label": _parse_label,
         "attr": _Attr(),
-        "depset": lambda items=(), **_kw: list(items),
+        "depset": _make_depset,
         "fail": lambda msg: (_ for _ in ()).throw(_StarlarkFail(msg)),
+        "json": types.SimpleNamespace(encode=json.dumps),
         "native": _Native(),
         "provider": lambda **_kw: (lambda **f: types.SimpleNamespace(**f)),
         "rule": lambda implementation, attrs=None, **_kw: _Rule(
@@ -105,13 +152,32 @@ def _load_contract_bzl():
         "struct": lambda **kwargs: types.SimpleNamespace(**kwargs),
     }
 
-    def _load(_bzl, *symbols):
+    def _load(bzl, *symbols):
+        if bzl == "//tools:sync_manifest.bzl":
+            sync_bzl_path = _path("TALOS_SYNC_MANIFEST_BZL")
+            sync_env = {
+                "Label": env["Label"],
+                "depset": env["depset"],
+                "fail": env["fail"],
+                "native": env["native"],
+                "load": lambda _sub, *sub_syms: [
+                    sync_env.__setitem__(s, make_recorder(s)) for s in sub_syms
+                ],
+            }
+            with open(sync_bzl_path, "r", encoding="utf-8") as f:
+                sync_tree = ast.parse(f.read(), filename=sync_bzl_path)
+            sync_tree = _ElemsToList().visit(sync_tree)
+            ast.fix_missing_locations(sync_tree)
+            exec(compile(sync_tree, sync_bzl_path, "exec"), sync_env)  # noqa: S102
+            for sym in symbols:
+                env[sym] = sync_env[sym]
+            return
         for sym in symbols:
             if sym == "STAMP_ATTRS":
                 env[sym] = {}
             elif sym == "DEFAULT_INCLUDE_PATHS":
                 env[sym] = []
-            elif sym in ("PyInfo", "maybe_stamp", "manifest_freshness_stamp"):
+            elif sym in ("PyInfo", "maybe_stamp"):
                 env[sym] = lambda *a, **kw: None
             else:
                 env[sym] = make_recorder(sym)
@@ -375,7 +441,8 @@ class TalosMessagesMacroContractTest(unittest.TestCase):
         # with real flatc and real descriptor_gen against bad/good/included.fbs.
         # Deleting `"$5" lint "$4" "//$3"` from _talos_bfbs_impl makes bad.fbs
         # exit 0 and fails this test.
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
             tree_dir = os.path.join(tmp, "tree")
             os.makedirs(os.path.join(tree_dir, "lint_test"))
             out_dir = os.path.join(tmp, "out")
@@ -452,6 +519,226 @@ class TalosMessagesMacroContractTest(unittest.TestCase):
                 capture_output=True, text=True, check=False)
             self.assertEqual(inc_res.returncode, 1, inc_res.stderr)
             self.assertEqual(_reported(inc_res.stderr), {"Included.raw"})
+
+
+class TalosBundleManifestGateContractTest(unittest.TestCase):
+    # REQ-CONTRACT-19
+    def test_talos_bundle_wires_and_executes_manifest_freshness_check(self):
+        env, recorded = _load_contract_bzl()
+        talos_bundle = env["talos_bundle"]
+        bundle_rule = env["_talos_bundle"]
+        default_info = env["DefaultInfo"]
+
+        # talos_bundle derives the sibling `<stem>_manifest.bzl` label and
+        # binds `_manifest_sync` to //tools:sync_manifest.
+        talos_bundle(
+            name="bot_bundle",
+            config="robot.toml",
+            nodes=["//bot/intake:node"],
+            config_files=["subsystems/intake.toml"],
+        )
+        bundle_calls = recorded.get("_talos_bundle_impl", [])
+        self.assertEqual(len(bundle_calls), 1)
+        self.assertEqual(bundle_calls[0]["config"], "robot.toml")
+        self.assertEqual(bundle_calls[0]["manifest"],
+                         "//test_pkg:robot_manifest.bzl")
+        self.assertEqual(bundle_rule.attrs["_manifest_sync"]["default"],
+                         "//tools:sync_manifest")
+        self.assertEqual(bundle_rule.attrs["_resolve"]["default"],
+                         "//talOS/configuration:resolve")
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
+            os.makedirs(os.path.join(tmp, "bot", "subsystems"))
+            os.makedirs(os.path.join(tmp, "out"))
+            with open(os.path.join(tmp, "bot", "BUILD"), "w",
+                      encoding="utf-8") as f:
+                f.write("")
+            with open(os.path.join(tmp, "bot", "robot.toml"), "w",
+                      encoding="utf-8") as f:
+                f.write(
+                    '[robot]\nname = "bot"\n\n'
+                    '[[subsystems]]\nname = "intake"\n'
+                    'path = "subsystems/intake.toml"\n'
+                )
+            with open(os.path.join(tmp, "bot", "subsystems", "intake.toml"),
+                      "w", encoding="utf-8") as f:
+                f.write(
+                    '[subsystem]\nname = "intake"\n'
+                    'node = "//bot/intake:node"\n'
+                )
+            with open(os.path.join(tmp, "bot", "robot_manifest.bzl"), "w",
+                      encoding="utf-8") as f:
+                f.write("NODES = []\nCONFIG_FILES = []\n")
+
+            shell_actions = []
+            run_actions = []
+
+            class _FakeActions:
+                def declare_file(self, rel):
+                    rel_path = os.path.join("out", rel)
+                    os.makedirs(
+                        os.path.dirname(os.path.join(tmp, rel_path)),
+                        exist_ok=True,
+                    )
+                    return types.SimpleNamespace(
+                        path=rel_path, short_path=rel_path)
+
+                def declare_directory(self, rel):
+                    rel_path = os.path.join("out", rel)
+                    os.makedirs(os.path.join(tmp, rel_path), exist_ok=True)
+                    return types.SimpleNamespace(
+                        path=rel_path, short_path=rel_path)
+
+                def write(self, output, content, is_executable=False):
+                    full = os.path.join(tmp, output.path)
+                    with open(full, "w", encoding="utf-8") as out_f:
+                        out_f.write(content)
+                    if is_executable:
+                        os.chmod(full, 0o755)
+
+                def run_shell(self, **kwargs):
+                    shell_actions.append(kwargs)
+
+                def run(self, **kwargs):
+                    run_actions.append(kwargs)
+
+            class _FakeRunfiles:
+                def __init__(self, files=()):
+                    self.files = env["depset"](files)
+
+                def merge(self, other):
+                    return _FakeRunfiles(list(self.files) + list(other.files))
+
+            sync_tool_abs = os.path.abspath(_path("TALOS_SYNC_MANIFEST"))
+            sync_tool_rel = os.path.relpath(sync_tool_abs, tmp)
+            sync_tool_ftr = types.SimpleNamespace(
+                executable=types.SimpleNamespace(path=sync_tool_rel))
+            resolve_exec = types.SimpleNamespace(path="bin/resolve")
+            resolve_ftr = types.SimpleNamespace(executable=resolve_exec)
+            builder_ftr = types.SimpleNamespace(
+                executable=types.SimpleNamespace(path="bin/bundle_builder"))
+            launcher_exec = types.SimpleNamespace(
+                path="bin/launcher", short_path="bin/launcher")
+            launcher_rf = _FakeRunfiles()
+            launcher_ftr = types.SimpleNamespace(
+                executable=launcher_exec, repo_mapping_manifest=None)
+
+            config_file = types.SimpleNamespace(
+                path="bot/robot.toml", short_path="bot/robot.toml")
+            manifest_file = types.SimpleNamespace(
+                path="bot/robot_manifest.bzl",
+                short_path="bot/robot_manifest.bzl")
+            sub_file = types.SimpleNamespace(
+                path="bot/subsystems/intake.toml",
+                short_path="bot/subsystems/intake.toml")
+
+            ctx = types.SimpleNamespace(
+                label=types.SimpleNamespace(name="bot_bundle"),
+                file=types.SimpleNamespace(
+                    config=config_file,
+                    manifest=manifest_file,
+                    studio_webroot=None,
+                ),
+                files=types.SimpleNamespace(config_files=[sub_file]),
+                executable=types.SimpleNamespace(
+                    launcher=launcher_exec, _resolve=resolve_exec),
+                attr=types.SimpleNamespace(
+                    config=types.SimpleNamespace(
+                        label=types.SimpleNamespace(workspace_root="")),
+                    launcher={default_info: types.SimpleNamespace(
+                        default_runfiles=launcher_rf,
+                        files_to_run=launcher_ftr,
+                    )},
+                    nodes=[],
+                    studio_bridge=None,
+                    studio_webroot=None,
+                    apparent_repos={},
+                    testonly=False,
+                    _manifest_sync={default_info: types.SimpleNamespace(
+                        files_to_run=sync_tool_ftr)},
+                    _resolve={default_info: types.SimpleNamespace(
+                        files_to_run=resolve_ftr)},
+                    _builder={default_info: types.SimpleNamespace(
+                        files_to_run=builder_ftr)},
+                ),
+                actions=_FakeActions(),
+                runfiles=lambda files=(): _FakeRunfiles(files),
+            )
+
+            bundle_rule.implementation(ctx)
+
+            # Real manifest_freshness_stamp must emit TalosManifestCheck, and
+            # its stamp must gate both _resolve_config and TalosBundle.
+            check_actions = [
+                a for a in shell_actions
+                if a.get("mnemonic") == "TalosManifestCheck"
+            ]
+            resolve_actions = [
+                a for a in shell_actions
+                if a.get("mnemonic") == "TalosResolveConfig"
+            ]
+            bundle_actions = [
+                a for a in run_actions
+                if a.get("mnemonic") == "TalosBundle"
+            ]
+            self.assertEqual(len(check_actions), 1)
+            self.assertEqual(len(resolve_actions), 1)
+            self.assertEqual(len(bundle_actions), 1)
+
+            check_action = check_actions[0]
+            resolve_action = resolve_actions[0]
+            bundle_action = bundle_actions[0]
+
+            stamp = check_action["outputs"][0]
+            self.assertTrue(stamp.path.endswith("bot_bundle.manifest_current"))
+            self.assertIn(sync_tool_ftr, check_action["tools"])
+            self.assertIn(config_file, check_action["inputs"])
+            self.assertIn(manifest_file, check_action["inputs"])
+            self.assertIn(sub_file, check_action["inputs"])
+
+            resolved = resolve_action["outputs"][0]
+            self.assertIn(stamp, resolve_action["inputs"])
+            self.assertIn(stamp, bundle_action["inputs"])
+            self.assertIn(resolved, bundle_action["inputs"])
+
+            # Execute TalosManifestCheck's emitted shell command against the
+            # stale manifest: must exit nonzero, print the regenerate command,
+            # and create no stamp.
+            clean_env = {
+                k: v for k, v in os.environ.items()
+                if k != "BUILD_WORKSPACE_DIRECTORY"
+            }
+            stamp_full = os.path.join(tmp, stamp.path)
+            stale_res = subprocess.run(
+                ["bash", "-c", check_action["command"], "TalosManifestCheck",
+                 *check_action["arguments"]],
+                cwd=tmp, env=clean_env, capture_output=True, text=True,
+                check=False,
+            )
+            self.assertNotEqual(stale_res.returncode, 0, stale_res.stderr)
+            self.assertIn(
+                "bazel run //tools:sync_manifest -- bot/robot.toml",
+                stale_res.stderr,
+            )
+            self.assertFalse(os.path.exists(stamp_full))
+
+            # Regenerating the manifest makes the exact same action exit 0 and
+            # produce the stamp file.
+            regen = subprocess.run(
+                [sync_tool_abs, "bot/robot.toml"],
+                cwd=tmp, env=clean_env, capture_output=True, text=True,
+                check=False,
+            )
+            self.assertEqual(regen.returncode, 0, regen.stderr)
+            fresh_res = subprocess.run(
+                ["bash", "-c", check_action["command"], "TalosManifestCheck",
+                 *check_action["arguments"]],
+                cwd=tmp, env=clean_env, capture_output=True, text=True,
+                check=False,
+            )
+            self.assertEqual(fresh_res.returncode, 0, fresh_res.stderr)
+            self.assertTrue(os.path.isfile(stamp_full))
 
 
 if __name__ == "__main__":

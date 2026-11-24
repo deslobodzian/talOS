@@ -100,6 +100,7 @@ class BenchMotor:
             return _UNKNOWN if time is None else _micros(now_ns - time)
 
         fault_valid = self.status.fresh() and self.status.value.health_valid
+        fault_bit = 1 << self.motor.hardware_index
         self.state.send(
             sample_time_ns=now_ns,
             position_rot=self.motor.position,
@@ -113,7 +114,8 @@ class BenchMotor:
             acquisition_valid=(position_time is not None
                                and velocity_time is not None),
             connected=self.motor.connected,
-            fault=fault_valid and self.status.value.motor_fault_mask != 0,
+            fault=(fault_valid
+                   and (self.status.value.motor_fault_mask & fault_bit) != 0),
             fault_valid=fault_valid,
             enabled=enabled,
             mode=mode,

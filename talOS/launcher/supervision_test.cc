@@ -4045,12 +4045,12 @@ TEST(Supervision, SessionDirectoryLockIsRefreshedAndRetakenWhileHeld) {
       clock.Advance(half);
       aged_before_due = pass() && aged();
       clock.Advance(half);
-      touched_when_due = wait([&] { return !aged(); });
+      touched_when_due = pass() && !aged();
       // Removed twice, each time refreshed into a lock retention sees.
       for (bool* outcome : {&retaken, &retaken_again}) {
         ::unlink(lock.c_str());
         clock.Advance(kLockFileRefresh);
-        *outcome = wait([&] { return SessionDirectoryLock::Held(dir, false); });
+        *outcome = pass() && SessionDirectoryLock::Held(dir, false);
       }
       wait([&] { return reports() > 0; });
       pass();
@@ -4311,6 +4311,357 @@ TEST(Supervision, StudioBridgeRestartAloneWakesTheLoop) {
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
   ::remove(attempts.c_str());
+}
+
+// Pure unit test of every wake-deadline term in NextSupervisionWake: deleting
+// any single term (watchdog, lock refresh, bridge stop timeout, shutdown
+// timeout, session duration, sim schedule poll, bridge protocol poll, member
+// liveness look, pending member restart, Studio bridge next check) fails here.
+// REQ-OPS-45
+TEST(Supervision, NextSupervisionWakeSelectsEarliestActiveTerm) {
+  constexpr SupervisionTime kT0 = SupervisionTime{} + 1h;
+  const SupervisionTime kFar = kT0 + 10h;
+
+  // Nothing due -> SupervisionTime::max().
+  EXPECT_EQ(NextSupervisionWake(SupervisionWakeInputs{.now = kT0}),
+            SupervisionTime::max());
+
+  // Baseline in kNone with every term far in the future except the one tested.
+  const auto baseline = [&] {
+    SupervisionWakeInputs inputs;
+    inputs.now = kT0;
+    inputs.watchdog = std::chrono::hours{12};
+    inputs.next_lock_refresh = kFar;
+    inputs.session_deadline = kFar;
+    inputs.studio_next_check = kFar;
+    return inputs;
+  };
+
+  // Watchdog term alone.
+  {
+    auto inputs = baseline();
+    inputs.watchdog = 100ms;
+    EXPECT_EQ(NextSupervisionWake(inputs), kT0 + 100ms);
+  }
+
+  // Lock refresh term alone (e.g. 1 h kLockFileRefresh).
+  {
+    auto inputs = baseline();
+    inputs.next_lock_refresh = kT0 + kLockFileRefresh;
+    EXPECT_EQ(NextSupervisionWake(inputs), kT0 + kLockFileRefresh);
+  }
+
+  // Session duration deadline term alone (kNone only).
+  {
+    auto inputs = baseline();
+    inputs.session_deadline = kT0 + 5s;
+    EXPECT_EQ(NextSupervisionWake(inputs), kT0 + 5s);
+
+    inputs.stop_phase = SupervisionStopPhase::kBridge;
+    inputs.bridge_killed = true;
+    EXPECT_EQ(NextSupervisionWake(inputs), kFar);
+
+    inputs.stop_phase = SupervisionStopPhase::kAllSignaled;
+    inputs.shutdown_deadline = kT0;
+    EXPECT_EQ(NextSupervisionWake(inputs), kFar);
+  }
+
+  // Sim schedule start poll term (kNone only).
+  {
+    auto inputs = baseline();
+    inputs.sim_schedule_polling = true;
+    EXPECT_EQ(NextSupervisionWake(inputs), kT0 + kSimScheduleStartPoll);
+
+    inputs.stop_phase = SupervisionStopPhase::kAllSignaled;
+    inputs.shutdown_deadline = kT0;
+    EXPECT_EQ(NextSupervisionWake(inputs), kFar);
+  }
+
+  // Bridge protocol poll term (kNone only).
+  {
+    auto inputs = baseline();
+    inputs.bridge_protocol_polling = true;
+    EXPECT_EQ(NextSupervisionWake(inputs), kT0 + kBridgeProtocolPoll);
+
+    inputs.stop_phase = SupervisionStopPhase::kBridge;
+    inputs.bridge_killed = true;
+    EXPECT_EQ(NextSupervisionWake(inputs), kFar);
+  }
+
+  // Running members' liveness NextLook terms (kNone only).
+  {
+    const std::array looks{kT0 + 400ms, kT0 + 125ms, kT0 + 300ms};
+    auto inputs = baseline();
+    inputs.member_next_looks = looks;
+    EXPECT_EQ(NextSupervisionWake(inputs), kT0 + 125ms);
+
+    inputs.stop_phase = SupervisionStopPhase::kAllSignaled;
+    inputs.shutdown_deadline = kT0;
+    EXPECT_EQ(NextSupervisionWake(inputs), kFar);
+  }
+
+  // Pending member restarts (active in every phase).
+  {
+    const std::array restarts{kT0 + 200ms, kT0 + 50ms};
+    auto inputs = baseline();
+    inputs.pending_restarts = restarts;
+    EXPECT_EQ(NextSupervisionWake(inputs), kT0 + 50ms);
+
+    inputs.stop_phase = SupervisionStopPhase::kBridge;
+    inputs.bridge_killed = true;
+    EXPECT_EQ(NextSupervisionWake(inputs), kT0 + 50ms);
+  }
+
+  // Studio bridge next check (settle interval, liveness, or restart).
+  {
+    auto inputs = baseline();
+    inputs.studio_next_check = kT0 + kStudioBridgeSettleInterval;
+    EXPECT_EQ(NextSupervisionWake(inputs), kT0 + kStudioBridgeSettleInterval);
+  }
+
+  // Two-phase bridge stop deadline (kBridge, polling for kFlagQuiesced at
+  // kBridgeQuiescePoll capped at bridge_stop_deadline, only when
+  // !bridge_killed and now < bridge_stop_deadline).
+  {
+    auto inputs = baseline();
+    inputs.stop_phase = SupervisionStopPhase::kBridge;
+    inputs.bridge_stop_deadline = kT0 + kBridgeStopTimeout;
+    EXPECT_EQ(NextSupervisionWake(inputs), kT0 + kBridgeQuiescePoll);
+
+    inputs.bridge_stop_deadline = kT0 + 2ms;
+    EXPECT_EQ(NextSupervisionWake(inputs), kT0 + 2ms);
+
+    inputs.bridge_killed = true;
+    EXPECT_EQ(NextSupervisionWake(inputs), kFar);
+
+    inputs.bridge_killed = false;
+    inputs.bridge_stop_deadline = kT0;
+    EXPECT_EQ(NextSupervisionWake(inputs), kFar);
+  }
+
+  // Final stop timeout deadline (kAllSignaled, only when
+  // now < shutdown_deadline).
+  {
+    auto inputs = baseline();
+    inputs.stop_phase = SupervisionStopPhase::kAllSignaled;
+    inputs.shutdown_deadline = kT0 + kStopTimeout;
+    EXPECT_EQ(NextSupervisionWake(inputs), kT0 + kStopTimeout);
+
+    inputs.shutdown_deadline = kT0;
+    EXPECT_EQ(NextSupervisionWake(inputs), kFar);
+  }
+}
+
+// The service watchdog is a wake deadline of its own: with nothing else due
+// for an hour (NothingDueOptions) and WATCHDOG_USEC = 200 ms (100 ms wake
+// interval), the sleeping loop wakes on its own to send repeated WATCHDOG=1
+// pings. Deleting the watchdog wake term leaves the loop asleep for an hour
+// after its first pass.
+// REQ-OPS-07, REQ-OPS-45
+TEST(Supervision, WatchdogAloneWakesTheLoop) {
+  const std::string path = "/tmp/tw_wake_" + std::to_string(::getpid());
+  ::unlink(path.c_str());
+  const int sock = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+  ASSERT_GE(sock, 0);
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+  ASSERT_EQ(::bind(sock, reinterpret_cast<const sockaddr*>(&address),
+                   static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                          path.size() + 1)),
+            0);
+  const auto runs = TempPath("watchdog_wake_runs");
+  ::remove(runs.c_str());
+  auto options = NothingDueOptions("watchdog_wake", runs);
+  int pings = 0;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    // Pass 0 sends READY=1 and WATCHDOG=1; receiving 3 WATCHDOG=1 pings
+    // requires at least two loop wakes driven by the watchdog deadline alone.
+    for (int datagrams = 0;
+         !stop.stop_requested() && pings < 3 && datagrams < 10; ++datagrams) {
+      pollfd ready{sock, POLLIN, 0};
+      if (::poll(&ready, 1, kHangSeconds * 1000) <= 0) break;
+      char buffer[64];
+      const ssize_t size = ::recv(sock, buffer, sizeof(buffer), 0);
+      if (size > 0 && std::string_view(buffer, static_cast<std::size_t>(
+                                                   size)) == "WATCHDOG=1") {
+        ++pings;
+      }
+    }
+    ::kill(::getpid(), SIGTERM);
+  }};
+  ::setenv("NOTIFY_SOCKET", path.c_str(), 1);
+  ::setenv("WATCHDOG_USEC", "200000", 1);
+  const int status = RunSession(options);
+  ::unsetenv("NOTIFY_SOCKET");
+  ::unsetenv("WATCHDOG_USEC");
+  driver.join();
+  EXPECT_EQ(status, 0);
+  EXPECT_GE(pings, 3) << "WATCHDOG=1 waited for an unrelated wake";
+  ::close(sock);
+  ::unlink(path.c_str());
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+}
+
+// The session duration (--duration-s) is a wake deadline of its own: with
+// nothing else due for an hour (NothingDueOptions) and duration_s = 1, the
+// sleeping loop wakes on its own at 1 s and ends the session cleanly.
+// REQ-OPS-45
+TEST(Supervision, SessionDurationAloneWakesTheLoop) {
+  const auto runs = TempPath("duration_wake_runs");
+  ::remove(runs.c_str());
+  auto options = NothingDueOptions("duration_wake", runs);
+  options.duration_s = 1;
+  std::atomic<bool> returned{false};
+  bool rescued = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    if (!WaitFor(stop, [&] { return returned.load(); })) {
+      rescued = !returned.load();
+      ::kill(::getpid(), SIGTERM);
+    }
+  }};
+  const int status = RunSession(options);
+  returned = true;
+  driver.join();
+  EXPECT_FALSE(rescued) << "--duration-s waited for an unrelated wake";
+  EXPECT_EQ(status, 0);
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+}
+
+// A regular member's pending restart backoff is a wake deadline of its own:
+// with nothing else due for an hour (NothingDueOptions), alpha crashes on its
+// first run (critical immediate restart, 0 ms) and its second run (100 ms
+// backoff, sleeping in the loop), and must start its third run without any
+// peer look or synthetic wake.
+// REQ-OPS-04, REQ-OPS-45
+TEST(Supervision, MemberRestartAloneWakesTheLoop) {
+  const auto runs = TempPath("member_restart_wake_runs");
+  const auto alpha_runs = TempPath("member_restart_wake_alpha");
+  ::remove(runs.c_str());
+  ::remove(alpha_runs.c_str());
+  auto options = NothingDueOptions("member_restart_wake", runs);
+  options.max_restarts = 2;
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("member_restart_wake_alpha",
+                "echo x >> '" + alpha_runs +
+                    "'\n"
+                    "if [ \"$(wc -l < '" +
+                    alpha_runs +
+                    "')\" -le 2 ]; then exit 1; fi\n"
+                    "exec sleep 60\n",
+                "alpha");
+  bool restarted = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    restarted =
+        WaitFor(stop, [&] { return ReadLines(alpha_runs).size() >= 3; });
+    ::kill(::getpid(), SIGTERM);
+  }};
+  RunSession(options);
+  driver.join();
+  EXPECT_TRUE(restarted)
+      << "alpha's backed-off restart waited for an unrelated wake";
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+  ::remove(alpha_runs.c_str());
+}
+
+// The Studio bridge's settle interval (kStudioBridgeSettleInterval) is a wake
+// deadline of its own: with nothing else due for an hour (NothingDueOptions),
+// the sleeping loop wakes on its own after 1 s and announces the settled
+// bridge in talos.log without any peer look or synthetic wake.
+// REQ-OPS-30, REQ-OPS-45
+TEST(Supervision, StudioBridgeSettleAloneWakesTheLoop) {
+  const auto runs = TempPath("studio_settle_wake_runs");
+  ::remove(runs.c_str());
+  auto options = NothingDueOptions("studio_settle_wake", runs);
+  options.start_studio_bridge = true;
+  options.studio_http_port = 8080;
+  options.binary_overrides["//studio/bridge:studio_bridge"] = WriteStub(
+      "studio_settle_wake_bridge", "exec sleep 60\n", "studio_bridge");
+  const std::string talos_log = options.output_dir + "/" +
+                                std::to_string(options.session_id) + "/" +
+                                std::string{kLauncherOutputFile};
+  bool settled = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    settled = WaitFor(stop, [&] {
+      return ReadFile(talos_log).find("Started studio_bridge (pid ") !=
+             std::string::npos;
+    });
+    ::kill(::getpid(), SIGTERM);
+  }};
+  RunSession(options);
+  driver.join();
+  EXPECT_TRUE(settled) << "studio_bridge settle waited for an unrelated wake\n"
+                       << ReadFile(talos_log);
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+}
+
+// The hourly lock refresh (next_lock_refresh) is a wake deadline of its own:
+// with every other deadline hours further out, advancing the clock once to
+// 300 ms before kLockFileRefresh runs one pass that leaves session.lock aged
+// and puts the loop to sleep; with no further synthetic wake, the sleeping
+// loop must wake on its own 300 ms later and touch session.lock.
+// REQ-OPS-11, REQ-OPS-45
+TEST(Supervision, LockRefreshAloneWakesTheLoop) {
+  const auto runs = TempPath("lock_refresh_wake_runs");
+  ::remove(runs.c_str());
+  auto options = NothingDueOptions("lock_refresh_wake", runs);
+  // Hours past kLockFileRefresh so only next_lock_refresh falls due.
+  options.duration_s = 1'000'000;
+  options.heartbeat_periods = 10'000'000;
+  options.heartbeat_startup_grace_ms = 1'000'000'000;
+  options.construction_timeout = 1000h;
+  testing::SteppedClock clock;
+  options.supervision_clock = clock.clock();
+  const std::string dir =
+      options.output_dir + "/" + std::to_string(options.session_id);
+  const std::string lock = dir + "/" + std::string{kSessionDirectoryLockFile};
+  constexpr time_t kAged = 1'000'000;
+  const auto age = [&lock] {
+    const timespec times[2] = {{kAged, 0}, {kAged, 0}};
+    return ::utimensat(AT_FDCWD, lock.c_str(), times, 0) == 0;
+  };
+  const auto aged = [&lock] {
+    struct stat status {};
+    return ::stat(lock.c_str(), &status) == 0 && status.st_mtime == kAged;
+  };
+  testing::SupervisionPasses passes;
+  bool started = false;
+  bool aged_before_due = false;
+  bool touched_on_own_wake = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const auto pass = [&] {
+      const uint64_t after = passes.Started() + 2;
+      return WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= after;
+      });
+    };
+    started = WaitFor(stop, [&] { return ReadLines(runs).size() == 3; }) &&
+              pass() && age();
+    if (started) {
+      const uint64_t before_advance = passes.Started();
+      // One advance + wake lands 300 ms before next_lock_refresh; no further
+      // wake is sent, so only next_lock_refresh can wake the sleeping loop.
+      clock.Advance(kLockFileRefresh - 300ms);
+      if (WaitFor(stop, [&] { return passes.Started() > before_advance; })) {
+        aged_before_due = aged();
+        touched_on_own_wake = WaitFor(stop, [&] { return !aged(); });
+      }
+    }
+    ::kill(::getpid(), SIGTERM);
+  }};
+  RunSession(options);
+  driver.join();
+  ASSERT_TRUE(started) << "not every member started";
+  EXPECT_TRUE(aged_before_due) << "lock was touched before next_lock_refresh";
+  EXPECT_TRUE(touched_on_own_wake)
+      << "next_lock_refresh waited for an unrelated wake";
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
 }
 
 // A Studio bridge stub's body: once its stop trap is set, appends its pid
@@ -6155,6 +6506,353 @@ TEST(Supervision, ShutdownStopsHardwareNodeBeforeActuatorOwners) {
     }
     std::filesystem::remove_all(options.output_dir);
     ::remove(ready.c_str());
+  }
+}
+
+// REQ-OPS-20, REQ-OPS-06: two-phase shutdown decouples bridge quiescence
+// (kBridgeStopTimeout, 500 ms) from `.tlog` flush (kStopTimeout, 2 s):
+// (a) a quiesced bridge stalling past 500 ms and exiting 0 at 800 ms lets
+//     actuator owners stop immediately on kFlagQuiesced without a 500 ms
+//     SIGKILL and exits 0;
+// (b) a quiesced bridge hanging past 2 s is SIGKILLed with stop_timeout;
+// (c) an un-quiesced hung bridge is still SIGKILLed at 500 ms before actuator
+//     owners are signaled.
+TEST(Supervision, QuiescedBridgeDecouplesActuatorStopFromLogFlushTimeout) {
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles{
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error)};
+  ASSERT_NE(runfiles, nullptr) << error;
+  const char* quiesce_env = std::getenv("TALOS_QUIESCE_BRIDGE");
+  ASSERT_NE(quiesce_env, nullptr);
+  const std::string quiesce_bin = runfiles->Rlocation(quiesce_env);
+
+  const auto make_owner = [](std::string_view tag, std::string_view name,
+                             const std::string& ready,
+                             const std::string& events) {
+    return WriteStub(tag,
+                     "got_int=0\n"
+                     "trap 'got_int=1' INT\n"
+                     "echo " +
+                         std::string{name} + " >> '" + ready +
+                         "'\n"
+                         "while [ \"$got_int\" -eq 0 ]; do sleep 0.01; done\n"
+                         "echo " +
+                         std::string{name} + "_int >> '" + events +
+                         "'\n"
+                         "exit 0\n",
+                     name);
+  };
+
+  const auto make_bridge =
+      [&](std::string_view tag, std::string_view mode, const std::string& ready,
+          const std::string& events, const std::string& release) {
+        return WriteStub(tag,
+                         "exec '" + quiesce_bin + "' " + std::string{mode} +
+                             " '" + ready + "' '" + events + "' '" + release +
+                             "' \"$@\"\n",
+                         "hardware_node");
+      };
+
+  // Case (a): quiesced bridge stalls past 500 ms and exits 0 at 800 ms.
+  {
+    const auto ready = TempPath("quiesce_clean_ready");
+    const auto events = TempPath("quiesce_clean_events");
+    const auto release_hw = TempPath("quiesce_clean_release");
+    for (const auto* p : {&ready, &events, &release_hw}) ::remove(p->c_str());
+
+    testing::SteppedClock clock;
+    const SupervisionTime start = clock.Freeze();
+    auto options = BaseOptions("quiesce_clean");
+    options.duration_s = 3600;
+    options.max_restarts = 0;
+    options.heartbeat_periods = 1'000'000;
+    options.heartbeat_startup_grace_ms = 3'600'000;
+    options.construction_timeout = 1h;
+    options.supervision_clock = clock.clock();
+    options.binary_overrides["//talOS/bridge:hardware_node"] =
+        make_bridge("quiesce_clean_hw", "quiesce", ready, events, release_hw);
+    options.binary_overrides["//example/alpha:node"] =
+        make_owner("quiesce_clean_alpha", "alpha", ready, events);
+    options.binary_overrides["//example/beta:node"] =
+        make_owner("quiesce_clean_beta", "beta", ready, events);
+
+    const uint64_t session = options.session_id;
+    const std::string live =
+        options.output_dir + "/" + std::to_string(session) + "/manifest.json";
+    testing::SupervisionPasses passes;
+    bool owners_signaled_on_quiesced = false;
+    bool hw_alive_at_800ms = false;
+    std::atomic<bool> session_done{false};
+    std::jthread driver{[&](const std::stop_token& stop) {
+      const testing::SteppedClock::ReleaseOnExit release_clock{clock};
+      if (!WaitFor(stop, [&] {
+            return ReadLines(ready).size() == 3 &&
+                   Registered("hardware_node", session);
+          })) {
+        std::ofstream{release_hw}.close();
+        ::kill(::getpid(), SIGTERM);
+        return;
+      }
+      ::kill(::getpid(), SIGTERM);
+      // Actuator owners must be signaled immediately upon kFlagQuiesced while
+      // hardware_node is still alive (clock frozen at start, release_hw
+      // absent).
+      owners_signaled_on_quiesced = WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return ReadLines(events).size() >= 4;
+      });
+      // Advance past kBridgeStopTimeout (500 ms) to 800 ms (< kStopTimeout 2
+      // s): the quiesced bridge must NOT be SIGKILLed at 500 ms.
+      clock.HoldAt(start + 800ms);
+      const uint64_t after_800 = passes.Started() + 2;
+      WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= after_800;
+      });
+      const auto mid_hw = ManifestRuns(ReadFile(live), "hardware_node");
+      hw_alive_at_800ms =
+          !mid_hw.empty() &&
+          mid_hw.back().find("\"running\"") != std::string::npos;
+      // Release hardware_node at 800 ms so it exits 0 cleanly; keep clock
+      // held until RunSession finishes so ReleaseOnExit cannot jump past
+      // kStopTimeout while children are still being reaped.
+      std::ofstream{release_hw}.close();
+      WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return session_done.load(std::memory_order_acquire);
+      });
+    }};
+
+    EXPECT_EQ(RunSession(options), 0);
+    session_done.store(true, std::memory_order_release);
+    driver.request_stop();
+    driver.join();
+    EXPECT_TRUE(owners_signaled_on_quiesced)
+        << "actuator owners were not signaled immediately on kFlagQuiesced";
+    EXPECT_TRUE(hw_alive_at_800ms)
+        << "quiesced hardware_node was killed before 800 ms";
+    const auto all_events = ReadLines(events);
+    ASSERT_EQ(all_events.size(), 5u);
+    EXPECT_EQ(all_events[0], "hw_int");
+    // quiesce_bridge marks kFlagQuiesced before writing "hw_quiesced", so
+    // signaled owners can log their SIGINT lines concurrently with it.
+    std::vector<std::string> middle(all_events.begin() + 1,
+                                    all_events.begin() + 4);
+    std::sort(middle.begin(), middle.end());
+    EXPECT_EQ(middle, (std::vector<std::string>{"alpha_int", "beta_int",
+                                                "hw_quiesced"}));
+    EXPECT_EQ(all_events[4], "hw_exit");
+
+    const std::string manifest =
+        ReadFile(options.output_dir + "/manifest.json");
+    const auto hw = ManifestRuns(manifest, "hardware_node");
+    ASSERT_EQ(hw.size(), 1u);
+    EXPECT_NE(hw.back().find("\"reason\": \"stop\""), std::string::npos)
+        << hw.back();
+    EXPECT_NE(hw.back().find("\"exit_code\": 0"), std::string::npos)
+        << hw.back();
+
+    std::filesystem::remove_all(options.output_dir);
+    for (const auto* p : {&ready, &events, &release_hw}) ::remove(p->c_str());
+  }
+
+  // Case (b): quiesced bridge hanging past kStopTimeout (2 s) IS SIGKILLed
+  // with reason stop_timeout.
+  {
+    const auto ready = TempPath("quiesce_timeout_ready");
+    const auto events = TempPath("quiesce_timeout_events");
+    const auto release_hw = TempPath("quiesce_timeout_release");
+    for (const auto* p : {&ready, &events, &release_hw}) ::remove(p->c_str());
+
+    testing::SteppedClock clock;
+    const SupervisionTime start = clock.Freeze();
+    auto options = BaseOptions("quiesce_timeout");
+    options.duration_s = 3600;
+    options.max_restarts = 0;
+    options.heartbeat_periods = 1'000'000;
+    options.heartbeat_startup_grace_ms = 3'600'000;
+    options.construction_timeout = 1h;
+    options.supervision_clock = clock.clock();
+    options.binary_overrides["//talOS/bridge:hardware_node"] =
+        make_bridge("quiesce_timeout_hw", "quiesce", ready, events, release_hw);
+    options.binary_overrides["//example/alpha:node"] =
+        make_owner("quiesce_timeout_alpha", "alpha", ready, events);
+    options.binary_overrides["//example/beta:node"] =
+        make_owner("quiesce_timeout_beta", "beta", ready, events);
+
+    const uint64_t session = options.session_id;
+    const std::string live =
+        options.output_dir + "/" + std::to_string(session) + "/manifest.json";
+    testing::SupervisionPasses passes;
+    bool hw_alive_before_2s = false;
+    std::atomic<bool> session_done{false};
+    std::jthread driver{[&](const std::stop_token& stop) {
+      const testing::SteppedClock::ReleaseOnExit release_clock{clock};
+      if (!WaitFor(stop, [&] {
+            return ReadLines(ready).size() == 3 &&
+                   Registered("hardware_node", session);
+          })) {
+        ::kill(::getpid(), SIGTERM);
+        return;
+      }
+      ::kill(::getpid(), SIGTERM);
+      // Wait for kFlagQuiesced -> kAllSignaled (shutdown_deadline = start +
+      // 2s) and for alpha/beta to exit cleanly before advancing to
+      // kStopTimeout.
+      if (!WaitFor(stop, [&] {
+            SupervisionWakeup::Wake();
+            if (ReadLines(events).size() < 4) return false;
+            const std::string cur = ReadFile(live);
+            const auto alpha = ManifestRuns(cur, "alpha");
+            const auto beta = ManifestRuns(cur, "beta");
+            return !alpha.empty() &&
+                   alpha.back().find("\"running\"") == std::string::npos &&
+                   !beta.empty() &&
+                   beta.back().find("\"running\"") == std::string::npos;
+          })) {
+        return;
+      }
+      clock.HoldAt(start + kStopTimeout - 100ms);
+      const uint64_t after_1900 = passes.Started() + 2;
+      WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= after_1900;
+      });
+      const auto mid_hw = ManifestRuns(ReadFile(live), "hardware_node");
+      hw_alive_before_2s =
+          !mid_hw.empty() &&
+          mid_hw.back().find("\"running\"") != std::string::npos;
+      clock.HoldAt(start + kStopTimeout);
+      WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return session_done.load(std::memory_order_acquire);
+      });
+    }};
+
+    EXPECT_EQ(RunSession(options), -1);
+    session_done.store(true, std::memory_order_release);
+    driver.request_stop();
+    driver.join();
+    EXPECT_TRUE(hw_alive_before_2s)
+        << "quiesced hardware_node ended before kStopTimeout (2 s)";
+    const std::string manifest =
+        ReadFile(options.output_dir + "/manifest.json");
+    const auto hw = ManifestRuns(manifest, "hardware_node");
+    ASSERT_EQ(hw.size(), 1u);
+    EXPECT_NE(hw.back().find("\"reason\": \"stop_timeout\""), std::string::npos)
+        << hw.back();
+    EXPECT_NE(hw.back().find("\"exit_signal\": 9"), std::string::npos)
+        << hw.back();
+    for (const char* name : {"alpha", "beta"}) {
+      const auto runs = ManifestRuns(manifest, name);
+      ASSERT_EQ(runs.size(), 1u);
+      EXPECT_NE(runs.back().find("\"reason\": \"stop\""), std::string::npos)
+          << name << ": " << runs.back();
+    }
+
+    std::filesystem::remove_all(options.output_dir);
+    for (const auto* p : {&ready, &events, &release_hw}) ::remove(p->c_str());
+  }
+
+  // Case (c): un-quiesced hung bridge (registered row without kFlagQuiesced)
+  // is STILL SIGKILLed at kBridgeStopTimeout (500 ms) before actuator owners
+  // are signaled.
+  {
+    const auto ready = TempPath("quiesce_hung_ready");
+    const auto events = TempPath("quiesce_hung_events");
+    const auto release_hw = TempPath("quiesce_hung_release");
+    for (const auto* p : {&ready, &events, &release_hw}) ::remove(p->c_str());
+
+    testing::SteppedClock clock;
+    const SupervisionTime start = clock.Freeze();
+    auto options = BaseOptions("quiesce_hung");
+    options.duration_s = 3600;
+    options.max_restarts = 0;
+    options.heartbeat_periods = 1'000'000;
+    options.heartbeat_startup_grace_ms = 3'600'000;
+    options.construction_timeout = 1h;
+    options.supervision_clock = clock.clock();
+    options.binary_overrides["//talOS/bridge:hardware_node"] =
+        make_bridge("quiesce_hung_hw", "hang", ready, events, release_hw);
+    options.binary_overrides["//example/alpha:node"] =
+        make_owner("quiesce_hung_alpha", "alpha", ready, events);
+    options.binary_overrides["//example/beta:node"] =
+        make_owner("quiesce_hung_beta", "beta", ready, events);
+
+    const uint64_t session = options.session_id;
+    const std::string live =
+        options.output_dir + "/" + std::to_string(session) + "/manifest.json";
+    testing::SupervisionPasses passes;
+    std::vector<std::string> events_before_500ms;
+    bool held_before_500ms = false;
+    std::atomic<bool> session_done{false};
+    std::jthread driver{[&](const std::stop_token& stop) {
+      const testing::SteppedClock::ReleaseOnExit release_clock{clock};
+      if (!WaitFor(stop, [&] {
+            return ReadLines(ready).size() == 3 &&
+                   Registered("hardware_node", session);
+          })) {
+        ::kill(::getpid(), SIGTERM);
+        return;
+      }
+      ::kill(::getpid(), SIGTERM);
+      if (!WaitFor(stop, [&] {
+            const auto lines = ReadLines(events);
+            return !lines.empty() && lines[0] == "hw_int";
+          })) {
+        return;
+      }
+      clock.HoldAt(start + kBridgeStopTimeout - 50ms);
+      const uint64_t after_450 = passes.Started() + 2;
+      WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= after_450;
+      });
+      events_before_500ms = ReadLines(events);
+      const std::string mid = ReadFile(live);
+      const auto mid_hw = ManifestRuns(mid, "hardware_node");
+      const auto mid_alpha = ManifestRuns(mid, "alpha");
+      held_before_500ms =
+          !mid_hw.empty() &&
+          mid_hw.back().find("\"running\"") != std::string::npos &&
+          !mid_alpha.empty() &&
+          mid_alpha.back().find("\"running\"") != std::string::npos;
+      // Hold clock at start + kBridgeStopTimeout until RunSession finishes so
+      // ReleaseOnExit cannot jump to wall time (> kStopTimeout) while alpha
+      // and beta are handling SIGINT and exiting.
+      clock.HoldAt(start + kBridgeStopTimeout);
+      WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return session_done.load(std::memory_order_acquire);
+      });
+    }};
+
+    EXPECT_EQ(RunSession(options), -1);
+    session_done.store(true, std::memory_order_release);
+    driver.request_stop();
+    driver.join();
+    EXPECT_TRUE(held_before_500ms)
+        << "un-quiesced hardware_node or alpha ended before 500 ms";
+    EXPECT_EQ(events_before_500ms, (std::vector<std::string>{"hw_int"}))
+        << "actuator owners were signaled before un-quiesced bridge SIGKILL";
+    const std::string manifest =
+        ReadFile(options.output_dir + "/manifest.json");
+    const auto hw = ManifestRuns(manifest, "hardware_node");
+    ASSERT_EQ(hw.size(), 1u);
+    EXPECT_NE(hw.back().find("\"reason\": \"stop_timeout\""), std::string::npos)
+        << hw.back();
+    EXPECT_NE(hw.back().find("\"exit_signal\": 9"), std::string::npos)
+        << hw.back();
+    for (const char* name : {"alpha", "beta"}) {
+      const auto runs = ManifestRuns(manifest, name);
+      ASSERT_EQ(runs.size(), 1u);
+      EXPECT_NE(runs.back().find("\"reason\": \"stop\""), std::string::npos)
+          << name << ": " << runs.back();
+    }
+
+    std::filesystem::remove_all(options.output_dir);
+    for (const auto* p : {&ready, &events, &release_hw}) ::remove(p->c_str());
   }
 }
 

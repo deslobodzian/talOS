@@ -7,21 +7,27 @@ RULES.md 3, docs/TESTING.md §6.1 and §8.1, docs/METHODOLOGY.md §9 and §10
 (REQ-RT-06, REQ-RT-17). Over the tracked files it finds:
 
 - `sleep`: a sleep call (`sleep_for`, `sleep_until`, `usleep`, `nanosleep`,
-  `sleep(`, `time.sleep(`) in a test source or a node package's source;
+  `clock_nanosleep`, `sleep(`, `time.sleep(`) in a test source or a node
+  package's source;
 - `clock`: a wall-clock read (`steady_clock::now`, `system_clock::now`,
   `high_resolution_clock::now`, the same through an alias the file declares,
   `using Clock = std::chrono::steady_clock;` then `Clock::now()`,
   `time.time(`, `time.monotonic(`) in test sources and node code, and in node
-  code additionally `clock_gettime(`, `gettimeofday(`, `Poller::now(` (and
-  aliases of `Poller`), `std::time(`, `utc_clock`/`tai_clock`/`gps_clock`/
+  code additionally `clock_gettime(`, `gettimeofday(`, `timespec_get(`,
+  `Poller::now(` (and aliases of `Poller`), `steady_now(`, `std::time(` /
+  `::time(` / bare `time(`, `utc_clock`/`tai_clock`/`gps_clock`/
   `file_clock::now(`, and Python `time.monotonic_ns(`, `time.time_ns(`,
   `time.perf_counter[_ns](`, `time.process_time[_ns](`, `datetime.now(`,
-  `datetime.utcnow(`, `datetime.today(`, `import time`, `from time import`;
+  `datetime.utcnow(`, `datetime.today(`, `date.today(`, `import time`,
+  `from time import`, `import datetime`, and `from datetime import` of
+  `datetime`/`date`/`*`;
 - `random`: a randomness API in node code (`std::rand`/`rand`/`srand`,
-  `drand48`/`lrand48`/`mrand48`, `arc4random*`, C++ `<random>` engines
-  `mt19937[_64]`, `default_random_engine`, `minstd_rand[0]`, `ranlux*`,
-  `knuth_b`, and in Python `random.*`, `import random`, `from random import`,
-  `os.urandom(`, `secrets.*`);
+  `drand48`/`lrand48`/`mrand48`, `arc4random*`, `getrandom`, `getentropy`,
+  C++ `<random>` `random_device` and engines `mt19937[_64]`,
+  `default_random_engine`, `minstd_rand[0]`, `ranlux*`, `knuth_b`, and in
+  Python `random.*`, `import [numpy.]random`, `from [numpy.]random import`,
+  `from numpy import random`, `urandom(`, `getrandom(`, `secrets.*`,
+  `uuid1(`/ `uuid4(`, and corresponding `from os/secrets/uuid import`);
 - `io`: blocking I/O, logging, or `print` in node code (C++ `std::cout`/
   `cerr`/`clog`/`cin`, `printf`/`fprintf`/`puts`/`fopen`,
   `std::ifstream`/`ofstream`/`fstream`, bare POSIX `socket`/`bind`/`listen`/
@@ -87,8 +93,9 @@ NODE_MACRO = re.compile(r"\b(talos_cc_node|talos_py_node|talos_cc_shared_node)"
 SOURCE_SUFFIXES = (".cc", ".h", ".cpp", ".hpp", ".py")
 
 TIME_PATTERNS = {
-    "sleep": re.compile(r"\b(sleep_for|sleep_until|usleep|nanosleep|sleep)"
-                        r"\s*\(", re.MULTILINE),
+    "sleep": re.compile(
+        r"\b(sleep_for|sleep_until|usleep|nanosleep|clock_nanosleep|sleep)"
+        r"\s*\(", re.MULTILINE),
     "clock": re.compile(r"\b(steady_clock|system_clock|high_resolution_clock)"
                         r"\s*::\s*now\s*\(|\btime\s*\.\s*(time|monotonic)\s*\(",
                         re.MULTILINE),
@@ -102,20 +109,28 @@ NODE_TIME_PATTERNS = {
     "clock": re.compile(
         TIME_PATTERNS["clock"].pattern +
         r"|\b(?:utc_clock|tai_clock|gps_clock|file_clock)\s*::\s*now\s*\(" +
-        r"|\b(?:clock_gettime|gettimeofday)\s*\(" +
+        r"|(?:\bstd\s*::\s*|(?<![\w.>])::\s*|(?<![.>])(?<!::)\b)"
+        r"(?:clock_gettime|gettimeofday|timespec_get)\s*\(" +
         r"|\bPoller\s*::\s*now\s*\(" +
-        r"|\bstd\s*::\s*time\s*\(" +
+        r"|(?<![.>])\bsteady_now\s*\(" +
+        r"|(?:\bstd\s*::\s*|(?<![\w.>])::\s*)time\s*\(" +
+        r"|(?:^|[=({\[,);?!~+\-*/%&|^<}]|(?<!-)>|(?<!:):(?!:)|"
+        r"\b(?:return|else|do|throw|case|co_return|co_yield)\b)"
+        r"[ \t]*\btime\s*\(\s*[^)\s]" +
         r"|\btime\s*\.\s*(?:time_ns|monotonic_ns|perf_counter(?:_ns)?|"
         r"process_time(?:_ns)?)\s*\(" +
-        r"|\bdatetime\s*\.\s*(?:now|utcnow|today)\s*\(",
+        r"|\bdatetime\s*\.\s*(?:now|utcnow|today)\s*\(" +
+        r"|\bdate\s*\.\s*today\s*\(",
         re.MULTILINE,
     ),
     "random": re.compile(
         r"(?<![.>])\b(?:std\s*::\s*)?(?:s?rand|drand48|lrand48|mrand48|"
         r"arc4random(?:_uniform|_buf)?)\s*\(" +
-        r"|\b(?:std\s*::\s*)?(?:mt19937(?:_64)?|default_random_engine|"
-        r"minstd_rand0?|ranlux24_base|ranlux48_base|ranlux24|ranlux48|"
-        r"knuth_b)\b",
+        r"|(?:(?<![\w.>])::\s*|(?<![.>])(?<!::)\b)"
+        r"(?:getrandom|getentropy)\s*\(" +
+        r"|\b(?:std\s*::\s*)?(?:random_device|mt19937(?:_64)?|"
+        r"default_random_engine|minstd_rand0?|ranlux24_base|"
+        r"ranlux48_base|ranlux24|ranlux48|knuth_b)\b",
         re.MULTILINE,
     ),
     "io": re.compile(
@@ -136,32 +151,41 @@ NODE_TIME_PATTERNS = {
 # Python-only node patterns (scoped to `.py` files so C++ struct members such
 # as `random.value` never false-positive).
 PY_NODE_CLOCK_EXTRA = re.compile(
-    r"(?:^|;)[ \t]*from\s+time\s+import\b"
-    r"|(?:^|;)[ \t]*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*time\b",
+    r"(?:^|[;:])[ \t]*from\s+time\s+import\b"
+    r"|(?:^|[;:])[ \t]*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*time\b"
+    r"|(?:^|[;:])[ \t]*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*datetime\b"
+    r"|(?:^|[;:])[ \t]*from\s+datetime\s+import(?:\s*\([^)]*?\b"
+    r"(?:datetime|date)\b|[^\n;#]*(?:\b(?:datetime|date)\b|\*))",
     re.MULTILINE,
 )
 PY_NODE_RANDOM_PATTERN = re.compile(
     r"\brandom\s*\.\s*\w+"
-    r"|(?:^|;)[ \t]*from\s+random\s+import\b"
-    r"|(?:^|;)[ \t]*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*random\b"
-    r"|\bos\s*\.\s*urandom\s*\("
-    r"|(?:^|;)[ \t]*from\s+os\s+import(?:\s*\([^)]*?\burandom\b|[^\n;#]*\burandom\b)"
+    r"|(?:^|[;:])[ \t]*from\s+(?:[\w.]+\.)?random\s+import\b"
+    r"|(?:^|[;:])[ \t]*from\s+numpy\s+import(?:\s*\([^)]*?\brandom\b|"
+    r"[^\n;#]*\brandom\b)"
+    r"|(?:^|[;:])[ \t]*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*"
+    r"(?:[\w.]+\.)?random\b"
+    r"|(?<!def )\b(?:urandom|getrandom|uuid[14])\s*\("
+    r"|(?:^|[;:])[ \t]*from\s+os\s+import(?:\s*\([^)]*?\b"
+    r"(?:urandom|getrandom)\b|[^\n;#]*\b(?:urandom|getrandom)\b)"
     r"|\bsecrets\s*\.\s*\w+"
-    r"|(?:^|;)[ \t]*from\s+secrets\s+import\b"
-    r"|(?:^|;)[ \t]*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*secrets\b",
+    r"|(?:^|[;:])[ \t]*from\s+secrets\s+import\b"
+    r"|(?:^|[;:])[ \t]*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*secrets\b"
+    r"|(?:^|[;:])[ \t]*from\s+uuid\s+import(?:\s*\([^)]*?\buuid[14]\b|"
+    r"[^\n;#]*(?:\buuid[14]\b|\*))",
     re.MULTILINE,
 )
 PY_NODE_IO_PATTERN = re.compile(
     r"(?<!\.)(?<!def )\b(?:print|open)\s*\("
-    r"|(?:^|;)[ \t]*from\s+(?:socket|urllib|requests|subprocess|logging)"
+    r"|(?:^|[;:])[ \t]*from\s+(?:socket|urllib|requests|subprocess|logging)"
     r"(?:\.[\w.]+)?\s+import\b"
-    r"|(?:^|;)[ \t]*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*"
+    r"|(?:^|[;:])[ \t]*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*"
     r"(?:socket|urllib|requests|subprocess|logging)\b",
     re.MULTILINE,
 )
 PY_NODE_LOCK_PATTERN = re.compile(
     r"\bthreading\s*\.\s*(?:Lock|RLock|Semaphore|BoundedSemaphore|Condition)\b"
-    r"|(?:^|;)[ \t]*from\s+threading\s+import(?:\s*\([^)]*?\b"
+    r"|(?:^|[;:])[ \t]*from\s+threading\s+import(?:\s*\([^)]*?\b"
     r"(?:Lock|RLock|Semaphore|BoundedSemaphore|Condition)\b"
     r"|[^\n;#]*\b(?:Lock|RLock|Semaphore|BoundedSemaphore|Condition)\b)",
     re.MULTILINE,
@@ -495,18 +519,31 @@ def _strip_c_comments(text, is_ts=False, strip_strings=False):
         text, is_ts=is_ts, strip_strings=strip_strings)[0]
 
 
-def _strip_hash_comments(text, python_strings=True, strip_strings=False):
+def _strip_hash_comments_with_lines(text, python_strings=True,
+                                    strip_strings=False):
     """Replaces `# ...` comments (and, when `strip_strings` is set, non-f-string
-    Python string literal interiors) with spaces, preserving newlines."""
+    Python string literal interiors) with spaces, splicing Python explicit `\\`
+    line continuations while returning a per-character 1-based original line map."""
     out = []
+    out_lines = []
+    line = 1
     i = 0
     n = len(text)
+
+    def emit(ch, ln):
+        out.append(ch)
+        out_lines.append(ln)
+
+    def emit_str(s, ln):
+        for c in s:
+            emit(c, ln)
+
     while i < n:
         ch = text[i]
         if ch == "#" and (
                 python_strings or i == 0 or text[i - 1] in (" ", "\t", "\n")):
             while i < n and text[i] != "\n":
-                out.append(" ")
+                emit(" ", line)
                 i += 1
             continue
         if ch in ('"', "'"):
@@ -525,36 +562,106 @@ def _strip_hash_comments(text, python_strings=True, strip_strings=False):
                 blank = not is_fstring
             if python_strings and text[i:i + 3] == ch * 3:
                 quote = ch * 3
-                out.append(quote)
+                emit_str(quote, line)
                 i += 3
                 while i < n:
                     if text[i] == "\\" and i + 1 < n:
                         escaped = text[i + 1]
-                        if blank:
-                            out.append("\n" if escaped == "\n" else "  ")
+                        if escaped == "\n":
+                            if blank:
+                                emit("\n", line)
+                            else:
+                                emit("\\", line)
+                                emit("\n", line)
+                            line += 1
                         else:
-                            out.append(text[i:i + 2])
+                            if blank:
+                                emit(" ", line)
+                                emit(" ", line)
+                            else:
+                                emit(text[i], line)
+                                emit(escaped, line)
                         i += 2
                         continue
                     if text[i:i + 3] == quote:
-                        out.append(quote)
+                        emit_str(quote, line)
                         i += 3
                         break
                     c = text[i]
-                    out.append(("\n" if c == "\n" else " ") if blank else c)
+                    if c == "\n":
+                        emit("\n", line)
+                        line += 1
+                    else:
+                        emit(" " if blank else c, line)
                     i += 1
                 continue
-            out.append(ch)
-            i = _copy_quoted(text, i + 1, ch, out, blank,
-                             escapes=python_strings or ch == '"')
+            emit(ch, line)
+            i += 1
+            escapes = python_strings or ch == '"'
+            while i < n:
+                c = text[i]
+                if escapes and c == "\\" and i + 1 < n:
+                    escaped = text[i + 1]
+                    if escaped == "\n":
+                        if blank:
+                            emit("\n", line)
+                        else:
+                            emit("\\", line)
+                            emit("\n", line)
+                        line += 1
+                    else:
+                        if blank:
+                            emit(" ", line)
+                            emit(" ", line)
+                        else:
+                            emit(c, line)
+                            emit(escaped, line)
+                    i += 2
+                    continue
+                if c == ch:
+                    emit(c, line)
+                    i += 1
+                    break
+                if c == "\n":
+                    emit("\n", line)
+                    line += 1
+                    i += 1
+                    break
+                emit(" " if blank else c, line)
+                i += 1
             continue
         if ch == "\\" and _is_line_continuation(text, i):
-            out.append(" ")
+            if python_strings:
+                # Splice explicit Python line continuations (`\` [ws] `\r?\n`)
+                # into a single space while tracking original line numbers so
+                # `from mod import \` / `import \` across lines cannot bypass
+                # single-line import regexes.
+                emit(" ", line)
+                i += 1
+                while i < n and text[i] in (" ", "\t", "\r"):
+                    i += 1
+                if i < n and text[i] == "\n":
+                    line += 1
+                    i += 1
+                continue
+            emit(" ", line)
             i += 1
             continue
-        out.append(ch)
+        if ch == "\n":
+            emit("\n", line)
+            line += 1
+            i += 1
+            continue
+        emit(ch, line)
         i += 1
-    return "".join(out)
+    return "".join(out), out_lines
+
+
+def _strip_hash_comments(text, python_strings=True, strip_strings=False):
+    """Replaces `# ...` comments (and, when `strip_strings` is set, non-f-string
+    Python string literal interiors) with spaces."""
+    return _strip_hash_comments_with_lines(
+        text, python_strings=python_strings, strip_strings=strip_strings)[0]
 
 
 def _strip_comments_with_lines(text, path, strip_strings=False):
@@ -566,8 +673,8 @@ def _strip_comments_with_lines(text, path, strip_strings=False):
     name = os.path.basename(path)
     python_strings = (path.endswith(PY_COMMENT_SUFFIXES) or
                       name in PY_COMMENT_NAMES)
-    return _strip_hash_comments(text, python_strings=python_strings,
-                                strip_strings=strip_strings), None
+    return _strip_hash_comments_with_lines(
+        text, python_strings=python_strings, strip_strings=strip_strings)
 
 
 def strip_comments(text, path, strip_strings=False):

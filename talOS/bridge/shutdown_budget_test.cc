@@ -1,27 +1,39 @@
 #include <gtest/gtest.h>
 #include <poll.h>
+#include <unistd.h>
 
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <span>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include "talOS/bridge/node.h"
 #include "talOS/bridge/node_test_support.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/events/log/log_writer.h"
 #include "talOS/events/os/poller.h"
 #include "talOS/hardware/gateway.h"
 #include "talOS/hardware/messages.h"
+#include "talOS/introspection/registry.h"
 #include "talOS/ipc/publisher.h"
 #include "talOS/ipc/subscriber.h"
 #include "talOS/process/process.h"
 #include "talOS/protocol/frame.h"
 
 namespace talos::hardware {
+extern std::function<void(event::log::LogWriterOptions&)> log_options_for_test;
+
 namespace {
 using namespace bridge_test;  // NOLINT(google-build-using-namespace)
 
@@ -457,6 +469,148 @@ TEST(HardwareNodeShutdownBudgetTest, RunSendsShutdownNeutralOnCleanExit) {
   Command published_cmd{};
   ASSERT_TRUE(Decode(published->bytes(), published_cmd));
   EXPECT_EQ(published_cmd, shutdown->command);
+}
+
+// HardwareNode::Run() sends its shutdown neutral, closes its waits and UDP
+// socket, publishes introspection, and marks its registry row kFlagQuiesced
+// BEFORE log_->finish() + log_->flush() blocks on disk I/O (REQ-OPS-20).
+// REQ-OPS-20
+TEST(HardwareNodeShutdownBudgetTest,
+     RunQuiescesAndClosesUdpBeforeLogFlushUnblocks) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  cfg.hardware.command_timeout_us = 500'000;
+  Config hw_cfg = cfg.hardware;
+  hw_cfg.commissioned = true;
+  const uint64_t config_id = ConfigurationId(hw_cfg);
+  const std::string log_path = ::testing::TempDir() + "/bridge_quiesce_" +
+                               std::to_string(::getpid()) + ".tlog";
+  constexpr uint64_t kSessionId = 61;
+
+  struct StopGuard {
+    ~StopGuard() {
+      process::stop_requested.store(false);
+      static_cast<void>(process::ConsumeStopWake());
+    }
+  };
+  struct HeldLog {
+    HeldLog() {
+      log_options_for_test = [this](event::log::LogWriterOptions& options) {
+        options.write_interval = std::chrono::hours{1};
+        options.sync_interval = std::chrono::hours{1};
+        options.before_write = [this] {
+          write_blocked.store(true, std::memory_order_release);
+          std::unique_lock lock{mutex};
+          cv.wait(lock, [this] { return released; });
+        };
+        options.before_flush_wait = [this] {
+          flush_entered.store(true, std::memory_order_release);
+        };
+      };
+    }
+    ~HeldLog() {
+      Release();
+      log_options_for_test = nullptr;
+    }
+    HeldLog(const HeldLog&) = delete;
+    HeldLog& operator=(const HeldLog&) = delete;
+    void Release() {
+      {
+        std::lock_guard lock{mutex};
+        released = true;
+      }
+      cv.notify_all();
+    }
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool released{false};
+    std::atomic<bool> write_blocked{false};
+    std::atomic<bool> flush_entered{false};
+  };
+
+  {
+    Link link;
+    StopGuard stop_guard;
+    HeldLog held;
+    ASSERT_TRUE(link.Open(cfg, true, log_path, kSessionId));
+    HardwareNode& node = link.node.value();
+    ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+
+    const uint64_t start_us =
+        static_cast<uint64_t>(event::Poller::now().nanos() / 1000);
+    ASSERT_TRUE(InjectState(node, link.gateway,
+                            TrustState(config_id, 11, 2, 5'000), start_us));
+    Command req = IntakeRequest(cfg, 5.0);
+    req.epoch = 2;
+    req.observed_time_us = 5'000;
+    PublishCommand(intake_pub, req);
+    node.Tick(start_us);
+    const auto driving = ReceiveCommandFrame(link.gateway);
+    ASSERT_TRUE(driving.has_value());
+
+    // Refresh accepted State right before Run() so command_timeout_us stays
+    // fresh for SendShutdownNeutral(stop_us).
+    constexpr uint64_t kRefreshSampleUs = 10'000;
+    const uint64_t states_before_refresh = node.states_received();
+    const uint64_t commands_before_refresh = node.commands_sent();
+    ASSERT_TRUE(SendState(link.gateway,
+                          TrustState(config_id, 11, 2, kRefreshSampleUs)));
+    ASSERT_TRUE(WaitFor([&] { return SocketReadable(node); }));
+    const uint64_t refresh_us =
+        static_cast<uint64_t>(event::Poller::now().nanos() / 1000);
+    node.Tick(refresh_us);
+    ASSERT_EQ(node.states_received(), states_before_refresh + 1);
+    for (uint64_t c = commands_before_refresh; c < node.commands_sent(); ++c) {
+      ASSERT_TRUE(ReceiveCommandFrame(link.gateway).has_value());
+    }
+
+    process::stop_requested.store(true);
+    std::atomic<int> exit_code{-1};
+    std::thread runner{[&] { exit_code.store(node.Run()); }};
+    struct JoinOnExit {
+      HeldLog& held;
+      std::thread& thread;
+      ~JoinOnExit() {
+        held.Release();
+        if (thread.joinable()) thread.join();
+      }
+    } join_on_exit{held, runner};
+
+    // Wait until Run() is blocked inside log_->flush() while the background
+    // LogWriter thread is held inside before_write.
+    ASSERT_TRUE(WaitFor(
+        [&] { return held.flush_entered.load(std::memory_order_acquire); }));
+    ASSERT_TRUE(WaitFor(
+        [&] { return held.write_blocked.load(std::memory_order_acquire); }));
+
+    // While before_write is still blocked, the bridge must already have sent
+    // its shutdown neutral, closed its UDP socket, and marked kFlagQuiesced.
+    const auto reader = introspect::RegistryReader::open();
+    ASSERT_TRUE(reader.has_value());
+    std::optional<introspect::NodeSnapshot> bridge_row;
+    for (const auto& row : reader->nodes()) {
+      if (row.name == kNodeName &&
+          row.pid == static_cast<uint64_t>(::getpid()) &&
+          row.session_id == kSessionId &&
+          (!bridge_row || row.generation > bridge_row->generation)) {
+        bridge_row = row;
+      }
+    }
+    ASSERT_TRUE(bridge_row.has_value()) << "bridge registry row missing";
+    EXPECT_TRUE(bridge_row->quiesced())
+        << "kFlagQuiesced was not set before log_->flush() blocked";
+    EXPECT_EQ(node.udp_fd(), -1)
+        << "UDP socket was not closed before log_->flush() blocked";
+
+    const auto shutdown = ReceiveCommandFrame(link.gateway);
+    ASSERT_TRUE(shutdown.has_value())
+        << "SendShutdownNeutral did not reach gateway while log flush blocked";
+    ExpectAllNeutral(shutdown->command, hw_cfg);
+
+    held.Release();
+    runner.join();
+    EXPECT_EQ(exit_code.load(), 0);
+  }
+  std::filesystem::remove(log_path);
 }
 
 // Staggered bursts (31 + 32 + 32) within a single 1 ms window must never

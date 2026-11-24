@@ -883,6 +883,143 @@ class NewSubsystemTest(unittest.TestCase):
                 os.path.join(dir_link, "arm"), "arm", "py", talos)
             self.assertTrue(writes_via_parent)
 
+    # REQ-DEV-02
+    def test_standalone_matches_wrist_repo_and_exports_module_and_defaults(self):
+        # plan_standalone(..., "wrist", "cpp", ...) must stay aligned with the
+        # committed examples/wrist_repo fixture (consumed via bazel_dep +
+        # local_path_override by //examples/external_subsystem), and both C++
+        # and Python standalone repos must declare module(name = ...), export
+        # defaults.toml with node = "@<name>//:node", and keep :node public.
+        repo_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+        wrist_dir = os.path.join(repo_root, "examples", "wrist_repo")
+
+        def read_file(path):
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "wrist_repo")
+            writes = new_subsystem.plan_standalone(target, "wrist", "cpp",
+                                                   repo_root)
+            generated = {
+                os.path.relpath(path, target).replace(os.sep, "/"): content
+                for path, _, content in writes
+            }
+            talos_rel = os.path.relpath(
+                os.path.realpath(repo_root),
+                os.path.realpath(target)).replace(os.sep, "/")
+
+            for rel_path in (".bazelversion", "defaults.toml",
+                             "testdata/wrist.toml", "wrist.cc", "wrist.h",
+                             "wrist_message.fbs"):
+                with self.subTest(golden=rel_path):
+                    self.assertEqual(
+                        generated[rel_path],
+                        read_file(os.path.join(wrist_dir, rel_path)))
+
+            self.assertEqual(
+                generated["MODULE.bazel"].replace(
+                    f'path = "{talos_rel}"', 'path = "../.."'),
+                read_file(os.path.join(wrist_dir, "MODULE.bazel")))
+            self.assertEqual(
+                generated[".bazelrc"].replace(
+                    f"import %workspace%/{talos_rel}/talos.bazelrc",
+                    "import %workspace%/../../talos.bazelrc"),
+                read_file(os.path.join(wrist_dir, ".bazelrc")))
+
+            # examples/wrist_repo/BUILD differs only in exposing node_test
+            # publicly for //examples/external_subsystem:wrist_tests and
+            # omitting testdata/neighbor.toml (its test uses Sim::FromToml).
+            wrist_build = read_file(os.path.join(wrist_dir, "BUILD"))
+            wrist_build_norm = wrist_build.replace(
+                "    # Run from the consuming workspace too "
+                "(//examples/external_subsystem).\n"
+                '    visibility = ["//visibility:public"],\n',
+                "")
+            gen_build_norm = generated["BUILD"].replace(
+                '        "testdata/neighbor.toml",\n', "")
+            self.assertEqual(gen_build_norm, wrist_build_norm)
+
+        # Verify both C++ and Python standalone scaffolds expose the Bzlmod
+        # module, @<name>//:node in defaults.toml, exports_files, and a
+        # non-private :node target.
+        for lang, node_rule, expected_deps in (
+                ("cpp", "talos_cc_node", {"talos", "rules_cc", "googletest"}),
+                ("py", "talos_py_node", {"talos", "rules_python"})):
+            with self.subTest(lang=lang), tempfile.TemporaryDirectory() as tmp:
+                target = os.path.join(tmp, "arm_repo")
+                writes = new_subsystem.plan_standalone(target, "arm", lang,
+                                                       repo_root)
+                by_rel = {
+                    os.path.relpath(path, target).replace(os.sep, "/"): content
+                    for path, _, content in writes
+                }
+
+                defaults = tomllib.loads(by_rel["defaults.toml"])
+                self.assertEqual(defaults["subsystem"]["name"], "arm")
+                self.assertEqual(defaults["subsystem"]["node"], "@arm//:node")
+
+                mod_tree = ast.parse(by_rel["MODULE.bazel"],
+                                     filename="MODULE.bazel")
+                module_names = []
+                dep_names = set()
+                override_paths = {}
+                for stmt in mod_tree.body:
+                    if not (isinstance(stmt, ast.Expr)
+                            and isinstance(stmt.value, ast.Call)
+                            and isinstance(stmt.value.func, ast.Name)):
+                        continue
+                    call = stmt.value
+                    kwargs = {
+                        kw.arg: kw.value.value
+                        for kw in call.keywords
+                        if (isinstance(kw.value, ast.Constant)
+                            and isinstance(kw.value.value, str))
+                    }
+                    if call.func.id == "module":
+                        module_names.append(kwargs.get("name"))
+                    elif call.func.id == "bazel_dep":
+                        dep_names.add(kwargs.get("name"))
+                    elif call.func.id == "local_path_override":
+                        override_paths[kwargs.get("module_name")] = kwargs.get(
+                            "path")
+                self.assertEqual(module_names, ["arm"])
+                self.assertEqual(dep_names, expected_deps)
+                self.assertIn("talos", override_paths)
+                self.assertEqual(
+                    os.path.realpath(
+                        os.path.join(target, override_paths["talos"])),
+                    os.path.realpath(repo_root))
+
+                build_tree = ast.parse(by_rel["BUILD"], filename="BUILD")
+                exported = []
+                node_calls = []
+                for stmt in build_tree.body:
+                    if not (isinstance(stmt, ast.Expr)
+                            and isinstance(stmt.value, ast.Call)
+                            and isinstance(stmt.value.func, ast.Name)):
+                        continue
+                    call = stmt.value
+                    if (call.func.id == "exports_files" and call.args
+                            and isinstance(call.args[0], ast.List)):
+                        exported.extend(
+                            elt.value for elt in call.args[0].elts
+                            if isinstance(elt, ast.Constant)
+                            and isinstance(elt.value, str))
+                    elif call.func.id == node_rule:
+                        node_calls.append(call)
+                self.assertIn("defaults.toml", exported)
+                self.assertEqual(len(node_calls), 1)
+                node_kwargs = {kw.arg: kw.value for kw in node_calls[0].keywords}
+                self.assertEqual(node_kwargs["name"].value, "node")
+                if "visibility" in node_kwargs:
+                    vis = [
+                        elt.value for elt in node_kwargs["visibility"].elts
+                        if isinstance(elt, ast.Constant)
+                    ]
+                    self.assertIn("//visibility:public", vis)
+                    self.assertNotIn("//visibility:private", vis)
+
     # REQ-DEV-01
     def test_talos_checkout_flag_is_held_to_the_checkout_check(self):
         # --talos-checkout DIR (relative to the robot repository's root)

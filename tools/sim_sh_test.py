@@ -459,6 +459,96 @@ class SimShConfigTest(unittest.TestCase):
             args_cli = f.read()
         self.assertIn(f"--studio-http-port {port_cli}", args_cli)
 
+    # REQ-DEV-05
+    def test_sim_gateway_forwards_schedules_gateway_args_and_default_output_dir(
+            self):
+        # sim.sh --sim-gateway forwards --mode-schedule, --joystick-schedule,
+        # and repeatable --gateway-arg (e.g. --fault-schedule) to the launcher
+        # via --sim-gateway-arg, and defaults --output-dir to /tmp/talos_logs
+        # when TALOS_SIM_LOG_DIR is unset.
+        resolved = json.dumps({
+            "nodes": ["//bot:node"],
+            "effective": {
+                "robot": {"sim_gateway": "//talOS/simulation:sim_gateway"},
+                "studio": {},
+            },
+        })
+        put(os.path.join(self.root, "bazel-bin", "talOS", "configuration",
+                         "resolve"),
+            f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(resolved)}\n",
+            0o755)
+        bin_dir = os.path.join(self.tmp, "bin")
+        put(os.path.join(bin_dir, "bazel"),
+            '#!/bin/sh\n[ "$1" = run ] || [ "$1" = build ] && exit 0\n'
+            'echo "bazel stub: $*" >&2; exit 97\n',
+            0o755)
+        launcher_args = os.path.join(self.tmp, "launcher_argv")
+        put(os.path.join(self.root, "bazel-bin", "talOS", "launcher",
+                         "launcher"),
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "$@" > {shlex.quote(launcher_args)}\n'
+            'out_dir=""\n'
+            'session_id=""\n'
+            'while [ $# -gt 0 ]; do\n'
+            '  case "$1" in\n'
+            '    --output-dir) out_dir="$2"; shift ;;\n'
+            '    --session-id) session_id="$2"; shift ;;\n'
+            '  esac\n'
+            '  shift\n'
+            'done\n'
+            'mkdir -p "$out_dir/$session_id"\n'
+            'printf "{}\\n" > "$out_dir/$session_id/graph.json"\n'
+            'exit 0\n',
+            0o755)
+
+        mode_schedule = "disabled:1,teleop:5"
+        joystick_schedule = (
+            "0:axes=0;buttons=0;pov=-1|2:axes=0;buttons=4;pov=-1")
+        fault_schedule = "1.0:disconnect:arm_motor"
+
+        env = dict(self.env, PWD=self.root)
+        env.pop("TALOS_SIM_LOG_DIR", None)
+        proc = subprocess.run(
+            ["bash", self.sim, "--config", CONFIG, "--sim-gateway",
+             "--no-studio", "--mode-schedule", mode_schedule,
+             "--joystick-schedule", joystick_schedule,
+             "--gateway-arg", "--fault-schedule",
+             "--gateway-arg", fault_schedule],
+            cwd=self.root, env=env, capture_output=True, text=True, timeout=15)
+        if os.path.exists(launcher_args):
+            with open(launcher_args, encoding="utf-8") as f:
+                argv = f.read().splitlines()
+            if "--output-dir" in argv and "--session-id" in argv:
+                out_dir = argv[argv.index("--output-dir") + 1]
+                session_id = argv[argv.index("--session-id") + 1]
+                self.addCleanup(
+                    shutil.rmtree, os.path.join(out_dir, session_id), True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        with open(launcher_args, encoding="utf-8") as f:
+            argv = f.read().splitlines()
+
+        self.assertIn("--start-sim-gateway", argv)
+        out_dir = argv[argv.index("--output-dir") + 1]
+        session_id = argv[argv.index("--session-id") + 1]
+        self.assertEqual(out_dir, "/tmp/talos_logs", argv)
+        self.assertIn(f"session logs in /tmp/talos_logs/{session_id}",
+                      proc.stdout)
+
+        gateway_args = [
+            argv[i + 1] for i in range(len(argv) - 1)
+            if argv[i] == "--sim-gateway-arg"
+        ]
+        self.assertIn("--physics", gateway_args)
+        for flag, value in (
+                ("--mode-schedule", mode_schedule),
+                ("--joystick-schedule", joystick_schedule),
+                ("--fault-schedule", fault_schedule)):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, gateway_args)
+                idx = gateway_args.index(flag)
+                self.assertLess(idx + 1, len(gateway_args), gateway_args)
+                self.assertEqual(gateway_args[idx + 1], value, gateway_args)
+
     def _assert_signal_during_wpilib_wait_exits(self, sig, expected_rc):
         resolved = json.dumps({
             "nodes": ["//bot:node"],

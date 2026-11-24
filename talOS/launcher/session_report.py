@@ -49,19 +49,142 @@ def stats(values, unit="ms"):
             f"max_{unit}": values[-1]}
 
 
-def scalars(decoded):
-    # DecodeToText uses descriptor field names and decimal scalar values. Only
-    # top-level status scalars are consumed; nested target contents are not.
+_SCALAR_VALUE = re.compile(r"true|false|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?")
+_FIELD_KEY = re.compile(r"\w+")
+_MAX_DECODED_DEPTH = 64
+
+
+def _parse_scalar_token(token):
+    if _SCALAR_VALUE.fullmatch(token) is None:
+        return None
+    try:
+        parsed = json.loads(token)
+    except ValueError:
+        return None
+    if isinstance(parsed, float) and not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _parse_decoded_value(text, pos, depth):
+    n = len(text)
+    while pos < n and text[pos].isspace():
+        pos += 1
+    if pos >= n or depth > _MAX_DECODED_DEPTH:
+        return None, n
+    ch = text[pos]
+    if ch == "{":
+        pos += 1
+        obj = {}
+        while pos < n:
+            while pos < n and text[pos].isspace():
+                pos += 1
+            if pos >= n:
+                return obj, n
+            if text[pos] == "}":
+                return obj, pos + 1
+            key_match = _FIELD_KEY.match(text, pos)
+            if key_match is None:
+                return obj, n
+            key = key_match.group(0)
+            pos = key_match.end()
+            while pos < n and text[pos].isspace():
+                pos += 1
+            if pos >= n or text[pos] != ":":
+                return obj, n
+            pos += 1
+            value, pos = _parse_decoded_value(text, pos, depth + 1)
+            obj[key] = value
+            while pos < n and text[pos].isspace():
+                pos += 1
+            if pos < n and text[pos] == ",":
+                pos += 1
+                continue
+            if pos < n and text[pos] == "}":
+                return obj, pos + 1
+            return obj, n
+        return obj, n
+    if ch == "[":
+        pos += 1
+        items = []
+        while pos < n:
+            while pos < n and text[pos].isspace():
+                pos += 1
+            if pos >= n:
+                return items, n
+            if text[pos] == "]":
+                return items, pos + 1
+            value, pos = _parse_decoded_value(text, pos, depth + 1)
+            items.append(value)
+            while pos < n and text[pos].isspace():
+                pos += 1
+            if pos < n and text[pos] == ",":
+                pos += 1
+                continue
+            if pos < n and text[pos] == "]":
+                return items, pos + 1
+            return items, n
+        return items, n
+    if ch == "<":
+        end = text.find(">", pos)
+        return None, n if end == -1 else end + 1
+    end = pos
+    while end < n and text[end] not in ",}]":
+        end += 1
+    return _parse_scalar_token(text[pos:end].strip()), end
+
+
+def _parse_decoded_struct(decoded):
     if not isinstance(decoded, str):
         return {}
-    found = {}
-    for key, value in re.findall(
-        r"(?:\{|,)\s*(\w+):\s*(true|false|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*(?=[,}])", decoded
-    ):
-        parsed = json.loads(value)
-        if isinstance(parsed, float) and not math.isfinite(parsed):
-            continue
-        found[key] = parsed
+    pos = 0
+    n = len(decoded)
+    while pos < n and decoded[pos].isspace():
+        pos += 1
+    if pos >= n or decoded[pos] != "{":
+        return {}
+    parsed, _ = _parse_decoded_value(decoded, pos, 0)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def scalars(decoded):
+    # DecodeToText uses descriptor field names and decimal scalar values. Only
+    # depth-1 top-level scalar fields are returned; nested structs and arrays
+    # never overwrite or leak into top-level keys.
+    parsed = _parse_decoded_struct(decoded)
+    return {
+        key: value
+        for key, value in parsed.items()
+        if isinstance(value, (bool, int, float))
+    }
+
+
+def status_scalars(decoded):
+    # Top-level BridgeStatus scalars plus active can_buses[0..can_bus_count-1]
+    # slot scalars keyed as `can_buses[i].<field>`, so unused zeroed slots
+    # never overwrite active CAN buses (REQ-OPS-16, REQ-OPS-20).
+    parsed = _parse_decoded_struct(decoded)
+    found = {
+        key: value
+        for key, value in parsed.items()
+        if isinstance(value, (bool, int, float))
+    }
+    buses = parsed.get("can_buses")
+    if isinstance(buses, list):
+        count = found.get("can_bus_count")
+        if "can_bus_count" not in parsed:
+            limit = len(buses)
+        elif isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            limit = min(count, len(buses))
+        else:
+            limit = 0
+        for index in range(limit):
+            slot = buses[index]
+            if not isinstance(slot, dict):
+                continue
+            for key, value in slot.items():
+                if isinstance(value, (bool, int, float)):
+                    found[f"can_buses[{index}].{key}"] = value
     return found
 
 
@@ -858,13 +981,14 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
         lost["gaps"] += 1
     status_source, status_records = stream(records, "/hw/status")
     for r in status_records:
-        for field, value in scalars(r["decoded"]).items():
+        for field, value in status_scalars(r["decoded"]).items():
             status.setdefault(field, []).append(value)
     status_summary = {}
     for field, values in status.items():
         item = {"samples": len(values), "first": values[0], "last": values[-1],
                 "min": min(values), "max": max(values)}
-        if field.endswith("_count") and field not in ("subsystem_count", "clock_window_count"):
+        if field.endswith("_count") and field not in (
+                "subsystem_count", "clock_window_count", "can_bus_count"):
             # Negative differences indicate a producer restart/reset, not a
             # negative rejection count. Retain each epoch's observed increments.
             item["delta"] = sum(max(0, b - a) for a, b in zip(values, values[1:]))

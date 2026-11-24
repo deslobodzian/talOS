@@ -254,6 +254,8 @@ py_test(
         "testdata/lint_test/good.fbs",
         "testdata/lint_test/included.fbs",
         ":descriptor_gen",
+        "//tools:sync_manifest",
+        "//tools:sync_manifest.bzl",
         "@flatbuffers//:flatc",
     ],
     env = {
@@ -266,6 +268,8 @@ py_test(
         "TALOS_LINT_GOOD_FBS": "$(rlocationpath testdata/lint_test/good.fbs)",
         "TALOS_LINT_INCLUDED": "$(rlocationpath lint_fixtures/included.bfbs)",
         "TALOS_LINT_INCLUDED_FBS": "$(rlocationpath testdata/lint_test/included.fbs)",
+        "TALOS_SYNC_MANIFEST": "$(rlocationpath //tools:sync_manifest)",
+        "TALOS_SYNC_MANIFEST_BZL": "$(rlocationpath //tools:sync_manifest.bzl)",
     },
     legacy_create_init = False,
     deps = ["@rules_python//python/runfiles"],

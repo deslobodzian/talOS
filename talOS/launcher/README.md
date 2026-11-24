@@ -511,8 +511,8 @@ bundled bridge), and the bundle's webroot replaces a relative
 no bridge: the flag adds none to the roster and the launcher says the bundle
 carries no Studio. The bridge answers `--describe`
 like any other node, and the launcher starts it with `--session-id`, the
-session's `graph.json` as `--declared` and the session's `manifest.json` as
-`--manifest`; its stdout and stderr land in
+session's `graph.json` as `--declared`, the session's `manifest.json` as
+`--manifest`, and `--sim` in simulation; its stdout and stderr land in
 `<output_dir>/<session_id>/studio_bridge.log` (plaintext, not a `.tlog`) beside
 the manifest, like every member's [output](#node-output), but are not echoed to
 the launcher's stdout.
@@ -686,9 +686,14 @@ it reaches its stop handlers within the stop timeout (`kStopTimeout`, 2 s)
 of the launcher's stop. One still starting then is SIGKILLed and recorded
 `stop_timeout`, as a stuck constructor is, and the session ends nonzero.
 On shutdown, the launcher stops `hardware_node` first (`kStopSignal`, up to
-`kBridgeStopTimeout`, 500 ms, before SIGKILLing a hung bridge) and signals the
-remaining members only after `hardware_node` has been reaped, so the bridge
-quiesces and stops forwarding before actuator owners exit.
+`kBridgeStopTimeout`, 500 ms, before SIGKILLing a bridge that has neither
+exited nor quiesced) and signals the remaining members as soon as
+`hardware_node` has either exited or marked its registry row `kFlagQuiesced`
+(after sending its shutdown neutral, closing its waits and UDP socket, and
+publishing introspection, before flushing its `.tlog`). A quiesced bridge still
+flushing its event log shares `kStopTimeout` (2 s) with the remaining members
+before SIGKILL; an un-quiesced bridge that hits `kBridgeStopTimeout` is
+SIGKILLed and reaped before other members are signaled.
 Probes, group guardians, `--replay-inputs` runs, members that do not say so
 (`hardware_node`, `sim_gateway`, the Studio bridge, foreign binaries) and
 members whose `--describe` probe did not answer (a non-critical member the
@@ -957,7 +962,7 @@ hold and touches no disk. The times it sleeps until:
 | one settle interval (1 s) after the Studio bridge's last spawn, until that run is up | whether it holds the session open ([Studio bridge](#studio-bridge)) |
 | 20 ms startup polls while waiting to write `sim_schedule_start` (`kSimScheduleStartPoll`, until written or `sim_gateway` exits with no pending restart) or for the bridge run's first `/hw/status` (`kBridgeProtocolPoll`, until its protocol version is checked) | starting `sim_gateway`'s schedule; bridge protocol check |
 | `--duration-s`'s end, until the stop is sent | the stop |
-| two-phase stop timeouts: first `hardware_node` (500 ms, `kBridgeStopTimeout`), then the remaining members (2 s, `kStopTimeout`), until their SIGKILLs are sent | `stop_timeout` |
+| two-phase stop timeouts: first `hardware_node` quiescence (5 ms `kBridgeQuiescePoll` on its registry row for `kFlagQuiesced`, bounded by 500 ms `kBridgeStopTimeout`), then the remaining members (and any quiesced bridge still flushing its log; 2 s, `kStopTimeout`), until their SIGKILLs are sent | `stop_timeout` |
 | half of `WATCHDOG_USEC`, when systemd sets it | `WATCHDOG=1` |
 | the hourly refresh of the session lock and of the session directory's `session.lock` and quiet files | [one session per namespace](#one-session-per-namespace), [retention](#session-segments-and-logs) |
 
@@ -1243,7 +1248,7 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
 | `construction_deadline` | was killed for constructing longer than the deadline |
 | `endpoint_mismatch` | was killed, or its session stopped, for [live endpoints](#live-endpoints) that differ from its probe |
 | `stop` | ended as the session's stop (signal, `--duration-s`) asks: exit 0, SIGINT or SIGTERM (which of these leave the launcher's exit status 0: [restarts](#restarts)) |
-| `stop_timeout` | outlived the stop timeout after its SIGINT (500 ms for `hardware_node`, 2 s for other members) and was killed (SIGKILL) |
+| `stop_timeout` | outlived the stop timeout after its SIGINT (500 ms `kBridgeStopTimeout` for an un-quiesced `hardware_node`, 2 s `kStopTimeout` for a quiesced `hardware_node` still flushing its log and for other members) and was killed (SIGKILL) |
 | `spawn_failed` | could not be spawned (`exit_code` -1, `exit_signal` 0) |
 
 A kill of the launcher's own (`stalled`, `heartbeat_missing`,

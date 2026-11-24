@@ -366,34 +366,65 @@ struct FileBuild {
   std::unordered_map<std::uint16_t, std::size_t> overflow_bit;
 };
 
+constexpr std::size_t kMaxOverflowWordsPerFile =
+    kMaxOverflowBytesPerFile / sizeof(std::uint64_t);
+
 void RecordOverflowSource(LogFile& log_file, FileBuild& build,
                           std::size_t cp_idx, std::uint16_t source_id) {
-  const auto [it, inserted] = build.overflow_bit.emplace(
-      source_id, log_file.overflow_source_ids.size());
-  if (inserted) {
-    log_file.overflow_source_ids.push_back(source_id);
-    const std::size_t needed_words =
-        (log_file.overflow_source_ids.size() + 63) / 64;
+  const auto it = build.overflow_bit.find(source_id);
+  std::size_t bit_idx = 0;
+  if (it == build.overflow_bit.end()) {
+    if (log_file.overflow_source_ids.size() >= kMaxOverflowSources) {
+      log_file.overflow_capped = true;
+      return;
+    }
+    const std::size_t next_bit = log_file.overflow_source_ids.size();
+    const std::size_t needed_words = (next_bit + 64) / 64;
     if (needed_words > log_file.overflow_words_per_cp) {
       const std::size_t old_words = log_file.overflow_words_per_cp;
+      const std::size_t new_words =
+          old_words == 0
+              ? 1
+              : std::min(kMaxOverflowWordsPerCheckpoint, old_words * 2);
       const std::size_t old_cps =
           old_words == 0 ? 0 : log_file.overflow_bits.size() / old_words;
-      std::vector<std::uint64_t> grown(
-          std::max(old_cps, cp_idx + 1) * needed_words, 0);
+      const std::size_t target_cps = std::max(old_cps, cp_idx + 1);
+      if (target_cps > kMaxOverflowWordsPerFile / new_words) {
+        log_file.overflow_capped = true;
+        return;
+      }
+      std::vector<std::uint64_t> grown(target_cps * new_words, 0);
       for (std::size_t c = 0; c < old_cps; ++c) {
         for (std::size_t w = 0; w < old_words; ++w) {
-          grown[c * needed_words + w] =
-              log_file.overflow_bits[c * old_words + w];
+          grown[c * new_words + w] = log_file.overflow_bits[c * old_words + w];
         }
       }
       log_file.overflow_bits = std::move(grown);
-      log_file.overflow_words_per_cp = needed_words;
+      log_file.overflow_words_per_cp = new_words;
+    } else if (cp_idx + 1 >
+               kMaxOverflowWordsPerFile / log_file.overflow_words_per_cp) {
+      log_file.overflow_capped = true;
+      return;
+    }
+    build.overflow_bit.emplace(source_id, next_bit);
+    log_file.overflow_source_ids.push_back(source_id);
+    bit_idx = next_bit;
+  } else {
+    bit_idx = it->second;
+    if (cp_idx + 1 >
+        kMaxOverflowWordsPerFile / log_file.overflow_words_per_cp) {
+      log_file.overflow_capped = true;
+      return;
     }
   }
-  const std::size_t bit_idx = it->second;
   const std::size_t required_size =
       (cp_idx + 1) * log_file.overflow_words_per_cp;
   if (log_file.overflow_bits.size() < required_size) {
+    if (log_file.overflow_bits.capacity() < required_size) {
+      const std::size_t doubled = log_file.overflow_bits.capacity() * 2;
+      log_file.overflow_bits.reserve(
+          std::min(kMaxOverflowWordsPerFile, std::max(required_size, doubled)));
+    }
     log_file.overflow_bits.resize(required_size, 0);
   }
   log_file.overflow_bits[cp_idx * log_file.overflow_words_per_cp +
@@ -404,10 +435,12 @@ void RecordOverflowSource(LogFile& log_file, FileBuild& build,
 class Indexer {
  public:
   std::vector<TopicBuild> topics;
+  std::size_t total_channels{0};
 
   // The topic `source` carries, created on first sight; -1 for one that
   // holds no channel review reads, or whose schema disagrees with the one
-  // the topic was first seen with.
+  // the topic was first seen with. Throws std::runtime_error when adding
+  // the topic would exceed kMaxSessionChannels across the session.
   std::int32_t Resolve(const talos::event::Registration& source,
                        const std::string& path) {
     const auto& schema = source.schema;
@@ -433,6 +466,7 @@ class Indexer {
     topic.hardware =
         talos::launcher::HardwareRecordOf(source.name, schema.name);
     std::int32_t index = -1;
+    bool resolved = false;
     try {
       if (topic.hardware == HardwareRecord::kDriverStation) {
         topic.decoder = Decoder::kDriverStation;
@@ -450,18 +484,26 @@ class Indexer {
         topic.channels = talos::telemetry::FlattenTopic(
             source.name, schema.name, schema.bfbs);
       }
-      if (topic.decoder == Decoder::kHardware || !topic.channels.empty()) {
-        for (std::uint32_t c = 0; c < topic.channels.size(); ++c) {
-          if (topic.channels[c].alert != Talos::Telemetry::AlertLevel_None) {
-            topic.alert_channels.push_back(c);
-          }
-        }
-        index = static_cast<std::int32_t>(topics.size());
-        topics.push_back(std::move(topic));
-      }
+      resolved = topic.decoder == Decoder::kHardware || !topic.channels.empty();
     } catch (const std::exception& e) {
       std::cerr << "studio_review: " << source.name << " in " << path
                 << " is not reviewed: " << e.what() << '\n';
+    }
+    if (resolved) {
+      if (topics.size() >= kMaxSessionChannels ||
+          topic.channels.size() > kMaxSessionChannels - total_channels) {
+        throw std::runtime_error("session exceeds channel cap (" +
+                                 std::to_string(kMaxSessionChannels) +
+                                 ") at topic " + source.name);
+      }
+      total_channels += topic.channels.size();
+      for (std::uint32_t c = 0; c < topic.channels.size(); ++c) {
+        if (topic.channels[c].alert != Talos::Telemetry::AlertLevel_None) {
+          topic.alert_channels.push_back(c);
+        }
+      }
+      index = static_cast<std::int32_t>(topics.size());
+      topics.push_back(std::move(topic));
     }
     by_name_.emplace(source.name, index);
     return index;
@@ -485,13 +527,12 @@ bool LogFile::HasSource(std::size_t cp_idx, std::uint16_t source_id,
                         std::optional<std::size_t> overflow_bit) const {
   const std::uint64_t mask = checkpoints[cp_idx].sources;
   if (source_id < 63) return (mask & (std::uint64_t{1} << source_id)) != 0;
-  if ((mask & (std::uint64_t{1} << 63)) == 0 || !overflow_bit ||
-      overflow_words_per_cp == 0) {
-    return false;
-  }
+  if ((mask & (std::uint64_t{1} << 63)) == 0) return false;
+  if (!overflow_bit) return overflow_capped;
+  if (overflow_words_per_cp == 0) return true;
   const std::size_t word_idx =
       cp_idx * overflow_words_per_cp + (*overflow_bit / 64);
-  if (word_idx >= overflow_bits.size()) return false;
+  if (word_idx >= overflow_bits.size()) return true;
   return (overflow_bits[word_idx] &
           (std::uint64_t{1} << (*overflow_bit % 64))) != 0;
 }
@@ -631,8 +672,16 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
         topic.decoded_second = second;
         FlattenHardware(topic.name, topic.hardware, r.payload, samples);
         for (const HardwareSample& sample : samples) {
-          if (!sample.null)
-            topic.hardware_channels.emplace(sample.name, sample.kind);
+          if (!sample.null &&
+              topic.hardware_channels.emplace(sample.name, sample.kind)
+                  .second) {
+            if (indexer.total_channels >= kMaxSessionChannels) {
+              throw std::runtime_error("session exceeds channel cap (" +
+                                       std::to_string(kMaxSessionChannels) +
+                                       ") at topic " + topic.name);
+            }
+            ++indexer.total_channels;
+          }
         }
       }
     } else if (topic.decoder == Decoder::kDriverStation) {
@@ -707,6 +756,10 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
     throw std::runtime_error(error);
   }
   if (!any) throw std::runtime_error("no records in " + dir.string());
+  for (LogFile& log_file : session->files_) {
+    log_file.overflow_bits.shrink_to_fit();
+    log_file.overflow_source_ids.shrink_to_fit();
+  }
   std::stable_sort(session->gaps_.begin(), session->gaps_.end(),
                    [&files = session->files_](const Gap& a, const Gap& b) {
                      if (a.start_ns != b.start_ns) {
@@ -921,7 +974,8 @@ std::size_t Session::index_bytes() const {
   std::size_t bytes =
       log_seconds() * sizeof(Checkpoint) + gaps_.size() * sizeof(Gap);
   for (const LogFile& file : files_) {
-    bytes += file.overflow_bits.size() * sizeof(std::uint64_t);
+    bytes += file.overflow_bits.size() * sizeof(std::uint64_t) +
+             file.overflow_source_ids.size() * sizeof(std::uint16_t);
   }
   return bytes;
 }
@@ -1046,6 +1100,7 @@ std::vector<Series> Session::ReadSeries(std::span<const ChannelRef> channels,
         first, checkpoints.end(), last_second,
         [](std::int64_t s, const Checkpoint& c) { return s < c.second; });
     std::uint64_t low_mask = 0;
+    bool fallback_overflow = false;
     std::vector<std::pair<std::size_t, std::uint64_t>> overflow_checks;
     for (const auto& [id, topic] : sources) {
       if (id < 63) {
@@ -1053,19 +1108,22 @@ std::vector<Series> Session::ReadSeries(std::span<const ChannelRef> channels,
       } else if (const auto bit = file.OverflowBit(id)) {
         overflow_checks.emplace_back(*bit / 64,
                                      std::uint64_t{1} << (*bit % 64));
+      } else if (file.overflow_capped) {
+        fallback_overflow = true;
       }
     }
     const auto cp_holds = [&](std::size_t cp_idx) {
       const std::uint64_t mask = checkpoints[cp_idx].sources;
       if ((mask & low_mask) != 0) return true;
-      if (overflow_checks.empty() || (mask & (std::uint64_t{1} << 63)) == 0 ||
-          file.overflow_words_per_cp == 0) {
-        return false;
-      }
+      if ((mask & (std::uint64_t{1} << 63)) == 0) return false;
+      if (fallback_overflow) return true;
+      if (overflow_checks.empty()) return false;
+      if (file.overflow_words_per_cp == 0) return true;
       const std::size_t base = cp_idx * file.overflow_words_per_cp;
+      if (base >= file.overflow_bits.size()) return true;
       for (const auto& [word_off, bit_mask] : overflow_checks) {
         const std::size_t idx = base + word_off;
-        if (idx < file.overflow_bits.size() &&
+        if (idx >= file.overflow_bits.size() ||
             (file.overflow_bits[idx] & bit_mask) != 0) {
           return true;
         }
@@ -1143,19 +1201,44 @@ std::vector<Series> Session::ReadSeries(std::span<const ChannelRef> channels,
 
 std::vector<Sample> Session::Snapshot(std::int64_t t_ns, ReadStats* stats,
                                       std::size_t max_channels) const {
+  if (max_channels == 0 || topics_.empty()) return {};
   struct Latest {
     std::int64_t publish_ns{std::numeric_limits<std::int64_t>::min()};
     std::vector<std::uint64_t> raw;
     std::vector<std::uint8_t> present;
   };
   std::vector<Latest> latest(topics_.size());
+  std::vector<std::uint8_t> topic_has_value(topics_.size(), 0);
+  std::size_t topic_cutoff = topics_.size();
+  std::size_t filled_channels = 0;
+
   std::vector<std::uint32_t> all(topics_.size());
   for (std::uint32_t t = 0; t < all.size(); ++t) all[t] = t;
   const std::int64_t target_second = FloorSecond(t_ns);
   std::vector<std::uint64_t> raw;
   std::vector<std::uint8_t> present;
 
-  for (const auto& [file_index, sources] : SourcesByFile(topics_, all)) {
+  // Order files by their smallest topic index so earlier topics in output
+  // order fill max_channels first, letting later files be skipped completely.
+  const FileSources by_file = SourcesByFile(topics_, all);
+  std::vector<std::pair<std::size_t, std::uint32_t>> file_order;
+  file_order.reserve(by_file.size());
+  for (const auto& [file_index, sources] : by_file) {
+    std::uint32_t min_topic = std::numeric_limits<std::uint32_t>::max();
+    for (const auto& [id, topic] : sources) {
+      min_topic = std::min(min_topic, topic);
+    }
+    file_order.emplace_back(file_index, min_topic);
+  }
+  std::sort(file_order.begin(), file_order.end(),
+            [](const auto& a, const auto& b) {
+              if (a.second != b.second) return a.second < b.second;
+              return a.first < b.first;
+            });
+
+  for (const auto& [file_index, min_topic] : file_order) {
+    if (min_topic >= topic_cutoff) continue;
+    const auto& sources = by_file.at(file_index);
     const LogFile& file = files_[file_index];
     const auto& checkpoints = file.checkpoints;
     const std::int64_t last_second = target_second + file.max_lead_s;
@@ -1181,11 +1264,49 @@ std::vector<Sample> Session::Snapshot(std::int64_t t_ns, ReadStats* stats,
     std::vector<Item> items;
     items.reserve(sources.size());
     for (const auto& [id, topic] : sources) {
+      if (topic >= topic_cutoff) continue;
       Item item{id, topic, file.OverflowBit(id), -1, -1, {}};
       item.candidate =
           previous(item, static_cast<std::ptrdiff_t>(checkpoints.size()) - 1);
-      items.push_back(std::move(item));
+      if (item.candidate >= 0) items.push_back(std::move(item));
     }
+    const auto mark_topic_found = [&](std::uint32_t t) {
+      if (t >= topic_cutoff || topic_has_value[t] != 0) return;
+      topic_has_value[t] = 1;
+      filled_channels += topics_[t].channels.size();
+      if (filled_channels < max_channels) return;
+      std::size_t sum = 0;
+      std::size_t new_cutoff = topic_cutoff;
+      for (std::size_t j = 0; j < topic_cutoff; ++j) {
+        if (topic_has_value[j] == 0) continue;
+        sum += topics_[j].channels.size();
+        if (sum >= max_channels) {
+          new_cutoff = j + 1;
+          break;
+        }
+      }
+      if (new_cutoff < topic_cutoff) {
+        for (std::size_t j = new_cutoff; j < topic_cutoff; ++j) {
+          if (topic_has_value[j] != 0) {
+            filled_channels -= topics_[j].channels.size();
+          }
+          latest[j].raw.clear();
+          latest[j].raw.shrink_to_fit();
+          latest[j].present.clear();
+          latest[j].present.shrink_to_fit();
+        }
+        topic_cutoff = new_cutoff;
+        for (Item& item : items) {
+          if (item.topic >= topic_cutoff) {
+            item.candidate = -1;
+            item.found.raw.clear();
+            item.found.raw.shrink_to_fit();
+            item.found.present.clear();
+            item.found.present.shrink_to_fit();
+          }
+        }
+      }
+    };
     // Seconds latest first, each read once, for every item whose candidate
     // it is; an item keeps checking earlier checkpoints until none can hold a
     // newer publication (accounting for publish/receipt skew).
@@ -1208,7 +1329,10 @@ std::vector<Sample> Session::Snapshot(std::int64_t t_ns, ReadStats* stats,
         Count(record, stats);
         const auto& header = record.header;
         for (Item& item : items) {
-          if (item.candidate != second || item.id != header.source_id) continue;
+          if (item.candidate != second || item.id != header.source_id ||
+              item.topic >= topic_cutoff) {
+            continue;
+          }
           const Topic& topic = topics_[item.topic];
           if (header.kind != static_cast<std::uint16_t>(topic.kind) ||
               !IsValueRecord(header) || header.publish_time_ns > t_ns ||
@@ -1222,6 +1346,7 @@ std::vector<Sample> Session::Snapshot(std::int64_t t_ns, ReadStats* stats,
           item.found.raw = raw;
           item.found.present = present;
           item.found_checkpoint = second;
+          mark_topic_found(item.topic);
         }
         return true;
       };
@@ -1229,6 +1354,10 @@ std::vector<Sample> Session::Snapshot(std::int64_t t_ns, ReadStats* stats,
                      tlog::VisitOptions{checkpoints[at].offset});
       for (Item& item : items) {
         if (item.candidate != second) continue;
+        if (item.topic >= topic_cutoff) {
+          item.candidate = -1;
+          continue;
+        }
         if (item.found.raw.empty()) {
           item.candidate = previous(item, second - 1);
         } else {
@@ -1244,14 +1373,15 @@ std::vector<Sample> Session::Snapshot(std::int64_t t_ns, ReadStats* stats,
       }
     }
     for (Item& item : items) {
-      if (!item.found.raw.empty() &&
+      if (item.topic < topic_cutoff && !item.found.raw.empty() &&
           item.found.publish_ns > latest[item.topic].publish_ns) {
         latest[item.topic] = std::move(item.found);
       }
     }
   }
   std::vector<Sample> samples;
-  for (std::uint32_t t = 0; t < latest.size(); ++t) {
+  samples.reserve(std::min(filled_channels, max_channels));
+  for (std::uint32_t t = 0; t < topic_cutoff; ++t) {
     const Latest& value = latest[t];
     for (std::uint32_t c = 0; c < value.raw.size(); ++c) {
       if (samples.size() >= max_channels) return samples;

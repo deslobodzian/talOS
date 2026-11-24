@@ -58,6 +58,7 @@ talOS/rtms/test.cc clock 4 concurrency: WriteThread/ReadThread spin-yield loops 
 talOS/simulation/sim_gateway_test.py clock 4 integration: the simulator as a child process; deadlines on its UDP datagrams only bound a hang (TESTING.md §6)
 talOS/telemetry/dashboard_layout.cc io 1 construction-only: ParseDashboardLayout reads the [studio] dashboard TOML file via std::ifstream during Telemetry construction, never in update()
 talOS/telemetry/node.h io 1 construction-only: ReportPages prints the channel/page budget to std::cerr once in Telemetry's constructor (and --describe-only), never in update()
+talOS/telemetry/node.h random 1 construction-only: RandomStreamId generates a per-process stream_id via std::random_device once in Telemetry's constructor, never in update()
 talOS/vision/pipeline_test.cc clock 2 integration: pipeline worker threads, condition wait with a deadline
 talOS/vision/pipeline_test.cc sleep 1 integration: pipeline worker threads, condition wait with a deadline
 talOS/vision/recording/recorder_test.cc clock 4 integration: recorder thread, condition wait with a deadline

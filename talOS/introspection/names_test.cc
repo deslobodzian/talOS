@@ -671,48 +671,67 @@ TEST(LintGraph, AnActuatorNodeThatReadsNoTargetLaneIsWarned) {
 }
 
 SourceShape Typed(SourceShape shape, std::string schema, std::uint64_t hash,
-                  std::uint32_t slots) {
+                  std::uint32_t slots, std::uint32_t alignment = 8) {
   shape.schema = std::move(schema);
   shape.schema_hash = hash;
-  shape.alignment = 8;
+  shape.alignment = alignment;
   shape.slots = slots;
   return shape;
 }
 
 // Both ends of a topic must agree on its type: by size when there is no schema
-// (a registry snapshot), else by schema name and hash (a field can change type
-// without changing size), and on the ring layout the segment is created with.
+// (a registry snapshot) or when both share a schema (e.g. talos.Bytes), else by
+// schema name and hash (a field can change type without changing size), and on
+// the ring layout (slots and alignment) the segment is created with.
 // A disagreement is exactly one error on the topic, naming both nodes.
 // REQ-CONTRACT-09
 TEST(LintGraph, BothEndsMustAgreeOnTypeAndRingLayout) {
   struct Case {
     std::uint32_t bytes;
-    const char* schema;  // nullptr: an untyped (registry) shape.
-    std::uint64_t hash;
+    const char* writer_schema;  // nullptr: an untyped (registry) shape.
+    const char* reader_schema;
+    std::uint64_t writer_hash;
+    std::uint64_t reader_hash;
+    std::uint32_t alignment;
     std::uint32_t slots;
     bool error;
   };
-  for (const auto& [bytes, schema, hash, slots, error] : std::vector<Case>{
-           {24, nullptr, 0, 0, false},
-           {32, nullptr, 0, 0, true},
-           {24, "shooter.State", 0x1, 1024, false},
-           {24, "shooter.OldState", 0x2, 1024, true},
-           {24, "shooter.State", 0x3, 1024, true},
-           {24, "shooter.State", 0x1, 64, true},
+  const std::uint64_t bytes_hash = schema::BytesHash();
+  for (const auto& [bytes, writer_schema, reader_schema, writer_hash,
+                    reader_hash, alignment, slots, error] : std::vector<Case>{
+           {24, nullptr, nullptr, 0, 0, 8, 0, false},
+           {32, nullptr, nullptr, 0, 0, 8, 0, true},
+           {24, "shooter.State", "shooter.State", 0x1, 0x1, 8, 1024, false},
+           {24, "shooter.State", "shooter.OldState", 0x1, 0x2, 8, 1024, true},
+           // Schema name-only mismatch with equal hash.
+           {24, "shooter.State", "shooter.OldState", 0x1, 0x1, 8, 1024, true},
+           // Schema hash-only mismatch with equal name.
+           {24, "shooter.State", "shooter.State", 0x1, 0x3, 8, 1024, true},
+           // Slot count mismatch with equal schema, size and alignment.
+           {24, "shooter.State", "shooter.State", 0x1, 0x1, 8, 64, true},
+           // Alignment-only mismatch with equal schema, size and slots.
+           {24, "shooter.State", "shooter.State", 0x1, 0x1, 4, 1024, true},
+           // Byte-topic ends with equal schema/hash must still agree on size.
+           {24, "talos.Bytes", "talos.Bytes", bytes_hash, bytes_hash, 8, 1024,
+            false},
+           {32, "talos.Bytes", "talos.Bytes", bytes_hash, bytes_hash, 8, 1024,
+            true},
        }) {
     SourceShape writer = Sender("/shooter/state", 24);
     SourceShape reader = Watcher("/shooter/state", bytes);
-    if (schema != nullptr) {
-      writer = Typed(writer, "shooter.State", 0x1, 1024);
-      reader = Typed(reader, schema, hash, slots);
+    if (writer_schema != nullptr) {
+      writer = Typed(writer, writer_schema, writer_hash, 1024, 8);
+      reader = Typed(reader, reader_schema, reader_hash, slots, alignment);
     }
     const std::vector<NodeShape> nodes = {
         {"shooter", "//robot/shooter:node", {writer}},
         {"odometry", "//robot/odometry:node", {reader}},
     };
     const auto diagnostics = LintGraph(nodes);
-    const auto label = std::to_string(bytes) + " " + (schema ? schema : "-") +
-                       " " + std::to_string(hash) + " " + std::to_string(slots);
+    const auto label = std::to_string(bytes) + " " +
+                       (reader_schema ? reader_schema : "-") + " " +
+                       std::to_string(reader_hash) + " " +
+                       std::to_string(alignment) + " " + std::to_string(slots);
     ASSERT_EQ(Errors(diagnostics), error ? 1 : 0)
         << label << Describe(diagnostics);
     if (!error) continue;
