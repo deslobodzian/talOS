@@ -11,11 +11,15 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -386,29 +390,134 @@ TEST_F(VelocityMechanismTest, NonFiniteDemandGoesNeutral) {
   ExpectNeutral();
 }
 
-// A request is refused outside update() (here every()), naming the
-// mechanism, and lasts only the update() it was made in.
+// Requests and update() are refused outside update() (the constructor, an
+// every() timer, a message callback, and off the loop thread while update()
+// is running), throwing std::logic_error naming the mechanism, and a request
+// lasts only the update() it was made in.
 // REQ-SAFE-37
 TEST(VelocityMechanismRequest, RequestIsTiedToItsUpdate) {
-  struct TimerNode {
-    explicit TimerNode(Node& node) : flywheel{node, "flywheel"} {
-      node.every(20ms, [this] { flywheel.set_goal(60.0); });
-    }
-    void update() { flywheel.update(); }
-    VelocityMechanism flywheel;
+  struct Case {
+    const char* name;
+    void (*call)(VelocityMechanism&);
   };
+  static constexpr std::array<Case, 3> kCases{{
+      {"set_goal", [](VelocityMechanism& m) { m.set_goal(60.0); }},
+      {"stop", [](VelocityMechanism& m) { m.stop(); }},
+      {"update", [](VelocityMechanism& m) { m.update(); }},
+  }};
+  constexpr std::string_view kExpectedName = "VelocityMechanism 'flywheel'";
+
+  // Constructor (before the event loop runs update()).
   {
+    struct CtorNode {
+      explicit CtorNode(Node& node) : flywheel{node, "flywheel"} {
+        for (std::size_t i = 0; i < kCases.size(); ++i) {
+          try {
+            kCases[i].call(flywheel);
+            errors[i] = "accepted";
+          } catch (const std::logic_error& e) {
+            errors[i] = e.what();
+          }
+        }
+      }
+      void update() { flywheel.update(); }
+      VelocityMechanism flywheel;
+      std::array<std::string, kCases.size()> errors{};
+    };
     auto sim = Sim::FromToml(kRobotToml);
-    sim.add<TimerNode>("shooter");
+    const auto& node = sim.add<CtorNode>("shooter");
+    for (std::size_t i = 0; i < kCases.size(); ++i) {
+      SCOPED_TRACE(std::string{"constructor: "} + kCases[i].name);
+      EXPECT_NE(node.errors[i].find(kExpectedName), std::string::npos)
+          << node.errors[i];
+    }
+  }
+
+  // every() timer callback.
+  for (const Case& c : kCases) {
+    SCOPED_TRACE(std::string{"every: "} + c.name);
+    struct TimerNode {
+      explicit TimerNode(Node& node) : flywheel{node, "flywheel"} {
+        node.every(20ms, [this] { call(flywheel); });
+      }
+      void update() { flywheel.update(); }
+      VelocityMechanism flywheel;
+      void (*call)(VelocityMechanism&) = nullptr;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    sim.add<TimerNode>("shooter").call = c.call;
     try {
       sim.step(50ms);
-      ADD_FAILURE() << "set_goal() from every() was accepted";
+      ADD_FAILURE() << c.name << " from every() was accepted";
     } catch (const std::logic_error& e) {
-      EXPECT_NE(std::string{e.what()}.find("VelocityMechanism 'flywheel'"),
-                std::string::npos)
+      EXPECT_NE(std::string{e.what()}.find(kExpectedName), std::string::npos)
           << e.what();
     }
   }
+
+  // Subscription callback.
+  for (const Case& c : kCases) {
+    SCOPED_TRACE(std::string{"callback: "} + c.name);
+    struct CallbackNode {
+      explicit CallbackNode(Node& node)
+          : flywheel{node, "flywheel"},
+            goal{node.subscribe<control::VelocityTarget>(
+                "/test/goal",
+                [this](const control::VelocityTarget&) { call(flywheel); })} {}
+      void update() { flywheel.update(); }
+      VelocityMechanism flywheel;
+      void (*call)(VelocityMechanism&) = nullptr;
+      Subscription<control::VelocityTarget> goal;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    sim.add<CallbackNode>("shooter").call = c.call;
+    sim.publish("/test/goal", control::VelocityTarget{60.0, 0.0});
+    try {
+      sim.step(10ms);
+      ADD_FAILURE() << c.name << " from a callback was accepted";
+    } catch (const std::logic_error& e) {
+      EXPECT_NE(std::string{e.what()}.find(kExpectedName), std::string::npos)
+          << e.what();
+    }
+  }
+
+  // Off the loop thread while update() is running (joined before update()
+  // returns so there is no concurrent access to node or mechanism state).
+  {
+    struct ThreadedNode {
+      explicit ThreadedNode(Node& node) : flywheel{node, "flywheel"} {}
+      void update() {
+        if (!ran) {
+          ran = true;
+          std::thread other{[this] {
+            for (std::size_t i = 0; i < kCases.size(); ++i) {
+              try {
+                kCases[i].call(flywheel);
+                errors[i] = "accepted";
+              } catch (const std::logic_error& e) {
+                errors[i] = e.what();
+              }
+            }
+          }};
+          other.join();
+        }
+        flywheel.update();
+      }
+      VelocityMechanism flywheel;
+      bool ran = false;
+      std::array<std::string, kCases.size()> errors{};
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    const auto& node = sim.add<ThreadedNode>("shooter");
+    sim.step(10ms);
+    ASSERT_TRUE(node.ran);
+    for (std::size_t i = 0; i < kCases.size(); ++i) {
+      SCOPED_TRACE(std::string{"off-thread: "} + kCases[i].name);
+      EXPECT_NE(node.errors[i].find(kExpectedName), std::string::npos)
+          << node.errors[i];
+    }
+  }
+
   struct SkippingNode {
     explicit SkippingNode(Node& node) : flywheel{node, "flywheel"} {}
     void update() {
