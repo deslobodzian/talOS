@@ -689,4 +689,21 @@ TEST(CpuAprilTagBackendTest,
   EXPECT_NEAR(dual->alternative_rotation.determinant(), 1.0, 1e-6);
 }
 
+TEST(CpuAprilTagBackendTest, RejectsNegativeStride) {
+  DetectorOptions options;
+  options.family_name = "tag36h11";
+  options.quad_decimate = 1.0f;
+  CpuAprilTagBackend backend(options);
+
+  const std::string path = GetTestdataPath("scene_single_tag0.png");
+  image_u8_t* im = LoadGrayImageU8(path);
+  ASSERT_NE(im, nullptr);
+  ASSERT_EQ(backend.Detect(im->buf, im->width, im->height, im->stride).size(),
+            1u);
+  EXPECT_TRUE(
+      backend.Detect(im->buf, im->width, im->height, -im->width).empty());
+  EXPECT_TRUE(backend.Detect(im->buf, im->width, im->height, -1).empty());
+  image_u8_destroy(im);
+}
+
 }  // namespace talos::vision::apriltag

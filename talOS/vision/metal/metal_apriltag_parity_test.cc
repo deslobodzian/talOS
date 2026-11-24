@@ -703,6 +703,44 @@ TEST_F(MetalAprilTagParityTest, ConcurrentExecuteAndSetOptionsAreThreadSafe) {
   metal_backend_->SetOptions(options_);
 }
 
+TEST_F(MetalAprilTagParityTest, SetOptionsIsAtomicOnInvalidOptions) {
+  const std::string path = ResolveTestdataPath("scene_single_tag0.png");
+  ASSERT_TRUE(std::filesystem::exists(path)) << "Fixture not found: " << path;
+  image_u8_t* im = talos::vision::apriltag::LoadGrayImageU8(path);
+  ASSERT_NE(im, nullptr);
+
+  talos::vision::apriltag::DetectorOptions good_opts = options_;
+  good_opts.quad_decimate = 1.0f;
+  good_opts.quad_sigma = 0.0f;
+  metal_backend_->SetOptions(good_opts);
+
+  // Invalid threads with quad_sigma != 0 must throw without mutating
+  // impl_->options or tearing down the working detector.
+  talos::vision::apriltag::DetectorOptions bad_threads = good_opts;
+  bad_threads.quad_sigma = 1.0f;
+  bad_threads.threads = 0;
+  EXPECT_THROW(metal_backend_->SetOptions(bad_threads), std::invalid_argument);
+
+  talos::vision::apriltag::DetectorOptions bad_family = good_opts;
+  bad_family.quad_decimate = 3.0f;
+  bad_family.family_name = "not_a_real_family";
+  EXPECT_THROW(metal_backend_->SetOptions(bad_family), std::invalid_argument);
+
+  talos::vision::Frame frame(
+      0, 0, 0, talos::event::steady_now(), static_cast<uint32_t>(im->width),
+      static_cast<uint32_t>(im->height), static_cast<uint32_t>(im->stride),
+      PixelFormat::kGray8, im->buf,
+      static_cast<size_t>(im->stride) * im->height);
+  const auto res = metal_backend_->Execute(frame);
+  EXPECT_TRUE(res.success);
+  ASSERT_EQ(res.detections.size(), 1u);
+  EXPECT_EQ(res.detections[0].id, 0);
+  if (metal_backend_->supports_gpu()) {
+    EXPECT_EQ(res.effective_backend, "metal");
+  }
+  image_u8_destroy(im);
+}
+
 #if defined(__APPLE__)
 void AssertThresholdParity(MetalAprilTagBackend& backend, image_u8_t* im,
                            uint32_t min_diff = 5,

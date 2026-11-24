@@ -252,11 +252,13 @@ class Source final : public CameraSource {
         mode.fps <= 0 || mode.fps > 1000000) {
       return false;
     }
-    if (!JoinExitedWorker()) {
+    std::lock_guard lifecycle(lifecycle_mutex_);
+    if (!JoinExitedWorkerLocked()) {
       return false;
     }
     std::lock_guard lock(state_mutex_);
-    if (running_.load(std::memory_order_acquire) || worker_.joinable()) {
+    if (running_.load(std::memory_order_acquire) || worker_.joinable() ||
+        !retired_workers_.empty()) {
       return false;
     }
     mode_ = mode;
@@ -267,11 +269,13 @@ class Source final : public CameraSource {
     return controls_;
   }
   bool SetControls(const CameraControls& controls) override {
-    if (!JoinExitedWorker()) {
+    std::lock_guard lifecycle(lifecycle_mutex_);
+    if (!JoinExitedWorkerLocked()) {
       return false;
     }
     std::lock_guard lock(state_mutex_);
-    if (running_.load(std::memory_order_acquire) || worker_.joinable()) {
+    if (running_.load(std::memory_order_acquire) || worker_.joinable() ||
+        !retired_workers_.empty()) {
       return false;
     }
     controls_ = controls;
@@ -294,10 +298,24 @@ class Source final : public CameraSource {
   uint64_t dropped_frames() const override { return dropped_frames_.load(); }
   bool controls_applied() const override { return controls_applied_; }
   bool Start() override {
+    std::unique_lock lifecycle(lifecycle_mutex_);
     if (running_.load(std::memory_order_acquire)) {
       return true;
     }
-    Stop();
+    if (StopLocked()) {
+      lifecycle.unlock();
+      ReportConnection(ConnectionState::kError,
+                       device_id() + ": cannot restart inside frame callback");
+      return false;
+    }
+    auto fail = [&](const char* step, int error) {
+      StopLocked();
+      std::string message = device_id() + ": " + step;
+      if (error != 0) message += std::string(": ") + std::strerror(error);
+      lifecycle.unlock();
+      ReportConnection(ConnectionState::kError, message);
+      return false;
+    };
     CameraMode mode;
     CameraControls controls;
     {
@@ -307,22 +325,22 @@ class Source final : public CameraSource {
     }
     if (!mode.width || !mode.height || !std::isfinite(mode.fps) ||
         mode.fps <= 0 || mode.fps > 1000000) {
-      return Fail("invalid capture mode", 0);
+      return fail("invalid capture mode", 0);
     }
     fd_ = sys_.open_fn(device_id().c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (fd_ < 0) {
-      return Fail("open", errno);
+      return fail("open", errno);
     }
     v4l2_capability caps{};
     if (Ioctl(sys_, fd_, VIDIOC_QUERYCAP, &caps) < 0) {
-      return Fail("VIDIOC_QUERYCAP", errno);
+      return fail("VIDIOC_QUERYCAP", errno);
     }
     const uint32_t capabilities = caps.capabilities & V4L2_CAP_DEVICE_CAPS
                                       ? caps.device_caps
                                       : caps.capabilities;
     if (!(capabilities & V4L2_CAP_VIDEO_CAPTURE) ||
         !(capabilities & V4L2_CAP_STREAMING)) {
-      return Fail("not a streaming video capture device", 0);
+      return fail("not a streaming video capture device", 0);
     }
     driver_.assign(reinterpret_cast<const char*>(caps.driver),
                    strnlen(reinterpret_cast<const char*>(caps.driver),
@@ -340,7 +358,7 @@ class Source final : public CameraSource {
         message += ' ' + DescribeV4L2Mode(offered_mode) + ',';
       }
       if (!offered.empty()) message.pop_back();
-      return Fail(message.c_str(), 0);
+      return fail(message.c_str(), 0);
     }
     v4l2_format format{};
     format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -349,17 +367,17 @@ class Source final : public CameraSource {
     format.fmt.pix.pixelformat = selected->pixel_format;
     format.fmt.pix.field = V4L2_FIELD_NONE;
     if (Ioctl(sys_, fd_, VIDIOC_S_FMT, &format) < 0) {
-      return Fail("VIDIOC_S_FMT", errno);
+      return fail("VIDIOC_S_FMT", errno);
     }
     v4l2_streamparm parm{};
     parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     parm.parm.capture.timeperframe = {selected->interval_numerator,
                                       selected->interval_denominator};
     if (Ioctl(sys_, fd_, VIDIOC_S_PARM, &parm) < 0) {
-      return Fail("VIDIOC_S_PARM", errno);
+      return fail("VIDIOC_S_PARM", errno);
     }
     if (!(parm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME)) {
-      return Fail("device cannot set its frame interval", 0);
+      return fail("device cannot set its frame interval", 0);
     }
     const V4L2Mode granted{format.fmt.pix.pixelformat, format.fmt.pix.width,
                            format.fmt.pix.height,
@@ -369,7 +387,7 @@ class Source final : public CameraSource {
       const std::string message = "driver granted " +
                                   DescribeV4L2Mode(granted) + " for " +
                                   DescribeV4L2Mode(*selected);
-      return Fail(message.c_str(), 0);
+      return fail(message.c_str(), 0);
     }
     mode.width = granted.width;
     mode.height = granted.height;
@@ -383,24 +401,24 @@ class Source final : public CameraSource {
     // A compressed frame's size varies; it is decoded into `decoded_`.
     stride_ = mjpeg_ ? mode.width : format.fmt.pix.bytesperline;
     if (!mode.height || stride_ < mode.width * BytesPerPixel(mode.format)) {
-      return Fail("driver reported an invalid stride", 0);
+      return fail("driver reported an invalid stride", 0);
     }
     const size_t size = mjpeg_ ? 1 : static_cast<size_t>(stride_) * mode.height;
     decoded_.assign(mjpeg_ ? static_cast<size_t>(stride_) * mode.height : 0, 0);
     DeviceControls device(fd_, sys_);
     if (const auto error = ApplyV4L2Controls(controls, device);
         !error.empty()) {
-      return Fail(("control " + error).c_str(), 0);
+      return fail(("control " + error).c_str(), 0);
     }
     v4l2_requestbuffers request{};
     request.count = 4;
     request.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     request.memory = V4L2_MEMORY_MMAP;
     if (Ioctl(sys_, fd_, VIDIOC_REQBUFS, &request) < 0) {
-      return Fail("VIDIOC_REQBUFS", errno);
+      return fail("VIDIOC_REQBUFS", errno);
     }
     if (request.count < 2) {
-      return Fail("driver granted fewer than 2 buffers", 0);
+      return fail("driver granted fewer than 2 buffers", 0);
     }
     mappings_.resize(request.count);
     for (uint32_t i = 0; i < request.count; ++i) {
@@ -409,10 +427,10 @@ class Source final : public CameraSource {
       buffer.memory = request.memory;
       buffer.index = i;
       if (Ioctl(sys_, fd_, VIDIOC_QUERYBUF, &buffer) < 0) {
-        return Fail("VIDIOC_QUERYBUF", errno);
+        return fail("VIDIOC_QUERYBUF", errno);
       }
       if (buffer.length < size) {
-        return Fail("driver buffer smaller than one frame", 0);
+        return fail("driver buffer smaller than one frame", 0);
       }
       mappings_[i].size = buffer.length;
       mappings_[i].data =
@@ -420,27 +438,36 @@ class Source final : public CameraSource {
                        MAP_SHARED, fd_, buffer.m.offset);
       if (mappings_[i].data == MAP_FAILED ||
           Ioctl(sys_, fd_, VIDIOC_QBUF, &buffer) < 0) {
-        return Fail("mmap/VIDIOC_QBUF", errno);
+        return fail("mmap/VIDIOC_QBUF", errno);
       }
     }
     auto type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (Ioctl(sys_, fd_, VIDIOC_STREAMON, &type) < 0) {
-      return Fail("VIDIOC_STREAMON", errno);
+      return fail("VIDIOC_STREAMON", errno);
     }
     streaming_ = true;
     session_ = event::steady_now().nanos();
     sequence_ = 0;
     {
       std::lock_guard lock(state_mutex_);
+      capture_active_.store(true, std::memory_order_release);
       running_.store(true, std::memory_order_release);
       worker_ =
           std::jthread([this](const std::stop_token& stop) { Capture(stop); });
     }
+    lifecycle.unlock();
     ReportConnection(ConnectionState::kConnected, "");
     return true;
   }
   void Stop() override {
+    std::lock_guard lifecycle(lifecycle_mutex_);
+    StopLocked();
+  }
+
+ private:
+  bool StopLocked() {
     std::vector<std::jthread> to_join;
+    bool on_self_capture = false;
     {
       std::lock_guard lock(state_mutex_);
       const auto self = std::this_thread::get_id();
@@ -453,13 +480,20 @@ class Source final : public CameraSource {
         }
       }
       ReapRetiredLocked(to_join);
+      for (const auto& t : retired_workers_) {
+        if (t.joinable() && t.get_id() == self) {
+          on_self_capture = capture_active_.load(std::memory_order_acquire);
+          break;
+        }
+      }
     }
     JoinThreads(to_join);
     running_.store(false, std::memory_order_release);
-    ReleaseDevice();
+    if (!on_self_capture) {
+      ReleaseDevice();
+    }
+    return on_self_capture;
   }
-
- private:
   void ReapRetiredLocked(std::vector<std::jthread>& to_join) {
     const auto self = std::this_thread::get_id();
     std::erase_if(retired_workers_, [&](std::jthread& t) {
@@ -476,7 +510,7 @@ class Source final : public CameraSource {
       }
     }
   }
-  bool JoinExitedWorker() {
+  bool JoinExitedWorkerLocked() {
     std::vector<std::jthread> to_join;
     {
       std::lock_guard lock(state_mutex_);
@@ -523,14 +557,6 @@ class Source final : public CameraSource {
     if (connection) {
       connection(state, message);
     }
-  }
-  // Reports why Start failed; `error` is the errno of the failed call, or 0.
-  bool Fail(const char* step, int error) {
-    Stop();
-    std::string message = device_id() + ": " + step;
-    if (error != 0) message += std::string(": ") + std::strerror(error);
-    ReportConnection(ConnectionState::kError, message);
-    return false;
   }
   void Capture(const std::stop_token& stop) {
     talos::process::ConfigureBackgroundThread();
@@ -617,6 +643,7 @@ class Source final : public CameraSource {
     }
     running_.store(false, std::memory_order_release);
     ReleaseDevice();
+    capture_active_.store(false, std::memory_order_release);
     if (!stop.stop_requested()) {
       ReportConnection(ConnectionState::kDisconnected,
                        device_id() + ": " + reason);
@@ -628,6 +655,7 @@ class Source final : public CameraSource {
   };
   CameraSourceConfig config_;
   V4L2Syscalls sys_;
+  mutable std::mutex lifecycle_mutex_;
   mutable std::mutex state_mutex_;
   CameraMode mode_;
   CameraControls controls_;
@@ -638,6 +666,7 @@ class Source final : public CameraSource {
   int fd_{-1};
   bool streaming_{false};
   bool controls_applied_{true};
+  std::atomic<bool> capture_active_{false};
   std::atomic<bool> running_{false};
   std::atomic<uint64_t> dropped_frames_{0};
   std::jthread worker_;
