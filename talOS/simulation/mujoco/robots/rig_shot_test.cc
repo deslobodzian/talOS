@@ -83,7 +83,7 @@ config::RobotConfig RigConfig(const std::string& field) {
          "supply_limit_a = 40.0\nstator_limit_a = 80.0\n"
          "slot0 = { v = 0.12 }\n\n"
          "[simulation.mujoco]\nrobot_model = \"robot.xml\"\nfield = \""
-      << field << "\"\nseed = 1\n";
+      << field << "\"\nseed = 1\nsleeping = true\n";
   return config::ParseRobotConfig((dir / "robot.toml").string());
 }
 

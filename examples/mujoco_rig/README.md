@@ -120,7 +120,7 @@ schedule clock is 3 s past the eighth launch or 30 s past its start.
 `//talOS/simulation/mujoco/robots:rig_shot_test` is the same scene without
 processes, at least 7 of 8 and the same `/sim/state/match` every run, on
 talOS's copy of the model (talOS does not depend on an example) and its
-own config, with sleeping off;
+own config, with sleeping on as `robot_sim.toml` has it;
 `model_twin_test` holds the two models to the same bytes. `sim_test`
 (`talos_sim_test`) starts, runs and stops the rig cleanly. The nodes keep the
 node test matrix `new_subsystem` gave them.
