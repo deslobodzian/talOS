@@ -423,13 +423,22 @@ TEST(ConfigFuzzTest, MalformedAndSymlinkPathsThrowInvalidArgument) {
         << content;
   }
 
-  // Embedded NUL byte in path must be rejected as std::invalid_argument.
+  // Embedded NUL byte and path traversal in paths must be rejected as
+  // std::invalid_argument.
   EXPECT_THROW(talos::config::ParseRobotConfigString(
                    std::string("[studio]\ndashboard = \"a\\u0000b\"\n"
                                "[subsystems.drive.motors.m]\ncan_id = 1\n")),
                std::invalid_argument);
   EXPECT_THROW(talos::config::ParseRobotConfigString(std::string(
                    "[subsystems.drive.trajectories]\nt = \"a\\u0000b\"\n"
+                   "[subsystems.drive.motors.m]\ncan_id = 1\n")),
+               std::invalid_argument);
+  EXPECT_THROW(talos::config::ParseRobotConfigString(std::string(
+                   "[simulation.mujoco]\nrobot_model = \"../outside.xml\"\n"
+                   "[subsystems.drive.motors.m]\ncan_id = 1\n")),
+               std::invalid_argument);
+  EXPECT_THROW(talos::config::ParseRobotConfigString(std::string(
+                   "[simulation.mujoco]\nrobot_model = \"a\\u0000b.xml\"\n"
                    "[subsystems.drive.motors.m]\ncan_id = 1\n")),
                std::invalid_argument);
 
