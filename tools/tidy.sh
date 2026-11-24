@@ -56,7 +56,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-tmp="$(mktemp -d)"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/talos-tidy.XXXXXX")"
 staging=""
 cleanup() {
   rm -rf "$tmp"
