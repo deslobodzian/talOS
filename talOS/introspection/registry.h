@@ -708,6 +708,11 @@ class NodeRegistration {
   void begin_sample() {
     if (!owns_slot()) return;
     record_->sample_seq.fetch_add(1, std::memory_order_relaxed);
+    // Release fence: pairs with copy_stable()'s post-copy acquire fence so
+    // counter stores below cannot become visible ahead of turning sample_seq
+    // odd (which would let a reader accept torn counters with an unchanged
+    // even sequence on weakly ordered architectures such as ARM64).
+    std::atomic_thread_fence(std::memory_order_release);
   }
 
   void end_sample() {
