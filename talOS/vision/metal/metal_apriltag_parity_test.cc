@@ -826,7 +826,8 @@ TEST_F(MetalAprilTagParityTest,
     std::vector<uint8_t> storage(kBytes + 32768u, 0);
     const uintptr_t base = reinterpret_cast<uintptr_t>(storage.data());
     const uintptr_t aligned_16k = (base + 16383u) & ~uintptr_t{16383u};
-    uint8_t* ptr_4k = reinterpret_cast<uint8_t*>(aligned_16k + 4096u);
+    uint8_t* ptr_16k = storage.data() + static_cast<size_t>(aligned_16k - base);
+    uint8_t* ptr_4k = ptr_16k + 4096u;
     ASSERT_EQ(reinterpret_cast<uintptr_t>(ptr_4k) % 4096u, 0u);
     ASSERT_NE(reinterpret_cast<uintptr_t>(ptr_4k) % 16384u, 0u);
 
@@ -841,7 +842,6 @@ TEST_F(MetalAprilTagParityTest,
     AssertAcceptanceContract(cpu_dets, metal_dets, "Aligned4096Not16384");
 
     // Also verify page-aligned + page-multiple buffer parity (zero-copy path).
-    uint8_t* ptr_16k = reinterpret_cast<uint8_t*>(aligned_16k);
     ASSERT_EQ(reinterpret_cast<uintptr_t>(ptr_16k) % 16384u, 0u);
     std::memmove(ptr_16k, ptr_4k, kBytes);
     const auto metal_16k_dets =
@@ -863,7 +863,7 @@ TEST_F(MetalAprilTagParityTest,
     std::vector<uint8_t> storage(kBytes + 16384u, 0);
     const uintptr_t base = reinterpret_cast<uintptr_t>(storage.data());
     const uintptr_t aligned_16k = (base + 16383u) & ~uintptr_t{16383u};
-    uint8_t* ptr_16k = reinterpret_cast<uint8_t*>(aligned_16k);
+    uint8_t* ptr_16k = storage.data() + static_cast<size_t>(aligned_16k - base);
     ASSERT_EQ(reinterpret_cast<uintptr_t>(ptr_16k) % 16384u, 0u);
 
     stamp_centered_tag(ptr_16k, kWidth, kHeight, kWidth);
