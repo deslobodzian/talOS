@@ -251,21 +251,41 @@ export function dispatch(
   // a number, or a decimal string beyond 2^53. The frame's `exact` and
   // `kinds` maps are how the decoder carries that, not topics.
   if (method === 'get_schema_tree') {
-    const topics: Record<string, string> = {};
+    const topics: Record<string, string> = Object.create(null);
+    const visited = new Map<string, Set<object>>();
+    const seenChannels = new Set<string>();
     function walk(value: unknown, prefix: string) {
       if (value !== null && typeof value === 'object') {
+        let seen = visited.get(prefix);
+        if (seen?.has(value)) return;
+        if (!seen) {
+          seen = new Set<object>();
+          visited.set(prefix, seen);
+        }
+        seen.add(value);
         for (const [key, child] of Object.entries(value))
           walk(child, prefix ? `${prefix}.${key}` : key);
       } else
         topics[prefix] = typeof value;
     }
     for (const frame of timeline.frames) {
-      const {exact: _exact, kinds, ...rest} = frame;
-      walk(rest, '');
-      for (const name of Object.keys(frame.channels))
+      for (const [key, value] of Object.entries(frame)) {
+        if (key === 'exact' || key === 'kinds' || key === 'channels') continue;
+        walk(value, key);
+      }
+      const {channels, kinds} = frame;
+      for (const name in channels) {
+        if (!Object.hasOwn(channels, name) || seenChannels.has(name)) continue;
+        seenChannels.add(name);
+        const value: unknown = channels[name];
+        if (value !== null && typeof value === 'object')
+          walk(value, `channels.${name}`);
+        else
+          topics[`channels.${name}`] = typeof value;
         topics[name] = kinds && Object.hasOwn(kinds, name) ?
             KIND_NAMES[kinds[name]] ?? 'unknown' :
             'double';
+      }
     }
     return {
       topics,
