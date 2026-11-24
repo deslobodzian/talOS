@@ -56,18 +56,33 @@ cc_library(
     visibility = ["//talOS:__subpackages__"],
 )
 
-# Simulation ground truth (reserved owner `sim`): the simulated robot's true
-# field pose and field-frame velocity as geometry.OdometrySample, written only
-# by a physics-backed simulator (sim_gateway --physics), never on a robot.
+# Simulation ground truth (reserved owner `sim`), written only by a simulator,
+# never on a robot: the simulated robot's true field pose and field-frame
+# velocity as geometry.OdometrySample on /sim/state (a physics-backed
+# simulator), and the match a field's game rules referee as sim.MatchState
+# (sim.fbs) on /sim/state/match.
 talos_messages(
     name = "sim_messages",
-    srcs = [],
+    srcs = ["sim.fbs"],
     include_prefix = "sim",
     topics = {
+        "match_state": "/sim/state/match",
         "state": "/sim/state",
     },
     visibility = ["//visibility:public"],
     deps = ["//talOS/msgs:geometry"],
+)
+
+# Compile-time checks of sim.fbs's shared-memory layout: building it is the
+# check (sim_layout_asserts.cc).
+cc_library(
+    name = "sim_layout_asserts",
+    testonly = True,
+    srcs = ["sim_layout_asserts.cc"],
+    deps = [
+        ":sim_messages",
+        "//talOS/node",
+    ],
 )
 
 cc_library(

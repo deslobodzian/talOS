@@ -105,6 +105,7 @@ cc_test(
         ":channels",
         "//talOS/driver_station",
         "//talOS/hardware",
+        "//talOS/hardware:sim_messages",
         "//talOS/schema:field_path",
         "//talOS/schema:identity",
         "//talOS/schema:test_messages",

@@ -17,6 +17,9 @@
 #include "flatbuffers/flatbuffers.h"
 #include "flatbuffers/reflection_generated.h"
 #include "schema_test/shapes_generated.h"
+#include "sim/sim_descriptor.h"
+#include "sim/sim_generated.h"
+#include "sim/topics.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/schema/field_path.h"
@@ -69,6 +72,87 @@ TEST(TelemetryChannels, AValueEndingPastTheMessageIsNotRead) {
   std::array<std::uint64_t, kDriverStationChannelCount> values{};
   ASSERT_TRUE(ReadDriverStation(packet_bytes.first(packet_end), values));
   EXPECT_FALSE(ReadDriverStation(packet_bytes.first(packet_end - 1), values));
+}
+
+// REQ-DEV-40: /sim/state/match reports the match to Studio through telemetry
+// alone (no Studio code), so its message must flatten into channels with
+// their units and the period's labels, each read at the offset the simulator
+// writes. The offsets are the slot layout other readers and recorded logs
+// rely on (docs/DATA_FLOW.md): a reordered or repadded field fails here, a
+// size change fails sim_layout_asserts.cc, and a field without a unit suffix
+// fails the build.
+TEST(TelemetryChannels, MatchStateFlattensWithUnitsLabelsAndPinnedOffsets) {
+  const schema::Identity identity = schema::Of<sim::MatchState>();
+  const std::vector<Channel> channels =
+      FlattenTopic(sim::topics::kMatchState, identity.name, identity.bfbs);
+
+  using reflection::BaseType;
+  const std::vector<std::string> period_labels = {"None", "Autonomous",
+                                                  "Teleop", "Ended"};
+  const struct {
+    const char* name;
+    const char* unit;
+    std::size_t offset;
+    BaseType base;
+    std::uint64_t value;
+  } expected[] = {
+      {"sim/state/match/sample_time_ns", "ns", 0, BaseType::ULong, 101},
+      {"sim/state/match/schedule_time_us", "us", 8, BaseType::ULong, 102},
+      {"sim/state/match/period_remaining_us", "us", 16, BaseType::ULong, 103},
+      {"sim/state/match/blue_points_count", "", 24, BaseType::UInt, 4},
+      {"sim/state/match/red_points_count", "", 28, BaseType::UInt, 5},
+      {"sim/state/match/blue_auto_points_count", "", 32, BaseType::UInt, 6},
+      {"sim/state/match/red_auto_points_count", "", 36, BaseType::UInt, 7},
+      {"sim/state/match/blue_scored_count", "", 40, BaseType::UInt, 8},
+      {"sim/state/match/red_scored_count", "", 44, BaseType::UInt, 9},
+      {"sim/state/match/shots_count", "", 48, BaseType::UInt, 10},
+      {"sim/state/match/pieces_in_play_count", "", 52, BaseType::UShort, 11},
+      {"sim/state/match/pieces_held_count", "", 54, BaseType::UShort, 12},
+      {"sim/state/match/period", "", 56, BaseType::UByte, 2},
+      {"sim/state/match/stage_index", "", 57, BaseType::UByte, 3},
+      {"sim/state/match/blue_scoring_active", "", 58, BaseType::Bool, 1},
+      {"sim/state/match/red_scoring_active", "", 59, BaseType::Bool, 0},
+      {"sim/state/match/blue_inactive_first", "", 60, BaseType::Bool, 1},
+      {"sim/state/match/tie_drawn", "", 61, BaseType::Bool, 1},
+  };
+  ASSERT_EQ(channels.size(), std::size(expected));
+
+  const sim::MatchState message{101,
+                                102,
+                                103,
+                                4,
+                                5,
+                                6,
+                                7,
+                                8,
+                                9,
+                                10,
+                                11,
+                                12,
+                                sim::MatchPeriod::Teleop,
+                                3,
+                                true,
+                                false,
+                                true,
+                                true};
+  const std::span<const std::byte> bytes =
+      std::as_bytes(std::span{&message, 1});
+  for (std::size_t i = 0; i < channels.size(); ++i) {
+    const Channel& channel = channels[i];
+    SCOPED_TRACE(expected[i].name);
+    EXPECT_EQ(channel.name, expected[i].name);
+    EXPECT_EQ(channel.unit, expected[i].unit);
+    EXPECT_EQ(channel.offset, expected[i].offset);
+    EXPECT_EQ(channel.base, expected[i].base);
+    EXPECT_EQ(channel.kind, KindOf(expected[i].base));
+    EXPECT_EQ(channel.alert, Talos::Telemetry::AlertLevel_None);
+    EXPECT_EQ(channel.labels, channel.name == "sim/state/match/period"
+                                  ? period_labels
+                                  : std::vector<std::string>{});
+    std::uint64_t raw = 0;
+    ASSERT_TRUE(ReadChannel(channel, bytes, raw));
+    EXPECT_EQ(raw, expected[i].value);
+  }
 }
 
 // REQ-OPS-41: studio_review reads a recorded target lane through these
