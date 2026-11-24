@@ -26,6 +26,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1967,6 +1968,300 @@ TEST_F(Registry, ReporterThreadRunsAsBackground) {
   ASSERT_TRUE(observed.load(std::memory_order_acquire)) << reporter.error();
   EXPECT_TRUE(extra_background.load(std::memory_order_relaxed));
   EXPECT_TRUE(selection_background.load(std::memory_order_relaxed));
+}
+
+// REQ-RT-18, REQ-OPS-17: begin_sample() fences counter stores behind turning
+// sample_seq odd so non-fallback snapshots from RegistryReader::nodes()
+// observe consistent correlated counters.
+TEST_F(Registry,
+       SeqlockKeepsCorrelatedCountersConsistentAcrossConcurrentSamples) {
+  NodeRegistration registration{{.name = "sampled"}, path_};
+  registration.publish(sample_manifest());
+  RegistryMapping mapping{path_, /*read_only=*/true};
+  const NodeRecord& record = mapping.header()->nodes[registration.slot()];
+  RegistryReader reader{path_};
+
+  constexpr std::uint64_t kRounds = 1000;
+  std::atomic<std::uint64_t> start_round{0};
+  std::atomic<std::uint64_t> finished_round{0};
+  std::jthread writer{[&](const std::stop_token& stop) {
+    for (std::uint64_t k = 1; k <= kRounds; ++k) {
+      while (start_round.load(std::memory_order_acquire) < k) {
+        if (stop.stop_requested()) return;
+        std::this_thread::yield();
+      }
+      registration.begin_sample();
+      registration.set_source(0, /*events=*/k, /*dropped=*/0, /*sequence=*/k,
+                              /*last_monotonic_ns=*/0, /*last_latency_ns=*/0,
+                              /*max_latency_ns=*/0);
+      registration.set_wake_loss(/*wake_failures=*/k, /*stalled_arms=*/k,
+                                 /*wake_fallbacks=*/k);
+      registration.end_sample();
+      finished_round.store(k, std::memory_order_release);
+    }
+  }};
+
+  for (std::uint64_t k = 1; k <= kRounds; ++k) {
+    start_round.store(k, std::memory_order_release);
+    const std::uint32_t seq_before =
+        record.sample_seq.load(std::memory_order_acquire);
+    const auto nodes = reader.nodes();
+    const std::uint32_t seq_after =
+        record.sample_seq.load(std::memory_order_acquire);
+
+    ASSERT_EQ(nodes.size(), 1u);
+    const NodeSnapshot& node = nodes.front();
+    ASSERT_EQ(node.sources.size(), 3u);
+    EXPECT_GE(node.sources[0].events, k - 1);
+    EXPECT_LE(node.sources[0].events, k);
+    EXPECT_GE(node.sources[0].sequence, k - 1);
+    EXPECT_LE(node.sources[0].sequence, k);
+    EXPECT_GE(node.wake_failures, k - 1);
+    EXPECT_LE(node.wake_failures, k);
+    EXPECT_GE(node.stalled_arms, k - 1);
+    EXPECT_LE(node.stalled_arms, k);
+    EXPECT_GE(node.wake_fallbacks, k - 1);
+    EXPECT_LE(node.wake_fallbacks, k);
+
+    if ((seq_before & 1u) == 0u && seq_after == seq_before) {
+      const std::uint64_t expected = seq_before / 2u;
+      EXPECT_EQ(node.sources[0].events, expected);
+      EXPECT_EQ(node.sources[0].sequence, expected);
+      EXPECT_EQ(node.wake_failures, expected);
+      EXPECT_EQ(node.stalled_arms, expected);
+      EXPECT_EQ(node.wake_fallbacks, expected);
+    }
+
+    while (finished_round.load(std::memory_order_acquire) < k) {
+      std::this_thread::yield();
+    }
+  }
+  writer.join();
+
+  const auto final_nodes = reader.nodes();
+  ASSERT_EQ(final_nodes.size(), 1u);
+  ASSERT_EQ(final_nodes.front().sources.size(), 3u);
+  EXPECT_EQ(final_nodes.front().sources[0].events, kRounds);
+  EXPECT_EQ(final_nodes.front().sources[0].sequence, kRounds);
+  EXPECT_EQ(final_nodes.front().wake_failures, kRounds);
+  EXPECT_EQ(final_nodes.front().stalled_arms, kRounds);
+  EXPECT_EQ(final_nodes.front().wake_fallbacks, kRounds);
+}
+
+// REQ-RT-18, REQ-OPS-17: RegistryReader::copy() loads flags with acquire
+// ordering so any snapshot observing kFlagConstructing cleared after
+// activate() also observes the full sources and selections published before
+// it.
+TEST_F(Registry, ActivatedRowAlwaysExposesPublishedSourcesAndSelections) {
+  const event::Manifest manifest = sample_manifest();
+  const std::vector<Policy> policies{{{"teleop", "auto"}}};
+  const std::vector<std::string> expected_selection{"teleop", "auto"};
+  constexpr int kBatches = 32;
+  constexpr std::size_t kClaimsPerBatch = 8;
+
+  std::uint64_t total_active_reads = 0;
+  std::atomic<std::uint64_t> bad_sources{0};
+  std::atomic<std::uint64_t> bad_selections{0};
+
+  for (int batch = 0; batch < kBatches; ++batch) {
+    RegistryMapping::unlink(path_);
+    PrepareRegistry(path_);
+    RegistryReader reader{path_};
+    std::atomic<std::uint64_t> active_in_batch{0};
+    std::atomic<bool> batch_done{false};
+
+    std::jthread poller{[&](const std::stop_token& stop) {
+      while (!batch_done.load(std::memory_order_acquire) &&
+             !stop.stop_requested()) {
+        const auto nodes = reader.nodes();
+        for (const NodeSnapshot& node : nodes) {
+          if (node.name != "activating") continue;
+          if ((node.flags & kFlagConstructing) != 0u) continue;
+          active_in_batch.fetch_add(1, std::memory_order_release);
+          if (node.sources.size() != 3u || node.declared_source_count != 3u ||
+              node.sources[0].name != "tick" ||
+              node.sources[1].name != "/drivetrain/state" ||
+              node.sources[2].name != "/odometry/state") {
+            bad_sources.fetch_add(1, std::memory_order_relaxed);
+          }
+          if (node.selections.size() != 1u ||
+              node.declared_selection_count != 1u ||
+              node.selections[0].sources != expected_selection) {
+            bad_selections.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+      }
+    }};
+
+    // Keep registrations alive until the poller joins so no slot is recycled
+    // while the poller is reading.
+    std::vector<std::unique_ptr<NodeRegistration>> registrations;
+    registrations.reserve(kClaimsPerBatch);
+    for (std::size_t i = 0; i < kClaimsPerBatch; ++i) {
+      registrations.push_back(std::make_unique<NodeRegistration>(
+          NodeRegistration::Identity{.name = "activating",
+                                     .flags = kFlagConstructing},
+          path_));
+      registrations.back()->publish(manifest);
+      registrations.back()->publish_selections(policies);
+      registrations.back()->activate();
+    }
+    while (active_in_batch.load(std::memory_order_acquire) == 0u) {
+      std::this_thread::yield();
+    }
+
+    batch_done.store(true, std::memory_order_release);
+    poller.join();
+    total_active_reads += active_in_batch.load(std::memory_order_relaxed);
+  }
+
+  EXPECT_GE(total_active_reads, static_cast<std::uint64_t>(kBatches));
+  EXPECT_EQ(bad_sources.load(std::memory_order_relaxed), 0u);
+  EXPECT_EQ(bad_selections.load(std::memory_order_relaxed), 0u);
+}
+
+// REQ-OPS-17, REQ-RT-18: sweep_stale() evaluates liveness under RegistryLock
+// while keeping state ACTIVE (never flickering ACTIVE -> CLAIMING -> ACTIVE
+// or hiding a live row from concurrent readers) and stores FREE directly when
+// a slot's owner is confirmed gone.
+TEST_F(Registry, SweepStaleKeepsLiveRowsVisibleAndNeverEntersClaiming) {
+  // Part 1: A live row heartbeating near the kLivenessTimeout boundary stays
+  // ACTIVE and visible to a concurrent RegistryReader across repeated sweeps.
+  {
+    NodeRegistration live{{.name = "live"}, path_};
+    live.publish(sample_manifest());
+    const std::size_t live_slot = live.slot();
+    RegistryMapping mapping{path_};
+    NodeRecord& live_record = mapping.header()->nodes[live_slot];
+    RegistryReader reader{path_};
+
+    std::atomic<bool> done{false};
+    std::atomic<std::uint64_t> reader_passes{0};
+    std::atomic<std::uint64_t> saw_claiming{0};
+    std::atomic<std::uint64_t> non_active_states{0};
+    std::atomic<std::uint64_t> missing_live_reads{0};
+
+    std::jthread observer{[&](const std::stop_token& stop) {
+      while (!done.load(std::memory_order_acquire) && !stop.stop_requested()) {
+        const std::uint64_t state =
+            live_record.state.load(std::memory_order_acquire);
+        if (state == static_cast<std::uint64_t>(SlotState::CLAIMING)) {
+          saw_claiming.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (state != static_cast<std::uint64_t>(SlotState::ACTIVE)) {
+          non_active_states.fetch_add(1, std::memory_order_relaxed);
+        }
+        const auto nodes = reader.nodes();
+        const bool found = std::any_of(
+            nodes.begin(), nodes.end(),
+            [](const NodeSnapshot& n) { return n.name == "live" && n.alive; });
+        if (!found) {
+          missing_live_reads.fetch_add(1, std::memory_order_relaxed);
+        }
+        reader_passes.fetch_add(1, std::memory_order_release);
+      }
+    }};
+
+    while (reader_passes.load(std::memory_order_acquire) == 0u) {
+      std::this_thread::yield();
+    }
+
+    const std::int64_t half_timeout_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
+            .count() /
+        2;
+    // Keep sweepers alive until the observer joins so no slot is recycled
+    // under the concurrent reader.
+    std::vector<std::unique_ptr<NodeRegistration>> sweepers;
+    constexpr std::size_t kSweeps = 16;
+    sweepers.reserve(kSweeps);
+    for (std::size_t i = 0; i < kSweeps; ++i) {
+      if ((i & 1u) == 0u) {
+        live_record.heartbeat_monotonic_ns.store(
+            monotonic_now_ns() - half_timeout_ns, std::memory_order_relaxed);
+      } else {
+        live.heartbeat();
+      }
+      sweepers.push_back(std::make_unique<NodeRegistration>(
+          NodeRegistration::Identity{.name = "sweeper_" + std::to_string(i)},
+          path_));
+    }
+
+    done.store(true, std::memory_order_release);
+    observer.join();
+
+    EXPECT_GT(reader_passes.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(saw_claiming.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(non_active_states.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(missing_live_reads.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(live_record.state.load(std::memory_order_acquire),
+              static_cast<std::uint64_t>(SlotState::ACTIVE));
+  }
+
+  // Part 2: Sweeping a confirmed-dead row transitions ACTIVE -> FREE directly
+  // without passing through CLAIMING.
+  RegistryMapping::unlink(path_);
+  auto holder = std::make_unique<NodeRegistration>(
+      NodeRegistration::Identity{.name = "holder"}, path_);
+  ASSERT_EQ(holder->slot(), 0u);
+
+  Pipe ready;
+  Children children;
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    try {
+      // ::_exit skips destructors, leaving the slot ACTIVE with a fresh
+      // heartbeat and a dead pid.
+      NodeRegistration doomed{{.name = "doomed"}, path_};
+      const char token = doomed.slot() == 1u ? 1 : 2;
+      if (!write_all(ready.writer(), &token, 1)) ::_exit(2);
+      ::_exit(0);
+    } catch (...) {
+      ::_exit(1);
+    }
+  }
+  children.add(pid);
+  char token = 0;
+  ASSERT_TRUE(read_all(ready.reader(), &token, 1));
+  ASSERT_EQ(token, 1);
+  const int status = children.reap(pid);
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(WEXITSTATUS(status), 0);
+
+  // Free slot 0 with an old heartbeat so the sweeper claims slot 0 and never
+  // reclaims slot 1 after sweep_stale() frees slot 1.
+  holder.reset();
+  RegistryMapping mapping{path_};
+  mapping.header()->nodes[0].heartbeat_monotonic_ns.store(
+      0, std::memory_order_relaxed);
+  const NodeRecord& doomed_record = mapping.header()->nodes[1];
+  ASSERT_EQ(doomed_record.state.load(std::memory_order_acquire),
+            static_cast<std::uint64_t>(SlotState::ACTIVE));
+
+  std::atomic<bool> observer_ready{false};
+  std::atomic<bool> swept{false};
+  std::atomic<std::uint64_t> saw_claiming{0};
+  std::jthread state_observer{[&](const std::stop_token& stop) {
+    observer_ready.store(true, std::memory_order_release);
+    observer_ready.notify_all();
+    while (!swept.load(std::memory_order_acquire) && !stop.stop_requested()) {
+      if (doomed_record.state.load(std::memory_order_acquire) ==
+          static_cast<std::uint64_t>(SlotState::CLAIMING)) {
+        saw_claiming.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }};
+
+  observer_ready.wait(false);
+  NodeRegistration sweeper{{.name = "sweeper"}, path_};
+  swept.store(true, std::memory_order_release);
+  state_observer.join();
+
+  EXPECT_EQ(sweeper.slot(), 0u);
+  EXPECT_EQ(doomed_record.state.load(std::memory_order_acquire),
+            static_cast<std::uint64_t>(SlotState::FREE));
+  EXPECT_EQ(saw_claiming.load(std::memory_order_relaxed), 0u);
 }
 
 }  // namespace
