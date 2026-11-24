@@ -34,6 +34,16 @@ build --incompatible_strict_action_env
 # Linux processwrapper-sandbox; prevent races writing __pycache__/*.pyc files.
 build --test_env=PYTHONDONTWRITEBYTECODE=1
 
+# MuJoCo's engine is C, as are the collision and file libraries it links (ccd,
+# qhull, miniz), and the -O3 below is C++ only (--cxxopt): without this they
+# compile with no -O at all, about three times slower per step. -O2 is what
+# `-c opt` gives them. Matched by source path under the external repository,
+# so no talOS source is touched. It applies under `-c dbg` and the sanitizer
+# configs too (it comes after their -O flags), so MuJoCo's C is never built
+# unoptimised. It relies on the canonical repository names mujoco+, ccd+,
+# qhull+ and miniz+ (Bazel 8's module naming).
+build --per_file_copt=external/(mujoco|ccd|qhull|miniz)[+]/.*[.]c$@-O2
+
 build:linux --cxxopt=-std=c++23 --cxxopt=-O3
 # Build tools (the config resolver run inside bundle/manifest actions) compile
 # in the exec configuration, which ignores --cxxopt.
