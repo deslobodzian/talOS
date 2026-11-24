@@ -19,6 +19,7 @@ against a hang only; none of them decides a pass.
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -73,13 +74,15 @@ def start_schedule(path):
     os.rename(pending, path)
 
 
-def dump(log_dump, session, topic, node):
+def dump(log_dump, inputs, topic, node):
     """The topic's records in `node`'s event log, decoded (log_dump). While
     the session runs, the log's last record may be partly written: log_dump
     stops before it."""
+    if isinstance(inputs, (str, os.PathLike)):
+        inputs = [str(inputs)]
     proc = subprocess.run(
         [log_dump, "--format", "jsonl", "--node", node, "--topic", topic,
-         session],
+         "--", *inputs],
         capture_output=True, text=True, timeout=LOG_DUMP_TIMEOUT_S,
         check=False)
     if proc.returncode != 0:
@@ -91,14 +94,28 @@ def dump(log_dump, session, topic, node):
 def fields(record):
     """log_dump's decoded struct, `{a: 1, b: true}`, as a dict of strings."""
     out = {}
-    for item in record["decoded"].strip("{}").split(", "):
+    body = record["decoded"].strip("{}").strip()
+    if not body:
+        return out
+    for item in body.split(", "):
         key, value = item.split(": ", 1)
         out[key] = value
     return out
 
 
-def matches(log_dump, session):
-    return [fields(r) for r in dump(log_dump, session, MATCH, "telemetry")
+def matches(log_dump, session, live=False):
+    if live:
+        # While the session runs, read only telemetry's .tlog files (skipping
+        # the 200 Hz hardware_node log) and treat an absent log as no records
+        # yet instead of failing log_dump before the writer creates it.
+        telemetry_logs = sorted(
+            str(p) for p in Path(session).glob("telemetry*.tlog"))
+        if not telemetry_logs:
+            return []
+        inputs = telemetry_logs
+    else:
+        inputs = [session]
+    return [fields(r) for r in dump(log_dump, inputs, MATCH, "telemetry")
             if r["kind"] == "MESSAGE"]
 
 
@@ -131,112 +148,158 @@ class ShotTest(unittest.TestCase):
         root = Path(launcher).parents[2]
         # The launcher's own --duration-s: the one wall-clock bound, so a
         # session the record never ends stops before Bazel's timeout.
-        backstop_s = (int(os.environ.get("TEST_TIMEOUT") or 300) -
-                      sim_check.HANG_MARGIN_S)
+        timeout_s = int(os.environ.get("TEST_TIMEOUT") or 300)
+        backstop_s = timeout_s - sim_check.HANG_MARGIN_S
+        if backstop_s < sim_check.MIN_READY_S:
+            raise ValueError(
+                f"TEST_TIMEOUT={timeout_s} leaves {backstop_s} s after "
+                f"{sim_check.HANG_MARGIN_S} s stop margin")
+        ready_timeout_s = min(READY_TIMEOUT_S, backstop_s)
 
-        gateway_port, bridge_port = sim_check.udp_ports()
-        with tempfile.TemporaryDirectory(
-                dir=os.environ.get("TEST_TMPDIR")) as tmp:
-            work = os.path.join(tmp, "work")
-            os.makedirs(work)
-            os.symlink(str(root), os.path.join(work, "bazel-bin"))
-            output = os.path.join(tmp, "sessions")
-            os.makedirs(output)
-            log = os.path.join(tmp, "launch.log")
-            start_file = os.path.join(tmp, "schedule_start")
-            env = os.environ.copy()
-            env.pop("TALOS_SHM_NAMESPACE", None)
+        # Bazel ends a test at its timeout with SIGTERM: unwind through the
+        # with/finally blocks so Launch stops its session, registry_unlink
+        # runs, and failure artifacts are preserved.
+        previous_sigterm = signal.signal(
+            signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
+        try:
+            with tempfile.TemporaryDirectory(
+                    dir=os.environ.get("TEST_TMPDIR")) as tmp:
+                work = os.path.join(tmp, "work")
+                os.makedirs(work)
+                os.symlink(str(root), os.path.join(work, "bazel-bin"))
+                output = os.path.join(tmp, "sessions")
+                os.makedirs(output)
+                log = os.path.join(tmp, "launch.log")
+                start_file = os.path.join(tmp, "schedule_start")
+                # Isolate shared-memory segments and lock files into this
+                # run's temp directory even when TEST_TMPDIR is unset or
+                # shared outside Bazel.
+                env = os.environ.copy()
+                env.pop("TALOS_SHM_NAMESPACE", None)
+                env["TEST_TMPDIR"] = tmp
 
-            gateway_args = [
-                "--mode-schedule", MODE_SCHEDULE,
-                "--joystick-schedule", JOYSTICK_SCHEDULE,
-                "--schedule-start-file", start_file,
-            ]
-            args = [
-                launcher, "--config", config, "--sim", "--start-sim-gateway",
-                "--remote", "127.0.0.1",
-                "--remote-port", str(gateway_port),
-                "--local-port", str(bridge_port),
-                "--output-dir", output,
-                "--duration-s", str(backstop_s),
-            ]
-            for arg in gateway_args:
-                args += ["--sim-gateway-arg", arg]
+                gateway_args = [
+                    "--mode-schedule", MODE_SCHEDULE,
+                    "--joystick-schedule", JOYSTICK_SCHEDULE,
+                    "--schedule-start-file", start_file,
+                ]
+                # Reserve and release UDP ports immediately before Launch to
+                # narrow the bind TOCTOU window (docs/TESTING.md §6.4).
+                gateway_port, bridge_port = sim_check.udp_ports()
+                args = [
+                    launcher, "--config", config, "--sim",
+                    "--start-sim-gateway",
+                    "--remote", "127.0.0.1",
+                    "--remote-port", str(gateway_port),
+                    "--local-port", str(bridge_port),
+                    "--output-dir", output,
+                    "--duration-s", str(backstop_s),
+                ]
+                for arg in gateway_args:
+                    args += ["--sim-gateway-arg", arg]
 
-            failed = True
-            try:
-                session = None
-                match_log = []
+                failed = True
                 try:
-                    with open(log, "wb") as out, \
-                            sim_check.Launch(args, out, cwd=work,
-                                             env=env) as launch:
-                        unready = sim_check.wait_ready(
-                            launch, output, READY_TIMEOUT_S)
-                        ended = launch.process.poll()
-                        if not unready and ended is None:
-                            session = next(
-                                os.path.join(output, d)
-                                for d in os.listdir(output)
-                                if os.path.isdir(os.path.join(output, d)))
-                            start_schedule(start_file)
-                            while launch.process.poll() is None:
-                                match_log = matches(log_dump, session)
-                                if finished(match_log):
-                                    break
-                                try:
-                                    launch.process.wait(timeout=POLL_S)
-                                except subprocess.TimeoutExpired:
-                                    pass
+                    sessions = []
+                    session = None
+                    match_log = []
+                    try:
+                        with open(log, "wb") as out, \
+                                sim_check.Launch(args, out, cwd=work,
+                                                 env=env) as launch:
+                            unready = sim_check.wait_ready(
+                                launch, output, ready_timeout_s)
                             ended = launch.process.poll()
-                        in_order, killed = launch.finish()
+                            if not unready and ended is None:
+                                sessions = [
+                                    os.path.join(output, d)
+                                    for d in os.listdir(output)
+                                    if os.path.isdir(os.path.join(output, d))
+                                ]
+                                if len(sessions) == 1:
+                                    session = sessions[0]
+                                    start_schedule(start_file)
+                                    while launch.process.poll() is None:
+                                        match_log = matches(
+                                            log_dump, session, live=True)
+                                        if finished(match_log):
+                                            break
+                                        try:
+                                            launch.process.wait(timeout=POLL_S)
+                                        except subprocess.TimeoutExpired:
+                                            pass
+                                ended = launch.process.poll()
+                            in_order, killed = launch.finish()
+                    finally:
+                        subprocess.run([registry_unlink], env=env, check=False)
+
+                    with open(log, encoding="utf-8", errors="replace") as f:
+                        launch_output = f.read()
+                    diagnostics = (
+                        f"{' '.join(args)}\nports {gateway_port}, "
+                        f"{bridge_port} (released before the launch; "
+                        "another process may have taken one)\n"
+                        f"launch output:\n{launch_output}"
+                    )
+                    self.assertEqual(unready, "", diagnostics)
+                    if ended is not None and ended != 0:
+                        self.fail(
+                            f"launch exited early ({ended}):\n{diagnostics}")
+                    self.assertTrue(in_order, diagnostics)
+                    self.assertEqual(killed, [], diagnostics)
+                    self.assertEqual(launch.process.returncode, 0, diagnostics)
+                    self.assertEqual(
+                        len(sessions), 1,
+                        f"expected one session directory, found {sessions}\n"
+                        f"{diagnostics}")
+                    self.assertTrue(
+                        finished(match_log),
+                        f"the shot did not end before the launch's "
+                        f"--duration-s: {match_log[-1:]}\n"
+                        f"{diagnostics}")
+                    self.assertIsNone(
+                        ended,
+                        f"launch exited early ({ended}):\n{diagnostics}")
+                    self.assertEqual(
+                        sim_check.judge(session, log_dump, report), [],
+                        diagnostics)
+
+                    final_matches = matches(log_dump, session)
+                    self.assertTrue(
+                        final_matches,
+                        f"no {MATCH} records in session\n{diagnostics}")
+                    last = final_matches[-1]
+                    summary = (f"{last}\n" + "\n".join(
+                        line for line in launch_output.splitlines()
+                        if "mujoco_gateway:" in line))
+                    self.assertEqual(last["period"], "Teleop", summary)
+                    self.assertEqual(
+                        int(last["shots_count"]), PRELOADS, summary)
+                    self.assertGreaterEqual(
+                        int(last["blue_points_count"]), MIN_POINTS, summary)
+
+                    # Each beam break closed (read false: sim_closed_reads is
+                    # false) at least once, and was open at least once.
+                    readings = {}
+                    for record in dump(log_dump, session, "/hw/state",
+                                       "hardware_node"):
+                        if record["kind"] != "SEND":
+                            continue
+                        for beam in record["hardware"]["digital_inputs"]:
+                            readings.setdefault(beam["name"], set()).add(
+                                beam["value"])
+                    self.assertEqual(readings, {"feeder_beam": {False, True},
+                                                "shooter_beam": {False, True}})
+                    failed = False
                 finally:
-                    subprocess.run([registry_unlink], env=env, check=False)
-
-                with open(log, encoding="utf-8", errors="replace") as f:
-                    diagnostics = f.read()
-                self.assertEqual(unready, "", diagnostics)
-                self.assertTrue(finished(match_log),
-                                f"the shot did not end before the launch's "
-                                f"--duration-s: {match_log[-1:]}\n"
-                                f"{diagnostics}")
-                self.assertIsNone(
-                    ended, f"launch exited early ({ended}):\n{diagnostics}")
-                self.assertTrue(in_order, diagnostics)
-                self.assertEqual(killed, [], diagnostics)
-                self.assertEqual(launch.process.returncode, 0, diagnostics)
-                self.assertEqual(
-                    sim_check.judge(session, log_dump, report), [],
-                    diagnostics)
-
-                last = matches(log_dump, session)[-1]
-                summary = (f"{last}\n" + "\n".join(
-                    line for line in diagnostics.splitlines()
-                    if "mujoco_gateway:" in line))
-                self.assertEqual(last["period"], "Teleop", summary)
-                self.assertEqual(int(last["shots_count"]), PRELOADS, summary)
-                self.assertGreaterEqual(int(last["blue_points_count"]),
-                                        MIN_POINTS, summary)
-
-                # Each beam break closed (read false: sim_closed_reads is
-                # false) at least once, and was open at least once.
-                readings = {}
-                for record in dump(log_dump, session, "/hw/state",
-                                   "hardware_node"):
-                    if record["kind"] != "SEND":
-                        continue
-                    for beam in record["hardware"]["digital_inputs"]:
-                        readings.setdefault(beam["name"], set()).add(
-                            beam["value"])
-                self.assertEqual(readings, {"feeder_beam": {False, True},
-                                            "shooter_beam": {False, True}})
-                failed = False
-            finally:
-                if failed:
-                    kept = sim_check.preserve_failure_artifacts(log, output)
-                    if kept:
-                        print(f"failure artifacts preserved: {kept}",
-                              file=sys.stderr)
+                    if failed:
+                        kept = sim_check.preserve_failure_artifacts(
+                            log, output)
+                        if kept:
+                            print(f"failure artifacts preserved: {kept}",
+                                  file=sys.stderr)
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":
