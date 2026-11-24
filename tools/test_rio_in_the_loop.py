@@ -254,6 +254,8 @@ class Scenario:
         environment["TALOS_SIM_RUN_MS"] = str(seconds * 1000)
         if disable_after_ms is not None:
             environment["TALOS_SIM_DS_DISABLE_AFTER_MS"] = str(disable_after_ms)
+        else:
+            environment.pop("TALOS_SIM_DS_DISABLE_AFTER_MS", None)
         # A fresh RoboRIO: nothing to restore (SIM_SAVED_CONFIG).
         (self.root / SIM_SAVED_CONFIG).unlink(missing_ok=True)
 
@@ -326,7 +328,8 @@ class Scenario:
         the last closer unlinks each; a killed holder would leave it.
         """
         for process in processes:
-            _terminate_group(process, signal.SIGTERM)
+            if process.poll() is None:
+                _terminate_group(process, signal.SIGTERM)
         failed = []
         deadline = time.monotonic() + STOP_SECONDS
         for process in processes:

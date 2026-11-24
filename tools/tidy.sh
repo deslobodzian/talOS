@@ -30,8 +30,9 @@
 # (no bazel, the database could not be produced, or clang 18 cannot parse the
 # host's C++ standard library and no fallback is available).
 set -euo pipefail
+script_dir="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 cd "$(git rev-parse --show-toplevel)"
-. "$(dirname "${BASH_SOURCE[0]}")/clang18.sh"
+. "$script_dir/clang18.sh"
 
 # Pinned Debian GCC 14 headers for Linux x86_64 hosts whose system libstdc++
 # is newer than clang 18 can parse (e.g. Arch Linux GCC 16).
@@ -49,13 +50,13 @@ while [ $# -gt 0 ]; do
     --all) base_arg=--all ;;
     --base) [ $# -ge 2 ] || clang18_die "--base needs a ref"; base_arg="$2"; shift ;;
     --refresh) refresh=1 ;;
-    -h|--help) sed -n '2,/^set /p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,/^set /p' "$script_dir/tidy.sh" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
     *) clang18_die "unknown argument: $1" ;;
   esac
   shift
 done
 
-tmp="$(mktemp -d)"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/talos-tidy.XXXXXX")"
 staging=""
 cleanup() {
   rm -rf "$tmp"
@@ -64,6 +65,9 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 command -v python3 >/dev/null 2>&1 || clang18_die "need python3"
 clang18_setup

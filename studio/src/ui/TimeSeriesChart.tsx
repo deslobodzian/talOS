@@ -30,6 +30,45 @@ export type Span = {x: number; yMin: number; yMax: number};
 // A connected run of spans; runs are separated by NaN gaps in the source.
 export type SpanRun = Span[];
 
+// Map `v` into [0, 1] over [lo, hi] without float64 overflow or 0/0 NaN:
+// returns the midpoint when the span is degenerate, and half-scales when
+// `hi - lo` or `v - lo` overflows float64 (e.g. [-1e308, 1e308]).
+function normalize(v: number, lo: number, hi: number): number {
+  const span = hi - lo;
+  if (!(span > 0)) return 0.5;
+  if (Number.isFinite(span)) {
+    const diff = v - lo;
+    if (Number.isFinite(diff)) return diff / span;
+  }
+  const halfSpan = hi * 0.5 - lo * 0.5;
+  if (!(halfSpan > 0) || !Number.isFinite(halfSpan)) return 0.5;
+  return (v * 0.5 - lo * 0.5) / halfSpan;
+}
+
+// Pad constant domains (including large values >= 2^53 where ±1 is a float64
+// no-op) and apply margin when doing so stays finite.
+function expandDomain(min: number, max: number, marginFrac: number): [number, number] {
+  if (min === max) {
+    const pad = Math.max(1, Math.abs(min) * 1e-6);
+    const lo = min - pad;
+    const hi = max + pad;
+    if (Number.isFinite(lo) && Number.isFinite(hi) && hi > lo) {
+      min = lo;
+      max = hi;
+    } else {
+      return [min, max];
+    }
+  }
+  const span = max - min;
+  if (Number.isFinite(span)) {
+    const margin = span * marginFrac;
+    const lo = min - margin;
+    const hi = max + margin;
+    if (Number.isFinite(lo) && Number.isFinite(hi)) return [lo, hi];
+  }
+  return [min, max];
+}
+
 // Min/max decimation of one series into `width` horizontal buckets. Samples
 // are bucketed by their x position (`times[i]`, or the sample index when
 // `times` is absent) mapped over [loX, hiX]; each non-empty bucket becomes one
@@ -39,10 +78,9 @@ export function decimateMinMax(
     times: ArrayLike<number>|undefined, values: ArrayLike<number>,
     width: number, loX: number, hiX: number): SpanRun[] {
   const n = values.length;
-  const domain = hiX - loX || 1;
   const xAt = (i: number) => times ? times[i] : i;
   const bucketOf = (x: number) => {
-    const b = Math.floor(((x - loX) / domain) * width);
+    const b = Math.floor(normalize(x, loX, hiX) * width);
     return b < 0 ? 0 : b >= width ? width - 1 : b;
   };
 
@@ -118,16 +156,10 @@ function computeGeometry(
     if (threshold < minY) minY = threshold;
     if (threshold > maxY) maxY = threshold;
   }
-  if (minX === maxX) { minX -= 1; maxX += 1; }
-  if (minY === maxY) { minY -= 1; maxY += 1; }
-  const spanX = maxX - minX;
-  const spanY = maxY - minY;
-  const loX = minX - spanX * 0.02;
-  const hiX = maxX + spanX * 0.02;
-  const loY = minY - spanY * 0.05;
-  const hiY = maxY + spanY * 0.05;
-  const xOf = (x: number) => ((x - loX) / (hiX - loX)) * width;
-  const yOf = (v: number) => height - ((v - loY) / (hiY - loY)) * height;
+  const [loX, hiX] = expandDomain(minX, maxX, 0.02);
+  const [loY, hiY] = expandDomain(minY, maxY, 0.05);
+  const xOf = (x: number) => normalize(x, loX, hiX) * width;
+  const yOf = (v: number) => height - normalize(v, loY, hiY) * height;
 
   const out: Geometry['lines'] = [];
   const legend: Geometry['legend'] = [];
@@ -212,10 +244,13 @@ export function TimeSeriesChart({lines, width = 600, height = 96, fillWidth = tr
              aria-hidden="true" className={bare ? 'bare' : undefined}
              style={{height, width: fillWidth ? '100%' : width}}>
           {bands.map((b, i) => {
+            if (!Number.isFinite(b.start) || !Number.isFinite(b.end)) return null;
             const x1 = geometry.xOf(b.start);
             const x2 = geometry.xOf(b.end);
+            const w = Math.max(1, x2 - x1);
+            if (!Number.isFinite(x1) || !Number.isFinite(w)) return null;
             return <rect key={i} x={x1} y={0}
-                         width={Math.max(1, x2 - x1)} height={height}
+                         width={w} height={height}
                          className="ts-chart-band"/>;
           })}
           {threshold !== undefined && Number.isFinite(threshold) &&

@@ -10,13 +10,16 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
+import signal
 import struct
 import subprocess
 import sys
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 
 from python.runfiles import runfiles
 
@@ -194,7 +197,24 @@ class BundleBuilderTest(unittest.TestCase):
                 self.assertTrue(os.path.isfile(os.path.join(out, rel)), rel)
             self.assertIn('config_path = "config/config/robot.toml"', manifest)
             with open(os.path.join(out, "run.sh"), encoding="utf-8") as f:
-                self.assertIn('--config "config/config/robot.toml"', f.read())
+                self.assertIn(
+                    f"--config {shlex.quote('config/config/robot.toml')}",
+                    f.read())
+
+    # REQ-OPS-48: run.sh must shell-quote config_rel so metacharacters cannot
+    # expand or split when starting the launcher.
+    def test_run_script_quotes_config_path_with_shell_metacharacters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out, _ = self.build(tmp, {
+                "bot/config/robot $(echo pwned).toml": "[robot]\n",
+            })
+            self.echo_launcher(out)
+            proc = subprocess.run([os.path.join(out, "run.sh")],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            args = json.loads(proc.stdout)
+            self.assertEqual(args[args.index("--config") + 1],
+                             "config/robot $(echo pwned).toml")
 
     def test_config_in_its_own_directory_stays_at_the_top(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1221,9 +1241,157 @@ class BundleBuilderTest(unittest.TestCase):
             self.assertEqual(env2["RUNFILES_DIR"], root)
             self.assertTrue(os.path.isfile(os.path.join(work_dir2, "robot.toml")))
 
-    # REQ-OPS-48: empty, path-escaping, or duplicate node["name"] must fail
-    # closed rather than destroying bin/ or silently overwriting another node's
-    # binary and runfiles.
+    # REQ-DEV-30: workspace() must skip a top-level bazel-bin entry in main_dir
+    # and never let a top-level external/ directory shadow bazel-bin/external.
+    def test_launcher_runner_workspace_skips_bazel_bin_and_preserves_external(self):
+        runner_path = runfiles.Create().Rlocation(
+            "_main/talOS/build/launcher_runner.py")
+        spec = importlib.util.spec_from_file_location(
+            "launcher_runner_ws", runner_path)
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "runfiles")
+            put(os.path.join(root, "_main", "robot.toml"), "[robot]\n")
+            put(os.path.join(root, "_main", "bazel-bin", "stale.txt"), "x\n")
+            put(os.path.join(root, "_main", "external", "local.txt"), "local\n")
+            launcher = os.path.join(
+                root, "talos+", "talOS", "launcher", "launcher")
+            put(launcher, "")
+            with mock.patch.dict(os.environ, {"RUNFILES_DIR": root}):
+                work_dir, config, _ = runner.workspace(
+                    os.path.join(tmp, "work"), launcher, "_main/robot.toml")
+            self.assertEqual(config, "robot.toml")
+            self.assertTrue(os.path.isfile(
+                os.path.join(work_dir, "external", "local.txt")))
+            self.assertTrue(os.path.isdir(
+                os.path.join(work_dir, "bazel-bin", "external", "talos+")))
+            self.assertFalse(os.path.exists(
+                os.path.join(work_dir, "bazel-bin", "external", "local.txt")))
+
+    # REQ-DEV-30, REQ-OPS-33: sim() installs signal handlers before Popen,
+    # forwards SIGHUP unless SIG_IGN, and returns 128 + (-rc) for signal exits.
+    def test_launcher_runner_sim_signal_handling_and_exit_codes(self):
+        runner_path = runfiles.Create().Rlocation(
+            "_main/talOS/build/launcher_runner.py")
+        spec = importlib.util.spec_from_file_location(
+            "launcher_runner_sim", runner_path)
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "runfiles")
+            put(os.path.join(root, "_main", "robot.toml"), "[robot]\n")
+            launcher = os.path.join(
+                root, "talos+", "talOS", "launcher", "launcher")
+            put(launcher, "")
+
+            # 1. Handlers are installed BEFORE Popen; SIGHUP is forwarded when
+            # not SIG_IGN and left untouched when SIG_IGN.
+            seen_handlers = {}
+
+            class _DummyChild:
+                def wait(self):
+                    return 0
+
+            def _fake_popen(*_args, **_kwargs):
+                for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                    seen_handlers[sig] = signal.getsignal(sig)
+                return _DummyChild()
+
+            old_hup = signal.signal(signal.SIGHUP, signal.SIG_DFL)
+            try:
+                with mock.patch.dict(os.environ, {"RUNFILES_DIR": root}), \
+                        mock.patch.object(runner.subprocess, "Popen",
+                                          side_effect=_fake_popen):
+                    self.assertEqual(
+                        runner.sim(launcher, "_main/robot.toml", []), 0)
+                for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                    self.assertTrue(callable(seen_handlers[sig]), sig)
+                self.assertEqual(signal.getsignal(signal.SIGHUP), signal.SIG_DFL)
+
+                seen_handlers.clear()
+                signal.signal(signal.SIGHUP, signal.SIG_IGN)
+                with mock.patch.dict(os.environ, {"RUNFILES_DIR": root}), \
+                        mock.patch.object(runner.subprocess, "Popen",
+                                          side_effect=_fake_popen):
+                    self.assertEqual(
+                        runner.sim(launcher, "_main/robot.toml", []), 0)
+                self.assertEqual(seen_handlers[signal.SIGHUP], signal.SIG_IGN)
+                self.assertEqual(signal.getsignal(signal.SIGHUP), signal.SIG_IGN)
+            finally:
+                signal.signal(signal.SIGHUP, old_hup)
+
+            # 2. Real SIGHUP forwarding from runner to child launcher.
+            marker = os.path.join(tmp, "sighup_received")
+            hup_stub = (
+                "import os, signal, sys\n"
+                "def on_hup(*_):\n"
+                f"    with open({marker!r}, 'w', encoding='utf-8') as f:\n"
+                "        f.write('forwarded\\n')\n"
+                "    sys.exit(0)\n"
+                "signal.signal(signal.SIGHUP, on_hup)\n"
+                "signal.alarm(5)\n"
+                "os.kill(os.getppid(), signal.SIGHUP)\n"
+                "signal.pause()\n"
+            )
+            put(launcher,
+                "#!/bin/sh\n"
+                f"exec {shlex.quote(sys.executable)} -c {shlex.quote(hup_stub)}\n")
+            os.chmod(launcher, 0o755)
+            old_hup = signal.signal(signal.SIGHUP, signal.SIG_DFL)
+            try:
+                with mock.patch.dict(os.environ, {"RUNFILES_DIR": root}):
+                    rc = runner.sim(launcher, "_main/robot.toml", [])
+            finally:
+                signal.signal(signal.SIGHUP, old_hup)
+            self.assertEqual(rc, 0)
+            with open(marker, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "forwarded\n")
+
+            # 3. Signal-killed child returns 128 + signum (not negative rc).
+            kill_stub = "import os, signal; os.kill(os.getpid(), signal.SIGKILL)\n"
+            put(launcher,
+                "#!/bin/sh\n"
+                f"exec {shlex.quote(sys.executable)} -c {shlex.quote(kill_stub)}\n")
+            os.chmod(launcher, 0o755)
+            with mock.patch.dict(os.environ, {"RUNFILES_DIR": root}):
+                rc = runner.sim(launcher, "_main/robot.toml", [])
+            self.assertEqual(rc, 128 + int(signal.SIGKILL))
+
+    # REQ-OPS-48, REQ-DEV-30: Python nodes' repo_mapping_manifest passed in the
+    # node spec is staged to both bin/<name>.runfiles/_repo_mapping and
+    # bin/<name>.repo_mapping, and a missing repo_mapping fails closed.
+    def test_python_node_stages_repo_mapping_from_spec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (py,) = self.python_nodes(tmp, {"a": "#!/bin/sh\n"})
+            rm_src = os.path.join(tmp, "src", "a.repo_mapping")
+            rm_text = ",my_talos,talos+\n,wrist,wrist+\n"
+            put(rm_src, rm_text)
+            py["repo_mapping"] = rm_src
+            proc = self.assemble(
+                tmp, {"c/robot.toml": "[robot]\n"},
+                [node(tmp, "hardware_node", HARDWARE_NODE), py], ["//a:node"])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = os.path.join(tmp, "out")
+            for rel in (os.path.join("bin", "a.runfiles", "_repo_mapping"),
+                        os.path.join("bin", "a.repo_mapping")):
+                staged = os.path.join(out, rel)
+                self.assertTrue(os.path.isfile(staged), rel)
+                with open(staged, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), rm_text)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (py,) = self.python_nodes(tmp, {"a": "#!/bin/sh\n"})
+            py["repo_mapping"] = os.path.join(tmp, "src", "missing.repo_mapping")
+            proc = self.assemble(
+                tmp, {"c/robot.toml": "[robot]\n"},
+                [node(tmp, "hardware_node", HARDWARE_NODE), py], ["//a:node"])
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("repo_mapping", proc.stderr)
+
+    # REQ-OPS-48, REQ-OPS-25: empty, path-escaping, or duplicate node["name"]
+    # and invalid lib["name"] must fail closed rather than destroying bin/lib/
+    # or silently overwriting another node's binary and runfiles.
     def test_invalid_and_duplicate_node_names_fail_closed(self):
         for bad_name in ("", ".", "..", "../escape", "sub/node"):
             with self.subTest(bad_name=bad_name), tempfile.TemporaryDirectory() as tmp:
@@ -1241,6 +1409,23 @@ class BundleBuilderTest(unittest.TestCase):
                 self.assertIn("invalid node name", proc.stderr.lower())
                 self.assertFalse(os.path.exists(os.path.join(tmp, "out", "bin")))
                 self.assertFalse(os.path.exists(os.path.join(tmp, "out", "escape")))
+
+        for bad_lib in ("", ".", "..", "../escape.so", "sub/libfoo.so",
+                        "lib\\foo.so"):
+            with self.subTest(bad_lib=bad_lib), tempfile.TemporaryDirectory() as tmp:
+                lib_src = os.path.join(tmp, "src", "solib", "libbad.so")
+                put(lib_src, "so-bytes")
+                arm = node(tmp, "arm")
+                arm["shared_libs"] = [{"src_path": lib_src, "name": bad_lib}]
+                proc = self.assemble(
+                    tmp, {"c/robot.toml": "[robot]\n"},
+                    [node(tmp, "hardware_node", HARDWARE_NODE), arm],
+                    ["//arm:node"])
+                self.assertNotEqual(proc.returncode, 0,
+                                    f"expected refusal for lib name {bad_lib!r}")
+                self.assertIn("invalid shared library name", proc.stderr.lower())
+                self.assertFalse(os.path.exists(os.path.join(tmp, "out", "lib")))
+                self.assertFalse(os.path.exists(os.path.join(tmp, "out", "escape.so")))
 
         with tempfile.TemporaryDirectory() as tmp:
             first_bin = os.path.join(tmp, "src", "bin", "arm_a")

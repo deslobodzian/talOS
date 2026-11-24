@@ -1680,6 +1680,59 @@ class NewSubsystemTest(unittest.TestCase):
                             build.index('"@my_talos//talOS/node:testing"'),
                             build.index('"@rules_cc//cc/runfiles"'))
 
+    # REQ-DEV-02, REQ-DEV-01
+    def test_standalone_python_module_declares_default_python_toolchain(self):
+        # A standalone Python subsystem repository must register the default
+        # Python 3.11 toolchain matching @talos's MODULE.bazel so its pip
+        # wheels resolve under `bazel test //...`.
+        py_module = new_subsystem.package_files(
+            "arm", "py", standalone=True)["MODULE.bazel"]
+        ast.parse(py_module)
+        self.assertIn(
+            'python = use_extension("@rules_python//python/extensions:python.bzl", "python")',
+            py_module,
+        )
+        toolchain = re.search(r"python\.toolchain\(([^)]*)\)", py_module)
+        self.assertIsNotNone(toolchain, py_module)
+        self.assertRegex(toolchain.group(1), r"is_default\s*=\s*True")
+        self.assertRegex(toolchain.group(1), r'python_version\s*=\s*"3\.11"')
+
+        cpp_module = new_subsystem.package_files(
+            "arm", "cpp", standalone=True)["MODULE.bazel"]
+        ast.parse(cpp_module)
+        self.assertNotIn("python.toolchain", cpp_module)
+
+    # REQ-DEV-01
+    def test_estimator_avoids_camera_and_chassis_fixture_collisions(self):
+        # Naming an estimator after any default fixture camera or chassis
+        # subsystem must pick collision-free fixture names so its own
+        # /<name>/state PoseEstimate topic never collides with a camera's
+        # PoseObservation topic or the chassis motor table.
+        for name in ("front_camera", "back_camera", "side_camera", "chassis"):
+            for lang in ("cpp", "py"):
+                with self.subTest(name=name, lang=lang):
+                    files = new_subsystem.package_files(
+                        name, lang, kind="estimator")
+                    robot = tomllib.loads(files["testdata/robot.toml"])
+                    subsystems = robot["subsystems"]
+                    self.assertIn(name, subsystems)
+                    self.assertEqual(len(subsystems), 2, subsystems)
+                    cameras = subsystems[name]["cameras"]
+                    self.assertEqual(len(set(cameras)), 2, cameras)
+                    self.assertNotIn(name, cameras)
+                    chassis_names = [k for k in subsystems if k != name]
+                    self.assertEqual(len(chassis_names), 1, subsystems)
+                    self.assertNotEqual(chassis_names[0], name)
+
+                    test_file = ("node_test.cc" if lang == "cpp"
+                                 else "node_test.py")
+                    test_text = files[test_file]
+                    self.assertNotIn(f'Observe("{name}"', test_text)
+                    self.assertNotIn(f'self.observe("{name}"', test_text)
+                    self.assertNotIn(f"[subsystems.{name}.motors.", test_text)
+                    for cam in cameras:
+                        self.assertIn(f'"{cam}"', test_text)
+
 
 if __name__ == "__main__":
     unittest.main()

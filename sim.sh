@@ -310,16 +310,32 @@ mkdir -p "$LOG_DIR"
 
 PIDS=""
 NAMES=""
+SLEEP_PID=""
 
-# Print a process and everything it spawned, children first. Gradle and the
-# launcher both fork, and killing only the parent orphans a simulation that
-# then holds the UDP port against the next run.
+# True while PID exists and is not an exited zombie waiting for wait().
+is_alive() {
+  kill -0 "$1" 2>/dev/null || return 1
+  local state
+  if state="$(ps -o stat= -p "$1" 2>/dev/null)"; then
+    case "$state" in
+      ""|Z*|*" "Z*) return 1 ;;
+    esac
+  else
+    kill -0 "$1" 2>/dev/null || return 1
+  fi
+  return 0
+}
+
+# Print a live process and every live process it spawned, children first.
+# Gradle and the launcher both fork, and killing only the parent after a
+# timeout would orphan a simulation that holds the UDP port against the next
+# run.
 descendants() {
   local child
   for child in $(pgrep -P "$1" 2>/dev/null); do
     descendants "$child"
   done
-  echo "$1"
+  is_alive "$1" && echo "$1"
 }
 
 CLEANED=0
@@ -327,18 +343,59 @@ cleanup() {
   [ "$CLEANED" = "1" ] && return
   CLEANED=1
   trap - EXIT INT TERM
+  [ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null
   echo ""
   echo "sim.sh: shutting down"
-  # Reverse start order, so the bridge stops before the graph it reads.
-  local ordered="" p tree=""
+  # Reverse start order, so the node graph stops before the controller.
+  local ordered="" p live="" tree="" live_any tree_any orphans_signalled=0 i
   for p in $PIDS; do ordered="$p $ordered"; done
-  # Snapshot the trees before signalling: a parent that exits on TERM
-  # reparents its children, and they could no longer be found to KILL.
-  for p in $ordered; do tree="$tree $(descendants "$p")"; done
-  if [ -n "$tree" ]; then
-    for p in $tree; do kill -TERM "$p" 2>/dev/null; done
-    sleep 1
-    for p in $tree; do kill -KILL "$p" 2>/dev/null; done
+  # Snapshot live top-level PIDs and their descendant trees before signalling:
+  # a parent that exits on TERM reparents any stray child, so it could no
+  # longer be found if a fallback KILL is needed after the timeout.
+  for p in $ordered; do
+    if is_alive "$p"; then
+      live="$live $p"
+      tree="$tree $(descendants "$p")"
+    fi
+  done
+  if [ -n "$live" ]; then
+    # Signal only live tracked top-level PIDs so the launcher runs its own
+    # orderly shutdown (stopping nodes, flushing logs, writing manifest.json,
+    # unlinking shared memory) without its children or guardian killed early.
+    for p in $live; do kill -TERM "$p" 2>/dev/null; done
+    # Poll up to 5 s (50 x 0.1 s), returning immediately once everything exits.
+    tree_any=0
+    for (( i = 0; i < 50; i++ )); do
+      live_any=0
+      for p in $live; do
+        if is_alive "$p"; then
+          live_any=1
+          break
+        fi
+      done
+      tree_any=0
+      for p in $tree; do
+        if is_alive "$p"; then
+          tree_any=1
+          break
+        fi
+      done
+      [ "$tree_any" = "0" ] && break
+      # If every tracked parent has exited but a reparented descendant stayed
+      # up, signal the remaining descendants once before the timeout expires.
+      if [ "$live_any" = "0" ] && [ "$orphans_signalled" = "0" ]; then
+        orphans_signalled=1
+        for p in $tree; do
+          is_alive "$p" && kill -TERM "$p" 2>/dev/null
+        done
+      fi
+      sleep 0.1
+    done
+    if [ "$tree_any" = "1" ]; then
+      for p in $tree; do
+        is_alive "$p" && kill -KILL "$p" 2>/dev/null
+      done
+    fi
   fi
   wait 2>/dev/null
   echo "sim.sh: session logs in $SESSION_DIR (launcher/RIO output in $LOG_DIR)"
@@ -413,13 +470,15 @@ if [ "$WANT_RIO" = "1" ]; then
   else
     ( cd "$RIO_DIR" && ./gradlew "${GRADLE_ARGS[@]}" ) > "$LOG_DIR/rio.log" 2>&1 &
   fi
-  track $! "wpilib-sim"
-  disown $! 2>/dev/null
+  RIO_PID=$!
+  track "$RIO_PID" "wpilib-sim"
+  disown "$RIO_PID" 2>/dev/null
   # Gradle has to resolve and compile before the simulation exists. Wait for
   # the task to actually be running rather than guessing with a fixed sleep.
   say "  waiting for the simulation to come up"
   SIM_UP=0
-  for _ in $(seq 1 240); do
+  RIO_EXITED=0
+  for (( _i = 0; _i < 240; _i++ )); do
     if grep -q "Robot program starting" "$LOG_DIR/rio.log" 2>/dev/null; then
       SIM_UP=1
       break
@@ -428,10 +487,24 @@ if [ "$WANT_RIO" = "1" ]; then
       tail -25 "$LOG_DIR/rio.log" >&2
       die "the WPILib simulation failed to start"
     fi
-    sleep 0.5
+    if ! is_alive "$RIO_PID"; then
+      if grep -q "Robot program starting" "$LOG_DIR/rio.log" 2>/dev/null; then
+        SIM_UP=1
+      else
+        RIO_EXITED=1
+      fi
+      break
+    fi
+    sleep 0.5 &
+    SLEEP_PID=$!
+    wait "$SLEEP_PID" 2>/dev/null
+    SLEEP_PID=""
   done
   if [ "$SIM_UP" != "1" ]; then
     tail -25 "$LOG_DIR/rio.log" >&2
+    if [ "$RIO_EXITED" = "1" ]; then
+      die "the WPILib simulation exited before starting (log: $LOG_DIR/rio.log)"
+    fi
     die "the WPILib simulation did not start within 120 s (log: $LOG_DIR/rio.log)"
   fi
   if [ "$HEADLESS" != "1" ]; then
@@ -464,12 +537,15 @@ LAUNCHER_PID=$!
 track "$LAUNCHER_PID" "launcher"
 
 GRAPH="$SESSION_DIR/graph.json"
-for _ in $(seq 1 60); do
+for (( _i = 0; _i < 60; _i++ )); do
   [ -f "$GRAPH" ] && break
   # A launcher that already exited (a refused graph, or another session in
   # this shared-memory namespace) said why in its log: show it now.
-  kill -0 "$LAUNCHER_PID" 2>/dev/null || break
-  sleep 0.5
+  is_alive "$LAUNCHER_PID" || break
+  sleep 0.5 &
+  SLEEP_PID=$!
+  wait "$SLEEP_PID" 2>/dev/null
+  SLEEP_PID=""
 done
 if [ ! -f "$GRAPH" ]; then
   tail -25 "$LOG_DIR/launcher.log" >&2
@@ -485,12 +561,16 @@ say "  declared graph: $GRAPH"
 if [ "$WANT_STUDIO" = "1" ]; then
   URL="http://localhost:${HTTP_PORT}"
   STUDIO_UP=0
-  for _ in $(seq 1 60); do
+  for (( _i = 0; _i < 60; _i++ )); do
     if (echo > /dev/tcp/127.0.0.1/"$HTTP_PORT") 2>/dev/null; then
       STUDIO_UP=1
       break
     fi
-    sleep 1
+    is_alive "$LAUNCHER_PID" || break
+    sleep 1 &
+    SLEEP_PID=$!
+    wait "$SLEEP_PID" 2>/dev/null
+    SLEEP_PID=""
   done
   if [ "$STUDIO_UP" = "1" ]; then
     say "Studio on $URL"

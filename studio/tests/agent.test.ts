@@ -3,7 +3,11 @@ import {execFileSync} from 'node:child_process';
 import dgram from 'node:dgram';
 import {once} from 'node:events';
 import fs, {existsSync, readdirSync, readFileSync, readlinkSync, statSync} from 'node:fs';
-import {createServer} from 'node:http';
+import {
+  Agent as HttpAgent,
+  createServer,
+  request as httpRequest,
+} from 'node:http';
 import type {AddressInfo} from 'node:net';
 import path from 'node:path';
 import {test} from 'node:test';
@@ -18,13 +22,22 @@ import {
   type RpcContext,
   RpcFault,
 } from '../agent/rpc';
-import {MAX_BATCH, startAgent} from '../agent/server';
-import {TelemetryDecoder, Timeline} from '../src/core';
+import {MAX_BATCH, MAX_WS_CLIENTS, startAgent} from '../agent/server';
+import {type Snapshot, TelemetryDecoder, Timeline} from '../src/core';
+import {
+  type ChannelSpec,
+  concatPages,
+  encodeDictionaryPages,
+  encodeValuePages,
+  type PageHeader,
+  rawFromDouble,
+} from '../src/encode';
 import {ChannelKind} from '../src/generated/talos/telemetry/channel-kind';
 import {GRAPH_STALE_AFTER_MS} from '../src/data/freshness';
 import {demoDeclaredGraph, demoPacket, demoSystemGraph} from '../src/demo';
 import {
   type DeclaredGraph,
+  MAX_DECLARED_BYTES,
   parseDeclaredGraph,
   parseSystemGraph,
   SYSTEM_GRAPH_VERSION,
@@ -1065,4 +1078,419 @@ test('REQ-SAFE-35: a running agent opens no datagram socket and no file for writ
          Object.assign(fs.promises, {open: real.promisesOpen});
        }
        assert.deepEqual(opened, []);
+     });
+
+test('chunked /declared.json past MAX_DECLARED_BYTES stops reading and records declaredError',
+     {timeout: HANG_BOUND_MS}, async () => {
+       let streamClosed = false;
+       const server = createServer((req, res) => {
+         if (req.url === '/declared.json') {
+           // Chunked response with no Content-Length, kept open past the cap
+           // so an unbounded response.text() read would hang indefinitely.
+           res.writeHead(200, {'Content-Type': 'application/json'});
+           res.on('close', () => { streamClosed = true; });
+           const chunk = Buffer.alloc(65536, 0x20);
+           const count = Math.floor(MAX_DECLARED_BYTES / chunk.length) + 1;
+           for (let i = 0; i < count; i++) res.write(chunk);
+           return;
+         }
+         res.writeHead(404).end();
+       });
+       const sockets = new WebSocketServer({server, path: '/telemetry'});
+       server.listen(0, '127.0.0.1');
+       await once(server, 'listening');
+       const {port} = server.address() as AddressInfo;
+       const agent = startAgent(0, `ws://127.0.0.1:${port}/telemetry`);
+       try {
+         await settle(() => streamClosed,
+                      'oversized chunked /declared.json stream was not aborted');
+         await settle(() => !!agent.server.address(), 'agent did not listen');
+         const agentPort = (agent.server.address() as AddressInfo).port;
+         const health = await (await fetch(
+             `http://127.0.0.1:${agentPort}/health`)).json() as {
+           declared: {received: boolean; error: string|null};
+         };
+         assert.equal(agent.context().declared, null);
+         assert.equal(health.declared.received, false);
+         assert.equal(
+             health.declared.error, 'Invalid declared graph: document too large');
+       } finally {
+         agent.close();
+         for (const client of sockets.clients) client.terminate();
+         sockets.close();
+         server.close();
+         server.closeAllConnections();
+       }
+     });
+
+test('stale declared fetch cannot overwrite a newer 404, and close aborts in-flight fetches',
+     {timeout: HANG_BOUND_MS}, async () => {
+       const bridge = await fakeBridge(null);
+       const realFetch = globalThis.fetch;
+       let callCount = 0;
+       let firstSignal: AbortSignal|undefined;
+       let firstStartedResolve!: () => void;
+       const firstStarted = new Promise<void>(r => { firstStartedResolve = r; });
+       let releaseFirst!: () => void;
+       const firstGate = new Promise<void>(r => { releaseFirst = r; });
+       let secondHandledResolve!: (status: number) => void;
+       const secondHandled =
+           new Promise<number>(r => { secondHandledResolve = r; });
+
+       globalThis.fetch = (input, init) => {
+         const url = typeof input === 'string' ? input : input.toString();
+         if (!url.endsWith('/declared.json')) return realFetch(input, init);
+         callCount++;
+         if (callCount === 1) {
+           firstSignal = init?.signal ?? undefined;
+           firstStartedResolve();
+           // Resolve with a stale 200 after the gate opens, even if aborted,
+           // to verify the agent ignores stale connection results.
+           return firstGate.then(
+               () => new Response(demoDeclaredGraph(), {status: 200}));
+         }
+         const response = realFetch(input, init);
+         response.then(r => setImmediate(secondHandledResolve, r.status),
+                       () => setImmediate(secondHandledResolve, -1));
+         return response;
+       };
+
+       const agent = startAgent(0, bridge.url);
+       try {
+         await firstStarted;
+         assert.ok(firstSignal, 'fetchDeclaredGraph must pass an AbortSignal');
+         bridge.reconnect(null);
+         await settle(() => firstSignal?.aborted === true,
+                      'closing upstream did not abort in-flight declared fetch');
+         assert.equal(await secondHandled, 404);
+         releaseFirst();
+         await new Promise(r => setImmediate(r));
+         await new Promise(r => setImmediate(r));
+         assert.equal(agent.context().declared, null);
+       } finally {
+         releaseFirst();
+         globalThis.fetch = realFetch;
+         agent.close();
+         bridge.close();
+       }
+
+       // Verify close() aborts an in-flight declared fetch immediately.
+       const bridge2 = await fakeBridge(null);
+       let closeSignal: AbortSignal|undefined;
+       let closeStartedResolve!: () => void;
+       const closeStarted = new Promise<void>(r => { closeStartedResolve = r; });
+       globalThis.fetch = (input, init) => {
+         const url = typeof input === 'string' ? input : input.toString();
+         if (!url.endsWith('/declared.json')) return realFetch(input, init);
+         closeSignal = init?.signal ?? undefined;
+         closeStartedResolve();
+         return new Promise<Response>((_, reject) => {
+           init?.signal?.addEventListener(
+               'abort', () => reject(new DOMException('Aborted', 'AbortError')));
+         });
+       };
+       const agent2 = startAgent(0, bridge2.url);
+       try {
+         await closeStarted;
+         assert.ok(closeSignal && !closeSignal.aborted);
+         agent2.close();
+         assert.equal(closeSignal.aborted, true);
+       } finally {
+         globalThis.fetch = realFetch;
+         agent2.close();
+         bridge2.close();
+       }
+     });
+
+test('reconnecting to a restarted session resets rateWindow and decoder',
+     {timeout: HANG_BOUND_MS}, async () => {
+       // Build a 100-channel 2-page update so connection 1 can drop mid-update.
+       const channels: ChannelSpec[] = Array.from(
+           {length: 100}, (_, i) => ({name: `ch_${i}`, unit: ''}));
+       const pose = {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0};
+       const header1: PageHeader = {
+         streamId: 99n,
+         sequenceId: 1n,
+         timestampNs: 1_000_000_000n,
+         dictionaryId: 7,
+         channelCount: channels.length
+       };
+       const header2: PageHeader = {
+         ...header1,
+         sequenceId: 2n,
+         timestampNs: 2_000_000_000n
+       };
+       const header3: PageHeader = {
+         ...header1,
+         sequenceId: 3n,
+         timestampNs: 3_000_000_000n
+       };
+       const dictPages = encodeDictionaryPages(header1, channels);
+       const valPages1 = encodeValuePages(
+           header1, pose, true,
+           channels.map((_, i): [number, bigint] => [i, rawFromDouble(i)]));
+       assert.equal(valPages1.length, 2);
+       const valPages2 = encodeValuePages(
+           header2, pose, true,
+           channels.map(
+               (_, i): [number, bigint] => [i, rawFromDouble(i === 0 ? 42 : i)]));
+       const valPages3 = encodeValuePages(
+           header3, pose, true,
+           channels.map(
+               (_, i): [number, bigint] => [i, rawFromDouble(i === 0 ? 43 : i)]));
+
+       const shiftWall = (raw: string, deltaNs: bigint) => {
+         const doc = JSON.parse(raw);
+         doc.wall_ns = (BigInt(doc.wall_ns) + deltaNs).toString();
+         return JSON.stringify(doc);
+       };
+       const session1Graph = demoSystemGraph(1000n);
+       const session2Graph1 = shiftWall(demoSystemGraph(0n), 20_500_000_000n);
+       const session2Graph2 = shiftWall(demoSystemGraph(25n), 20_500_000_000n);
+       const expectedWallNs2 = parseSystemGraph(session2Graph2).wall_ns;
+
+       let connections = 0;
+       const server = createServer((_, res) => res.writeHead(404).end());
+       const sockets = new WebSocketServer({server, path: '/telemetry'});
+       sockets.on('connection', client => {
+         connections++;
+         if (connections === 1) {
+           client.send(session1Graph);
+           // Send dictionary + page 0 of a 2-page keyframe, then drop mid-update.
+           client.send(concatPages(dictPages), {binary: true});
+           client.send(valPages1[0], {binary: true});
+         } else {
+           // Session 2 restarted with counters reset to 0.
+           client.send(session2Graph1);
+           client.send(session2Graph2);
+           // Orphan page 1 from session 1 must NOT stitch onto page 0; then
+           // complete dictionary + 2-page keyframes must decode cleanly in order.
+           client.send(valPages1[1], {binary: true});
+           client.send(
+               concatPages([...dictPages, ...valPages2, ...valPages3]),
+               {binary: true});
+         }
+       });
+       server.listen(0, '127.0.0.1');
+       await once(server, 'listening');
+       const {port} = server.address() as AddressInfo;
+       const agent = startAgent(0, `ws://127.0.0.1:${port}/telemetry`);
+       try {
+         await settle(() => agent.context().system !== null,
+                      'connection 1 never received system graph');
+         // Drop connection 1 to trigger socket.on('close') resets and reconnect.
+         for (const client of sockets.clients) client.terminate();
+         await settle(() => agent.context().system?.wall_ns === expectedWallNs2,
+                      'connection 2 never received restarted system graphs');
+         await settle(
+             () => agent.timeline.frames.some(f => f.sequence_id === '3'),
+             'connection 2 never decoded clean telemetry');
+
+         // RateWindow reset: valid positive rate on the 2nd graph of session 2.
+         const graph =
+             dispatch(agent.context(), 'get_system_graph', {}) as any;
+         const drivetrain =
+             graph.nodes.find((n: any) => n.name === 'drivetrain');
+         const timer = drivetrain.sources.find(
+             (s: any) => s.kind === 'TIMER' && s.period_ns !== '0');
+         const expectedHz = 1e9 / Number(timer.period_ns);
+         assert.equal(typeof timer.events_per_second, 'number');
+         assert.ok(
+             Math.abs(timer.events_per_second - expectedHz) < expectedHz * 0.05,
+             `expected ~${expectedHz} Hz, got ${timer.events_per_second}`);
+
+         // Decoder reset: only session 2's clean frames landed (no stitched seq 1).
+         assert.equal(agent.timeline.frames.length, 2);
+         assert.equal(agent.timeline.frames[0].sequence_id, '2');
+         assert.equal(agent.timeline.frames[0].channels['ch_0'], 42);
+         assert.equal(agent.timeline.frames[1].sequence_id, '3');
+         assert.equal(agent.timeline.frames[1].channels['ch_0'], 43);
+       } finally {
+         agent.close();
+         for (const client of sockets.clients) client.terminate();
+         sockets.close();
+         server.close();
+         server.closeAllConnections();
+       }
+     });
+
+test('get_schema_tree uses a null prototype and walks shared dictionary objects once',
+     () => {
+       const decoder = new TelemetryDecoder();
+       const base = decoder.decode(demoPacket(0n))!;
+       const sharedEnumLabels =
+           Object.freeze(Array.from({length: 128}, (_, i) => `state_${i}`));
+       const rawLabels: Record<string, string[]> = Object.freeze(Object.assign(
+           Object.create(null), base.labels,
+           {shared_a: sharedEnumLabels, shared_b: sharedEnumLabels}));
+       let unitsWalks = 0;
+       let labelsWalks = 0;
+       let alertsWalks = 0;
+       const countWalks = <T extends object>(target: T, bump: () => void): T =>
+           new Proxy(target, {
+             ownKeys(obj) {
+               bump();
+               return Reflect.ownKeys(obj);
+             }
+           });
+       const sharedUnits = countWalks(base.units, () => { unitsWalks++; });
+       const sharedLabels = countWalks(rawLabels, () => { labelsWalks++; });
+       const sharedAlerts =
+           countWalks(base.alerts ?? Object.create(null), () => { alertsWalks++; });
+
+       const timeline = new Timeline();
+       for (let i = 0; i < 5000; i++) {
+         const channels: Record<string, number> = Object.assign(
+             Object.create(null), base.channels);
+         if (i === 0) channels['__proto__'] = 1;
+         if (i === 4999) channels['late/channel'] = 2;
+         const frame: Snapshot = {
+           ...base,
+           sequence_id: String(i),
+           timestamp_ns: String(1_000_000_000n + BigInt(i) * 1_000_000n),
+           chassis: {...base.chassis},
+           channels,
+           units: sharedUnits,
+           labels: sharedLabels,
+           alerts: sharedAlerts
+         };
+         timeline.append(frame);
+       }
+
+       const result = dispatch(ctx(timeline), 'get_schema_tree') as {
+         topics: Record<string, string>;
+         frames: number;
+       };
+       assert.equal(result.frames, 5000);
+       assert.equal(Object.getPrototypeOf(result.topics), null);
+       assert.equal(unitsWalks, 1);
+       assert.equal(labelsWalks, 1);
+       assert.equal(alertsWalks, 1);
+       assert.equal(result.topics['velocity'], 'double');
+       assert.equal(result.topics['channels.velocity'], 'number');
+       assert.equal(result.topics['mode'], 'uint');
+       assert.equal(result.topics['units.velocity'], 'string');
+       assert.equal(result.topics['labels.mode.0'], 'string');
+       assert.equal(result.topics['labels.shared_a.127'], 'string');
+       assert.equal(result.topics['labels.shared_b.127'], 'string');
+       assert.equal(
+           result.topics['alerts.hw/status/alert_error_link_lost'], 'number');
+       assert.equal(result.topics['late/channel'], 'double');
+       assert.equal(result.topics['__proto__'], 'double');
+       assert.equal(({} as Record<string, unknown>)['polluted'], undefined);
+     });
+
+test('HTTP/WS reject empty Origin, guard multi-chunk >64 KiB POST, cap WS clients, and close keep-alive on shutdown',
+     {timeout: HANG_BOUND_MS}, async () => {
+       const bridge = await fakeBridge(null);
+       const agent = startAgent(0, bridge.url);
+       const wsClients: WebSocket[] = [];
+       const keepAliveAgent = new HttpAgent({keepAlive: true});
+       try {
+         await settle(() => !!agent.server.address(), 'agent did not listen');
+         const {port} = agent.server.address() as AddressInfo;
+
+         // (a) Empty Origin header is rejected on HTTP and WebSocket upgrade.
+         const statusFor = (method: string, path: string,
+                            headers: Record<string, string>) =>
+             new Promise<number>((resolve, reject) => {
+               const req = httpRequest(
+                   {host: '127.0.0.1', port, method, path, headers}, res => {
+                     res.resume();
+                     res.on('end', () => resolve(res.statusCode ?? 0));
+                   });
+               req.on('error', reject);
+               req.end();
+             });
+         assert.equal(await statusFor('GET', '/health', {Origin: ''}), 403);
+         assert.equal(await statusFor('POST', '/rpc', {Origin: ''}), 403);
+
+         const emptyOriginWs = new WebSocket(
+             `ws://127.0.0.1:${port}/rpc`, {headers: {Origin: ''}});
+         const emptyOriginRejected = await new Promise<boolean>(resolve => {
+           emptyOriginWs.on('open', () => resolve(false));
+           emptyOriginWs.on('error', () => resolve(true));
+           emptyOriginWs.on('close', () => resolve(true));
+         });
+         emptyOriginWs.terminate();
+         assert.equal(emptyOriginRejected, true);
+
+         // (b) Multi-chunk >64 KiB POST returns 413 cleanly without crashing.
+         const oversizedStatus = await new Promise<number>(resolve => {
+           const req = httpRequest(
+               {
+                 host: '127.0.0.1',
+                 port,
+                 method: 'POST',
+                 path: '/rpc',
+                 headers: {
+                   'Content-Type': 'application/json',
+                   'Transfer-Encoding': 'chunked'
+                 }
+               },
+               res => {
+                 res.resume();
+                 res.on('end', () => resolve(res.statusCode ?? 0));
+                 res.on('close', () => resolve(res.statusCode ?? 0));
+               });
+           // Server destroys the request stream after writing 413.
+           req.on('error', () => {});
+           const chunk = Buffer.alloc(20_000, 0x61);
+           for (let i = 0; i < 5; i++) req.write(chunk);
+           req.end();
+         });
+         assert.equal(oversizedStatus, 413);
+         const okRpc = await fetch(`http://127.0.0.1:${port}/rpc`, {
+           method: 'POST',
+           headers: {'Content-Type': 'application/json'},
+           body: JSON.stringify(
+               {jsonrpc: '2.0', id: 1, method: 'get_schema_tree'})
+         });
+         assert.equal(okRpc.status, 200);
+
+         // (c) WebSocket client cap enforces MAX_WS_CLIENTS.
+         for (let i = 0; i < MAX_WS_CLIENTS; i++) {
+           const wsClient = new WebSocket(`ws://127.0.0.1:${port}/rpc`);
+           wsClient.on('error', () => {});
+           await once(wsClient, 'open');
+           wsClients.push(wsClient);
+         }
+         const overflowWs = new WebSocket(`ws://127.0.0.1:${port}/rpc`);
+         const overflowRejected = await new Promise<boolean>(resolve => {
+           overflowWs.on('open', () => resolve(false));
+           overflowWs.on('error', () => resolve(true));
+           overflowWs.on('close', () => resolve(true));
+         });
+         overflowWs.terminate();
+         assert.equal(overflowRejected, true);
+         for (const wsClient of wsClients) wsClient.terminate();
+         wsClients.length = 0;
+
+         // (d) Idle HTTP keep-alive closes promptly on agent.close().
+         agent.server.keepAliveTimeout = 60_000;
+         await new Promise<void>((resolve, reject) => {
+           const req = httpRequest(
+               {
+                 host: '127.0.0.1',
+                 port,
+                 method: 'GET',
+                 path: '/health',
+                 agent: keepAliveAgent
+               },
+               res => {
+                 res.resume();
+                 res.on('end', () => resolve());
+               });
+           req.on('error', reject);
+           req.end();
+         });
+         const serverClosed = once(agent.server, 'close');
+         agent.close();
+         await serverClosed;
+       } finally {
+         for (const wsClient of wsClients) wsClient.terminate();
+         keepAliveAgent.destroy();
+         agent.close();
+         bridge.close();
+       }
      });

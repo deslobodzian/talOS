@@ -243,7 +243,8 @@ function RobotPanel() {
   const actions = useActions();
   const latch = useAlertLatch();
 
-  const graph = system.graph;
+  const graph = recorded ? null : system.graph;
+  const declared = recorded ? recorded.declared : system.declared;
   const channels = snapshot?.channels ?? {};
   const labels = snapshot?.labels ?? {};
 
@@ -398,7 +399,7 @@ function RobotPanel() {
                    {status.power.brownout === null ? '—' : status.power.brownout ? 'yes' : 'no'}
                  </Stat>
                  {status.power.canBuses.map(bus => {
-                   const configured = system.declared?.can_buses?.[bus.index];
+                   const configured = declared?.can_buses?.[bus.index];
                    const label = configured
                        ? `CAN ${configured}`
                        : bus.index === 0 ? 'CAN rio' : `CAN bus ${bus.index}`;

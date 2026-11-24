@@ -15,7 +15,7 @@ import {TelemetryStore} from '../src/data/store';
 import {createStaticStudio, type Studio, StudioProvider} from '../src/data/studio';
 import {demoPacket} from '../src/demo';
 import {assignYAxes, groupByUnit, type PlotChannel} from '../src/panels/plot/axes';
-import {cursorTimestampNs, plotColumn, plotData, plotPanel} from '../src/panels/plot';
+import {cursorTimestampNs, plotColumn, plotData, plotPanel, shouldResetPlotScales} from '../src/panels/plot';
 
 const pc = (name: string, unit = '', labels: string[] = []): PlotChannel =>
     ({name, unit, labels});
@@ -235,4 +235,64 @@ test('cursorTimestampNs returns null for missing or non-finite samples and exact
   assert.equal(cursorTimestampNs([Number.NaN, Infinity, -Infinity, 1e308], 3, origin), null);
   assert.equal(cursorTimestampNs([0], null, origin), null);
   assert.equal(cursorTimestampNs([0], 0, null), null);
+});
+
+// REQ-OPS-41, REQ-OPS-23: recorded/paused plots must reset scales on first data
+// arrival (uninitialized x-scale), during REPLAY_PLAYING / LIVE_STREAMING, when
+// the window shifts out from under the current x-scale, or on empty series,
+// while preserving a paused user zoom within the current data range.
+test('shouldResetPlotScales handles uninitialized scales, replay, scrubs, and paused zoom', () => {
+  const times = [0, 2, 4, 6, 8, 10];
+  // Uninitialized or non-finite x-scales (e.g. first recorded fetch arriving
+  // while PAUSED after an initial empty render) must reset so the plot draws.
+  assert.equal(shouldResetPlotScales({
+    windowChanged: false, mode: 'PAUSED', times, xScale: {min: null, max: null}
+  }), true);
+  assert.equal(shouldResetPlotScales({
+    windowChanged: false, mode: 'PAUSED', times, xScale: {min: undefined, max: undefined}
+  }), true);
+  assert.equal(shouldResetPlotScales({
+    windowChanged: false, mode: 'PAUSED', times, xScale: undefined
+  }), true);
+  assert.equal(shouldResetPlotScales({
+    windowChanged: false, mode: 'PAUSED', times, xScale: {min: Number.NaN, max: 10}
+  }), true);
+
+  // Advancing playback (REPLAY_PLAYING or LIVE_STREAMING) always resets scales.
+  assert.equal(shouldResetPlotScales({
+    windowChanged: false, mode: 'REPLAY_PLAYING', times, xScale: {min: 2, max: 6}
+  }), true);
+  assert.equal(shouldResetPlotScales({
+    windowChanged: false, mode: 'LIVE_STREAMING', times, xScale: {min: 2, max: 6}
+  }), true);
+
+  // Explicit window/channel change or empty data resets scales.
+  assert.equal(shouldResetPlotScales({
+    windowChanged: true, mode: 'PAUSED', times, xScale: {min: 2, max: 6}
+  }), true);
+  assert.equal(shouldResetPlotScales({
+    windowChanged: false, mode: 'PAUSED', times: [], xScale: {min: 0, max: 10}
+  }), true);
+
+  // Scrubbing across windows while PAUSED shifts times outside [min, max].
+  assert.equal(shouldResetPlotScales({
+    windowChanged: false, mode: 'PAUSED', times: [5, 10, 15], xScale: {min: 0, max: 10}
+  }), true);
+  assert.equal(shouldResetPlotScales({
+    windowChanged: false, mode: 'PAUSED', times: [5, 10, 15], xScale: {min: 10, max: 20}
+  }), true);
+  assert.equal(shouldResetPlotScales({
+    windowChanged: false, mode: 'PAUSED', times: [25, 30, 35], xScale: {min: 0, max: 10}
+  }), true);
+  assert.equal(shouldResetPlotScales({
+    windowChanged: false, mode: 'PAUSED', times: [0, 5, 10], xScale: {min: 25, max: 35}
+  }), true);
+
+  // Paused user zoom inside the current series range is preserved.
+  assert.equal(shouldResetPlotScales({
+    windowChanged: false, mode: 'PAUSED', times, xScale: {min: 2, max: 6}
+  }), false);
+  assert.equal(shouldResetPlotScales({
+    windowChanged: false, mode: 'PAUSED', times, xScale: {min: 0, max: 10}
+  }), false);
 });

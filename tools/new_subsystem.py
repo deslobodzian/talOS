@@ -2324,7 +2324,7 @@ class @PASCAL@Test : public ::testing::Test {
 
 TEST_F(@PASCAL@Test, PublishesFromALiveInput) {
   sim.step(20ms);
-  Observe("front_camera", 1.0, 2.0);
+  Observe("@CAMERA_A@", 1.0, 2.0);
   sim.step(40ms);
   const State state = Latest();
   EXPECT_TRUE(state.valid());
@@ -2336,7 +2336,7 @@ TEST_F(@PASCAL@Test, PublishesFromALiveInput) {
 TEST_F(@PASCAL@Test, EstimatesWhileTheRobotIsDisabled) {
   hw.enable(false);  // nothing here is actuation-gated
   sim.step(20ms);
-  Observe("back_camera", 3.0, 1.0);
+  Observe("@CAMERA_B@", 3.0, 1.0);
   sim.step(40ms);
   EXPECT_TRUE(Latest().valid());
   EXPECT_DOUBLE_EQ(Latest().pose().x_m(), 3.0);
@@ -2345,7 +2345,7 @@ TEST_F(@PASCAL@Test, EstimatesWhileTheRobotIsDisabled) {
 // REQ-CONTRACT-25
 TEST_F(@PASCAL@Test, StaleInputClearsValidity) {
   sim.step(20ms);
-  Observe("front_camera", 1.0, 2.0);
+  Observe("@CAMERA_A@", 1.0, 2.0);
   sim.step(40ms);
   ASSERT_TRUE(Latest().valid());
   sim.step(600ms);  // past observation_timeout_us
@@ -2356,9 +2356,9 @@ TEST_F(@PASCAL@Test, StaleInputClearsValidity) {
 
 TEST_F(@PASCAL@Test, RejectsUnusableObservations) {
   sim.step(20ms);
-  Observe("front_camera", 1.0, 2.0, /*valid=*/false);
+  Observe("@CAMERA_A@", 1.0, 2.0, /*valid=*/false);
   sim.step(40ms);
-  Observe("front_camera", 1.0, 2.0, true,
+  Observe("@CAMERA_A@", 1.0, 2.0, true,
           std::numeric_limits<double>::quiet_NaN());
   sim.step(40ms);
   const State state = Latest();
@@ -2369,7 +2369,7 @@ TEST_F(@PASCAL@Test, RejectsUnusableObservations) {
 
 TEST_F(@PASCAL@Test, ReadsOnlyTheListedCameras) {
   sim.step(20ms);
-  Observe("side_camera", 1.0, 2.0);  // not in `cameras`
+  Observe("@UNLISTED_CAMERA@", 1.0, 2.0);  // not in `cameras`
   sim.step(40ms);
   EXPECT_FALSE(Latest().valid());
   EXPECT_EQ(Latest().observation_accepted_count(), 0u);
@@ -2377,9 +2377,9 @@ TEST_F(@PASCAL@Test, ReadsOnlyTheListedCameras) {
 
 TEST_F(@PASCAL@Test, CountsEveryObservationBetweenTicks) {
   sim.step(20ms);
-  Observe("front_camera", 1.0, 2.0);
-  Observe("front_camera", 1.0, 2.0, /*valid=*/false);
-  Observe("front_camera", 1.5, 2.0);
+  Observe("@CAMERA_A@", 1.0, 2.0);
+  Observe("@CAMERA_A@", 1.0, 2.0, /*valid=*/false);
+  Observe("@CAMERA_A@", 1.5, 2.0);
   sim.step(40ms);
   const State state = Latest();
   EXPECT_EQ(state.observation_accepted_count(), 2u);
@@ -2395,7 +2395,7 @@ TEST(@PASCAL@Parameters, BadParameterFailsConstruction) {
       {"cameras", "observation_timeout_us = 500000"},
       {"cameras", "cameras = 3"},
       {"observation_timeout_us",
-       "cameras = ['front_camera']\\nobservation_timeout_us = 0"},
+       "cameras = ['@CAMERA_A@']\\nobservation_timeout_us = 0"},
   };
   for (const auto& row : rows) {
     SCOPED_TRACE(row.settings);
@@ -2403,7 +2403,7 @@ TEST(@PASCAL@Parameters, BadParameterFailsConstruction) {
         std::string{"[robot]\\nperiod_us = 20000\\ncommand_timeout_us = 100000\\n"
                     "[subsystems.@NAME@]\\n"} +
         row.settings +
-        "\\n[subsystems.chassis.motors.chassis_motor]\\n"
+        "\\n[subsystems.@CHASSIS@.motors.@CHASSIS@_motor]\\n"
         "type = 'TalonFX'\\ncan_id = 1\\n");
     try {
       sim.add<@PASCAL@>("@NAME@");
@@ -2422,7 +2422,7 @@ TEST_F(@PASCAL@Test, UpdateDoesNotAllocate) {
     GTEST_SKIP() << why;
   }
   sim.step(40ms);
-  Observe("front_camera", 1.0, 2.0);
+  Observe("@CAMERA_A@", 1.0, 2.0);
   AllocationProbe probe;
   probe.start();
   sim.step(60ms);
@@ -2544,7 +2544,7 @@ import math
 
     def test_publishes_from_a_live_input(self):
         self.sim.step(0.02)
-        self.observe("front_camera", 1.0, 2.0)
+        self.observe("@CAMERA_A@", 1.0, 2.0)
         self.sim.step(0.04)
         state = self.state()
         self.assertTrue(state.valid)
@@ -2554,7 +2554,7 @@ import math
     def test_estimates_while_the_robot_is_disabled(self):
         self.hw.enable(False)  # nothing here is actuation-gated
         self.sim.step(0.02)
-        self.observe("back_camera", 3.0, 1.0)
+        self.observe("@CAMERA_B@", 3.0, 1.0)
         self.sim.step(0.04)
         self.assertTrue(self.state().valid)
         self.assertEqual(self.state().pose_x_m, 3.0)
@@ -2562,7 +2562,7 @@ import math
     # REQ-CONTRACT-25
     def test_stale_input_clears_validity(self):
         self.sim.step(0.02)
-        self.observe("front_camera", 1.0, 2.0)
+        self.observe("@CAMERA_A@", 1.0, 2.0)
         self.sim.step(0.04)
         self.assertTrue(self.state().valid)
         self.sim.step(0.6)  # past observation_timeout_us
@@ -2571,9 +2571,9 @@ import math
 
     def test_rejects_unusable_observations(self):
         self.sim.step(0.02)
-        self.observe("front_camera", 1.0, 2.0, valid=False)
+        self.observe("@CAMERA_A@", 1.0, 2.0, valid=False)
         self.sim.step(0.04)
-        self.observe("front_camera", 1.0, 2.0, std_m=math.nan)
+        self.observe("@CAMERA_A@", 1.0, 2.0, std_m=math.nan)
         self.sim.step(0.04)
         state = self.state()
         self.assertFalse(state.valid)
@@ -2582,16 +2582,16 @@ import math
 
     def test_reads_only_the_listed_cameras(self):
         self.sim.step(0.02)
-        self.observe("side_camera", 1.0, 2.0)  # not in `cameras`
+        self.observe("@UNLISTED_CAMERA@", 1.0, 2.0)  # not in `cameras`
         self.sim.step(0.04)
         self.assertFalse(self.state().valid)
         self.assertEqual(self.state().observation_accepted_count, 0)
 
     def test_counts_every_observation_between_ticks(self):
         self.sim.step(0.02)
-        self.observe("front_camera", 1.0, 2.0)
-        self.observe("front_camera", 1.0, 2.0, valid=False)
-        self.observe("front_camera", 1.5, 2.0)
+        self.observe("@CAMERA_A@", 1.0, 2.0)
+        self.observe("@CAMERA_A@", 1.0, 2.0, valid=False)
+        self.observe("@CAMERA_A@", 1.5, 2.0)
         self.sim.step(0.04)
         state = self.state()
         self.assertEqual((state.observation_accepted_count,
@@ -2603,13 +2603,13 @@ import math
                 ("cameras", "observation_timeout_us = 500000"),
                 ("cameras", "cameras = 3"),
                 ("observation_timeout_us",
-                 'cameras = ["front_camera"]\\nobservation_timeout_us = 0')):
+                 'cameras = ["@CAMERA_A@"]\\nobservation_timeout_us = 0')):
             with self.subTest(settings=settings):
                 sim = Sim.from_toml(
                     "[robot]\\nperiod_us = 20000\\n"
                     "command_timeout_us = 100000\\n"
                     f"[subsystems.@NAME@]\\n{settings}\\n"
-                    "[subsystems.chassis.motors.chassis_motor]\\n"
+                    "[subsystems.@CHASSIS@.motors.@CHASSIS@_motor]\\n"
                     'type = "TalonFX"\\ncan_id = 1\\n')
                 with self.assertRaisesRegex((ValueError, talos.TalosError),
                                             key):
@@ -2623,12 +2623,12 @@ ESTIMATOR_TESTDATA_ROBOT = """\
 """ + TESTDATA_ROBOT_TABLE + """
 [subsystems.@NAME@]
 period_us = @PERIOD@
-cameras = ["front_camera", "back_camera"]
+cameras = ["@CAMERA_A@", "@CAMERA_B@"]
 observation_timeout_us = 500000
 
 # A robot config needs one motor; this stands in for the robot the
 # estimator rides on.
-[subsystems.chassis.motors.chassis_motor]
+[subsystems.@CHASSIS@.motors.@CHASSIS@_motor]
 type = "TalonFX"
 bus = "test"
 can_id = 1
@@ -2654,10 +2654,22 @@ observation_timeout_us = 500000
 """
 
 
+def estimator_fixtures(name):
+    """Collision-free camera and chassis fixture names for estimator tests."""
+    return {
+        "CAMERA_A": "left_camera" if name == "front_camera" else "front_camera",
+        "CAMERA_B": "right_camera" if name == "back_camera" else "back_camera",
+        "UNLISTED_CAMERA": (
+            "top_camera" if name == "side_camera" else "side_camera"
+        ),
+        "CHASSIS": "base_chassis" if name == "chassis" else "chassis",
+    }
+
+
 def estimator_files(name, lang, talos=""):
     """{relative path: content} of an estimator package."""
     values = dict(NAME=name, PASCAL=pascal(name), PERIOD=PERIOD_US,
-                  TALOS=talos)
+                  TALOS=talos, **estimator_fixtures(name))
     doc = fill(ESTIMATOR_DOC, **values)
     messages = fill(ESTIMATOR_MESSAGES_BUILD, **values)
     files = {"testdata/robot.toml": fill(ESTIMATOR_TESTDATA_ROBOT, **values)}
@@ -2733,6 +2745,12 @@ def package_files(name, lang, standalone=False, kind="velocity", raw=False,
             'bazel_dep(name = "googletest", version = "1.17.0.bcr.2")\n'
             if lang == "cpp" else
             'bazel_dep(name = "rules_python", version = "2.0.1")\n'
+            '\n'
+            'python = use_extension("@rules_python//python/extensions:python.bzl", "python")\n'
+            'python.toolchain(\n'
+            '    is_default = True,\n'
+            '    python_version = "3.11",\n'
+            ')\n'
         )
         files["MODULE.bazel"] = fill(
             STANDALONE_MODULE, EXTRA_DEPS=extra_deps, **values)

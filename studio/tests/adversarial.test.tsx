@@ -45,13 +45,15 @@ import {
   STALE_MS,
 } from '../src/drive/feed';
 import {parseLayout} from '../src/drive/layout';
-import {renderWidgets} from '../src/drive/view';
+import {renderWidget, renderWidgets} from '../src/drive/view';
 import {parseWorkspace} from '../src/layout/tree';
 import {robotPanel} from '../src/panels/robot';
 import {observationErrors} from '../src/panels/vision/logic';
 import {StatusStrip} from '../src/shell/StatusStrip';
 import {RateWindow, SystemGraphStream, type SystemGraph} from '../src/system';
 import {hertz, integer} from '../src/ui/formatters';
+import {Sparkline} from '../src/ui/Sparkline';
+import {TimeSeriesChart} from '../src/ui/TimeSeriesChart';
 
 const ZERO_POSE = {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0};
 const DS = 'hw/state/driver_station/';
@@ -655,4 +657,80 @@ test('parseWorkspace bounds deeply nested split trees without stack overflow', (
     version: 1, activePage: 'p', pages: [{id: 'p', title: 'Deep', root: node}]
   });
   assert.equal(ws.pages.length, 0);
+});
+
+// --- 7. Chart & sparkline float64 precision / overflow bounds ----------------
+
+// REQ-OPS-23, REQ-OPS-49: large constant values (>= 2^53 where ±1 is a float64
+// no-op), wide finite spans (±1e308 where max - min overflows to Infinity), and
+// non-finite bands must never emit NaN or Infinity into SVG paths or polylines.
+test('TimeSeriesChart, Sparkline, and drive graphWidget avoid SVG NaN/Infinity on extreme finite values', () => {
+  const cases: {label: string; values: number[]; times?: number[]}[] = [
+    {label: 'constant >= 2^53', values: [1.7e18, 1.7e18]},
+    {label: 'constant MAX_VALUE', values: [Number.MAX_VALUE, Number.MAX_VALUE]},
+    {label: 'wide span ±1e308', values: [-1e308, 1e308]},
+    {label: 'wide span ±MAX_VALUE', values: [-Number.MAX_VALUE, Number.MAX_VALUE]},
+    {label: 'large constant times', values: [1.7e18, 1.7e18], times: [1.7e18, 1.7e18]},
+    {label: 'wide times ±1e308', values: [-1e308, 1e308], times: [-1e308, 1e308]},
+  ];
+  const bands = [
+    {start: Number.NaN, end: 1},
+    {start: 0, end: Infinity},
+    {start: -Infinity, end: 1},
+    {start: 0, end: 1},
+  ];
+  for (const c of cases) {
+    const chartHtml = renderToStaticMarkup(
+        <TimeSeriesChart lines={[{name: 'v', color: '#48e1cf', times: c.times, values: c.values}]}
+                         bands={bands}/>);
+    assert.match(chartHtml, /<path /, `${c.label}: TimeSeriesChart missing path`);
+    assert.ok(!chartHtml.includes('NaN') && !chartHtml.includes('Infinity'),
+              `${c.label}: TimeSeriesChart emitted non-finite SVG: ${chartHtml}`);
+
+    // Also exercise decimated path (length > 2 * width).
+    const longValues = Array.from({length: 40}, (_, i) => c.values[i % c.values.length]);
+    const longTimes = c.times ?
+        Array.from({length: 40}, (_, i) => c.times![i % c.times!.length]) : undefined;
+    const decHtml = renderToStaticMarkup(
+        <TimeSeriesChart width={10} lines={[{name: 'v', color: '#48e1cf',
+                                             times: longTimes, values: longValues}]}/>);
+    assert.match(decHtml, /<path /, `${c.label}: decimated TimeSeriesChart missing path`);
+    assert.ok(!decHtml.includes('NaN') && !decHtml.includes('Infinity'),
+              `${c.label}: decimated TimeSeriesChart emitted non-finite SVG: ${decHtml}`);
+
+    const sparkHtml = renderToStaticMarkup(<Sparkline values={c.values}/>);
+    assert.match(sparkHtml, /<polyline /, `${c.label}: Sparkline missing polyline`);
+    assert.ok(!sparkHtml.includes('NaN') && !sparkHtml.includes('Infinity'),
+              `${c.label}: Sparkline emitted non-finite SVG: ${sparkHtml}`);
+  }
+
+  // /drive graphWidget with [1.7e18, 1.7e18] and [-1e308, 1e308].
+  const layout = parseLayout({
+    columns: 4, rows: 2, update_hz: 20,
+    widgets: [
+      {kind: 'graph', at: [0, 0, 4, 2], title: 'G', channels: {},
+       series: ['v'], window_s: 10}
+    ]
+  });
+  const graphWidget = layout.widgets[0];
+  const channels = [{name: 'v', unit: '', kind: ChannelKind.Double}];
+  const hdr = (seq: number) => ({
+    streamId: 1n, sequenceId: BigInt(seq), timestampNs: BigInt(seq) * 100_000_000n,
+    dictionaryId: 1, channelCount: 1
+  });
+  for (const pair of [[1.7e18, 1.7e18], [-1e308, 1e308], [Number.MAX_VALUE, Number.MAX_VALUE]] as [number, number][]) {
+    const sock = makeFakeSocket();
+    const model = new DriveModel('ws://test/drive', () => sock, ['v']);
+    model.clock = () => 100;
+    model.start(0);
+    sock.onopen!();
+    sock.send(
+        ...encodeDictionaryPages(hdr(1), channels),
+        ...encodeValuePages(hdr(1), ZERO_POSE, true, [[0, rawFromDouble(pair[0])]]),
+        ...encodeValuePages(hdr(2), ZERO_POSE, false, [[0, rawFromDouble(pair[1])]]));
+    const html = renderWidget(graphWidget, model, 100);
+    assert.match(html, /<polyline /, `graphWidget ${pair}: missing polyline`);
+    assert.ok(!html.includes('NaN') && !html.includes('Infinity'),
+              `graphWidget ${pair}: emitted non-finite SVG: ${html}`);
+  }
 });

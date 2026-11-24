@@ -3,10 +3,9 @@
 robot_physics_sim.toml is robot_py.toml run against the physics simulator.
 Config load refuses a nested include, so it repeats robot_py.toml's overrides
 on the same include instead of including it, and adds only
-[robot] simulation_only. This compares them with [studio] dropped from both
-and [robot] simulation_only dropped from robot_physics_sim.toml, so it fails
-when the include, the other [robot] overrides or the [[subsystems]] entries
-differ, and not on a [studio] difference.
+[robot] simulation_only. This compares them with only [robot] simulation_only
+dropped from robot_physics_sim.toml, so it fails when the include, [studio],
+the other [robot] overrides or the [[subsystems]] entries differ.
 
 //studio:drive_browser_test opens Studio's driver dashboard against
 studio/tests/browser/robot.toml, which must be the bench's physics
@@ -28,13 +27,14 @@ PYTHON = "_main/bench/main_processor/configuration/robot_py.toml"
 COPIES = ("_main/studio/tests/browser/robot.toml",)
 
 
-def overrides(path):
-    """The config at `path` as it overlays its include: everything but
-    [studio], with `include` and each subsystem's `path` and `defaults`
-    resolved from the file's directory."""
+def overrides(path, *, drop_studio=True):
+    """The config at `path` as it overlays its include: everything (less
+    [studio] when `drop_studio` is true), with `include` and each
+    subsystem's `path` and `defaults` resolved from the file's directory."""
     with open(path, "rb") as f:
         config = tomllib.load(f)
-    config.pop("studio", None)
+    if drop_studio:
+        config.pop("studio", None)
     here = os.path.dirname(path)
 
     def resolve(rel):
@@ -65,8 +65,9 @@ class PhysicsSimCopyTest(unittest.TestCase):
     def test_physics_sim_repeats_the_python_bench_overrides(self):
         r = runfiles.Create()
         self.assertEqual(
-            without_simulation_only(overrides(r.Rlocation(PHYSICS))),
-            overrides(r.Rlocation(PYTHON)),
+            without_simulation_only(
+                overrides(r.Rlocation(PHYSICS), drop_studio=False)),
+            overrides(r.Rlocation(PYTHON), drop_studio=False),
         )
 
     # REQ-CONTRACT-41: a config derived from another fails a test when it

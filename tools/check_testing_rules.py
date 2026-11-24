@@ -834,6 +834,9 @@ class _BuildState:
         self.sim_check_ok = sim_check_ok
         self.sim_check_err = sim_check_err
         self.bindings = {}
+        self.alias_group = {}
+        self.next_alias_id = 1
+        self.contained_names = {}
         self.cc_names = set(CC_TEST_RULES)
         self.sim_names = set(SIM_TEST_RULES)
         self.test_rule_names = set(KNOWN_TEST_RULES)
@@ -847,6 +850,11 @@ class _BuildState:
             self.sim_check_ok, self.sim_check_err,
         )
         copy.bindings = dict(self.bindings)
+        copy.alias_group = dict(self.alias_group)
+        copy.next_alias_id = self.next_alias_id
+        copy.contained_names = {
+            k: set(v) for k, v in self.contained_names.items()
+        }
         copy.cc_names = set(self.cc_names)
         copy.sim_names = set(self.sim_names)
         copy.test_rule_names = set(self.test_rule_names)
@@ -861,6 +869,94 @@ class _BuildState:
         self.cc_names.discard(name)
         self.sim_names.discard(name)
         self.test_rule_names.discard(name)
+
+    def alloc_alias_id(self):
+        gid = self.next_alias_id
+        self.next_alias_id += 1
+        return gid
+
+    def alias_members(self, name):
+        gid = self.alias_group.get(name)
+        if gid is None:
+            return {name}
+        return {k for k, v in self.alias_group.items() if v == gid}
+
+    def invalidate_with_aliases(self, name, include_self=True,
+                                include_contained=False):
+        """Marks `name`'s alias group (and optionally embedded container refs)
+        as `_UNRESOLVABLE`, returning all affected variable names."""
+        visited = set()
+        queue = list(self.alias_members(name))
+        if include_contained:
+            for member in list(queue):
+                queue.extend(self.contained_names.get(member, ()))
+        while queue:
+            cur = queue.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            for member in self.alias_members(cur):
+                if member not in visited:
+                    queue.append(member)
+            if include_contained:
+                for inner in self.contained_names.get(cur, ()):
+                    if inner not in visited:
+                        queue.append(inner)
+        affected = set()
+        for var in visited:
+            if not include_self and var == name:
+                continue
+            self.bindings[var] = _UNRESOLVABLE
+            self.discard_rule_aliases(var)
+            affected.add(var)
+        return affected
+
+
+MUTATING_METHODS = frozenset({
+    "append",
+    "extend",
+    "insert",
+    "pop",
+    "remove",
+    "clear",
+    "update",
+    "setdefault",
+})
+
+
+def _expr_ref_names(node):
+    """Variable names referenced in an expression (skipping bare Call.func
+    names like `dict(...)` so rule/builtin names do not pollute aliases)."""
+    if node is None:
+        return set()
+    skip = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+            skip.add(id(n.func))
+    return {
+        n.id for n in ast.walk(node)
+        if isinstance(n, ast.Name) and id(n) not in skip
+    }
+
+
+def _container_ref_names(node):
+    """Variable names embedded inside expressions that may hold or alias
+    mutable containers (literals, BinOp, IfExp, comprehensions, Call)."""
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict,
+                         ast.ListComp, ast.SetComp, ast.DictComp,
+                         ast.IfExp, ast.Call)):
+        return _expr_ref_names(node)
+    if isinstance(node, ast.BinOp) and isinstance(
+        node.op, (ast.Add, ast.BitOr, ast.Mult)
+    ):
+        return (
+            _container_ref_names(node.left) | _container_ref_names(node.right)
+            | (_expr_ref_names(node.left)
+               if isinstance(node.left, (ast.Name, ast.Subscript)) else set())
+            | (_expr_ref_names(node.right)
+               if isinstance(node.right, (ast.Name, ast.Subscript)) else set())
+        )
+    return set()
 
 
 def _subscript_root_name(node):
@@ -968,12 +1064,22 @@ def _check_call(call, state):
         ))
 
 
+def _iter_calls_postorder(node):
+    for child in ast.iter_child_nodes(node):
+        yield from _iter_calls_postorder(child)
+    if isinstance(node, ast.Call):
+        yield node
+
+
 def _walk_expr_calls(expr, state):
-    calls = [node for node in ast.walk(expr) if isinstance(node, ast.Call)]
-    calls.sort(key=lambda n: (getattr(n, "lineno", 0),
-                              getattr(n, "col_offset", 0)))
-    for call in calls:
+    """Checks all calls in `expr` in Starlark evaluation order (arguments
+    before enclosing call) and applies any mutating method calls, returning
+    the set of variable names modified."""
+    modified = set()
+    for call in _iter_calls_postorder(expr):
         _check_call(call, state)
+        modified |= _apply_mutating_call(call, state)
+    return modified
 
 
 def _apply_assign(targets, value, state):
@@ -988,12 +1094,34 @@ def _apply_assign(targets, value, state):
     elif isinstance(value, ast.Attribute):
         alias_of = value.attr
 
+    alias_source = None
+    if isinstance(value, ast.Name):
+        alias_source = value.id
+    elif isinstance(value, ast.Subscript):
+        alias_source = _subscript_root_name(value)
+
+    contained = _container_ref_names(value)
+    shared_gid = None
+    if alias_source is not None:
+        shared_gid = state.alias_group.get(alias_source)
+        if shared_gid is None:
+            shared_gid = state.alloc_alias_id()
+            state.alias_group[alias_source] = shared_gid
+
     modified = set()
     for target in targets:
         if isinstance(target, ast.Name):
             tid = target.id
             modified.add(tid)
             state.bindings[tid] = _BoundExpr(value, snap_env)
+            if shared_gid is not None:
+                state.alias_group[tid] = shared_gid
+            else:
+                state.alias_group[tid] = state.alloc_alias_id()
+            if contained:
+                state.contained_names[tid] = set(contained)
+            else:
+                state.contained_names.pop(tid, None)
             state.discard_rule_aliases(tid)
             if alias_of:
                 if alias_of in prev_cc:
@@ -1007,14 +1135,19 @@ def _apply_assign(targets, value, state):
         elif isinstance(target, ast.Subscript):
             root = _subscript_root_name(target)
             if root:
-                modified.add(root)
-                state.bindings[root] = _UNRESOLVABLE
-                state.discard_rule_aliases(root)
+                modified |= state.invalidate_with_aliases(
+                    root, include_self=True, include_contained=True)
+                inserted = _expr_ref_names(value)
+                if inserted:
+                    state.contained_names.setdefault(root, set()).update(
+                        inserted)
         else:
             for node in ast.walk(target):
                 if isinstance(node, ast.Name):
                     modified.add(node.id)
                     state.bindings[node.id] = _UNRESOLVABLE
+                    state.alias_group[node.id] = state.alloc_alias_id()
+                    state.contained_names.pop(node.id, None)
                     state.discard_rule_aliases(node.id)
     return modified
 
@@ -1032,40 +1165,74 @@ def _apply_aug_assign(target, op, value, state):
                 prev, _BoundExpr(value, snap_env),
                 is_add=isinstance(op, ast.Add),
             )
+            # In Starlark, `A += [...]` mutates a list in place, so any
+            # variable aliased to `tid` (or embedded in an aliased container)
+            # may observe the mutation.
+            modified |= state.invalidate_with_aliases(
+                tid, include_self=False, include_contained=True)
+            inserted = _expr_ref_names(value)
+            if inserted:
+                state.contained_names.setdefault(tid, set()).update(inserted)
         else:
-            state.bindings[tid] = _UNRESOLVABLE
+            modified |= state.invalidate_with_aliases(
+                tid, include_self=True, include_contained=True)
     elif isinstance(target, ast.Subscript):
         root = _subscript_root_name(target)
         if root:
-            modified.add(root)
-            state.bindings[root] = _UNRESOLVABLE
-            state.discard_rule_aliases(root)
+            modified |= state.invalidate_with_aliases(
+                root, include_self=True, include_contained=True)
+            inserted = _expr_ref_names(value)
+            if inserted:
+                state.contained_names.setdefault(root, set()).update(inserted)
     return modified
 
 
 def _apply_mutating_call(expr, state):
-    """Tracks in-place list/dict mutations like `TAGS.append('perf')`."""
+    """Tracks in-place list/dict mutations like `TAGS.append('perf')`,
+    including across variable aliases and subscripted containers."""
     if not isinstance(expr, ast.Call):
         return set()
     func = expr.func
-    if not (isinstance(func, ast.Attribute) and
-            isinstance(func.value, ast.Name)):
-        return set()
-    target = func.value.id
-    if target not in state.bindings:
+    if not isinstance(func, ast.Attribute):
         return set()
     method = func.attr
-    if method in ("append", "extend") and len(expr.args) == 1 and not expr.keywords:
-        snap_env = dict(state.bindings)
-        state.bindings[target] = _AugBinding(
-            state.bindings[target], _BoundExpr(expr.args[0], snap_env),
-            is_add=True,
-        )
-        return {target}
-    if method in ("insert", "pop", "remove", "clear", "update", "setdefault"):
-        state.bindings[target] = _UNRESOLVABLE
-        state.discard_rule_aliases(target)
-        return {target}
+    if method not in MUTATING_METHODS:
+        return set()
+    inserted = set()
+    for arg in expr.args:
+        inserted |= _expr_ref_names(arg)
+    for kw in expr.keywords:
+        inserted |= _expr_ref_names(kw.value)
+    if isinstance(func.value, ast.Name):
+        target = func.value.id
+        if target not in state.bindings and target not in state.alias_group:
+            return set()
+        if (method in ("append", "extend") and len(expr.args) == 1
+                and not expr.keywords and target in state.bindings):
+            snap_env = dict(state.bindings)
+            state.bindings[target] = _AugBinding(
+                state.bindings[target], _BoundExpr(expr.args[0], snap_env),
+                is_add=True,
+            )
+            modified = {target}
+            modified |= state.invalidate_with_aliases(
+                target, include_self=False, include_contained=True)
+            if inserted:
+                state.contained_names.setdefault(target, set()).update(inserted)
+            return modified
+        modified = state.invalidate_with_aliases(
+            target, include_self=True, include_contained=True)
+        if inserted:
+            state.contained_names.setdefault(target, set()).update(inserted)
+        return modified
+    if isinstance(func.value, ast.Subscript):
+        root = _subscript_root_name(func.value)
+        if root and (root in state.bindings or root in state.alias_group):
+            modified = state.invalidate_with_aliases(
+                root, include_self=True, include_contained=True)
+            if inserted:
+                state.contained_names.setdefault(root, set()).update(inserted)
+            return modified
     return set()
 
 
@@ -1074,21 +1241,24 @@ def _walk_statements(stmts, state):
     modified = set()
     for stmt in stmts:
         if isinstance(stmt, ast.Expr):
-            _walk_expr_calls(stmt.value, state)
-            modified |= _apply_mutating_call(stmt.value, state)
+            modified |= _walk_expr_calls(stmt.value, state)
         elif isinstance(stmt, ast.Assign):
-            _walk_expr_calls(stmt.value, state)
+            for target in stmt.targets:
+                modified |= _walk_expr_calls(target, state)
+            modified |= _walk_expr_calls(stmt.value, state)
             modified |= _apply_assign(stmt.targets, stmt.value, state)
         elif isinstance(stmt, ast.AugAssign):
-            _walk_expr_calls(stmt.value, state)
+            modified |= _walk_expr_calls(stmt.target, state)
+            modified |= _walk_expr_calls(stmt.value, state)
             modified |= _apply_aug_assign(
                 stmt.target, stmt.op, stmt.value, state)
         elif isinstance(stmt, ast.AnnAssign):
+            modified |= _walk_expr_calls(stmt.target, state)
             if stmt.value is not None:
-                _walk_expr_calls(stmt.value, state)
+                modified |= _walk_expr_calls(stmt.value, state)
                 modified |= _apply_assign([stmt.target], stmt.value, state)
         elif isinstance(stmt, ast.For):
-            _walk_expr_calls(stmt.iter, state)
+            modified |= _walk_expr_calls(stmt.iter, state)
             loop_state = state.clone_scope()
             for node in ast.walk(stmt.target):
                 if isinstance(node, ast.Name):
@@ -1099,11 +1269,10 @@ def _walk_statements(stmts, state):
             inner_mod |= _walk_statements(stmt.orelse, loop_state)
             state.merge_results(loop_state)
             for name in inner_mod:
-                state.bindings[name] = _UNRESOLVABLE
-                state.discard_rule_aliases(name)
-            modified |= inner_mod
+                modified |= state.invalidate_with_aliases(
+                    name, include_self=True)
         elif isinstance(stmt, ast.If):
-            _walk_expr_calls(stmt.test, state)
+            modified |= _walk_expr_calls(stmt.test, state)
             then_state = state.clone_scope()
             else_state = state.clone_scope()
             inner_mod = _walk_statements(stmt.body, then_state)
@@ -1111,9 +1280,8 @@ def _walk_statements(stmts, state):
             state.merge_results(then_state)
             state.merge_results(else_state)
             for name in inner_mod:
-                state.bindings[name] = _UNRESOLVABLE
-                state.discard_rule_aliases(name)
-            modified |= inner_mod
+                modified |= state.invalidate_with_aliases(
+                    name, include_self=True)
         elif isinstance(stmt, ast.FunctionDef):
             fn_state = state.clone_scope()
             for arg in (stmt.args.posonlyargs + stmt.args.args +
@@ -1127,7 +1295,7 @@ def _walk_statements(stmts, state):
             _walk_statements(stmt.body, fn_state)
             state.merge_results(fn_state)
         else:
-            _walk_expr_calls(stmt, state)
+            modified |= _walk_expr_calls(stmt, state)
     return modified
 
 

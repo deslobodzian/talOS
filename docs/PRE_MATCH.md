@@ -37,7 +37,7 @@ check below.
   |---|---|---|
   | **CONNECTING** | the page is opening its feed, or waiting for the first telemetry | wait a few seconds |
   | **LAUNCH REFUSED** `<reason>` | the main processor is powered and on the network, but the launcher refused to start the robot (a bad config, a graph error, `simulation_only = true`, a failed probe, or a full node registry); no robot node is running and the RoboRIO holds every output neutral. Distinct from **BRIDGE LINK**, which means power, network, or the bridge itself | read the refusal reason shown on `/drive` (also saved in `<prefix>/logs/last_refusal.json`); with the robot disabled, fix the config or bundle, install a passing bundle (or roll back with `tools/deploy.sh rollback`), and restart the service ([DEPLOYMENT.md](DEPLOYMENT.md#on-the-main-processor)) |
-  | **BRIDGE LINK** `Dashboard to bridge link down` or `nothing heard` | the laptop does not reach the main processor's port 5800: main processor off, still booting, off the robot network, or started with `--no-studio`; or the Studio bridge that serves the page died. The launcher restarts a dead bridge within about a second, a few times ([Studio bridge](../talOS/launcher/README.md#studio-bridge)), and the page reconnects by itself; one that keeps dying, or hangs, stays down for the rest of the session while the robot drives on | wait a few seconds; if it persists, [main processor not reachable](#main-processor-not-reachable) tells which; when only the dashboard is down, [dashboard down for the session](#dashboard-down-for-the-session) |
+  | **BRIDGE LINK** `Dashboard to bridge link down` or `nothing heard` | the laptop does not reach the main processor's port 5800: main processor off, still booting, off the robot network, or started with `--no-studio`; or the Studio bridge that serves the page died or hung. The launcher watches the bridge's live registry row, kills a hung bridge, and restarts a dead or hung bridge up to its restart bound ([Studio bridge](../talOS/launcher/README.md#studio-bridge)), after which the page reconnects by itself; one that keeps failing past that bound stays down for the rest of the session while the robot drives on | wait a few seconds; if it persists, [main processor not reachable](#main-processor-not-reachable) tells which; when only the dashboard is down, [dashboard down for the session](#dashboard-down-for-the-session) |
   | **TELEMETRY** `Telemetry stale` | the bridge is up but the telemetry node publishes nothing new: every value is stale | check the telemetry node in Studio at `/` (the pit); the robot can drive, but the dashboard shows nothing current. With `the page missed time (laptop asleep)`: the laptop slept, wait a second for a new tick |
   | **TELEMETRY** `Telemetry feed could not be decoded: reload the page` | the page could not decode what the bridge sent (a page built for another bridge version, or a corrupt message); it reconnects by itself, every 5 s after 3 failures in a row | reload the page; if it persists, the page and the bridge come from different builds: redeploy the bundle |
   | **PROTOCOL MISMATCH** `RoboRIO and main processor protocol versions differ; redeploy both` | the main processor received UDP frames from the RoboRIO of another hardware protocol version (checked before **ROBORIO LINK**); every output is neutral | redeploy both the RoboRIO program and the main processor bundle from one checkout ([DEPLOYMENT.md](DEPLOYMENT.md#roborio)) |
@@ -122,17 +122,22 @@ laptop. They tell whether the RoboRIO hears the main processor at all:
 ## Dashboard down for the session
 
 The robot drives on without the dashboard, but the dashboard will not come
-back by itself in this session when the launcher has left the Studio bridge
-after it kept dying (the launcher does not restart it again), or when the
-bridge hangs, which the launcher does not notice. Play the match without it;
-never restart anything during a match. Between matches, with the robot
-disabled, restart the service (`sudo systemctl restart talos` on Linux:
+back by itself in this session once the launcher has left the Studio bridge
+after it kept dying or hanging past its restart bound (the launcher watches
+the bridge's live registry row, kills a hung bridge, and restarts it up to
+`max_restarts` times per restart window before giving up:
+[Studio bridge](../talOS/launcher/README.md#studio-bridge)). Play the match
+without it; never restart anything during a match. Between matches, with the
+robot disabled, restart the service (`sudo systemctl restart talos` on Linux:
 [DEPLOYMENT.md](DEPLOYMENT.md#on-the-main-processor)) and reopen `/drive`.
 That restarts every node, so go through this checklist again.
 
 To find out why, in the pit: the session's `talos.log` on the main processor
 (`<prefix>/logs/<session-id>/`; `journalctl -u talos` on Linux) has a
-`studio_bridge exited` line for each death and, for a left bridge, one
-saying it `will not be restarted again`; `studio_bridge.log` beside it says
-why the bridge ended, and the session manifest's `studio_bridge` entry and
-`session_report` count its restarts. With no such line, the bridge hung.
+`studio_bridge stalled` or `studio_bridge heartbeat missing` line whenever
+liveness supervision killed a hung bridge, a `studio_bridge exited` line for
+each ending, and, once the restart bound is exhausted, one saying
+`studio_bridge will not be restarted again`; `studio_bridge.log` beside it
+says why the bridge ended, and the session manifest's `studio_bridge` entry
+and `session_report` record its restarts and each run's end reason (`stalled`
+and `heartbeat_missing` included).

@@ -803,6 +803,126 @@ class TraceTest(unittest.TestCase):
         }))
         self.assertEqual(failures, 0, out)
 
+    # REQ-DEV-25
+    def test_quarantine_tracks_aug_assign_mutating_calls_aliases_and_order(
+            self):
+        # Statement-order evaluation catches quarantine tags introduced via
+        # `+=`, `.append()` (both Expr and non-Expr), post-call reassignment,
+        # and fails closed on aliased or subscript-mutated bindings.
+        for name, build in (
+            (
+                "aug_assign_quarantine",
+                'TAGS = []\n'
+                'TAGS += ["quarantine"]\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n',
+            ),
+            (
+                "append_quarantine",
+                'TAGS = []\n'
+                'TAGS.append("quarantine")\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n',
+            ),
+            (
+                "assign_append_quarantine",
+                'TAGS = []\n'
+                '_ = TAGS.append("quarantine")\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n',
+            ),
+            (
+                "reassigned_after_call",
+                'TAGS = ["quarantine"]\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n'
+                'TAGS = []\n',
+            ),
+            (
+                "aliased_append_fails_closed",
+                'TAGS = ["fast"]\n'
+                'A = TAGS\n'
+                'A.append("quarantine")\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n',
+            ),
+            (
+                "subscript_mutation_fails_closed",
+                'TAGS = ["fast"]\n'
+                'TAGS[0] = "quarantine"\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n',
+            ),
+            (
+                "contained_list_subscript_append_fails_closed",
+                'TAGS = ["fast"]\n'
+                'BOX = [TAGS]\n'
+                'BOX[0].append("quarantine")\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n',
+            ),
+            (
+                "binop_contained_list_item_append_fails_closed",
+                'TAGS = ["fast"]\n'
+                'BOX = [TAGS] + []\n'
+                'ITEM = BOX[0]\n'
+                'ITEM.append("quarantine")\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n',
+            ),
+            (
+                "post_insert_dict_subscript_fails_closed",
+                'TAGS = ["fast"]\n'
+                'BOX = {}\n'
+                'BOX["k"] = TAGS\n'
+                'BOX["k"].append("quarantine")\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n',
+            ),
+            (
+                "post_insert_list_append_fails_closed",
+                'TAGS = ["fast"]\n'
+                'BOX = []\n'
+                'BOX.append(TAGS)\n'
+                'BOX[0].append("quarantine")\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n',
+            ),
+            (
+                "ifexp_bare_name_alias_fails_closed",
+                'TAGS = ["fast"]\n'
+                'ALIAS = TAGS if True else ["fast"]\n'
+                'ALIAS.append("quarantine")\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n',
+            ),
+            (
+                "dict_call_container_fails_closed",
+                'TAGS = ["fast"]\n'
+                'BOX = dict(k = TAGS)\n'
+                'BOX["k"].append("quarantine")\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n',
+            ),
+        ):
+            with self.subTest(case=name):
+                failures, out = check(tree(**{"talOS/node/BUILD": build}))
+                self.assertGreaterEqual(failures, 2, out)
+                self.assertIn("tagged quarantine without an open, dated", out)
+                self.assertIn("REQ-SAFE-01 (P0, SAFE) has no tagged test", out)
+
 
 if __name__ == "__main__":
     unittest.main()

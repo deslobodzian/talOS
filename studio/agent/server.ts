@@ -25,6 +25,12 @@ import {handleRpc, type RpcContext} from './rpc';
 // retained timeline on the one thread that also ingests telemetry.
 export const MAX_BATCH = 16;
 
+// Maximum concurrent local WebSocket RPC clients and outbound buffer before
+// inbound frames are dropped without parsing.
+export const MAX_WS_CLIENTS = 16;
+const MAX_WS_BUFFERED_BYTES = 1024 * 1024;
+const DECLARED_FETCH_TIMEOUT_MS = 10_000;
+
 export function startAgent(
     port = Number(process.env.AGENT_PORT ?? 5804),
     upstream = process.env.TELEMETRY_URL ?? 'ws://127.0.0.1:5800/telemetry') {
@@ -67,6 +73,13 @@ export function startAgent(
   // while one runs.
   let declared: DeclaredGraph|null = null;
   let declaredError = '';
+  let declaredFetch: AbortController|null = null;
+  let stopped = false;
+
+  const abortDeclaredFetch = () => {
+    declaredFetch?.abort();
+    declaredFetch = null;
+  };
 
   const context = (): RpcContext => ({
     timeline: history.timeline,
@@ -95,30 +108,87 @@ export function startAgent(
   // Neither is recorded as an error, so `get_declared_graph` keeps saying "no
   // declared graph received yet" rather than inventing a reason.
   const fetchDeclaredGraph = async () => {
+    abortDeclaredFetch();
     const target = declaredUrl(upstream);
-    if (!target) return;
+    if (!target || stopped) return;
+    const controller = new AbortController();
+    declaredFetch = controller;
+    const stale = () =>
+        stopped || controller.signal.aborted || declaredFetch !== controller;
+    const timer =
+        setTimeout(() => controller.abort(), DECLARED_FETCH_TIMEOUT_MS);
     try {
-      const response = await fetch(target, {cache: 'no-store'});
+      const response =
+          await fetch(target, {cache: 'no-store', signal: controller.signal});
+      if (stale()) {
+        void response.body?.cancel().catch(() => {});
+        return;
+      }
       if (response.status === 404) {
+        void response.body?.cancel().catch(() => {});
         declared = null;
         declaredError = '';
         return;
       }
       if (!response.ok) {
+        void response.body?.cancel().catch(() => {});
         declaredError = `Declared graph unavailable: HTTP ${response.status}`;
         return;
       }
-      // Advisory, and checked before the body is read rather than after: the
-      // parser enforces the real bound, but there is no reason to hold a
-      // gigabyte in memory first to find out it was too big.
-      const declaredSize = Number(response.headers.get('content-length') ?? 0);
-      if (declaredSize > MAX_DECLARED_BYTES) {
+      // Advisory fast path before reading chunks; the stream loop below
+      // enforces the real cap for chunked or missing Content-Length.
+      const contentLength = response.headers.get('content-length');
+      const declaredSize = contentLength === null ? 0 : Number(contentLength);
+      if (Number.isFinite(declaredSize) && declaredSize > MAX_DECLARED_BYTES) {
         declaredError = 'Invalid declared graph: document too large';
+        void response.body?.cancel().catch(() => {});
+        controller.abort();
         return;
       }
-      ingestDeclaredGraph(await response.text());
+      let text: string;
+      if (!response.body) {
+        text = await response.text();
+        if (stale()) return;
+        if (Buffer.byteLength(text, 'utf8') > MAX_DECLARED_BYTES) {
+          declaredError = 'Invalid declared graph: document too large';
+          return;
+        }
+      } else {
+        const reader = response.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let total = 0;
+        let finished = false;
+        try {
+          for (;;) {
+            const {done, value} = await reader.read();
+            if (stale()) return;
+            if (done) {
+              finished = true;
+              break;
+            }
+            total += value.byteLength;
+            if (total > MAX_DECLARED_BYTES) {
+              declaredError = 'Invalid declared graph: document too large';
+              void reader.cancel().catch(() => {});
+              finished = true;
+              controller.abort();
+              return;
+            }
+            chunks.push(value);
+          }
+        } finally {
+          if (!finished) void reader.cancel().catch(() => {});
+        }
+        text = Buffer.concat(chunks, total).toString('utf8');
+      }
+      if (stale()) return;
+      ingestDeclaredGraph(text);
     } catch {
-      // Unreachable bridge; the upstream socket is the thing that reports that.
+      // Unreachable bridge or aborted fetch; the upstream socket is the thing
+      // that reports connection loss.
+    } finally {
+      clearTimeout(timer);
+      if (declaredFetch === controller) declaredFetch = null;
     }
   };
 
@@ -192,7 +262,7 @@ export function startAgent(
   const server = createServer((req, res) => {
     // Loopback binding plus Origin rejection prevents browser pages reading
     // local telemetry.
-    if (req.headers.origin || !allowedHost(req.headers.host)) {
+    if ('origin' in req.headers || !allowedHost(req.headers.host)) {
       res.writeHead(403).end();
       return;
     }
@@ -234,17 +304,22 @@ export function startAgent(
       return;
     }
     let size = 0;
+    let tooLarge = false;
     const chunks: Buffer[] = [];
+    req.on('error', () => {});
     req.on('data', (chunk: Buffer) => {
+      if (tooLarge) return;
       size += chunk.length;
       if (size > 65536) {
-        res.writeHead(413).end();
+        tooLarge = true;
+        chunks.length = 0;
+        if (!res.writableEnded) res.writeHead(413).end();
         req.destroy();
       } else
         chunks.push(chunk);
     });
     req.on('end', () => {
-      if (res.writableEnded || req.destroyed) return;
+      if (tooLarge || res.writableEnded || req.destroyed) return;
       const response = parse(Buffer.concat(chunks).toString('utf8'));
       res.setHeader('Content-Type', 'application/json');
       res.writeHead(response === undefined ? 204 : 200)
@@ -253,8 +328,8 @@ export function startAgent(
   });
   const ws = new WebSocketServer({noServer: true, maxPayload: 65536});
   server.on('upgrade', (req, socket, head) => {
-    if (req.url !== '/rpc' || req.headers.origin ||
-        !allowedHost(req.headers.host)) {
+    if (req.url !== '/rpc' || 'origin' in req.headers ||
+        !allowedHost(req.headers.host) || ws.clients.size >= MAX_WS_CLIENTS) {
       socket.destroy();
       return;
     }
@@ -262,18 +337,23 @@ export function startAgent(
         req, socket, head, client => ws.emit('connection', client, req));
   });
   ws.on('connection', client => {
+    if (ws.clients.size > MAX_WS_CLIENTS) {
+      client.close(1013);
+      return;
+    }
     client.on('error', () => {
       try { client.close(); } catch {}
     });
     client.on('message', raw => {
+      if (client.bufferedAmount >= MAX_WS_BUFFERED_BYTES) return;
       const response = parse(raw.toString());
-      if (response !== undefined && client.bufferedAmount < 1024 * 1024)
+      if (response !== undefined &&
+          client.bufferedAmount < MAX_WS_BUFFERED_BYTES)
         client.send(JSON.stringify(response));
     });
   });
   let socket: WebSocket|undefined;
   let retry: NodeJS.Timeout|undefined;
-  let stopped = false;
   function connect() {
     // The upstream carries two message families now. A telemetry frame is at
     // most 16,384 bytes, but a system graph describing every node on every
@@ -320,11 +400,14 @@ export function startAgent(
     socket.on('close', () => {
       // A graph from a lost connection would keep reporting its nodes alive;
       // get_system_graph answers "no graph" until the bridge sends a new one.
+      abortDeclaredFetch();
       system = null;
       previousSystem = null;
       systemArrivalMs = null;
       systemMismatch = null;
       graphStream.reset();
+      rateWindow.reset();
+      decoder.reset();
       if (!stopped) retry = setTimeout(connect, 1000);
     });
   }
@@ -338,12 +421,14 @@ export function startAgent(
   connect();
   const close = () => {
     stopped = true;
+    abortDeclaredFetch();
     clearInterval(tick);
     clearTimeout(retry);
     socket?.terminate();
     for (const client of ws.clients) client.terminate();
     ws.close();
     server.close();
+    server.closeAllConnections();
   };
   return {
     server,
