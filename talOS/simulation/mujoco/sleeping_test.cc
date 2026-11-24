@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -95,8 +96,8 @@ TEST(MujocoSleeping, RestingFuelSleepsTheRobotNeverAndAStruckFuelWakes) {
 
   const int struck = FuelBody(m, kStruck);
   ASSERT_TRUE(Asleep(m, d, struck));
-  const std::array<double, 2> before = {d->xpos[3 * struck],
-                                        d->xpos[3 * struck + 1]};
+  const mjtNum* position = d->xpos + 3 * static_cast<std::ptrdiff_t>(struck);
+  const std::array<double, 2> before = {position[0], position[1]};
   const int dof = m->jnt_dofadr[m->body_jntadr[plant->robot_root_body()]];
   // 0.4 s at 2 m/s in -y: the box's front edge travels 0.8 m, past the
   // FUEL's centre 0.3 m beyond it.
@@ -105,8 +106,8 @@ TEST(MujocoSleeping, RestingFuelSleepsTheRobotNeverAndAStruckFuelWakes) {
     d->qvel[dof + 1] = -2.0;
     ASSERT_TRUE(plant->Step(1, {})) << plant->failure();
   }
-  const double moved = std::hypot(d->xpos[3 * struck] - before[0],
-                                  d->xpos[3 * struck + 1] - before[1]);
+  const double moved =
+      std::hypot(position[0] - before[0], position[1] - before[1]);
   EXPECT_GT(moved, 0.1) << "the struck FUEL stayed where it slept";
   // Waking is local: the row's far end (x = 1.0 m), untouched, still sleeps.
   EXPECT_TRUE(Asleep(m, d, FuelBody(m, kFirstReserve)));
