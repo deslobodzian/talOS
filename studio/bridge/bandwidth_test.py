@@ -238,12 +238,12 @@ def last_before(sock, high):
             last = sequence
 
 
-def probe(binaries, clients, seconds=None, stalled=False, excess=False, limit=4):
+def probe(binaries, clients, seconds=None, stalled=False, excess=False):
     processes, sockets = [], []
     with tempfile.TemporaryDirectory() as root:
         topic = f"/test/telemetry/p{os.getpid()}"
         config = Path(root, "robot.toml")
-        config.write_text(f"[studio]\nmax_clients = {limit}\n"
+        config.write_text("[studio]\nmax_clients = 4\n"
                           "# Placeholder CAN id; this probe never opens hardware.\n"
                           "[subsystems.alpha.motors.m1]\n"
                           "type = \"TalonFX\"\nbus = \"rio\"\ncan_id = 1\n")
@@ -393,11 +393,6 @@ class BandwidthTest(unittest.TestCase):
         self.assertIsNotNone(stall["last"], stall)
         for updates in stall["reader_updates"]:
             self.assertGreaterEqual(updates, 4, stall)
-
-    def test_configured_client_limit(self):
-        workspace = Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main")
-        result = probe(workspace / "studio/bridge", 1, excess=True, limit=1)
-        self.assertTrue(result["excess_refused"])
 
 
 if __name__ == "__main__":

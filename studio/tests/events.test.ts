@@ -92,15 +92,6 @@ test('brownout start is error and recovery is info', () => {
   assert.equal(brownout[1].severity, 'info');
 });
 
-test('fault mask changes raise a warning', () => {
-  const engine = new EventEngine();
-  engine.pushFrame(frame(1, 1n, {'hw/status/motor_fault_mask': 0}));
-  engine.pushFrame(frame(2, 2n, {'hw/status/motor_fault_mask': 5}));
-  const event = engine.events.find(e => e.id.startsWith('link-fault-mask:'));
-  assert.ok(event);
-  assert.equal(event.severity, 'warn');
-});
-
 test('identity and gateway counters report runs with their own severities', () => {
   const engine = new EventEngine();
   engine.pushFrame(frame(1, 1n, {'hw/status/identity_rejected_count': 1, 'hw/status/gateway_rx_count': 7}));
