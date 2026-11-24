@@ -1,0 +1,4 @@
+# A [simulation.mujoco] file that does not exist fails config load, naming
+# the key that lists it.
+accept = false
+error_contains = "[simulation.mujoco] robot_model_files[0]"

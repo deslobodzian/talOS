@@ -1,0 +1,23 @@
+<!-- A one-joint arm on a welded root (no freejoint): the start pose places
+     it, and the analytic chassis stays the backend's. The joint is the
+     mechanism (gear 1), so its armature is G^2 * J_rotor with G = 50. -->
+<mujoco model="arm">
+  <compiler angle="radian"/>
+  <default>
+    <geom contype="4" conaffinity="21"/>
+  </default>
+  <worldbody>
+    <body name="arm_base" pos="0 0 0.3">
+      <geom name="arm_base_box" type="box" size="0.1 0.1 0.05" mass="5"/>
+      <body name="arm_link" pos="0 0 0.1">
+        <joint name="arm_joint" type="hinge" axis="0 1 0" range="-1 2"
+               armature="0.15"/>
+        <geom name="arm_tube" type="capsule" fromto="0 0 0 0.4 0 0"
+              size="0.02" mass="1"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor name="arm" joint="arm_joint"/>
+  </actuator>
+</mujoco>

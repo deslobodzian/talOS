@@ -40,6 +40,17 @@ class BridgeDescribe(unittest.TestCase):
         self.assertTrue(source["schema_hash"].startswith("0x"))
         self.assertEqual(source["alignment"], 8)
         self.assertEqual(source["slots"], 64)
+        # REQ-DEV-43: the MuJoCo gateway's game pieces, read only to show:
+        # optional (no other gateway writes them) and an observer's read, on
+        # the gateway's ring, so a session without them lints clean.
+        (pieces,) = [s for s in doc["sources"]
+                     if s["name"] == "/sim/telemetry/pieces"]
+        self.assertEqual(pieces["kind"], "FETCHER")
+        self.assertTrue(pieces["optional"])
+        self.assertTrue(pieces["observer"])
+        self.assertEqual(pieces["schema"], "sim.GamePieces")
+        self.assertEqual(pieces["message_bytes"], 8336)
+        self.assertEqual(pieces["slots"], 8)
 
     # REQ-SAFE-35
     def test_describe_declares_no_writer(self):

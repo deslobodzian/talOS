@@ -19,6 +19,8 @@
 
 #include "geometry/geometry_generated.h"
 #include "schema_test/shapes_generated.h"
+#include "sim/sim_generated.h"
+#include "sim/topics.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/simulated_event_loop.h"
@@ -47,6 +49,15 @@ class ShapesNode {
 
   talos::Publisher<schema_test::Mixed> mixed_;
   talos::Publisher<schema_test::Arrays> arrays_;
+};
+
+// Test node that publishes the MuJoCo gateway's game pieces.
+class PiecesNode {
+ public:
+  explicit PiecesNode(talos::Node& node)
+      : pieces_{node.publish<::sim::GamePieces>(::sim::topics::kPieces)} {}
+
+  talos::Publisher<::sim::GamePieces> pieces_;
 };
 
 // Test node that publishes PoseEstimate.
@@ -197,6 +208,37 @@ node = "//talOS/telemetry:node"
   ASSERT_NE(frame, nullptr);
   EXPECT_DOUBLE_EQ(DecodeChannels(telemetry, frame).at("demo/state/position_m"),
                    4.5);
+}
+
+// REQ-DEV-43: only state and status topics become channels, so the game
+// pieces' telemetry topic (its 2,560 fields would also overrun the channel
+// cap) puts nothing in the feed or its recording.
+TEST(TelemetryTest, TelemetryRoleTopicIsNotObserved) {
+  const std::string kConfig = R"(
+[robot]
+period_us = 10000
+
+[studio]
+topic = "/talos/telemetry"
+
+[subsystems.demo]
+node = "//demo:node"
+
+[subsystems.gateway]
+node = "//gateway:node"
+
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)";
+  Sim sim = Sim::FromToml(kConfig);
+  sim.add<ShapesNode>("demo");
+  sim.add<PiecesNode>("gateway");
+  auto& telemetry = sim.add<Telemetry>("telemetry");
+  const auto dict = DictionaryMap(telemetry);
+  EXPECT_TRUE(dict.contains("demo/state/position_m"));
+  for (const auto& [name, channel] : dict) {
+    EXPECT_FALSE(name.starts_with("sim/")) << name;
+  }
 }
 
 TEST(TelemetryTest, SchemaLessPoseTopicIsStillAnError) {

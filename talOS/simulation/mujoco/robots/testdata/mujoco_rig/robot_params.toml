@@ -1,0 +1,97 @@
+# The MuJoCo rig example's parameters (examples/mujoco_rig), for
+# rig_shot_test, its scene without processes. Its tables are the example's;
+# the example's model_twin_test holds the two generated models byte for byte
+# equal. After editing it, regenerate:
+#   bazel run //talOS/simulation/mujoco/robots:generate_robot -- \
+#     --parameters talOS/simulation/mujoco/robots/testdata/mujoco_rig/robot_params.toml \
+#     --out talOS/simulation/mujoco/robots/testdata/mujoco_rig/robot.xml
+
+[robot]
+name = "mujoco_rig"
+root = "welded"
+mass_kg = 40.0
+
+[game_piece]
+radius_m = 0.07506  # the 2026 FUEL
+
+# A 27.5 in square frame, as shooter_rig's.
+[frame]
+length_m = 0.6985
+width_m = 0.6985
+belly_clearance_m = 0.035
+rail_height_m = 0.0508
+rail_width_m = 0.0254
+
+[bumpers]
+bottom_m = 0.0635
+height_m = 0.127
+thickness_m = 0.085
+
+# The motors' names are the subsystem files' (subsystems/*.toml).
+[motors.feeder_motor]
+gear = 1.0
+rotor_inertia_kg_m2 = 1.0e-4
+
+[motors.flywheel_motor]
+gear = 1.0
+rotor_inertia_kg_m2 = 1.0e-4
+
+# shooter_rig's hopper: three FUEL abreast in the pocket behind the feeder.
+[hopper]
+width_m = 0.56
+floor_front_m = 0.20
+floor_slope_deg = 12.0
+wall_top_m = 0.70
+
+[feeder]
+motor = "feeder_motor"
+x_m = -0.12
+roller_radius_m = 0.0254
+roller_mass_kg = 0.3
+compression_m = 0.01
+
+# A pair of 4 in wheels (about 0.2 kg and 0.00026 kg·m² each) and a 1.0 kg
+# steel flywheel weight 5 in across (0.0020 kg·m²) on one shaft: 1.4 kg and
+# 0.0025 kg·m², shooter_rig's inertia.
+[flywheel]
+motor = "flywheel_motor"
+radius_m = 0.0508
+width_m = 0.12
+mass_kg = 1.4
+inertia_kg_m2 = 0.0025
+axle_x_m = -0.336
+axle_z_m = 0.55
+compression_m = 0.02
+hood_start_deg = -20.0
+exit_elevation_deg = 60.0
+exit_offset_m = 0.15
+efficiency = 0.5
+
+# Across the hopper where a FUEL waits against the feeder, at its centre.
+[[beam_breaks]]
+name = "feeder_beam"
+position_m = [-0.06, -0.27, 0.195]
+direction = [0.0, 1.0, 0.0]
+cutoff_m = 0.54
+
+# Across the hopper under the feeder's roller, at a FUEL centre's height:
+# closed while a FUEL rolls under the roller into the pocket.
+[[beam_breaks]]
+name = "shooter_beam"
+position_m = [-0.12, -0.27, 0.1796]
+direction = [0.0, 1.0, 0.0]
+cutoff_m = 0.54
+
+# shooter_rig's eight FUEL: two rows of three on the floor in front of the
+# feeder, two more resting on them, each 5 mm or more clear of what it meets.
+[preload]
+positions_m = [
+  [-0.015, -0.16, 0.211],
+  [-0.015, 0.0, 0.211],
+  [-0.015, 0.16, 0.211],
+  [0.145, -0.16, 0.245],
+  [0.145, 0.0, 0.245],
+  [0.145, 0.16, 0.245],
+  [0.065, -0.08, 0.353],
+  [0.065, 0.08, 0.353],
+]

@@ -34,6 +34,16 @@ build --incompatible_strict_action_env
 # Linux processwrapper-sandbox; prevent races writing __pycache__/*.pyc files.
 build --test_env=PYTHONDONTWRITEBYTECODE=1
 
+# MuJoCo's engine is C, as are the collision and file libraries it links (ccd,
+# qhull, miniz), and the -O3 below is C++ only (--cxxopt): without this they
+# compile with no -O at all, about three times slower per step. -O2 is what
+# `-c opt` gives them. Matched by source path under the external repository,
+# so no talOS source is touched. It applies under `-c dbg` and the sanitizer
+# configs too (it comes after their -O flags), so MuJoCo's C is never built
+# unoptimised. It relies on the canonical repository names mujoco+, ccd+,
+# qhull+ and miniz+ (Bazel 8's module naming).
+build --per_file_copt=external/(mujoco|ccd|qhull|miniz)[+]/.*[.]c$@-O2
+
 build:linux --cxxopt=-std=c++23 --cxxopt=-O3
 # Build tools (the config resolver run inside bundle/manifest actions) compile
 # in the exec configuration, which ignores --cxxopt.
@@ -66,6 +76,9 @@ build:asan --copt=-O1 --cxxopt=-O1
 # No dependency exemptions: AprilTag's pjpeg (offline DetectImageFile only;
 # live detection takes raw camera buffers) is patched for its signed shifts and
 # an out-of-range coefficient run (third_party/apriltag_pjpeg_bounds.patch).
+# MuJoCo's two uninitialised flags and its zero-length memcpy are patched too
+# (third_party/mujoco_*.patch, listed in docs/INSTALL.md; root-only, so a dependent
+# builds MuJoCo unpatched).
 test:asan --test_tag_filters=-no_asan
 build:tsan --copt=-fsanitize=thread --linkopt=-fsanitize=thread
 build:tsan --copt=-fno-omit-frame-pointer --copt=-O1 --cxxopt=-O1

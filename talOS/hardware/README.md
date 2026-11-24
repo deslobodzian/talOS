@@ -120,8 +120,8 @@ CANcoder and Pigeon2 accept `type`, `bus`, `can_id`, `inverted`, and `offset_rot
 QuadratureEncoder accepts `type`, `dio_a`, `dio_b`, and `counts_per_rev`;
 DutyCycleEncoder accepts `type`, `dio`, and `offset_rot`; `digital_outputs`
 accepts only `dio`, `digital_inputs` accepts `dio` plus the optional
-`sim_motor`, `sim_closed_at_rot`, `sim_closed_above`, and `sim_closed_reads`
-keys, and analog inputs and PWM outputs accept only `channel`.
+`sim_motor`, `sim_closed_at_rot`, `sim_closed_above`, `sim_closed_reads` and
+`sim_sensor` keys, and analog inputs and PWM outputs accept only `channel`.
 
 Motor tables may specify `follow = "master_motor"` and optional
 `oppose_master = true` (default false). The master must be a motor owned by
@@ -241,17 +241,28 @@ A digital input may carry a simulated home switch:
 `sim_motor = "<motor>"` (a motor of the same subsystem) and
 `sim_closed_at_rot` (finite, required with `sim_motor`), with
 `sim_closed_above` and `sim_closed_reads` (both default false). Config load
-refuses a `sim_closed_*` key without `sim_motor`, a `sim_motor` that names no
-motor of the input's subsystem, and a non-finite `sim_closed_at_rot`, naming
+refuses `sim_closed_at_rot` or `sim_closed_above` without `sim_motor`, a
+`sim_motor` that names no motor of the input's subsystem, and a non-finite
+`sim_closed_at_rot`, naming
 the key and the input. Like `motor_type`, every config load accepts them but
 only the physics simulator reads them; they are not in the wire format or the
 configuration fingerprint. `sim_gateway --physics` binds them from its own
 parse of `--config` (`PhysicsSimBackend::SetHomeSwitches`; the backend table
 below gives the switch's behaviour).
 
+A digital input may instead name a sensor of the MuJoCo model
+(`[simulation.mujoco]` below): `sim_sensor = "<sensor>"` (a non-empty
+string), with `sim_closed_reads` (default false), the value the input reads
+while that sensor detects. Config load refuses `sim_sensor` with
+`sim_motor`; `sim_closed_at_rot` or `sim_closed_above` with `sim_sensor`;
+and `sim_closed_reads` with neither `sim_motor` nor `sim_sensor`, naming
+the key and the input. Like `sim_motor`, it is not in the wire format or the
+configuration fingerprint. Config load does not open the model, so a
+`sim_sensor` naming a sensor the model lacks is not refused at load.
+
 An optional top-level `[simulation]` table configures physics chassis geometry,
-end-of-travel hard stops, battery sag, chassis dynamics, and per-mechanism
-inertia/friction:
+end-of-travel hard stops, battery sag, chassis dynamics, per-mechanism
+inertia/friction, the robot's start pose and the MuJoCo model:
 - `wheel_radius_m` (positive finite double, default `0.0508` m),
 - `[[simulation.swerve_modules]]` entries (`drive`, `steer`, `x_m`, `y_m`, where
   `drive` and `steer` name distinct configured motors, no motor appears twice,
@@ -269,11 +280,50 @@ inertia/friction:
 - `[[simulation.mechanisms]]` entries (`motor` naming a configured master motor
   with no duplicates; `inertia_kg_m2` required positive finite at the mechanism
   shaft; optional `load`, `"roller"` (default) or `"flywheel"`; optional
-  non-negative finite `viscous_damping_nm_per_radps` and `static_friction_nm`).
+  non-negative finite `viscous_damping_nm_per_radps` and `static_friction_nm`),
+- `[simulation.start_pose]`, where the simulator places the robot at start,
+  in the field frame: `x_m`, `y_m` and `yaw_rad`, each a finite number (an
+  integer reads as one). Optional; unset, the robot starts at
+  (2, 2, 0). A file that sets it sets all three keys, and its pose replaces
+  an included file's whole. With a `[simulation.mujoco] field`, (`x_m`,
+  `y_m`) must lie on that field's floor, edges included (`rebuilt_2026`:
+  0 to 16.541188 m by 0 to 8.069326 m; config load holds each field's floor
+  in `config::kSimulationMujocoFields`). That checks the floor only: a pose
+  inside a field structure passes config load, and the plant then starts
+  with the robot overlapping it. Config load refuses a section that
+  is not a table, an unknown or missing key, a value that is not a finite
+  number and a position off the field's floor, naming the key and the file
+  that sets the pose. The gateway's `--start-pose` overrides it
+  ([simulator flags](../simulation/README.md)).
+- `[simulation.mujoco]`, the MuJoCo model: `robot_model` (required, the
+  robot's MJCF file), `robot_model_files` (optional array: every other file
+  the model reads, such as meshes), `field` (optional field model name,
+  today `"rebuilt_2026"`; absent or `""` is flat carpet) and `seed`
+  (optional, default 1: the seed the MuJoCo gateway gives the field's game
+  rules to draw from, an integer from 0 to 2^63 - 1, the non-negative range
+  of a TOML integer) and `sleeping` (optional boolean, default false: true
+  lets MuJoCo put resting game pieces to sleep, the robot's bodies never;
+  [what it changes](../simulation/mujoco/README.md#when-the-host-cannot-hold-real-time)).
+  The file
+  that sets `robot_model` sets the whole model: `robot_model_files` comes
+  only from that file (absent there, none), so a file that includes another
+  and sets `robot_model` discards the included file's list, while `field`,
+  `seed` and `sleeping` each override on their own. Each path is relative to the file that sets it and never
+  absolute; each file must exist, and the build lists it in the config's
+  `CONFIG_FILES`, so `talos_sim` and `talos_bundle` carry it, as
+  `[trajectories]` files are. Config load refuses an unknown key, a
+  non-string or empty path, a non-array `robot_model_files`,
+  `robot_model_files` in a file that does not set `robot_model`, an
+  unknown `field`, a `seed` that is not a non-negative integer and a
+  `sleeping` that is not a boolean, naming the key and the file that sets it. It checks only
+  that the files exist and the field name is known: it does not open the
+  model, so a file the model reads but the list omits is not refused at
+  load.
 
 Like `motor_type` and `sim_motor`, `[simulation]` stays off the wire and out of
-`ConfigurationId`; `sim_gateway --physics` passes `wheel_radius_m` in
-`PhysicsOptions` and binds `swerve_modules` (`SetSwerveModules`), `hard_stops`
+`ConfigurationId`; `sim_gateway --physics` passes `wheel_radius_m` and the
+start pose (`ApplyStartPose`: `--start-pose`, else `start_pose`, else the
+default) in `PhysicsOptions` and binds `swerve_modules` (`SetSwerveModules`), `hard_stops`
 (`SetHardStops`), `battery` (`SetBatteryModel`), `chassis`
 (`SetChassisDynamics`), and `mechanisms` (`SetMechanisms`) on
 `PhysicsSimBackend` before `Reconfigure` so all of them survive any later
@@ -1247,12 +1297,104 @@ centered rigid-body kinematics integrate yaw and yaw rate into every configured
 `Pigeon2`; non-chassis configurations leave manually injected `Pigeon2` raw yaw
 untouched.
 
+### An external plant
+
+`sim::PhysicsSimBackend::SetPlant` attaches a `sim::ExternalPlant`
+(`sim_plant.h`), which integrates the motion of the motors it binds and, when
+its model's root body has a free joint, the chassis. The backend stays the
+only controller and electrical model. At each `Configure` the plant binds
+motors by name (`ExternalPlant::Bind`); a program that builds its plant
+before attaching it reads the same motor list (names, gears, winding
+constants) from `PhysicsSimBackend::PlantMotors`. From then on a bound motor's rotor
+position and velocity, and the chassis pose and velocity when the plant owns
+it, are the plant's; a configuration never resets the plant's world, and the
+gyro zeroes on the plant's heading at each bind and controller restart.
+Unbound motors, the battery, controllers, Motion Magic profiles, CANcoders,
+remote feedback, home switches, limit switches and faults stay the backend's.
+
+Each `Read` hands every bound motor the drive its winding model gives at the
+tick-start rotor speed (`sim::PlantDrive`: volts, whether back-EMF applies,
+and torque bounds), in that speed's regime:
+
+- neutral: a shorted winding under brake, an open one under coast;
+- a voltage mode: the command clamped to `max_voltage` and the solved supply;
+- a follower: at its own tick-start speed, exactly the current the analytic
+  model gives it there (its master's applied volts through its own stator
+  band and supply limit). When its master's drive, turned into the
+  follower's direction and bounded only by the follower's own
+  `stator_limit_a`, carries that same current there (a follower on its
+  master's shaft), it takes that drive and follows the master's regime at
+  every step; otherwise (a follower on another shaft, or its own supply
+  limit binding) it holds its master's applied volts for the tick within
+  its own limits;
+- torque current: the voltage ceiling in the demand's direction, with the
+  demanded current as the torque bound on that side (0 A gives no torque
+  unless the rotor overspeeds the ceiling); a rotor back-driven so hard that
+  the demand would need more than the opposite ceiling gets that ceiling,
+  carrying more than the demand, with the demand as the bound on the other
+  side;
+- a `supply_limit_a` binding at the tick-start speed: its limited voltage,
+  held for the tick, in every mode (torque current keeps its demand as a
+  bound).
+
+`stator_limit_a` bounds the torque on both sides in every powered mode. The
+plant applies the drive's torque law at every one of its steps, so the
+stator limit and the torque-current demand hold at each step's speed. At the
+tick-start speed the torque is `k_t` times the stator current the analytic
+model gives there, except where that current exceeds `stator_limit_a` (back-EMF
+beyond the voltage ceiling plus `stator_limit_a` times the winding
+resistance), which the plant caps at the limit. The ceiling is `max_voltage`
+or the solved supply, whichever is lower, so the cap also applies when a
+sagging battery lowers the ceiling below back-EMF. The battery sag is solved
+with that same current at the tick-start speed.
+
+The State reports what the drive carried at the speed the plant reached: the
+stator current is the plant's current `I`; the voltage is the winding's,
+`I` times the resistance plus back-EMF, held within the ceiling (at the
+ceiling while the regeneration cap binds); the supply current is that
+voltage times `I` over the bus voltage, at most `supply_limit_a`.
+
+The plant steps in whole steps of its own `step_us`. Each `Read` adds the
+time since the last one to a signed remainder and steps the nearest whole
+number of steps, at most `2 * ceil(period_us / step_us)`; time past that cap
+is dropped and counted (`PhysicsSimBackend::plant_time()`), never caught up.
+Every other model the backend runs (Motion Magic profiles, unbound motors,
+the analytic chassis, gyro drift) advances by the same plant time, and every
+motor and CAN sensor sample is `max(lag_us, 0)` µs old. No wall clock is
+read.
+
+A bound motor's soft limits hold its output toward a limit it has reached
+neutral (torque current judged by its demand's sign) and leave the joint
+where it is; an analytic motor is clamped instead. A device reset restarts a
+bound motor's controller but not its joint. `SetWorldInputs` binds a digital
+input to a plant sensor by name; it reads `closed_reads` while the sensor is
+closed and ignores `SetDigitalInput`.
+
+`Configure` refuses, naming the key and the motor or input in
+`last_config_error()`:
+
+- a follower chain the plant binds only partly;
+- `[[simulation.mechanisms]]` or `[[simulation.hard_stops]]` naming a bound
+  motor (inertia and travel come from the model);
+- a swerve module whose drive or steer motor the plant does not bind while
+  the plant owns the chassis, and any swerve module while it does not;
+- a digital input bound to a plant sensor twice;
+- a plant `step_us` that is zero or odd;
+- whatever the plant's `Bind` refuses, with the plant's error;
+- a plant that has failed, with its `failure()` text.
+
+A plant whose step fails (`ExternalPlant::Step` returning false) latches: the
+backend makes no further call to it, every later `Read` reports every motor
+and CAN sensor invalid and returns false, so the gateway neutralizes every
+output (total loss), and world inputs hold their last reading.
+
 ### Which simulator to use for what
 
 | Path | How to run | Motor / chassis model | Driver Station & gamepad | Truth (`/sim/state`) & faults | Use for |
 |---|---|---|---|---|---|
 | Ideal (`SimBackend`) | `sim_gateway` (default, no `--physics`), or `SimHardware` in unit tests | Instant velocity/position; zero gains still move; zero Pigeon2 raw yaw | Scripted `--mode-schedule` / `--joystick-schedule` | None (resets & I/O setters in C++ tests only) | Fast logic, wiring, sequencing, mode/timeout unit tests |
 | Lightweight physics (`sim_gateway --physics`) | `./sim.sh --sim-gateway` (or `sim_gateway --physics`) | `sim::PhysicsSimBackend`: winding/current-limit model, gearing, opt-in rigid-body mechanism inertia, battery sag/brownout, hard stops, home switches, kinematic or dynamic mass/traction swerve ground pose & Pigeon2 yaw | Scripted `--mode-schedule` / `--joystick-schedule` (no USB gamepad) | Publishes `/sim/state` for cameras; odometry error (`--wheel-radius-error`, `--wheel-slip-gain`, `--gyro-drift-radps`) & `--fault-schedule` | Headless CI/soak runs, vision/odometry error tests, fault injection, PID/limit/homing/battery-sag verification |
+| MuJoCo physics (the MuJoCo gateway) | `[robot] sim_gateway = "//talOS/simulation/mujoco:sim_gateway"` and a `[simulation.mujoco]` model, under the launcher's `--sim --start-sim-gateway` | The lightweight physics backend with a MuJoCo world as its [external plant](#an-external-plant): bound motors and a free-root chassis move as the robot model on the field model moves ([its README](../simulation/mujoco/README.md#the-mujoco-gateway)) | As `sim_gateway --physics` | As `sim_gateway --physics`; model sensors drive `sim_sensor` digital inputs | Mechanisms with contact, gravity and linkages; game pieces on the field |
 | WPILib desktop sim (`PhoenixBackend`) | `./sim.sh` (or `./gradlew simulateNative` in `controller_processor/rio`) | Real Phoenix 6 simulator + WPILib `LinearSystemId::DCMotorSystem` plant (`KrakenX60`/`KrakenX60FOC` over UDP since `motor_type` is off-wire; `KrakenX44`/`Falcon500` when populated in-process) + inferred swerve/differential Pigeon2 yaw | WPILib Sim GUI with live USB gamepad (or `--headless` scripted schedules) | None (cameras emit invalid observations) | Interactive driving with a USB gamepad, testing real Phoenix 6 closed-loop/FOC/status-signal behaviour, RoboRIO-in-the-loop verification |
 
 ### Ground truth and odometry error

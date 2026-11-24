@@ -1,0 +1,12 @@
+# The framework's teleop node: turns Driver Station buttons, axes and POVs
+# into targets on /<subsystem>/target/teleop. It needs no code. Each binding
+# lives in the subsystem file of the mechanism it drives, not here; for
+# example, in subsystems/wrist.toml (talOS/teleop/README.md has the syntax):
+#
+# [[teleop.bindings]]
+# button = 3
+# while_held = { velocity_rps = 20.0 }
+[subsystem]
+name = "teleop"
+node = "//talOS/teleop:node"
+period_us = 20000

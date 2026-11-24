@@ -168,6 +168,28 @@ Third-party patches in `third_party/` that sanitizer runs depend on:
   only its `--config=tsan` runs report that flag's race. (talOS fetches
   toml++ as its own patched archive instead, so its parser patch reaches
   every repository that depends on talOS.)
+- `third_party/mujoco_mesh_transformed_init.patch`: MuJoCo 3.17.0's
+  `mjCMesh_::transformed_` (`src/user/user_objects.h`) is initialised to
+  `false`; upstream leaves it uninitialised, and the copy every nested
+  `<default class>` makes while an MJCF is parsed trips UBSan under
+  `--config=asan`. The value is never read, so behaviour is unchanged.
+- `third_party/mujoco_flex_interpolated_init.patch`: the same for
+  `mjCFlex_::interpolated`, which the constructor leaves uninitialised and
+  every copy of a default class copies (parsing nested defaults, and
+  `mjs_attach`, which copies the attached model's defaults). Only a compiled
+  flex reads it, after `Compile` sets it.
+- `third_party/mujoco_vector_copy_empty.patch`: MuJoCo's vector primitives
+  `mju_zero`, `mju_copy` (`src/engine/engine_util_blas.c`), `mju_zeroInt`
+  and `mju_copyInt` (`src/engine/engine_util_misc.c`) call `memset` or
+  `memcpy` only for a positive length. Upstream they pass whatever pointers
+  they are given, and a model with no degrees of freedom (a field alone, a
+  welded robot) gives them NULL, empty arrays when it compiles and steps,
+  which UBSan reports. A zero-length copy does nothing either way, so
+  behaviour is unchanged.
+
+The three MuJoCo patches are, like OpenCV's, a root-only
+`single_version_override`: a repository that depends on talOS builds MuJoCo
+unpatched, and only its `--config=asan` runs report these.
 - `third_party/apriltag_pjpeg_bounds.patch`: bounds, overflow, malformed-header/file,
   and restart-marker (`RST`) DC-predictor fixes in AprilTag's JPEG decoder (`pjpeg.c`),
   used only by the offline `DetectImageFile` API; live capture passes raw GREY/YUYV

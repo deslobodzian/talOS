@@ -1,0 +1,15 @@
+namespace feeder;
+
+// What a producer asks for on its lane, /feeder/target/<source>. The node
+// drives the motor only while the robot is enabled and a lane of its target
+// policy is live.
+struct FeederTarget {
+  velocity_rps:double;
+}
+
+// What the feeder is doing, published every tick.
+struct FeederState {
+  enabled:bool;
+  velocity_rps:double;
+  connected:bool;
+}

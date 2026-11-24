@@ -1,0 +1,45 @@
+namespace sim;
+
+// Simulation ground truth (reserved owner `sim`), written only by a simulator,
+// never on a robot. /sim/state's message is geometry.OdometrySample; this file
+// holds the truth messages that have no other home.
+
+// The match period a field's game rules run in.
+enum MatchPeriod : ubyte { None = 0, Autonomous = 1, Teleop = 2, Ended = 3 }
+
+// The match a field's game rules referee, on /sim/state/match (64 B; layout
+// pinned in sim_layout_asserts.cc and docs/DATA_FLOW.md).
+struct MatchState {
+  sample_time_ns: ulong;       // node clock, as /sim/state
+  schedule_time_us: ulong;     // the schedule-clock input the rules ran on
+  period_remaining_us: ulong;  // 0 outside Autonomous and Teleop
+  blue_points_count: uint;
+  red_points_count: uint;
+  blue_auto_points_count: uint;
+  red_auto_points_count: uint;
+  blue_scored_count: uint;     // through the hub, active or not
+  red_scored_count: uint;      // through the hub, active or not
+  shots_count: uint;           // scripted launches
+  pieces_in_play_count: ushort;
+  pieces_held_count: ushort;
+  period: MatchPeriod;
+  stage_index: ubyte;          // 2026: 0 TRANSITION, 1-4 SHIFT, 5 END GAME
+  blue_scoring_active: bool;
+  red_scoring_active: bool;
+  blue_inactive_first: bool;
+  tie_drawn: bool;
+}
+
+// Where a field's game pieces are, on /sim/telemetry/pieces (8336 B; layout
+// pinned in sim_layout_asserts.cc and docs/DATA_FLOW.md), for Studio's 3D
+// viewport (REQ-DEV-43). Piece i is the field model's i-th free body in body
+// order (the robot's never); entries at and past pieces_count are zero.
+struct GamePieces {
+  sample_time_ns: ulong;   // node clock, as /sim/state
+  pieces_count: uint;      // at most 640
+  radius_m: float;         // the first piece's bounding radius; every piece's
+  x_m: [float:640];        // field frame: the model's world, metres
+  y_m: [float:640];
+  z_m: [float:640];
+  in_play: [bool:640];     // false: the game holds it out of play
+}

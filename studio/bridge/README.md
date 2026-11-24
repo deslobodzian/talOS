@@ -17,7 +17,9 @@ bazel-bin/studio/bridge/studio_bridge /talos/telemetry 5800 studio/dist
 ```
 
 The mock publishes a tick every 5 ms; with `--on-stdin` it publishes one per
-line read from stdin instead, so a test controls when the topic is idle.
+line read from stdin instead, so a test controls when the topic is idle. With
+`--pieces` it also publishes `/sim/telemetry/pieces` every 10th tick, 504
+pieces of which ten move ([game pieces](#game-pieces)).
 
 ## Arguments
 
@@ -73,7 +75,7 @@ The manual runtime command still takes its topic positionally.
 | `/system.json` | Node registry and bridge statistics | Reports `registry.available: false` when the registry cannot be opened |
 | `/declared.json` | Startup copy of the declared graph file | 404 if absent, empty or unreadable |
 | `/manifest.json` | Current manifest file | 404 if absent or unreadable; 413 above 1 MiB (Studio's own manifest limit) |
-| `/telemetry` | WebSocket: binary telemetry and text system graphs | Excess clients receive 503 |
+| `/telemetry` | WebSocket: binary telemetry and [game pieces](#game-pieces), text system graphs | Excess clients receive 503 |
 | `/drive/layout.json` | The driver dashboard's layout (`DashboardLayoutJson`) | 404 without a layout (unless `--refusal-file`) |
 | `/drive/summary.json` | Latest `talos.drive.summary` JSON | 404 without a layout (unless `--refusal-file`) |
 | `/drive` | WebSocket upgrade: the [driver dashboard feed](#driver-dashboard-feed); any other GET: `drive.html` from the web directory | 404 without a layout (the upgrade, unless `--refusal-file`); 503 without the file (the page) |
@@ -128,8 +130,10 @@ budget (REQ-OPS-37). A page the socket refuses resynchronizes
 that client with a fresh keyframe.
 
 When started with a nonzero `--session-id` (as the launcher passes), the bridge
-claims a live registry row (`studio_bridge`, `LoopTier::kObserver`, one
-`WATCHER` source on its telemetry topic), advancing `heartbeat_monotonic_ns`
+claims a live registry row (`studio_bridge`, `LoopTier::kObserver`, a
+`WATCHER` source on its telemetry topic, then the `FETCHER` of
+`/sim/telemetry/pieces`, optional and an observer, as `--describe` declares
+them), advancing `heartbeat_monotonic_ns`
 and `dispatch_count` on every loop pass, and exits nonzero if claiming fails so
 the launcher detects and restarts a hung or failed bridge
 ([Studio bridge](../../talOS/launcher/README.md#studio-bridge)). Standalone
@@ -222,6 +226,75 @@ intended change, regenerate them and change both readers in the same commit:
 TALOS_UPDATE_GOLDEN=1 bazel run //studio/bridge:system_test -- \
     --gtest_filter=SystemGraph.GoldenFilesHoldTheFastValueOrder
 ```
+
+## Game pieces
+
+Under the MuJoCo gateway (REQ-DEV-43) the bridge reads
+`/sim/telemetry/pieces` (`sim.GamePieces`,
+[`talOS/hardware/sim.fbs`](../../talOS/hardware/sim.fbs)), latest only, and
+sends each programmer client (`/telemetry`) binary pieces messages for
+Studio's 3D viewport; drive clients (`/drive`) are sent none. It declares the
+topic in `--describe` as a `FETCHER`, `optional` and `observer`, on the
+topic's ring of 8 slots (`kPiecesSlots`,
+[`talOS/hardware/sim_rings.h`](../../talOS/hardware/sim_rings.h), which the
+gateway declares too), so a session without the MuJoCo gateway,
+which has no writer, lints clean; the telemetry node does not read it (it
+observes `state` and `status` topics only), so neither the telemetry feed nor
+its recording carries piece positions. The topic shares the telemetry topic's
+wake receiver, and is attached and re-attached as that one is
+([publisher and serving constraints](#publisher-and-serving-constraints)).
+
+Each message the gateway publishes is kept with its positions rounded to
+whole millimetres (`IngestPieces` in [`pieces.h`](pieces.h)); one with more
+than 640 pieces, a negative or non-finite radius, or a coordinate that is not
+finite or past an int32 of millimetres is refused and counted in the source's
+`dropped`. A client is sent a **keyframe** of every piece first (and when the
+count or radius changes, or a send was refused), then a **delta** naming only
+the pieces whose millimetre position or in-play flag changed since the last
+message it was sent, and nothing while none changed. Each programmer
+client's pieces have an allowance of a quarter of its rate, capped at one
+10,274 B keyframe (`PiecesFeed`); a message goes when the allowance covers
+it and the client's own and the shared bucket afford it. A system-graph
+message, a dictionary page and a telemetry keyframe go first: no pieces
+message goes while one is pending (`ClientFeeds::PiecesMayGo` in
+[`telemetry.h`](telemetry.h)). While a pieces message is owed, the client's
+telemetry updates leave room for it in the client's own bucket
+(`PiecesRoom`, `AffordProgrammerSend` in [`drive.h`](drive.h); the shared
+bucket and the shared reservation see only an update's own bytes), so
+telemetry that would fill the share cannot starve the pieces; telemetry
+keeps at least 3/4 of the share, and an update waits at most one pieces
+message's bytes / the client's rate longer
+([Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary)
+gives the rates and bounds). A message held back is not kept: the next is
+built against the latest message, so a slow client gets fewer, larger
+deltas and the bridge holds no backlog (each programmer client's state is
+fixed arrays of 640 pieces and one reserved message buffer; a drive client
+holds none). A pieces message never takes the [shared
+reservation](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary):
+one the shared bucket starves is rebuilt later.
+
+A pieces message is one binary WebSocket message, little-endian; a telemetry
+page never starts with its magic (it starts with its length):
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | magic `PCS1` |
+| 4 | 1 | flags: bit 0 keyframe (start from no piece) |
+| 5 | 1 | 0 |
+| 6 | 2 | u16 records that follow |
+| 8 | 4 | u32 `pieces_count`, the pieces on the field (at most 640) |
+| 12 | 4 | f32 `radius_m` |
+| 16 | 8 | u64 `sample_time_ns`, the gateway's node clock |
+| 24 | 16 each | records: u16 piece index, u8 flags (bit 0 in play), u8 0, then i32 x, y and z in millimetres, field frame |
+
+The largest, a keyframe of 640 pieces, is 10,264 B (10,274 B framed), inside
+the 64,000 B burst a send must fit; its cost against a client's share is in
+[Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary).
+`//studio/bridge:pieces_test` holds the keyframe, deltas, coalescing and
+gating; `integration_test.py`'s `test_game_pieces_reach_programmer_clients_only`
+the messages over a socket (with `studio_mock --pieces`, which publishes the
+topic as the gateway does); `:pieces_describe_test` the launcher's lint with
+and without the MuJoCo gateway.
 
 ## WebSocket operating limits
 
@@ -495,15 +568,16 @@ network.
 
 The bridge does not poll. Its one thread sleeps in the uSockets loop until a
 socket event (HTTP, a WebSocket message or a drained client socket), a
-publication on the telemetry topic, a stop, or its next duty. SIGINT and
+publication on the telemetry topic or the game pieces topic, a stop, or its
+next duty. SIGINT and
 SIGTERM go through `talOS/process`'s stop handlers, whose stop pipe is in the
 loop too, so a stop ends the wait at once however it lands. The reader slot names a
 `talos::WakeReceiver` whose descriptor is in the loop, so a publication wakes
 it at once
 ([wake channel](../../talOS/rtms/README.md#wake-channel)). Each wake is one
-pass: drain the receiver, read the topic (at most 256 pages a pass), check the
-segment and refresh the graph when due, send each client what is due, and arm
-the wake. A timer is then set to the earliest duty: the 250 ms graph refresh,
+pass: drain the receiver, read the topic (at most 256 pages a pass) and the
+newest game pieces message, check the segments and refresh the graph when
+due, arm the wake on both topics, and send each client what is due. A timer is then set to the earliest duty: the 250 ms graph refresh,
 the segment check (100 ms waiting, 1 s attached), and for each client its
 graph update (500 ms) or deferral notice (750 ms), its telemetry heartbeat
 (100 ms after its last update), the end of a telemetry hold (250 ms), and the

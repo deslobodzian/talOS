@@ -37,13 +37,15 @@ robot's integration, not of this software, and are measured at the bench
 ([docs/BENCH.md](docs/BENCH.md)).
 
 A controller processor is a program at the gateway end of `talOS/protocol`.
-The RoboRIO program, its WPILib simulation and `sim_gateway` all run the
+The RoboRIO program, its WPILib simulation, `sim_gateway` and
+the MuJoCo gateway all run the
 same `hardware::Gateway` and `hardware::Endpoint` (configuration, command
 checks, expiry, State, clock-probe echo) with the protocol and Driver Station
 codecs unchanged, and each supplies only:
 
 - a `hardware::Backend` (`talOS/hardware/gateway.h`) for its devices
-  (`PhoenixBackend`; `SimBackend`, `sim::PhysicsSimBackend`);
+  (`PhoenixBackend`; `SimBackend`, `sim::PhysicsSimBackend`, the latter
+  with a MuJoCo world as its external plant under the MuJoCo gateway);
 - a fixed-period loop that ticks the `Endpoint` on a monotonic clock
   (`Gateway::SetClock`) with the Driver Station's enable, observes the same
   flags in one `driver_station::ModeTracker` every tick, and sends Driver
@@ -101,7 +103,9 @@ Allowed dependencies:
   `//talOS/telemetry:{telemetry,channels}`, `//talOS/teleop:teleop`,
   `//talOS/node_api:node_api`, `//talOS/bridge:node_lib`,
   `//talOS/introspection:{registry,reporter}`,
-  `//talOS/launcher:launcher_lib`, `//talOS/simulation:schedules`,
+  `//talOS/launcher:launcher_lib`, `//talOS/simulation:{schedules,gateway_main}`,
+  `//talOS/simulation/mujoco:{gateway_extension,game,plant,scripted_shooter,world_rules}`,
+  `//talOS/simulation/mujoco/fields/rebuilt_2026:rules`,
   `//talOS/vision/capture:avfoundation`) are non-public in Bazel, and internal
   transport/wire/access deps of `//talOS/node:node` and
   `//talOS/devices:devices` live in `implementation_deps`, so robot node code
@@ -130,7 +134,7 @@ Beside the stack:
 | `talOS/bridge` | `:hardware_node`; publishes link health, RoboRIO power and each CAN bus's health (assembled by `//talOS/hardware:can_buses`, which `testing::SimHardware` also runs), gateway counters and build, and the gateway-to-node clock mapping (`//talOS/hardware:clock_offset`, read by `HardwareLink::sample_time()`) on `/hw/status` (`bridge::BridgeStatus`); runs `//talOS/hardware:merge` for the request merge rules (owner timeout, merged observation) that `testing::SimHardware` also runs; `--log` records every command, State and status it publishes, with the sequence and stamp its readers see |
 | `talOS/driver_station` | Driver Station codec |
 | `talOS/launcher` | spawns and supervises the nodes in a config (restarts crashed or stalled nodes per its [restart policy](talOS/launcher/README.md#restarts)); writes each session to `<output-dir>/<session_id>/` with a manifest kept current and old sessions pruned; `--describe-only` lints the graph; `:log_dump` prints its `.tlog`s |
-| `talOS/simulation` | `:sim_gateway`, the lightweight simulator that stands in for the RoboRIO for any robot config: devices from the config's hardware, ideal or `--physics` backend, scripted mode, joystick and fault schedules, `/sim/state` truth; the launcher starts it under `--start-sim-gateway` on the bridge's ports |
+| `talOS/simulation` | `:sim_gateway`, the lightweight simulator that stands in for the RoboRIO for any robot config: devices from the config's hardware, ideal or `--physics` backend, scripted mode, joystick and fault schedules, `/sim/state` truth; the launcher starts the program `[robot] sim_gateway` names (this one or the MuJoCo gateway) under `--sim --start-sim-gateway` on the bridge's ports; `mujoco:sim_gateway`, the MuJoCo gateway, the same program with a MuJoCo world (`[simulation.mujoco]`'s robot model on a field model) as the physics backend's plant, refereed by the field's game, whose match it publishes on `/sim/state/match`; the only package tree that may depend on MuJoCo |
 | `talOS/introspection` | `--describe`, the naming rules (`names.h`), the live registry Studio reads |
 | `talOS/process` | stop handlers and the stop pipe a node's loop and the launcher's start-up watch, `ConfigureRealtime` for node binaries and `ConfigureBackgroundThread` for their helper threads; `DurableSync`, the power-loss-safe sync of the launcher's session files and event logs |
 | `talOS/msgs` | shared geometry and control message structs (field and chassis angles in radians; `SwerveModulePosition`, `PoseObservation`, `PoseEstimate`) |
@@ -449,7 +453,7 @@ so `bazel run //tools:sync_manifest -- <dir>/robot.toml` writes
 `<dir>/robot_manifest.bzl` (`<stem>_manifest.bzl` for any other config name):
 `NODES`, every node label the config launches, and `CONFIG_FILES`, every file
 it reads besides itself (`include`, `path`, `defaults`, `[trajectories]`
-files, `[studio] dashboard`). `talos_bundle`, which ships them at the same relative layout, and
+files, `[studio] dashboard`, `[simulation.mujoco]` model files). `talos_bundle`, which ships them at the same relative layout, and
 `talos_graph_test` take those constants; no BUILD file lists nodes or
 subsystem files. Each config package has a `manifest_sync_test`
 (`tools/sync_manifest.bzl`). `talos_bundle` additionally runs the same check as

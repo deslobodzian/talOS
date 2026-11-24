@@ -1,0 +1,40 @@
+diff --git a/src/engine/engine_util_blas.c b/src/engine/engine_util_blas.c
+--- a/src/engine/engine_util_blas.c
++++ b/src/engine/engine_util_blas.c
+@@ -269,7 +269,7 @@ mjtNum mju_normalize4(mjtNum vec[4]) {
+ 
+ // res = 0
+ void mju_zero(mjtNum* res, int n) {
+-  memset(res, 0, n*sizeof(mjtNum));
++  if (n > 0) memset(res, 0, n*sizeof(mjtNum));
+ }
+ 
+ 
+@@ -291,7 +291,7 @@ void mju_fill(mjtNum* res, mjtNum val, int n) {
+ 
+ // res = vec
+ void mju_copy(mjtNum* res, const mjtNum* vec, int n) {
+-  memcpy(res, vec, n*sizeof(mjtNum));
++  if (n > 0) memcpy(res, vec, n*sizeof(mjtNum));
+ }
+ 
+ 
+diff --git a/src/engine/engine_util_misc.c b/src/engine/engine_util_misc.c
+--- a/src/engine/engine_util_misc.c
++++ b/src/engine/engine_util_misc.c
+@@ -2057,13 +2057,13 @@ int mju_isZeroByte(const unsigned char* vec, int n) {
+ 
+ // set integer vector to 0
+ void mju_zeroInt(int* res, int n) {
+-  memset(res, 0, n*sizeof(int));
++  if (n > 0) memset(res, 0, n*sizeof(int));
+ }
+ 
+ 
+ // copy int vector vec into res
+ void mju_copyInt(int* res, const int* vec, int n) {
+-  memcpy(res, vec, n*sizeof(int));
++  if (n > 0) memcpy(res, vec, n*sizeof(int));
+ }
+ 
+ // fill int vector with val

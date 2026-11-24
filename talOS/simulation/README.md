@@ -29,7 +29,9 @@ bazel run //talOS/simulation:sim_gateway -- \
 
 The gateway prints `active_ticks`, `first_wheel_rotations`,
 `first_wheel_rps` and `command_active` on shutdown. The backend choice is
-logged to stderr (`backend=ideal|physics`).
+logged to stderr (`backend=ideal|physics`); with `--physics` the same line
+gives the start pose and where it came from,
+`start_pose=X,Y,YAW (--start-pose|config|default)`.
 
 `--mode-schedule` accepts comma-separated `mode:seconds` phases with positive,
 finite fractional durations totaling at most 1e9 s. Modes are `disabled`, `auto` (or `autonomous`),
@@ -150,19 +152,19 @@ Physics-only flags (all values must be finite; supplying any without
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--start-pose X_M,Y_M,YAW_RAD` | `2,2,0` | Physical field start pose, independent of estimator parameters |
+| `--start-pose X_M,Y_M,YAW_RAD` | the config's `[simulation.start_pose]`, else `2,2,0` | Physical field start pose, independent of estimator parameters; overrides the config's |
 | `--wheel-radius-error FRAC` | `0` | True radius `wheel_radius_m × (1 + FRAC)` m (`wheel_radius_m` defaults to `0.0508`); strictly `-0.5 < FRAC < 0.5` |
 | `--wheel-slip-gain G` | `0` | Nonnegative acceleration-dependent traction loss |
 | `--gyro-drift-radps R` | `0` | Reported yaw bias grows by `R × elapsed_seconds`, yaw rate gains `R` |
 
 Nominal wheel radius, swerve module coordinates, mechanical end-of-travel hard
-stops, battery sag, chassis mass/traction dynamics, and per-mechanism inertia
-come from the optional top-level `[simulation]` table (`wheel_radius_m`,
-`[[simulation.swerve_modules]]`, `[[simulation.hard_stops]]`,
-`[simulation.battery]`, `[simulation.chassis]`, and
-`[[simulation.mechanisms]]`), falling back to `0.0508` m, ±0.30 m name
+stops, battery sag, chassis mass/traction dynamics, per-mechanism inertia and
+the start pose come from the optional top-level `[simulation]` table
+(`wheel_radius_m`, `[[simulation.swerve_modules]]`, `[[simulation.hard_stops]]`,
+`[simulation.battery]`, `[simulation.chassis]`, `[[simulation.mechanisms]]`
+and `[simulation.start_pose]`), falling back to `0.0508` m, ±0.30 m name
 inference, no hard stops, a constant `12.8` V bus, kinematic chassis
-integration, and the legacy first-order motor lag when omitted. Hard stops are
+integration, the legacy first-order motor lag and (2, 2, 0) when omitted. Hard stops are
 enforced in `--physics` even when `soft_limits = false` (as required for
 rezero-frame mechanisms), stopping the rotor so back-EMF drops to zero and
 stator current rises for stall homing. `[simulation]` never enters the hardware
@@ -198,6 +200,16 @@ the RoboRIO, so it takes the bridge's tier for its loop period
 (`loop_tier = "bridge"` in the session manifest). A gateway left at
 timeshare beside time-constraint nodes stops sending State whenever the host
 stalls timeshare work, and the nodes then correctly expire their targets.
+
+## MuJoCo gateway
+
+`//talOS/simulation/mujoco:sim_gateway` is this program with a MuJoCo
+world as the physics backend's plant: the robot's model from the config's
+`[simulation.mujoco]` on a field model, refereed by the field's game when
+it has one, whose match it publishes on `/sim/state/match` and stamps into
+the Driver Station packets. A config names it in `[robot] sim_gateway`;
+its flags, output and model rules are in
+[its README](mujoco/README.md#the-mujoco-gateway).
 
 ## Tests
 

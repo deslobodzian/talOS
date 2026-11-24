@@ -10,12 +10,24 @@ cc_binary(
     name = "sim_gateway",
     srcs = ["sim_gateway.cc"],
     visibility = ["//visibility:public"],
+    deps = [":gateway_main"],
+)
+
+# The simulator's program (flags, --describe, the loop) behind
+# RunSimGateway. A program that calls it with an extension can configure the
+# physics backend before the first Reconfigure and run after each tick.
+cc_library(
+    name = "gateway_main",
+    srcs = ["gateway_main.cc"],
+    hdrs = ["gateway_main.h"],
+    visibility = ["//talOS/simulation:__subpackages__"],
     deps = [
         ":ports",
         ":schedules",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/driver_station:schedule",
+        "//talOS/events:events_core",
         "//talOS/events:events_os",
         "//talOS/hardware",
         "//talOS/hardware:sim_messages",
@@ -25,6 +37,50 @@ cc_binary(
         "//talOS/memory:residency",
         "//talOS/msgs:geometry",
         "//talOS/process",
+    ],
+)
+
+# sim_gateway with an extension that stamps the Driver Station packets and
+# publishes a topic of its own (gateway_hooks_test).
+cc_binary(
+    name = "gateway_hooks_fixture",
+    testonly = True,
+    srcs = ["gateway_hooks_fixture.cc"],
+    deps = [
+        ":gateway_main",
+        "//talOS/events:events_core",
+        "//talOS/ipc",
+        "//talOS/msgs:geometry",
+    ],
+)
+
+# The extension hooks (gateway_main.h) as a program uses them: the Driver
+# Station stamp, the extension's topics in --describe and the live registry,
+# and the refusal of topics a registry row cannot hold. Integration lane:
+# fork/exec, loopback UDP and the live registry; one run of about 0.5 s of
+# real time.
+cc_test(
+    name = "gateway_hooks_test",
+    size = "small",
+    srcs = ["gateway_hooks_test.cc"],
+    data = [
+        ":gateway_hooks_fixture",
+        ":sim_gateway",
+    ],
+    env = {
+        "GATEWAY_HOOKS_FIXTURE": "$(rlocationpath :gateway_hooks_fixture)",
+        "SIM_GATEWAY": "$(rlocationpath :sim_gateway)",
+    },
+    tags = ["integration"],
+    deps = [
+        "//talOS/driver_station",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:names",
+        "//talOS/introspection:registry",
+        "//talOS/msgs:geometry",
+        "//talOS/protocol:frame",
+        "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
     ],
 )
 

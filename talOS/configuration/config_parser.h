@@ -20,7 +20,8 @@
 // A subsystem's [trajectories] table names data files (name = "path",
 // relative to the file that sets it); config load requires each to exist,
 // and the build lists each in the config's CONFIG_FILES (resolve.cc). So
-// does [studio] dashboard, the driver dashboard's layout file.
+// do [studio] dashboard, the driver dashboard's layout file, and
+// [simulation.mujoco] robot_model and robot_model_files, the MuJoCo model.
 
 #include <algorithm>
 #include <cstdint>
@@ -136,9 +137,56 @@ struct SimulationMechanismConfig {
   bool operator==(const SimulationMechanismConfig&) const = default;
 };
 
+// A field model `[simulation.mujoco] field` may name, with its floor in the
+// field frame: x from 0 to length_m, y from 0 to width_m (twice the model's
+// `field_centre` site, which //talOS/simulation/mujoco:fields_test holds it
+// to). The configuration layer cannot depend on talOS/simulation, so the
+// list lives here; each name must have its package,
+// //talOS/simulation/mujoco/fields/<name>.
+struct SimulationMujocoField {
+  std::string_view name;
+  double length_m;
+  double width_m;
+};
+inline constexpr SimulationMujocoField kSimulationMujocoFields[] = {
+    // The drawings' 651.22 x 317.69 in.
+    {.name = "rebuilt_2026", .length_m = 16.541188, .width_m = 8.069326},
+};
+
+// Optional `[simulation.start_pose]`: where the simulator places the robot
+// at start, in the field frame (metres, yaw radians CCW+). A file that sets
+// it sets all three keys, each a finite number; with a `[simulation.mujoco]
+// field`, (x_m, y_m) lies on that field's floor. Unset, the gateway starts
+// the robot at the defaults below; its `--start-pose` overrides either.
+struct SimulationStartPose {
+  double x_m{2.0};
+  double y_m{2.0};
+  double yaw_rad{0.0};
+  bool operator==(const SimulationStartPose&) const = default;
+};
+
+// Optional `[simulation.mujoco]`: the MuJoCo model to simulate. A config file's
+// paths are relative to the file that sets them, never absolute
+// (ResolveRobotConfig refuses one), and resolved here; a config parsed from a
+// string keeps them as written, relative to the working directory. Config load
+// refuses a file that does not exist, and the build lists each in the config's
+// CONFIG_FILES.
+struct SimulationMujocoConfig {
+  std::string robot_model;                     // resolved
+  std::vector<std::string> robot_model_files;  // resolved
+  std::string field;                           // "" = flat carpet
+  // The seed a field's game rules draw from: 0 to 2^63 - 1 (a TOML integer
+  // is signed 64-bit; a negative one is refused).
+  std::uint64_t seed{1};
+  // Whether MuJoCo puts resting free bodies to sleep (the robot's never
+  // sleep): off unless a file sets it.
+  bool sleeping{false};
+  bool operator==(const SimulationMujocoConfig&) const = default;
+};
+
 // Optional `[simulation]` table: physics simulator geometry, battery, chassis,
-// mechanisms, and end-of-travel hard stops that stay off the hardware wire and
-// never affect hardware::ConfigurationId.
+// mechanisms, end-of-travel hard stops, the start pose and the MuJoCo model,
+// all off the hardware wire and never affecting hardware::ConfigurationId.
 struct SimulationConfig {
   static constexpr double kDefaultWheelRadiusM = 0.0508;
   double wheel_radius_m{kDefaultWheelRadiusM};
@@ -147,6 +195,8 @@ struct SimulationConfig {
   std::optional<SimulationBatteryConfig> battery;
   std::optional<SimulationChassisConfig> chassis;
   std::vector<SimulationMechanismConfig> mechanisms;
+  std::optional<SimulationStartPose> start_pose;  // unset: the defaults
+  std::optional<SimulationMujocoConfig> mujoco;
 
   bool operator==(const SimulationConfig&) const = default;
 };
@@ -341,7 +391,8 @@ RobotConfig ParseRobotConfigString(std::string_view toml_content);
 // Resolve once for runtime and build tools. Readers may track dependencies or
 // supply pending file contents without changing include/manifest semantics.
 // `data(path, label)` sees every non-TOML file the config names (the
-// effective [trajectories] entries and [studio] dashboard), resolved against
+// effective [trajectories] entries, [studio] dashboard and
+// [simulation.mujoco] robot_model and robot_model_files), resolved against
 // the file that names it, with a label naming that file and the key, before
 // config load requires it to exist.
 toml::table ResolveRobotConfig(

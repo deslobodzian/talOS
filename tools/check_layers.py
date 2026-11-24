@@ -96,6 +96,13 @@ refuses from the start (RULES.md 2):
   `.bzl` macro `**kwargs` pass-through) that can add `-isystem` include search
   paths.
 
+It also refuses, in every tracked `BUILD`, `BUILD.bazel` and `.bzl` file
+outside `talOS/simulation/mujoco/` (talOS/ and tools/ included), a string
+constant (or constant concatenation, format or join) that is a `@mujoco`
+label, a `load` from `//talOS/simulation/mujoco`, and a `repo_name` on
+MODULE.bazel's mujoco `bazel_dep`: only that package may depend on MuJoCo
+(docs/METHODOLOGY.md §13).
+
 Structural enforcement (ARCH-2 / RULES.md 2): Bazel visibility (checked above
 for every restricted target) prevents robot node code from depending on
 privileged internal or transport targets, and `implementation_deps` on
@@ -184,6 +191,13 @@ _PRIVILEGED_FRAMEWORK_LIBRARIES = (
     "talOS/introspection:reporter",
     "talOS/launcher:launcher_lib",
     "talOS/simulation:schedules",
+    "talOS/simulation:gateway_main",
+    "talOS/simulation/mujoco:gateway_extension",
+    "talOS/simulation/mujoco:game",
+    "talOS/simulation/mujoco:plant",
+    "talOS/simulation/mujoco:scripted_shooter",
+    "talOS/simulation/mujoco:world_rules",
+    "talOS/simulation/mujoco/fields/rebuilt_2026:rules",
 )
 FORBIDDEN_NODE_DEPS = (
     "talOS/rtms/...",
@@ -376,6 +390,7 @@ FORBIDDEN_INCLUDE_EXACT = frozenset({
     "talOS/events/simulated_event_loop.h",
     "talOS/events/wake_channel_wait.h",
     "talOS/simulation/schedules.h",
+    "talOS/simulation/gateway_main.h",
     "talOS/telemetry/channels.h",
     "talOS/telemetry/node.h",
     "talOS/teleop/node.h",
@@ -2000,6 +2015,101 @@ def _extract_build_referenced_files(build_path, tree, tracked_set, pkg_files):
     return found
 
 
+# The MuJoCo dependency (docs/METHODOLOGY.md §13): only packages under
+# MUJOCO_PACKAGE may name `@mujoco`, so no node and not the RoboRIO program
+# links it. Every tracked BUILD, BUILD.bazel and `.bzl` file elsewhere is
+# scanned, talOS/ and tools/ included.
+MUJOCO_PACKAGE = "talOS/simulation/mujoco/"
+MUJOCO_LABEL_RE = re.compile(r"^@{1,2}mujoco\+?(?://|:|$)")
+MUJOCO_LOAD_RE = re.compile(r"^(?:@{1,2}talos\+?)?//talOS/simulation/mujoco(?:[/:]|$)")
+
+
+def _statement_context(stmt):
+    """Names the top-level statement a finding sits in: a rule or macro call
+    with its `name`, a `def`, or an assignment."""
+    if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+        call = stmt.value
+        kind = call.func.id if isinstance(call.func, ast.Name) else "call"
+        for kw in call.keywords:
+            if kw.arg == "name" and isinstance(kw.value, ast.Constant):
+                return f'{kind}(name = "{kw.value.value}")'
+        return kind
+    if isinstance(stmt, ast.FunctionDef):
+        return f"def {stmt.name}"
+    if isinstance(stmt, ast.Assign) and isinstance(stmt.targets[0], ast.Name):
+        return f"{stmt.targets[0].id} = ..."
+    return "top level"
+
+
+def scan_mujoco_labels(path, tree):
+    """Refuses a `@mujoco` label, or a load from the MuJoCo package, in a
+    Starlark file outside MUJOCO_PACKAGE. Returns `(line, detail)` pairs."""
+    bindings = _collect_starlark_bindings(tree)
+    found = {}
+    for stmt in tree.body:
+        context = _statement_context(stmt)
+        if (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call) and
+                isinstance(stmt.value.func, ast.Name) and
+                stmt.value.func.id == "load" and stmt.value.args):
+            label = _eval_starlark_str(stmt.value.args[0], bindings)
+            if label is None or MUJOCO_LOAD_RE.match(label):
+                found.setdefault(stmt.lineno, (
+                    f"load from the MuJoCo package ({label}) outside "
+                    f"{MUJOCO_PACKAGE}"))
+            continue
+        for node in ast.walk(stmt):
+            if not isinstance(node, (ast.Constant, ast.BinOp, ast.Call)):
+                continue
+            val = _eval_starlark_str(node, bindings)
+            if val is not None and MUJOCO_LABEL_RE.match(val.strip()):
+                found.setdefault(getattr(node, "lineno", stmt.lineno), (
+                    f"{context} names `{val.strip()}`; only {MUJOCO_PACKAGE} "
+                    f"may depend on MuJoCo"))
+    return sorted(found.items())
+
+
+def run_mujoco_checks(files, read, out=sys.stdout):
+    """Runs scan_mujoco_labels over every tracked Starlark file outside
+    MUJOCO_PACKAGE. Returns the number of failures; fails closed on a file
+    it cannot read or parse."""
+    failures = 0
+    scanned = 0
+    for path in sorted(files):
+        if path == "MODULE.bazel":
+            # A repo_name would give the dependency a label the scan misses.
+            for node in ast.walk(ast.parse(read(path), filename=path)):
+                if (isinstance(node, ast.Call) and
+                        getattr(node.func, "id", "") == "bazel_dep"):
+                    kw = {k.arg: k.value for k in node.keywords}
+                    name = kw.get("name")
+                    repo = kw.get("repo_name")
+                    if (isinstance(name, ast.Constant) and
+                            name.value == "mujoco" and repo is not None and
+                            getattr(repo, "value", None) != "mujoco"):
+                        failures += 1
+                        print(f"VIOLATION {path}:{node.lineno}: mujoco's "
+                              f"bazel_dep sets a repo_name; the @mujoco "
+                              f"check would not see its labels", file=out)
+            continue
+        if path.startswith(MUJOCO_PACKAGE) or not _is_starlark_file(path):
+            continue
+        scanned += 1
+        try:
+            tree = ast.parse(read(path), filename=path)
+        except (OSError, UnicodeDecodeError, SyntaxError) as exc:
+            failures += 1
+            print(f"VIOLATION {path}: cannot scan for @mujoco: {exc} "
+                  f"(fail closed)", file=out)
+            continue
+        for line, detail in scan_mujoco_labels(path, tree):
+            failures += 1
+            print(f"VIOLATION {path}:{line}: {detail}", file=out)
+    if not failures:
+        print(f"MuJoCo dependency check passed ({scanned} Starlark file(s) "
+              f"outside {MUJOCO_PACKAGE})", file=out)
+    return failures
+
+
 def discover_scanned_files(files, read):
     """Discovers every tracked source file and Starlark (`BUILD`, `BUILD.bazel`,
     `.bzl`) file under `bench/`, `examples/`, `tools/scaffold_testdata/`, and
@@ -2159,7 +2269,9 @@ def main(argv=None):
     failures = 0
     if not args.source_only:
         failures += run(Bazel())
-    failures += run_source_checks(tracked_files(), read_source_file)
+    files = tracked_files()
+    failures += run_source_checks(files, read_source_file)
+    failures += run_mujoco_checks(files, read_source_file)
     return 1 if failures else 0
 
 

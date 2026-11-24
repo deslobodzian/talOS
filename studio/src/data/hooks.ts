@@ -18,6 +18,7 @@ import type {RobotStatus} from './robot';
 import {robotStatus} from './robot';
 import {readingClock, sampleStale} from './freshness';
 import type {SessionManifest} from './manifest';
+import type {PiecesSnapshot} from './pieces';
 import type {
   ChannelInfo,
   ModeBand,
@@ -58,6 +59,14 @@ export function usePlayback(): PlaybackState {
 export function useSystem(): SystemState {
   const studio = useStudio();
   return useSyncExternalStore(studio.subscribe, () => studio.system, () => studio.system);
+}
+
+// The live game pieces (data/pieces.ts); null while a recorded session is
+// shown, which carries none.
+export function usePieces(): PiecesSnapshot|null {
+  const studio = useStudio();
+  const get = () => studio.recorded ? null : studio.pieces;
+  return useSyncExternalStore(studio.subscribe, get, get);
 }
 
 // While a recorded session is open, transport drives its playhead, and going

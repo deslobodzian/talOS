@@ -44,6 +44,7 @@ cc_test(
     data = [":resolution_cases"],
     deps = [
         ":configuration",
+        "//talOS/hardware:codecs",
         "//talOS/hardware:config",
         "@googletest//:gtest",
         "@googletest//:gtest_main",

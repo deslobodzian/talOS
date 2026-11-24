@@ -6,6 +6,8 @@
 *.lo
 *.o
 *.obj
+# A Wavefront mesh a MuJoCo test model reads is source, not an object file.
+!talOS/simulation/mujoco/testdata/**/*.obj
 
 # Precompiled Headers
 *.gch
