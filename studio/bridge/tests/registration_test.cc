@@ -793,7 +793,7 @@ TEST(BridgeRegistration, StandaloneRecoversFromUnlinkedAndReplacedRegistry) {
     for (int i = 0; i < 25; ++i) {
       const auto text = ws.ReadTextFrame();
       if (!text.has_value()) return std::nullopt;
-      const auto doc = nlohmann::json::parse(*text, nullptr, false);
+      auto doc = nlohmann::json::parse(*text, nullptr, false);
       if (doc.is_object() && doc.value("kind", "") == "talos.system_graph" &&
           predicate(doc)) {
         return doc;
