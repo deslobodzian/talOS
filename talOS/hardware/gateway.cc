@@ -116,7 +116,9 @@ Gateway::Gateway(Config config, Backend& backend, uint64_t boot_id)
     }
   }
   restore_waiting_ = !unavailable_.empty();
-  restore_retry_at_ = kRestoreInitialBackoffUs;
+  restore_retry_at_ = restore_waiting_ ? kRestoreInitialBackoffUs : 0;
+  restore_backoff_us_ = kRestoreInitialBackoffUs;
+  unattempted_restore_ = false;
 }
 Gateway::Gateway(Backend& backend, uint64_t boot_id) : backend_{backend} {
   if (boot_id == 0) {
@@ -192,8 +194,10 @@ void Gateway::CommitConfiguration(const Config& config) {
     }
   }
   restore_waiting_ = !unavailable_.empty();
-  restore_retry_at_ = state_.sample_time_us + kRestoreInitialBackoffUs;
+  restore_retry_at_ =
+      restore_waiting_ ? state_.sample_time_us + kRestoreInitialBackoffUs : 0;
   restore_backoff_us_ = kRestoreInitialBackoffUs;
+  unattempted_restore_ = false;
   last_requests_.fill(MotorRequest{});
   motor_drives_from_.fill(0);
   position_reference_.fill(PositionReference{});
@@ -212,6 +216,15 @@ void Gateway::Invalidate() {
   have_sequence_ = false;
   ++state_.epoch;
   backend_.Neutral();
+}
+void Gateway::ExpireCommand(uint64_t at_us) {
+  if (active_ && (at_us < accepted_at_ || at_us < observed_at_ ||
+                  at_us - accepted_at_ >= config_.command_timeout_us ||
+                  at_us - observed_at_ >= config_.command_timeout_us)) {
+    last_command_expiry_ = {last_command_expiry_.count + 1, at_us, observed_at_,
+                            accepted_at_};
+    Invalidate();
+  }
 }
 bool Gateway::DeviceUnavailable(uint16_t id) const {
   return std::find(unavailable_.begin(), unavailable_.end(), id) !=
@@ -281,6 +294,7 @@ void Gateway::NeutralUnavailable() {
 }
 
 bool Gateway::IsolateFailedMotors() {
+  const bool was_empty = unavailable_.empty();
   bool isolated = false;
   for (const auto id : backend_.ApplyFailedDevices()) {
     const bool motor =
@@ -296,8 +310,10 @@ bool Gateway::IsolateFailedMotors() {
     isolated = true;
   }
   if (isolated) {
+    if (was_empty) restore_backoff_us_ = kRestoreInitialBackoffUs;
     restore_waiting_ = true;
-    restore_retry_at_ = std::max(restore_retry_at_, state_.sample_time_us);
+    unattempted_restore_ = true;
+    restore_retry_at_ = state_.sample_time_us;
   }
   return isolated;
 }
@@ -337,9 +353,23 @@ void Gateway::PollResets() {
         }
       }
       restore_waiting_ = !unavailable_.empty();
-      restore_retry_at_ = state_.sample_time_us + restore_backoff_us_;
-      restore_backoff_us_ =
-          std::min(restore_backoff_us_ * 2, kRestoreMaxBackoffUs);
+      if (!restore_waiting_) {
+        restore_backoff_us_ = kRestoreInitialBackoffUs;
+        restore_retry_at_ = 0;
+        unattempted_restore_ = false;
+      } else if (unattempted_restore_) {
+        if (result == Backend::RestoreStatus::kDone &&
+            std::none_of(
+                restoring_ids_.begin(), restoring_ids_.end(),
+                [this](uint16_t id) { return DeviceUnavailable(id); })) {
+          restore_backoff_us_ = kRestoreInitialBackoffUs;
+        }
+        restore_retry_at_ = state_.sample_time_us;
+      } else {
+        restore_retry_at_ = state_.sample_time_us + restore_backoff_us_;
+        restore_backoff_us_ =
+            std::min(restore_backoff_us_ * 2, kRestoreMaxBackoffUs);
+      }
     }
   }
   // Keep detecting new resets even while a previous device is being restored.
@@ -357,6 +387,7 @@ void Gateway::PollResets() {
       }
     }
     restore_waiting_ = true;
+    unattempted_restore_ = true;
     restore_retry_at_ = state_.sample_time_us;
   }
   MaskUnavailable();
@@ -371,6 +402,7 @@ void Gateway::PollResets() {
   if (!restoring_ && restore_waiting_ &&
       state_.sample_time_us >= restore_retry_at_) {
     restore_waiting_ = false;
+    unattempted_restore_ = false;
     restoring_ = true;
     ++restore_attempt_count_;
     restoring_ids_ = unavailable_;
@@ -562,13 +594,7 @@ void Gateway::Tick(uint64_t now, bool enabled) {
     enabled_ = enabled;
     Invalidate();
   }
-  if (active_ && (now < accepted_at_ || now < observed_at_ ||
-                  now - accepted_at_ >= config_.command_timeout_us ||
-                  now - observed_at_ >= config_.command_timeout_us)) {
-    last_command_expiry_ = {last_command_expiry_.count + 1, now, observed_at_,
-                            accepted_at_};
-    Invalidate();
-  }
+  ExpireCommand(now);
   state_.sample_time_us = now;
   const bool was_healthy = healthy_;
   const bool read = configured_ && backend_.Read(state_);
@@ -580,6 +606,7 @@ void Gateway::Tick(uint64_t now, bool enabled) {
   // before any mask, ended here so PollResets applies nothing more.
   healthy_ = configured_ && JudgeFeedbackAge() && read;
   read_us_ = clock_ != nullptr ? std::max(now, clock_()) : now;
+  ExpireCommand(read_us_);
   // Total loss starts a new epoch whether or not a command is in force: a
   // request built from a State before it must never drive after it.
   if (!healthy_ && (was_healthy || active_)) Invalidate();
@@ -605,11 +632,12 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
   // Wrong whether or not the gateway takes commands now: another identity, an
   // expired or future observation, a replayed sequence or another manifest
   // size; then another epoch.
+  const uint64_t check_now = clock_ != nullptr ? std::max(now, clock_()) : now;
   const bool matched_but_epoch =
       c.config_id == state_.config_id && c.boot_id == state_.boot_id &&
       c.observed_time_us <= state_.sample_time_us &&
-      c.observed_time_us <= now &&
-      now - c.observed_time_us < config_.command_timeout_us &&
+      c.observed_time_us <= check_now &&
+      check_now - c.observed_time_us < config_.command_timeout_us &&
       !(have_sequence_ && sequence <= state_.last_command_sequence) &&
       c.count == config_.motors.size();
   const bool mismatched = !matched_but_epoch || c.epoch != state_.epoch;
@@ -747,7 +775,7 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
   last_requests_ = requests;
   active_ = true;
   have_sequence_ = true;
-  accepted_at_ = now;
+  accepted_at_ = check_now;
   observed_at_ = c.observed_time_us;
   state_.last_command_sequence = sequence;
   // Device-local send failures quarantine only the failed chain; the rest of
