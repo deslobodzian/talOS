@@ -8,6 +8,7 @@ load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 # (examples/robot_repo/BUILD.bazel).
 exports_files([
     "deploy.sh",
+    "sync_manifest.bzl",
     "sync_manifest.py",
     "trace.py",
     "workspace_status.sh",
