@@ -765,7 +765,7 @@ class SimGatewayStartup(unittest.TestCase):
             config = Path(tmp) / "robot.toml"
             config.write_text(
                 '[robot]\nname = "sim_truth_errors_test"\nperiod_us = 5000\n'
-                'command_timeout_us = 100000\n'
+                'command_timeout_us = 500000\n'
                 'controller_address = "127.0.0.1"\n'
                 '[subsystems.drive.motors]\n'
                 'back_left_drive = { can_id = 1 }\n'
@@ -818,13 +818,15 @@ class SimGatewayStartup(unittest.TestCase):
                          "--gyro-drift-radps", str(gyro_drift_radps),
                          "--port", str(gateway_port),
                          "--remote-port", str(peer.getsockname()[1]),
-                         "--duration-s", "0.5"],
+                         "--duration-s", "10"],
                         env=_isolated_env(self, tmp),
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         text=True) as proc:
                     cmd_seq = 0
+                    first_driven_us = None
+                    prev_drive_vel_rps = None
                     try:
-                        for _ in range(400):
+                        for _ in range(1200):
                             try:
                                 packet = peer.recv(4096)
                             except socket.timeout:
@@ -852,6 +854,20 @@ class SimGatewayStartup(unittest.TestCase):
                             states_by_seq[state_seq] = (
                                 sample_time_us, last_cmd_seq, drive_pos_rot,
                                 drive_vel_rps, pigeon_pos_rot, pigeon_vel_rps)
+                            if first_driven_us is None and drive_vel_rps > 1.0:
+                                first_driven_us = sample_time_us
+                            steady = (
+                                ring is not None
+                                and first_driven_us is not None
+                                and (sample_time_us - first_driven_us) >= 350_000
+                                and drive_vel_rps > 25.0
+                                and prev_drive_vel_rps is not None
+                                and abs(drive_vel_rps - prev_drive_vel_rps) < 0.05
+                            )
+                            prev_drive_vel_rps = drive_vel_rps
+                            if steady:
+                                proc.send_signal(signal.SIGTERM)
+                                break
                             cmd_seq += 1
                             payload = bytearray(struct.pack(
                                 "<QQQQHHH", config_id, boot_id, epoch,
@@ -915,8 +931,8 @@ class SimGatewayStartup(unittest.TestCase):
                 states_by_seq[last_seq][0] - states_by_seq[first_seq][0]
             ) * 1e-6
             self.assertGreaterEqual(
-                driven_s, 0.25,
-                f"expected >= 0.25 s of driven ticks, got {driven_s:.3f} s")
+                driven_s, 0.32,
+                f"expected >= 0.32 s of driven ticks, got {driven_s:.3f} s")
 
             # During initial acceleration, --wheel-slip-gain suppresses true
             # ground speed well below surface speed.
