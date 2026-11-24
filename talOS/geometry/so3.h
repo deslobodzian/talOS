@@ -49,17 +49,22 @@ class SO3 {
     return Matrix3::Identity() + h / Scalar(2) + c * h * h;
   }
 
-  // Exponential map (Rodrigues). Taylor below |w| ~ sqrt(eps), where the
-  // dropped O(|w|^3) terms sit under machine epsilon.
+  // Exponential map (Rodrigues). Taylor below |w|^2 ~ sqrt(eps), where the
+  // dropped O(|w|^4) terms sit under machine epsilon; elsewhere the half-angle
+  // identity avoids 1 - cos(theta) cancellation.
   static SO3 Exp(const Vector3& w) {
     const Scalar theta_sq = w.squaredNorm();
-    const Scalar theta = std::sqrt(theta_sq);
     const Matrix3 w_hat = Hat(w);
-    if (theta < TaylorThreshold()) {
-      return SO3(Matrix3::Identity() + w_hat + Scalar(0.5) * w_hat * w_hat);
+    Scalar a, b;
+    if (theta_sq < TaylorThreshold()) {
+      a = Scalar(1) - theta_sq / Scalar(6);
+      b = Scalar(0.5) - theta_sq / Scalar(24);
+    } else {
+      const Scalar theta = std::sqrt(theta_sq);
+      a = std::sin(theta) / theta;
+      const Scalar half_sin = std::sin(Scalar(0.5) * theta);
+      b = (Scalar(2) * half_sin * half_sin) / theta_sq;
     }
-    const Scalar a = std::sin(theta) / theta;
-    const Scalar b = (Scalar(1) - std::cos(theta)) / theta_sq;
     return SO3(Matrix3::Identity() + a * w_hat + b * w_hat * w_hat);
   }
 

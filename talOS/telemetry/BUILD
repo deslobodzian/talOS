@@ -131,6 +131,21 @@ cc_library(
     ],
 )
 
+cc_test(
+    name = "config_validation_test",
+    size = "small",
+    srcs = ["tests/config_validation_test.cc"],
+    deps = [
+        ":config_validation",
+        ":wire",
+        "//talOS/configuration",
+        "//talOS/events:events_core",
+        "//talOS/introspection:describe",
+        "@flatbuffers//:runtime_cc",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "telemetry",
     hdrs = ["node.h"],

@@ -22,10 +22,17 @@ TEST(Schedule, ModePhasesAccumulateWithTheirFlags) {
   EXPECT_EQ(phases[2].end, microseconds{1'750'000});
 }
 
+// REQ-CONTRACT-17
 TEST(Schedule, RejectsMalformedModeSchedules) {
-  for (const char* spec : {"", "teleop", "fly:1", "teleop:0", "teleop:-1",
-                           "teleop:nan", "teleop:1x", "teleop:1e999",
-                           "teleop:1,", ",auto:1", "teleop:6e8,auto:6e8"}) {
+  for (const char* spec :
+       {"", "teleop", "fly:1", "teleop:0", "teleop:-1", "teleop:nan",
+        "teleop:1x", "teleop:1e999", "teleop:1,", ",auto:1",
+        "teleop:6e8,auto:6e8",
+        // Positive seconds that round to zero microseconds.
+        "teleop:1e-9", "teleop:0.0000004", "teleop:1,auto:1e-9",
+        // Leading whitespace or hexadecimal floats accepted by std::stod.
+        "teleop: 1", "teleop:\t1", "teleop:0x1", "teleop:0X1p0",
+        "teleop:+0x1"}) {
     EXPECT_THROW(ParseModeSchedule(spec), std::invalid_argument) << spec;
   }
 }
@@ -67,7 +74,14 @@ TEST(Schedule, RejectsMalformedJoystickSchedules) {
         std::string{"0:axes=0;buttons=0;pov=360"},
         std::string{"0:axes=0;buttons=0;pov=45.5"},
         std::string{"0:axes=0;axes=0;buttons=0;pov=-1"},
-        std::string{"0:axes=0;buttons=0;pov=-1;rumble=1"}}) {
+        std::string{"0:axes=0;buttons=0;pov=-1;rumble=1"},
+        // Leading whitespace or hex floats in Finite() fields.
+        std::string{" 0:"} + kStick, std::string{"0x1:"} + kStick,
+        std::string{"0:axes= 0.5;buttons=0;pov=-1"},
+        std::string{"0:axes=0x1p-1;buttons=0;pov=-1"},
+        std::string{"0:axes=-0X1p-1;buttons=0;pov=-1"},
+        std::string{"0:axes=0;buttons=0;pov= 90"},
+        std::string{"0:axes=0;buttons=0;pov=0x10"}}) {
     EXPECT_THROW(ParseJoystickSchedule(spec), std::invalid_argument) << spec;
   }
 }

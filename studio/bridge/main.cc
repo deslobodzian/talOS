@@ -768,13 +768,30 @@ int main(int argc, char** argv) try {
   // probes every binary with the same flags.
   for (int i = 1; i < argc; ++i) {
     if (std::string_view(argv[i]) != "--describe") continue;
-    const char* config_path = nullptr;
-    for (int j = 1; j + 1 < argc; ++j) {
-      if (std::string_view(argv[j]) == "--config") config_path = argv[j + 1];
+    std::string config_path;
+    for (int j = 1; j < argc; ++j) {
+      const std::string_view argument = argv[j];
+      static constexpr std::string_view kConfig = "--config";
+      if (argument == kConfig) {
+        if (j + 1 >= argc || std::string_view(argv[j + 1]).empty()) {
+          std::cerr << "studio_bridge --describe: --config requires a path\n";
+          return 2;
+        }
+        config_path = argv[++j];
+      } else if (argument.starts_with(kConfig) &&
+                 argument.size() > kConfig.size() &&
+                 argument[kConfig.size()] == '=') {
+        const std::string_view value = argument.substr(kConfig.size() + 1);
+        if (value.empty()) {
+          std::cerr << "studio_bridge --describe: --config requires a path\n";
+          return 2;
+        }
+        config_path = std::string(value);
+      }
     }
     // The watched topic is read from [studio] topic in robot configuration.
     std::string topic = "/talos/telemetry";
-    if (config_path != nullptr) {
+    if (!config_path.empty()) {
       try {
         const auto robot = talos::config::ParseRobotConfig(config_path);
         topic = robot.studio.topic;
@@ -813,6 +830,7 @@ int main(int argc, char** argv) try {
   std::string refusal_reason;
   std::uint64_t session_id = 0;
   bool bad_session_id = false;
+  bool bad_config = false;
   unsigned idle_timeout_s = kIdleTimeoutS;
   bool bad_idle_timeout = false;
   const auto parse_session_id = [&](std::string_view value) {
@@ -822,15 +840,41 @@ int main(int argc, char** argv) try {
       bad_session_id = true;
     }
   };
+  const auto parse_idle_timeout = [&](std::string_view value) {
+    const auto [end, error] = std::from_chars(
+        value.data(), value.data() + value.size(), idle_timeout_s);
+    if (error != std::errc{} || end != value.data() + value.size() ||
+        idle_timeout_s < kMinIdleTimeoutS ||
+        idle_timeout_s > kMaxIdleTimeoutS) {
+      bad_idle_timeout = true;
+    }
+  };
   for (int i = 0; i < argc; ++i) {
     const std::string_view argument = argv[i];
+    static constexpr std::string_view kConfig = "--config";
     static constexpr std::string_view kDeclared = "--declared";
     static constexpr std::string_view kManifest = "--manifest";
     static constexpr std::string_view kSessionId = "--session-id";
     static constexpr std::string_view kRefusalFile = "--refusal-file";
     static constexpr std::string_view kRefusalReason = "--refusal-reason";
-    if (argument == "--config" && i + 1 < argc) {
-      config_path = argv[++i];
+    static constexpr std::string_view kIdleTimeoutS = "--idle-timeout-s";
+    if (argument == kConfig && i + 1 < argc) {
+      const std::string_view value = argv[++i];
+      if (value.empty()) {
+        bad_config = true;
+      } else {
+        config_path = std::string(value);
+      }
+      continue;
+    }
+    if (argument.starts_with(kConfig) && argument.size() > kConfig.size() &&
+        argument[kConfig.size()] == '=') {
+      const std::string_view value = argument.substr(kConfig.size() + 1);
+      if (value.empty()) {
+        bad_config = true;
+      } else {
+        config_path = std::string(value);
+      }
       continue;
     }
     if (argument == kRefusalFile && i + 1 < argc) {
@@ -863,14 +907,14 @@ int main(int argc, char** argv) try {
       parse_session_id(argument.substr(kSessionId.size() + 1));
       continue;
     }
-    if (argument == "--idle-timeout-s" && i + 1 < argc) {
-      const std::string_view value = argv[++i];
-      const auto [end, error] = std::from_chars(
-          value.data(), value.data() + value.size(), idle_timeout_s);
-      bad_idle_timeout = error != std::errc{} ||
-                         end != value.data() + value.size() ||
-                         idle_timeout_s < kMinIdleTimeoutS ||
-                         idle_timeout_s > kMaxIdleTimeoutS;
+    if (argument == kIdleTimeoutS && i + 1 < argc) {
+      parse_idle_timeout(argv[++i]);
+      continue;
+    }
+    if (argument.starts_with(kIdleTimeoutS) &&
+        argument.size() > kIdleTimeoutS.size() &&
+        argument[kIdleTimeoutS.size()] == '=') {
+      parse_idle_timeout(argument.substr(kIdleTimeoutS.size() + 1));
       continue;
     }
     if (argument == kDeclared && i + 1 < argc) {
@@ -900,7 +944,8 @@ int main(int argc, char** argv) try {
       std::any_of(args.begin() + 1, args.end(), [](const char* argument) {
         return std::string_view(argument).starts_with("--");
       });
-  if (count > 4 || unknown_option || bad_idle_timeout || bad_session_id) {
+  if (count > 4 || unknown_option || bad_idle_timeout || bad_session_id ||
+      bad_config) {
     std::cerr
         << "Usage: studio_bridge "
            "[topic=/talos/telemetry] [HTTP=5800] [webroot=studio/dist]\n"

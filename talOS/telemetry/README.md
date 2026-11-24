@@ -112,7 +112,9 @@ lapped and counts what it missed, and never stops publication for other
 readers; the bridge never applies a tick it lost a page of. Construction
 refuses a dictionary past `kMaxChannels`, naming the topics with the most
 channels to exclude; pages the dictionary once and refuses, by name, a channel
-whose entry alone cannot fit one dictionary page; and for a graph reports the
+whose entry alone cannot fit one dictionary page, as well as a dictionary whose
+combined dictionary-resend tick (`dictionary_pages + value_pages`) exceeds the
+64-slot `/talos/telemetry` ring; and for a graph reports the
 pages a tick takes. Studio
 refuses a whole dictionary over one channel it cannot decode, so construction
 also refuses, by name, a channel whose name, unit or label exceeds the
@@ -128,8 +130,9 @@ the channel model: `FlattenTopic(topic, schema_name, bfbs)` lists a topic's
 channels (name, kind, unit, labels, alert level, and the scalar's offset
 and type) from
 its schema, refusing a schema that names an object it does not hold, holds
-a struct that contains itself, nests structs more than 16 deep, or expands
-to more than 4096 struct instances (`channels.h`; a recorded log's schema
+a struct that contains itself, holds a zero-length array, nests structs more
+than 16 deep, expands to more than 4096 struct instances, or visits more than
+16384 scalar elements (`channels.h`; a recorded log's schema
 may be damaged or crafted). The review server also refuses a topic of more
 than 2048 channels; the node flattens only the channels its `exclude` keeps,
 so a large message can be brought within the dictionary cap below by

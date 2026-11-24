@@ -445,13 +445,11 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
     if (windowChanged && config.windowSeconds !== null && times.length > 0 &&
         times[0] < times[times.length - 1])
       plot.setScale('x', {min: times[0], max: times[times.length - 1]});
-    if (playback.cursor_ns && playback.mode !== 'LIVE_STREAMING')
-      plot.setCursor({
-        left: plot.valToPos(
-            Number(BigInt(playback.cursor_ns) - BigInt(series.t0_ns)) / 1e9,
-            'x'),
-        top: 0
-      });
+    if (times.length > 0 && playback.cursor_ns && playback.mode !== 'LIVE_STREAMING') {
+      const left = plot.valToPos(
+          Number(BigInt(playback.cursor_ns) - BigInt(series.t0_ns)) / 1e9, 'x');
+      if (Number.isFinite(left)) plot.setCursor({left, top: 0});
+    }
   }, [series, channelSig, config.windowSeconds, playback.cursor_ns, playback.mode, ordered]);
 
   // Redraw when events arrive or the marker toggle flips, without rebuilding.
