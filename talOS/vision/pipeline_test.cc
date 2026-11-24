@@ -433,7 +433,7 @@ TEST(PipelineTest, CpuBackendHandlesOddWidthYuyvInvalidFormatAndOversizedDims) {
   // Unknown PixelFormat enum value fails cleanly instead of throwing.
   const auto bad_format = static_cast<PixelFormat>(99);
   const Frame unknown_fmt(0, 1, 3, t0, 16, 16, 16, bad_format,
-                          std::vector<uint8_t>(16u * 16u, 0));
+                          std::vector<uint8_t>(size_t{16} * 16, 0));
   ASSERT_TRUE(unknown_fmt.holds_image());
   const auto fmt_res = backend.Execute(unknown_fmt);
   EXPECT_FALSE(fmt_res.success);

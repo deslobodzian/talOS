@@ -776,21 +776,20 @@ TEST_F(RecorderTest, ParseRecordRoundTripsSubnormalDoublesAndValidatesSchema) {
   }
 
   // Wrong nested JSON object/array/string types must fail.
-  for (const char* bad : {
-           "{\"format_version\":1,\"camera\":123}",
-           "{\"format_version\":1,\"reason\":123}",
-           "{\"format_version\":1,\"intrinsics\":123}",
-           "{\"format_version\":1,\"mounting\":[]}",
-           "{\"format_version\":1,\"detector\":\"cpu\"}",
-           "{\"format_version\":1,\"detections\":{}}",
-           "{\"format_version\":1,\"detections\":[42]}",
-           "{\"format_version\":1,\"detections\":[{\"tag_id\":1,"
-           "\"corners_px\":\"bad\"}]}",
-           "{\"format_version\":1,\"detections\":[{\"tag_id\":1,"
-           "\"reject_reason\":123}]}",
-           "{\"format_version\":1,\"observation\":[]}",
-           "{\"format_version\":1,\"truth\":123}",
-       }) {
+  for (
+      const char* bad : {
+          "{\"format_version\":1,\"camera\":123}",
+          "{\"format_version\":1,\"reason\":123}",
+          "{\"format_version\":1,\"intrinsics\":123}",
+          "{\"format_version\":1,\"mounting\":[]}",
+          "{\"format_version\":1,\"detector\":\"cpu\"}",
+          "{\"format_version\":1,\"detections\":{}}",
+          "{\"format_version\":1,\"detections\":[42]}",
+          R"({"format_version":1,"detections":[{"tag_id":1,"corners_px":"bad"}]})",
+          R"({"format_version":1,"detections":[{"tag_id":1,"reject_reason":123}]})",
+          "{\"format_version\":1,\"observation\":[]}",
+          "{\"format_version\":1,\"truth\":123}",
+      }) {
     SCOPED_TRACE(bad);
     error.clear();
     EXPECT_FALSE(ParseRecord(bad, &parsed_ctx, &parsed, &error));

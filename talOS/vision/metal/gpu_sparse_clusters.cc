@@ -184,8 +184,8 @@ extern "C" zarray_t* BuildSparseClustersFromGpuLabels(
         bool connected = false;
 
         auto do_conn = [&](int dx, int dy) {
-          const size_t ny = static_cast<size_t>(y + dy);
-          const size_t nx = static_cast<size_t>(x + dx);
+          const size_t ny = static_cast<size_t>(static_cast<int64_t>(y) + dy);
+          const size_t nx = static_cast<size_t>(static_cast<int64_t>(x) + dx);
           const uint8_t v1 = buf[ny * stride + nx];
           if (v0 + v1 == 255) {
             const uint64_t rep1 = RepresentativeOf(

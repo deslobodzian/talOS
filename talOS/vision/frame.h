@@ -299,7 +299,8 @@ class Frame {
     } else if (owned_storage_ && was_shared_.load(std::memory_order_acquire)) {
       // A previous Share() handed out a shared_ptr to owned_storage_; detach
       // via copy-on-write so those immutable readers never race with writes.
-      const auto prev = std::move(owned_storage_);
+      const auto prev = owned_storage_;
+      owned_storage_.reset();
       const size_t prev_offset = data_offset_;
       const size_t prev_size =
           prev->size() > prev_offset ? (prev->size() - prev_offset) : 0;
