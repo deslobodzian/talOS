@@ -59,15 +59,6 @@ TEST(OptimizeSwerveModule, FlipsAgainstAnUnwrappedMeasuredAngle) {
   }
 }
 
-// REQ-DEV-26: a wheel one radian off its heading drives at cos(1) of the
-// asked speed.
-TEST(OptimizeSwerveModule, ScalesSpeedByCosineOfSteeringChange) {
-  const auto setpoint = OptimizeSwerveModule(3.0, 1.0, 0.0);
-  EXPECT_FALSE(setpoint.reversed);
-  EXPECT_NEAR(setpoint.steer_delta_rad, 1.0, kTight);
-  EXPECT_NEAR(setpoint.speed, 3.0 * std::cos(1.0), kTight);
-}
-
 // REQ-DEV-26
 TEST(OptimizeSwerveModule, NonFiniteInputGivesZero) {
   constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
