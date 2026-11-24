@@ -25,12 +25,10 @@ void Header(std::span<std::byte> slot, std::uint32_t n,
 int main() {
   using talos::telemetry_wire::payload;
 
-  // The contract constants: value pages fit an MTU; a slot holds one page.
-  Check(talos::telemetry_wire::kMaxValueFrameBytes == 1200);
+  // The slot contract. (wire.h's static_asserts hold the value page at 1200
+  // bytes and inside one slot.)
   Check(talos::telemetry_wire::slot_bytes == 16384);
   Check(talos::telemetry_wire::slot_count == 64);
-  Check(talos::telemetry_wire::kMaxValueFrameBytes <=
-        talos::telemetry_wire::slot_bytes);
 
   std::array<std::byte, 64> bytes{};
 
