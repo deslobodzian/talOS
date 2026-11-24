@@ -4,8 +4,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <string>
 #include <vector>
@@ -52,6 +54,13 @@ BackendExecutionResult CpuAprilTagBackend::Execute(const Frame& frame) {
   const uint32_t w = frame.width();
   const uint32_t h = frame.height();
   const uint32_t stride = frame.stride();
+  constexpr uint32_t kMaxInt =
+      static_cast<uint32_t>(std::numeric_limits<int>::max());
+  if (w > kMaxInt || h > kMaxInt || stride > kMaxInt) {
+    result.success = false;
+    result.error_message = "Frame dimensions or stride exceed INT_MAX";
+    return result;
+  }
 
   std::vector<uint8_t> gray_storage;
   const uint8_t* gray_ptr = nullptr;
@@ -61,10 +70,21 @@ BackendExecutionResult CpuAprilTagBackend::Execute(const Frame& frame) {
 
   if (frame.format() == PixelFormat::kGray8) {
     gray_ptr = frame.data();
-  } else {
+  } else if (frame.format() == PixelFormat::kYuyv && (w & 1u) != 0u) {
+    // OpenCV's COLOR_YUV2GRAY_YUYV rejects odd widths; extract each pixel's Y
+    // byte (offset 2 * x) directly.
     gray_storage.resize(static_cast<size_t>(w) * h);
     gray_stride = w;
-
+    const uint8_t* src = frame.data();
+    for (uint32_t y = 0; y < h; ++y) {
+      const uint8_t* src_row = src + static_cast<size_t>(y) * stride;
+      uint8_t* dst_row = gray_storage.data() + static_cast<size_t>(y) * w;
+      for (uint32_t x = 0; x < w; ++x) {
+        dst_row[x] = src_row[static_cast<size_t>(x) * 2];
+      }
+    }
+    gray_ptr = gray_storage.data();
+  } else {
     int src_type = 0;
     int code = 0;
     switch (frame.format()) {
@@ -86,12 +106,24 @@ BackendExecutionResult CpuAprilTagBackend::Execute(const Frame& frame) {
         break;
       case PixelFormat::kGray8:
         break;  // Unreachable: handled above.
+      default:
+        result.success = false;
+        result.error_message = "Unsupported pixel format";
+        return result;
     }
-    cv::Mat src_mat(static_cast<int>(h), static_cast<int>(w), src_type,
-                    const_cast<uint8_t*>(frame.data()), stride);
-    cv::Mat dst_mat(static_cast<int>(h), static_cast<int>(w), CV_8UC1,
-                    gray_storage.data(), w);
-    cv::cvtColor(src_mat, dst_mat, code);
+    gray_storage.resize(static_cast<size_t>(w) * h);
+    gray_stride = w;
+    try {
+      cv::Mat src_mat(static_cast<int>(h), static_cast<int>(w), src_type,
+                      const_cast<uint8_t*>(frame.data()), stride);
+      cv::Mat dst_mat(static_cast<int>(h), static_cast<int>(w), CV_8UC1,
+                      gray_storage.data(), w);
+      cv::cvtColor(src_mat, dst_mat, code);
+    } catch (const cv::Exception& e) {
+      result.success = false;
+      result.error_message = e.what();
+      return result;
+    }
     gray_ptr = gray_storage.data();
   }
 
