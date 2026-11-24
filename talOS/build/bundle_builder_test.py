@@ -113,7 +113,7 @@ def node(tmp, name, target=None):
 
 class BundleBuilderTest(unittest.TestCase):
     def assemble(self, tmp, files, nodes, launches, robot=None, extra=(),
-                 studio=None, effective=None):
+                 studio=None, effective=None, testonly=False):
         """Runs the builder on `files` ({short_path: text}; the first is the
         config) and the node specs `nodes`, for a config whose subsystems
         launch the labels `launches` and whose effective [robot] table is
@@ -134,7 +134,8 @@ class BundleBuilderTest(unittest.TestCase):
                        "config": entries[0], "config_files": entries[1:],
                        "nodes": list(nodes),
                        "default_hardware_node": HARDWARE_NODE,
-                       "studio": studio}, f)
+                       "studio": studio,
+                       "testonly": bool(testonly)}, f)
         resolved = os.path.join(tmp, "resolved.json")
         with open(resolved, "w", encoding="utf-8") as f:
             json.dump({"nodes": list(launches),
@@ -1216,6 +1217,225 @@ class BundleBuilderTest(unittest.TestCase):
             self.assertEqual(config2, "robot.toml")
             self.assertEqual(env2["RUNFILES_DIR"], root)
             self.assertTrue(os.path.isfile(os.path.join(work_dir2, "robot.toml")))
+
+    # REQ-OPS-48: empty, path-escaping, or duplicate node["name"] must fail
+    # closed rather than destroying bin/ or silently overwriting another node's
+    # binary and runfiles.
+    def test_invalid_and_duplicate_node_names_fail_closed(self):
+        for bad_name in ("", ".", "..", "../escape", "sub/node"):
+            with self.subTest(bad_name=bad_name), tempfile.TemporaryDirectory() as tmp:
+                binary = os.path.join(tmp, "src", "bin", "bad")
+                put(binary, "binary")
+                bad_node = {"name": bad_name, "target": "//bad:node",
+                            "language": "cpp", "src_path": binary,
+                            "runfiles": [], "shared_libs": []}
+                proc = self.assemble(
+                    tmp, {"c/robot.toml": "[robot]\n"},
+                    [node(tmp, "hardware_node", HARDWARE_NODE), bad_node],
+                    ["//bad:node"])
+                self.assertNotEqual(proc.returncode, 0,
+                                    f"expected refusal for node name {bad_name!r}")
+                self.assertIn("invalid node name", proc.stderr.lower())
+                self.assertFalse(os.path.exists(os.path.join(tmp, "out", "bin")))
+                self.assertFalse(os.path.exists(os.path.join(tmp, "out", "escape")))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first_bin = os.path.join(tmp, "src", "bin", "arm_a")
+            second_bin = os.path.join(tmp, "src", "bin", "arm_b")
+            put(first_bin, "first-arm")
+            put(second_bin, "second-arm")
+            dup_a = {"name": "arm", "target": "//pkg_a:arm",
+                     "language": "cpp", "src_path": first_bin,
+                     "runfiles": [], "shared_libs": []}
+            dup_b = {"name": "arm", "target": "//pkg_b:arm",
+                     "language": "cpp", "src_path": second_bin,
+                     "runfiles": [], "shared_libs": []}
+            proc = self.assemble(
+                tmp, {"c/robot.toml": "[robot]\n"},
+                [node(tmp, "hardware_node", HARDWARE_NODE), dup_a, dup_b],
+                ["//pkg_a:arm", "//pkg_b:arm"])
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("duplicate", proc.stderr.lower())
+
+    # REQ-OPS-48: unresolved symlinks inside a Python runtime repo stage once
+    # under python/<runtime>/ (deduplicated, failing closed on conflict), and
+    # only executable bin/ targets of external links enter `interpreters` so
+    # non-executable links do not disable libpython stripping and lib/ .so
+    # links cannot cause alias_interpreter_copies to overwrite .so files.
+    def test_runtime_symlink_staging_and_interpreter_collection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            py_a = self._elf_python_node(tmp, make_elf(["libc.so.6"]))
+            src_a = os.path.join(tmp, "src", "py")
+
+            # Byte-identical sibling of libother.so in runtime lib/: if
+            # libother.so were added to `interpreters`, alias_interpreter_copies
+            # would overwrite libother_dup.so with a #!/bin/sh script!
+            libother_dup = os.path.join(src_a, "libother_dup.so")
+            with open(os.path.join(src_a, "libother.so"), "rb") as f:
+                libother_bytes = f.read()
+            put_bytes(libother_dup, libother_bytes)
+            os.chmod(libother_dup, 0o755)
+            py_a["runfiles"].append({
+                "src_path": libother_dup,
+                "rf_rel": f"{RUNTIME}/lib/libother_dup.so",
+            })
+
+            # Non-executable runtime data file + external symlink to it.
+            note_file = os.path.join(src_a, "note.txt")
+            put(note_file, "runtime note\n")
+            py_a["runfiles"].append({
+                "src_path": note_file,
+                "rf_rel": f"{RUNTIME}/lib/note.txt",
+            })
+            ext_note_link = os.path.join(src_a, "links", "note.txt")
+            os.makedirs(os.path.dirname(ext_note_link), exist_ok=True)
+            os.symlink(f"../../{RUNTIME}/lib/note.txt", ext_note_link)
+            py_a["runfiles"].append({
+                "src_path": ext_note_link,
+                "rf_rel": "_main/a/note.txt",
+            })
+
+            # External symlink to executable lib/libother.so.
+            ext_so_link = os.path.join(src_a, "links", "libother.so")
+            os.symlink(f"../../{RUNTIME}/lib/libother.so", ext_so_link)
+            py_a["runfiles"].append({
+                "src_path": ext_so_link,
+                "rf_rel": "_main/a/libother.so",
+            })
+
+            # Unresolved symlink inside the runtime repository itself.
+            rt_link = os.path.join(src_a, "links", "libother.so.1")
+            os.symlink("libother.so", rt_link)
+            py_a["runfiles"].append({
+                "src_path": rt_link,
+                "rf_rel": f"{RUNTIME}/lib/libother.so.1",
+            })
+
+            # Second Python node sharing the exact same runtime + runtime link.
+            py_b = dict(node(tmp, "b", "//b:node"), language="python",
+                        runfiles=list(py_a["runfiles"]))
+            proc = self.assemble(
+                tmp, {"c/robot.toml": "[robot]\n"},
+                [node(tmp, "hardware_node", HARDWARE_NODE), py_a, py_b],
+                ["//a:node", "//b:node"])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            built = os.path.join(tmp, "out")
+            rt_lib = os.path.join(built, RUNTIME_DIR, RUNTIME, "lib")
+
+            # Runtime-owned symlink landed in shared python/<runtime>/lib/,
+            # NOT inside either node's runfiles tree.
+            self.assertTrue(os.path.isfile(os.path.join(rt_lib, "libother.so.1")))
+            self.assertFalse(os.path.exists(os.path.join(
+                built, "bin", "a.runfiles", RUNTIME, "lib", "libother.so.1")))
+            self.assertFalse(os.path.exists(os.path.join(
+                built, "bin", "b.runfiles", RUNTIME, "lib", "libother.so.1")))
+
+            # Non-executable external link into runtime did NOT disable
+            # strip_unused_libpython.
+            self.assertFalse(os.path.exists(
+                os.path.join(rt_lib, "libpython3.11.so.1.0")))
+            self.assertFalse(os.path.exists(
+                os.path.join(rt_lib, "libpython3.so")))
+
+            # Executable .so link in lib/ was NOT treated as an interpreter:
+            # byte-identical sibling libother_dup.so kept its ELF bytes rather
+            # than being overwritten by an exec script.
+            with open(os.path.join(rt_lib, "libother_dup.so"), "rb") as f:
+                self.assertEqual(f.read(), libother_bytes)
+
+        # Conflicting runtime symlinks across two nodes must fail closed.
+        with tempfile.TemporaryDirectory() as tmp:
+            py_a = self._elf_python_node(tmp, make_elf(["libc.so.6"]))
+            src_a = os.path.join(tmp, "src", "py")
+            note_a = os.path.join(src_a, "note_a.txt")
+            note_b = os.path.join(src_a, "note_b.txt")
+            put(note_a, "a\n")
+            put(note_b, "b\n")
+            link_a = os.path.join(src_a, "link_a")
+            link_b = os.path.join(src_a, "link_b")
+            os.symlink("note_a.txt", link_a)
+            os.symlink("note_b.txt", link_b)
+            shared_extra = [
+                {"src_path": note_a, "rf_rel": f"{RUNTIME}/lib/note_a.txt"},
+                {"src_path": note_b, "rf_rel": f"{RUNTIME}/lib/note_b.txt"},
+            ]
+            py_a["runfiles"] = list(py_a["runfiles"]) + shared_extra + [
+                {"src_path": link_a, "rf_rel": f"{RUNTIME}/lib/active.txt"},
+            ]
+            py_b = dict(node(tmp, "b", "//b:node"), language="python",
+                        runfiles=list(py_a["runfiles"][:-1]) + [
+                            {"src_path": link_b,
+                             "rf_rel": f"{RUNTIME}/lib/active.txt"},
+                        ])
+            proc = self.assemble(
+                tmp, {"c/robot.toml": "[robot]\n"},
+                [node(tmp, "hardware_node", HARDWARE_NODE), py_a, py_b],
+                ["//a:node", "//b:node"])
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("active.txt", proc.stderr)
+
+    # REQ-OPS-53: bundle_builder emits `testonly = true` in the top table of
+    # bundle_manifest.toml before [studio] and [[nodes]], and tools/deploy.sh
+    # install refuses that assembled bundle outside a Bazel test while allowing
+    # it inside one.
+    def test_assembled_testonly_bundle_emits_top_table_and_deploy_refuses_it(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            bridge = os.path.join(tmp, "src", "studio_bridge")
+            put(bridge, "#!/bin/sh\n")
+            os.chmod(bridge, 0o755)
+            webroot = os.path.join(tmp, "src", "webroot")
+            put(os.path.join(webroot, "index.html"), "<html></html>")
+            put(os.path.join(webroot, "drive.html"), "<html></html>")
+            studio = {
+                "bridge_path": bridge,
+                "bridge_label": "//studio/bridge:studio_bridge",
+                "webroot_path": webroot,
+            }
+            proc = self.assemble(
+                tmp, {"c/robot.toml": "[robot]\n"},
+                [node(tmp, "hardware_node", HARDWARE_NODE), node(tmp, "arm")],
+                ["//arm:node"],
+                studio=studio,
+                testonly=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            bundle = os.path.join(tmp, "out")
+            manifest_path = os.path.join(bundle, "bundle_manifest.toml")
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest_text = f.read()
+            parsed = tomllib.loads(manifest_text)
+            self.assertTrue(parsed.get("testonly"))
+            # Must sit in the top table before [studio] and [[nodes]], which
+            # deploy.sh reads via `awk '/^\[/ { exit }'`.
+            top_table = manifest_text.split("\n[", 1)[0]
+            self.assertIn("testonly = true", top_table)
+            self.assertIn("[studio]", manifest_text)
+            self.assertIn("[[nodes]]", manifest_text)
+
+            deploy_sh = os.path.abspath(
+                runfiles.Create().Rlocation("_main/tools/deploy.sh"))
+            robot_env = {k: v for k, v in os.environ.items()
+                         if k not in ("TEST_TMPDIR", "TEST_TARGET")}
+            robot_prefix = os.path.join(tmp, "robot_prefix")
+            refused = subprocess.run(
+                ["bash", deploy_sh, "install", bundle, "--prefix", robot_prefix,
+                 "--no-warm-up"],
+                capture_output=True, text=True, env=robot_env)
+            self.assertNotEqual(refused.returncode, 0, refused.stdout)
+            self.assertIn("testonly", refused.stderr)
+            self.assertFalse(os.path.lexists(robot_prefix), refused.stdout)
+
+            test_dir = os.path.join(tmp, "bazel_test")
+            test_prefix = os.path.join(test_dir, "prefix")
+            test_env = dict(robot_env, TEST_TMPDIR=test_dir,
+                            TEST_TARGET="//talOS/build:bundle_builder_test")
+            allowed = subprocess.run(
+                ["bash", deploy_sh, "install", bundle, "--prefix", test_prefix,
+                 "--no-warm-up"],
+                capture_output=True, text=True, env=test_env)
+            self.assertEqual(allowed.returncode, 0, allowed.stderr)
+            self.assertTrue(os.path.isfile(
+                os.path.join(test_prefix, "current", "run.sh")))
 
 
 class DeployTest(unittest.TestCase):
