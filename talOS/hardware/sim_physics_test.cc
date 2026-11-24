@@ -3189,7 +3189,10 @@ class FakePlant final : public sim::ExternalPlant {
       error = *refusal;
       return false;
     }
+    bound_motors.assign(motors.begin(), motors.end());
+    bound_names.clear();
     for (std::size_t i = 0; i < motors.size(); ++i) {
+      bound_names.emplace_back(motors[i].name);
       owned[i] =
           std::find(binds.begin(), binds.end(), motors[i].name) != binds.end();
     }
@@ -3244,6 +3247,9 @@ class FakePlant final : public sim::ExternalPlant {
   std::optional<sim::PlantChassis> chassis_state;
   std::array<bool, 4> closed{};
   std::vector<std::string> sensors;
+  // What the last Bind received; the names copied, as a plant must.
+  std::vector<sim::PlantMotor> bound_motors;
+  std::vector<std::string> bound_names;
   std::vector<int> step_log;
   std::vector<sim::PlantDrive> last_drives;
 };
@@ -3253,11 +3259,12 @@ constexpr double kTauRad = 2.0 * std::numbers::pi;
 
 // The torque the plant law (sim_plant.h) gives at rotor speed `rps`, less
 // the no-load drag both models add on their own.
-double DriveTorqueNm(const sim::PlantDrive& drive, double rps) {
-  const sim::MotorModel x60 = sim::MotorModelFor(MotorType::kKrakenX60);
+double DriveTorqueNm(const sim::PlantDrive& drive, double rps,
+                     MotorType type = MotorType::kKrakenX60) {
+  const sim::MotorModel motor = sim::MotorModelFor(type);
   const double emf =
-      drive.back_emf ? x60.back_emf_v_per_radps() * rps * kTauRad : 0.0;
-  return std::clamp(x60.torque_constant_nm_per_a() / x60.resistance_ohm() *
+      drive.back_emf ? motor.back_emf_v_per_radps() * rps * kTauRad : 0.0;
+  return std::clamp(motor.torque_constant_nm_per_a() / motor.resistance_ohm() *
                         (drive.volts - emf),
                     drive.min_torque_nm, drive.max_torque_nm);
 }
@@ -3357,6 +3364,14 @@ TEST(SimPlant, StepsTheNearestWholeStepsAndDropsTimePastTheCap) {
         kDriftRadps * static_cast<double>(time.stepped_us) * 1e-6 / kTauRad,
         1e-12);
   }
+  // A step longer than the period still allows two steps a tick: 32-bit
+  // arithmetic would wrap period + step - 1 and allow none.
+  FakePlant plant;
+  plant.step = 4294967294u;
+  PhysicsSimBackend backend;
+  backend.SetPlant(&plant);
+  ASSERT_TRUE(backend.Configure(SingleMotorConfig()));
+  EXPECT_EQ(backend.plant_time().max_steps, 2u);
 }
 
 // REQ-DEV-37: the drive a bound motor's winding gets gives, at the
@@ -3390,6 +3405,7 @@ TEST(SimPlant, DriveTorqueIsTheWindingModelsInEveryMode) {
   struct Probe {
     double rps;
     double torque_nm;
+    std::size_t motor{0};
   };
   struct Case {
     const char* name;
@@ -3397,6 +3413,8 @@ TEST(SimPlant, DriveTorqueIsTheWindingModelsInEveryMode) {
     std::vector<MotorRequest> commands;
     std::vector<Motor> motors;
     std::vector<Probe> probes{};
+    // A motor's reported voltage at its tick-start speed.
+    std::vector<std::pair<std::size_t, double>> reported_volts{};
   };
   const auto voltage = [](uint16_t id, double v) {
     return MotorRequest{id, Mode::kVoltage, 0, v, 0.0};
@@ -3419,6 +3437,13 @@ TEST(SimPlant, DriveTorqueIsTheWindingModelsInEveryMode) {
   };
   const double held_tc = supply_held(10.0, 80.0);
   const double held_follower = supply_held(30.0, 10.0);
+  // The X60 master's stator-banded volts at 30 rps, which an X44 follower
+  // holds; and its current through the X44's own winding.
+  const sim::MotorModel x44 = sim::MotorModelFor(MotorType::kKrakenX44);
+  const double banded_30 = emf + 40.0 * r_ohm;
+  const double x44_a =
+      (banded_30 - x44.back_emf_v_per_rps() * w) / x44.resistance_ohm();
+  const double i_opposed = amps(-40.0 * r_ohm, -1.0);
   const std::vector<Case> cases{
       {"duty cycle",
        unlimited,
@@ -3607,6 +3632,69 @@ TEST(SimPlant, DriveTorqueIsTheWindingModelsInEveryMode) {
        {voltage(1, 6.0), voltage(2, 0.0)},
        {{w, {6.0, true, -kInf, kInf}, kt * i6, i6},
         {-w, {-6.0, true, -kInf, kInf}, -kt * i6, i6}}},
+      // A follower holds its master's regime (here the stator limit), not
+      // the master's tick-start banded volts: speeding up within the tick
+      // keeps both at 40 A.
+      {"follower of a stator-limited master",
+       [](Config& c) {
+         AddFollower(c, false);
+         for (auto& m : c.motors) m.stator_limit_a = 40.0;
+       },
+       {voltage(1, 12.0), voltage(2, 0.0)},
+       {{w, {12.0, true, -kt * 40.0, kt * 40.0}, kt * 40.0, 40.0},
+        {w, {12.0, true, -kt * 40.0, kt * 40.0}, kt * 40.0, 40.0}},
+       {{40.0, kt * 40.0, 0}, {40.0, kt * 40.0, 1}}},
+      {"opposed follower of a stator-limited master",
+       [](Config& c) {
+         AddFollower(c, true);
+         for (auto& m : c.motors) m.stator_limit_a = 40.0;
+       },
+       {voltage(1, 12.0), voltage(2, 0.0)},
+       {{w, {12.0, true, -kt * 40.0, kt * 40.0}, kt * 40.0, 40.0},
+        {-w, {-12.0, true, -kt * 40.0, kt * 40.0}, -kt * 40.0, 40.0}},
+       {{-40.0, -kt * 40.0, 1}}},
+      // On its own joint the follower takes what the master applies
+      // (1.31 V, the master stalled against its stator limit) at its own
+      // 30 rps: 2.27 V, braking at -40 A, as the analytic model gives; the
+      // master's 12 V regime would push +40 A.
+      {"follower on another shaft, master stalled",
+       [](Config& c) {
+         AddFollower(c, false);
+         for (auto& m : c.motors) m.stator_limit_a = 40.0;
+       },
+       {voltage(1, 12.0), voltage(2, 0.0)},
+       {{0.0, {12.0, true, -kt * 40.0, kt * 40.0}, kt * 40.0, 40.0},
+        {w, {40.0 * r_ohm, true, -kt * 40.0, kt * 40.0}, -kt * 40.0, 40.0}},
+       {{35.0, -kt * 40.0, 1}},
+       {{1, -40.0 * r_ohm + emf}}},
+      // An opposed follower ignores its own inverted; at -1 rps it carries
+      // -36.4 A of the master's -1.31 V, inside its band.
+      {"opposed, inverted follower at another speed",
+       [](Config& c) {
+         AddFollower(c, true);
+         c.motors[1].inverted = true;
+         for (auto& m : c.motors) m.stator_limit_a = 40.0;
+       },
+       {voltage(1, 12.0), voltage(2, 0.0)},
+       {{0.0, {12.0, true, -kt * 40.0, kt * 40.0}, kt * 40.0, 40.0},
+        {-1.0,
+         {-40.0 * r_ohm, true, -kt * 40.0, kt * 40.0},
+         kt * i_opposed,
+         std::abs(i_opposed)}}},
+      // An X44 follower with no stator limit of its own takes no bound from
+      // the X60 master's: it holds the master's banded volts.
+      {"follower of another motor type, no stator limit of its own",
+       [](Config& c) {
+         AddFollower(c, false);
+         c.motors[0].stator_limit_a = 40.0;
+         c.motors[1].motor_type.value = MotorType::kKrakenX44;
+       },
+       {voltage(1, 12.0), voltage(2, 0.0)},
+       {{w, {12.0, true, -kt * 40.0, kt * 40.0}, kt * 40.0, 40.0},
+        {w,
+         {banded_30, true, -kInf, kInf},
+         x44.torque_constant_nm_per_a() * x44_a,
+         x44_a}}},
       // Its master's applied volts, limited at its own speed (10 rps).
       {"follower at its own speed, supply limited",
        [](Config& c) {
@@ -3644,13 +3732,20 @@ TEST(SimPlant, DriveTorqueIsTheWindingModelsInEveryMode) {
       EXPECT_EQ(drive.back_emf, want.drive.back_emf);
       ExpectBound(drive.min_torque_nm, want.drive.min_torque_nm, "min");
       ExpectBound(drive.max_torque_nm, want.drive.max_torque_nm, "max");
-      EXPECT_NEAR(DriveTorqueNm(drive, want.rps), want.torque_nm, 1e-9);
+      EXPECT_NEAR(
+          DriveTorqueNm(drive, want.rps, cfg.motors[i].motor_type.value),
+          want.torque_nm, 1e-9);
       EXPECT_NEAR(state.motors[i].stator_current_a, want.stator_a, 1e-9);
     }
     for (const Probe& probe : c.probes) {
-      EXPECT_NEAR(DriveTorqueNm(plant.last_drives[0], probe.rps),
+      EXPECT_NEAR(DriveTorqueNm(plant.last_drives[probe.motor], probe.rps,
+                                cfg.motors[probe.motor].motor_type.value),
                   probe.torque_nm, 1e-9)
-          << "at " << probe.rps << " rps";
+          << "motor " << probe.motor << " at " << probe.rps << " rps";
+    }
+    for (const auto& [motor, volts] : c.reported_volts) {
+      EXPECT_NEAR(state.motors[motor].voltage, volts, 1e-9)
+          << "motor " << motor;
     }
   }
 }
@@ -3658,31 +3753,88 @@ TEST(SimPlant, DriveTorqueIsTheWindingModelsInEveryMode) {
 // REQ-DEV-37: a bound motor reports the voltage and currents of the drive
 // the plant integrated, at the speed the plant reached: a 12 V drive whose
 // stator limit bound at 30 rps draws only (12 V - back-EMF) / R at 100 rps,
-// at the full 12 V. Catches reports left at the tick-start speed's
-// stator-banded voltage.
+// at the full 12 V. Where the drive caps regeneration at the stator limit
+// (back-EMF beyond the ceiling plus 40 A * R, at 150 rps), the controller
+// is at its ceiling: the voltage reads the ceiling, the stator current the
+// cap, the supply current their power over the bus. Catches reports left
+// at the tick-start speed's banded voltage, and a voltage back-solved past
+// the ceiling (16.6 V).
 TEST(SimPlant, ReportsTheDriveAtThePostStepSpeed) {
   const sim::MotorModel x60 = sim::MotorModelFor(MotorType::kKrakenX60);
-  Config cfg = SingleMotorConfig();
-  cfg.motors[0].stator_limit_a = 40.0;
-  cfg.motors[0].supply_limit_a = 0.0;
-  FakePlant plant;
-  plant.binds = {"roller"};
-  plant.rotors[0] = {0.0, 30.0};
-  plant.rps_after_step = 100.0;
-  PhysicsSimBackend backend;
-  backend.SetPlant(&plant);
-  ASSERT_TRUE(backend.Configure(cfg));
-  const std::array commands{MotorRequest{1, Mode::kVoltage, 0, 12.0, 0.0}};
-  ASSERT_TRUE(backend.Apply(commands));
-  State state{};
-  ASSERT_TRUE(backend.Read(state));
-  const double amperes =
+  const double bus = kSimRestingSupplyV;
+  const double free_a =
       (12.0 - x60.back_emf_v_per_rps() * 100.0) / x60.resistance_ohm();
-  ASSERT_GT(amperes, 0.0);
-  EXPECT_NEAR(state.motors[0].voltage, 12.0, 1e-9);
-  EXPECT_NEAR(state.motors[0].stator_current_a, amperes, 1e-9);
-  EXPECT_NEAR(state.motors[0].supply_current_a,
-              12.0 * amperes / kSimRestingSupplyV, 1e-9);
+  struct Case {
+    const char* name;
+    MotorRequest command;
+    double rps_before;
+    double rps_after;
+    double voltage;
+    double stator_a;
+    double supply_a;
+    double supply_limit_a{0.0};
+  };
+  const std::vector<Case> cases{
+      {"stator limit released",
+       {1, Mode::kVoltage, 0, 12.0, 0.0},
+       30.0,
+       100.0,
+       12.0,
+       free_a,
+       12.0 * free_a / bus},
+      {"regeneration capped",
+       {1, Mode::kVoltage, 0, 12.0, 0.0},
+       150.0,
+       150.0,
+       12.0,
+       40.0,
+       -12.0 * 40.0 / bus},
+      {"regeneration capped, reverse",
+       {1, Mode::kVoltage, 0, -12.0, 0.0},
+       -150.0,
+       -150.0,
+       -12.0,
+       40.0,
+       -12.0 * 40.0 / bus},
+      // Regeneration is never clamped by supply_limit_a.
+      {"regeneration capped, supply limit set",
+       {1, Mode::kVoltage, 0, 12.0, 0.0},
+       150.0,
+       150.0,
+       12.0,
+       40.0,
+       -12.0 * 40.0 / bus,
+       30.0},
+      {"torque current back-driven past the stator limit",
+       {1, Mode::kTorqueCurrent, 0, 10.0, 0.0},
+       -110.0,
+       -150.0,
+       -12.0,
+       40.0,
+       -12.0 * 40.0 / bus},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    Config cfg = SingleMotorConfig();
+    cfg.motors[0].stator_limit_a = 40.0;
+    cfg.motors[0].supply_limit_a = c.supply_limit_a;
+    cfg.motors[0].foc = true;
+    cfg.motors[0].max_torque_current_a = 40.0;
+    FakePlant plant;
+    plant.binds = {"roller"};
+    plant.rotors[0] = {0.0, c.rps_before};
+    plant.rps_after_step = c.rps_after;
+    PhysicsSimBackend backend;
+    backend.SetPlant(&plant);
+    ASSERT_TRUE(backend.Configure(cfg));
+    ASSERT_TRUE(backend.Apply(std::array{c.command}));
+    State state{};
+    ASSERT_TRUE(backend.Read(state));
+    EXPECT_LE(std::abs(state.motors[0].voltage), 12.0);
+    EXPECT_NEAR(state.motors[0].voltage, c.voltage, 1e-9);
+    EXPECT_NEAR(state.motors[0].stator_current_a, c.stator_a, 1e-9);
+    EXPECT_NEAR(state.motors[0].supply_current_a, c.supply_a, 1e-9);
+  }
 }
 
 // REQ-DEV-37: bound motors draw from the battery as analytic ones do: two
@@ -3723,6 +3875,140 @@ TEST(SimPlant, BoundMotorsSagTheBatteryAsAnalyticOnes) {
     State bound_state{};
     ASSERT_TRUE(bound.Read(bound_state));
     EXPECT_DOUBLE_EQ(bound.supply_voltage(), analytic.supply_voltage());
+  }
+  // Regeneration capped at 40 A at 150 rps, against a 100 A base load: the
+  // ceiling is the sagged supply V itself, so the motor returns
+  // V * 40 A / V = 40 A and V = 12.8 - 0.05 * (100 - 40) = 9.8 V. The
+  // uncapped winding would return about 250 A.
+  Config regen = SingleMotorConfig();
+  regen.motors[0].stator_limit_a = 40.0;
+  regen.motors[0].supply_limit_a = 0.0;
+  FakePlant plant;
+  plant.binds = {"roller"};
+  plant.rotors[0] = {0.0, 150.0};
+  PhysicsSimBackend backend;
+  backend.SetBatteryModel(
+      {.internal_resistance_ohm = 0.05, .base_current_a = 100.0});
+  backend.SetPlant(&plant);
+  ASSERT_TRUE(backend.Configure(regen));
+  ASSERT_TRUE(
+      backend.Apply(std::array{MotorRequest{1, Mode::kVoltage, 0, 12.0, 0.0}}));
+  State state{};
+  ASSERT_TRUE(backend.Read(state));
+  EXPECT_NEAR(backend.supply_voltage(), 12.8 - 0.05 * (100.0 - 40.0), 1e-6);
+}
+
+// REQ-DEV-37: PlantMotors gives a program building a plant the motor list
+// Configure hands Bind: each motor's name, gear (rotor_to_sensor_ratio *
+// sensor_to_mechanism_ratio, a non-positive ratio taken as 1) and its motor
+// type's winding constants. The second motor's remote-CANcoder feedback,
+// inversion and CAN bus change none of them; the list still matches.
+TEST(SimPlant, PlantMotorsIsWhatBindReceives) {
+  Config cfg = SingleMotorConfig();
+  cfg.motors[0].rotor_to_sensor_ratio = 3.0;
+  cfg.motors[0].sensor_to_mechanism_ratio = 4.0;
+  cfg.motors[0].motor_type.value = MotorType::kKrakenX44;
+  MotorConfig arm = TestMotor(2, "arm", 2);
+  arm.bus = "canivore";
+  arm.inverted = true;
+  arm.feedback = Feedback::kRemoteCANcoder;
+  arm.feedback_sensor_id = 10;
+  arm.rotor_to_sensor_ratio = 50.0;
+  arm.sensor_to_mechanism_ratio = 0.0;  // not positive: 1
+  cfg.motors.push_back(arm);
+  SensorConfig encoder;
+  encoder.id = 10;
+  encoder.name = "arm_encoder";
+  encoder.can_id = 10;
+  encoder.bus = "canivore";
+  cfg.sensors.push_back(encoder);
+
+  const std::vector<sim::PlantMotor> motors =
+      PhysicsSimBackend::PlantMotors(cfg);
+  const sim::MotorModel x44 = sim::MotorModelFor(MotorType::kKrakenX44);
+  const sim::MotorModel x60 = sim::MotorModelFor(MotorType::kKrakenX60);
+  ASSERT_EQ(motors.size(), 2u);
+  EXPECT_EQ(motors[0].name, "roller");
+  EXPECT_EQ(motors[0].gear, 12.0);
+  EXPECT_EQ(motors[0].torque_constant_nm_per_a, x44.torque_constant_nm_per_a());
+  EXPECT_EQ(motors[0].back_emf_v_per_radps, x44.back_emf_v_per_radps());
+  EXPECT_EQ(motors[0].resistance_ohm, x44.resistance_ohm());
+  EXPECT_EQ(motors[0].no_load_damping_nm_per_radps,
+            x44.no_load_damping_nm_per_radps());
+  EXPECT_EQ(motors[1].name, "arm");
+  EXPECT_EQ(motors[1].gear, 50.0);
+  EXPECT_EQ(motors[1].torque_constant_nm_per_a, x60.torque_constant_nm_per_a());
+
+  FakePlant plant;
+  PhysicsSimBackend backend;
+  backend.SetPlant(&plant);
+  ASSERT_TRUE(backend.Configure(cfg));
+  ASSERT_EQ(plant.bound_motors.size(), motors.size());
+  for (std::size_t i = 0; i < motors.size(); ++i) {
+    SCOPED_TRACE(testing::Message() << "motor " << i);
+    EXPECT_EQ(plant.bound_names[i], motors[i].name);
+    const sim::PlantMotor& got = plant.bound_motors[i];
+    EXPECT_EQ(got.gear, motors[i].gear);
+    EXPECT_EQ(got.torque_constant_nm_per_a, motors[i].torque_constant_nm_per_a);
+    EXPECT_EQ(got.back_emf_v_per_radps, motors[i].back_emf_v_per_radps);
+    EXPECT_EQ(got.resistance_ohm, motors[i].resistance_ohm);
+    EXPECT_EQ(got.no_load_damping_nm_per_radps,
+              motors[i].no_load_damping_nm_per_radps);
+  }
+}
+
+// REQ-DEV-37: a motor no plant actuator binds behaves as under the analytic
+// backend alone: with motor A bound and B not, B's samples equal those of a
+// backend with no plant running the same config, commands and whole-step
+// tick times, every tick. With an ideal battery the supply is 12.8 V
+// whatever A draws, and B is equal bit for bit. With internal resistance A
+// stalls on both sides (a hard stop in the analytic backend, the plant
+// holding it at 0 rps) and draws its 80 A stator limit, so A's share of the
+// sag reaches B; B is then equal within 1e-6, because the plant path forms
+// A's current as R * (V / R), not bit-equal to V, and the 28-step sag
+// bisection can settle one step (12.8 V / 2^28) apart.
+TEST(SimPlant, AnUnboundMotorBehavesAsWithoutAPlant) {
+  for (const double r_int : {0.0, 0.05}) {
+    SCOPED_TRACE(testing::Message() << "battery " << r_int << " ohm");
+    Config cfg = SingleMotorConfig();
+    cfg.motors.push_back(TestMotor(2, "intake", 2));
+    const std::array commands{MotorRequest{1, Mode::kVoltage, 0, 3.0, 0.0},
+                              MotorRequest{2, Mode::kVoltage, 0, 6.0, 0.0}};
+    FakePlant plant;
+    plant.binds = {"roller"};
+    plant.rotors[0] = {0.0, r_int > 0.0 ? 0.0 : 20.0};
+    PhysicsSimBackend with_plant;
+    with_plant.SetPlant(&plant);
+    PhysicsSimBackend analytic;
+    if (r_int > 0.0) analytic.SetHardStops({{"roller", std::nullopt, 0.0}});
+    for (PhysicsSimBackend* backend : {&with_plant, &analytic}) {
+      backend->SetBatteryModel({.internal_resistance_ohm = r_int});
+      ASSERT_TRUE(backend->Configure(cfg));
+      ASSERT_TRUE(backend->Apply(commands));
+    }
+    State a{}, b{};
+    for (uint64_t now_us = 0; now_us <= 100000; now_us += 5000) {
+      SCOPED_TRACE(testing::Message() << "tick at " << now_us << " us");
+      a.sample_time_us = b.sample_time_us = now_us;
+      ASSERT_TRUE(with_plant.Read(a));
+      ASSERT_TRUE(analytic.Read(b));
+      if (r_int == 0.0) {
+        EXPECT_EQ(a.motors[1], b.motors[1]);
+        continue;
+      }
+      ASSERT_EQ(b.motors[0].velocity_rps, 0.0);  // A stalled
+      EXPECT_NEAR(a.motors[1].position_rot, b.motors[1].position_rot, 1e-6);
+      EXPECT_NEAR(a.motors[1].velocity_rps, b.motors[1].velocity_rps, 1e-6);
+      EXPECT_NEAR(a.motors[1].voltage, b.motors[1].voltage, 1e-6);
+      EXPECT_NEAR(a.motors[1].stator_current_a, b.motors[1].stator_current_a,
+                  1e-6);
+      EXPECT_NEAR(a.motors[1].supply_current_a, b.motors[1].supply_current_a,
+                  1e-6);
+    }
+    EXPECT_GT(b.motors[1].velocity_rps, 1.0);
+    if (r_int > 0.0) {
+      EXPECT_LT(analytic.supply_voltage(), kSimRestingSupplyV - 0.5);
+    }
   }
 }
 
