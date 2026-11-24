@@ -1261,6 +1261,81 @@ centered rigid-body kinematics integrate yaw and yaw rate into every configured
 `Pigeon2`; non-chassis configurations leave manually injected `Pigeon2` raw yaw
 untouched.
 
+### An external plant
+
+`sim::PhysicsSimBackend::SetPlant` attaches a `sim::ExternalPlant`
+(`sim_plant.h`), which integrates the motion of the motors it binds and, when
+its model's root body has a free joint, the chassis. The backend stays the
+only controller and electrical model. At each `Configure` the plant binds
+motors by name (`ExternalPlant::Bind`). From then on a bound motor's rotor
+position and velocity, and the chassis pose and velocity when the plant owns
+it, are the plant's; a configuration never resets the plant's world, and the
+gyro zeroes on the plant's heading at each bind and controller restart.
+Unbound motors, the battery, controllers, Motion Magic profiles, CANcoders,
+remote feedback, home switches, limit switches and faults stay the backend's.
+
+Each `Read` hands every bound motor the drive its winding model gives at the
+tick-start rotor speed (`sim::PlantDrive`: volts, whether back-EMF applies,
+and torque bounds), in that speed's regime:
+
+- neutral: a shorted winding under brake, an open one under coast;
+- a voltage mode (a follower included, fed its master's applied volts at its
+  own speed): the command clamped to `max_voltage` and the solved supply;
+- torque current: the voltage ceiling in the demand's direction, with the
+  demanded current as the torque bound on that side (0 A gives no torque
+  unless the rotor overspeeds the ceiling); a rotor back-driven so hard that
+  the demand would need more than the opposite ceiling gets that ceiling,
+  carrying more than the demand, with the demand as the bound on the other
+  side;
+- a `supply_limit_a` binding at the tick-start speed: its limited voltage,
+  held for the tick, in every mode (torque current keeps its demand as a
+  bound).
+
+`stator_limit_a` bounds the torque on both sides in every powered mode. The
+plant applies the drive's torque law at every one of its steps, so the
+stator limit and the torque-current demand hold at each step's speed. At the
+tick-start speed the torque is `k_t` times the stator current the analytic
+model gives there, except where that current exceeds `stator_limit_a` (back-EMF
+beyond the voltage ceiling plus `stator_limit_a` times the winding
+resistance), which the plant caps at the limit. The ceiling is `max_voltage`
+or the solved supply, whichever is lower, so the cap also applies when a
+sagging battery lowers the ceiling below back-EMF. The State reports the
+voltage and currents of the drive at the speed the plant reached.
+
+The plant steps in whole steps of its own `step_us`. Each `Read` adds the
+time since the last one to a signed remainder and steps the nearest whole
+number of steps, at most `2 * ceil(period_us / step_us)`; time past that cap
+is dropped and counted (`PhysicsSimBackend::plant_time()`), never caught up.
+Every other model the backend runs (Motion Magic profiles, unbound motors,
+the analytic chassis, gyro drift) advances by the same plant time, and every
+motor and CAN sensor sample is `max(lag_us, 0)` µs old. No wall clock is
+read.
+
+A bound motor's soft limits hold its output toward a limit it has reached
+neutral (torque current judged by its demand's sign) and leave the joint
+where it is; an analytic motor is clamped instead. A device reset restarts a
+bound motor's controller but not its joint. `SetWorldInputs` binds a digital
+input to a plant sensor by name; it reads `closed_reads` while the sensor is
+closed and ignores `SetDigitalInput`.
+
+`Configure` refuses, naming the key and the motor or input in
+`last_config_error()`:
+
+- a follower chain the plant binds only partly;
+- `[[simulation.mechanisms]]` or `[[simulation.hard_stops]]` naming a bound
+  motor (inertia and travel come from the model);
+- a swerve module whose drive or steer motor the plant does not bind while
+  the plant owns the chassis, and any swerve module while it does not;
+- a digital input bound to a plant sensor twice;
+- a plant `step_us` that is zero or odd;
+- whatever the plant's `Bind` refuses, with the plant's error;
+- a plant that has failed, with its `failure()` text.
+
+A plant whose step fails (`ExternalPlant::Step` returning false) latches: the
+backend makes no further call to it, every later `Read` reports every motor
+and CAN sensor invalid and returns false, so the gateway neutralizes every
+output (total loss), and world inputs hold their last reading.
+
 ### Which simulator to use for what
 
 | Path | How to run | Motor / chassis model | Driver Station & gamepad | Truth (`/sim/state`) & faults | Use for |

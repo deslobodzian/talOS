@@ -65,6 +65,15 @@
 // wall-clock or randomness is consulted anywhere here. Scheduling and UDP
 // timing (period_us pacing, link latency) stay endpoint concerns and are
 // tested separately.
+//
+// External plant (SetPlant, sim_plant.h). A plant such as the MuJoCo world
+// integrates the motors it binds at Configure and, when its model owns it,
+// the chassis; this backend stays the only controller and electrical model.
+// Each Read hands every bound motor the drive its winding model gives
+// (DriveFor) and steps the plant a whole number of its fixed steps, the
+// nearest to the time since the last Read (AdvancePlantTime); every other
+// model here advances by the same plant time. Without a plant nothing below
+// changes.
 
 #include <algorithm>
 #include <array>
@@ -72,14 +81,18 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "config_error.h"
 #include "feedback.h"
 #include "gateway.h"
 #include "sim_backend.h"
+#include "sim_plant.h"
 
 namespace talos::hardware::sim {
 
@@ -508,7 +521,21 @@ class PhysicsSimBackend final : public SimBackendBase {
     BindMechanisms();
   }
 
+  // With a plant attached, Configure also binds it (ExternalPlant::Bind) and
+  // refuses, naming the config key and motor in last_config_error():
+  //   - a follower chain the plant binds only partly;
+  //   - a [[simulation.mechanisms]] or [[simulation.hard_stops]] entry naming
+  //     a bound motor (its inertia and travel come from the model);
+  //   - a swerve module while the model's root body is welded (no chassis),
+  //     or with a drive or steer motor the plant does not bind while the
+  //     model owns the chassis;
+  //   - a plant step_us that is zero or odd;
+  //   - a digital input SetWorldInputs names twice;
+  //   - a plant that has failed (naming its failure()).
+  // A bound motor and the chassis then start where the plant has them: a
+  // configuration never resets the plant's world.
   bool Configure(const Config& config) override {
+    config_error_.reset();
     config_ = config;
     can_bus_count_ = CanBuses(config_).count;
     for (auto& m : config_.motors) {
@@ -536,7 +563,10 @@ class PhysicsSimBackend final : public SimBackendBase {
     motor_to_sensor_.fill(-1);
     forward_pressed_.fill(false);
     reverse_pressed_.fill(false);
-    previous_time_.reset();
+    // The plant's clock runs on through a configuration, as its world does.
+    if (plant_ == nullptr) previous_time_.reset();
+    owned_.fill(false);
+    bound_world_inputs_.clear();
     digital_inputs_.clear();
     digital_outputs_.clear();
     analog_inputs_.clear();
@@ -569,28 +599,41 @@ class PhysicsSimBackend final : public SimBackendBase {
       }
     }
     ConfigureSwerve();
+    if (plant_ != nullptr) return BindPlant();
     return true;
   }
 
+  // Without a plant, the models advance by the time since the last Read, at
+  // most 50 ms. With one, by the plant time AdvancePlantTime steps, and every
+  // motor and CAN sensor sample is as old as the plant lags the sample time;
+  // after the plant failed, every one reads invalid and Read returns false.
   bool Read(State& state) override {
     ReadSimulatedCanBus(state.health, can_bus_count_);
     double dt = 0.0;
+    int64_t delta = 0;
     if (previous_time_) {
-      const int64_t delta =
-          static_cast<int64_t>(state.sample_time_us - *previous_time_);
+      delta = static_cast<int64_t>(state.sample_time_us - *previous_time_);
       dt = delta > 0 ? static_cast<double>(delta) * 1e-6 : 0.0;
       if (dt > 0.05) dt = 0.05;
     }
     previous_time_ = state.sample_time_us;
-    StepModels(dt);
+    if (plant_ == nullptr) {
+      StepModels(dt);
+    } else {
+      AdvancePlantTime(std::max<int64_t>(delta, 0));
+    }
+    const uint32_t sample_age_us =
+        plant_ != nullptr
+            ? static_cast<uint32_t>(std::max<int32_t>(plant_time_.lag_us, 0))
+            : 0;
     ReadPower(state.health, {true, supply_v_, brownout_});
     bool healthy = config_.motors.empty() && config_.sensors.empty();
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
       const auto& m = config_.motors[i];
       auto& out = state.motors[i];
       out.id = m.id;
-      out.position_age_us = 0;
-      out.velocity_age_us = 0;
+      out.position_age_us = sample_age_us;
+      out.velocity_age_us = sample_age_us;
       if (!motor_connected_[i]) {
         out = HeldSample(i, state.sample_time_us);
         MarkInvalid(out);
@@ -618,7 +661,9 @@ class PhysicsSimBackend final : public SimBackendBase {
       out.voltage = powered_[i] ? applied_volts_[i] : 0.0;
       out.temperature_c = 25.0;
       out.fault_flags = HardLimitFlags(i);
-      if (EnforceSoftLimits(m, out, i) && powered_[i]) {
+      // A bound motor's soft limits gate its output (SoftLimitBlocks); the
+      // plant's joint is never moved.
+      if (!owned_[i] && EnforceSoftLimits(m, out, i) && powered_[i]) {
         applied_volts_[i] = LimitWindingVoltage(i, m, applied_volts_[i]);
         out.voltage = applied_volts_[i];
       }
@@ -632,8 +677,8 @@ class PhysicsSimBackend final : public SimBackendBase {
       const auto& s = config_.sensors[i];
       auto& out = state.sensors[i];
       out.id = s.id;
-      out.position_age_us = 0;
-      out.velocity_age_us = 0;
+      out.position_age_us = sample_age_us;
+      out.velocity_age_us = sample_age_us;
       if (!sensor_connected_[i]) {
         // Its frames stopped: its ages grow from its last sample.
         const uint32_t age_us =
@@ -689,6 +734,13 @@ class PhysicsSimBackend final : public SimBackendBase {
       state.digital_inputs[s.input].value =
           closed ? s.closed_reads : !s.closed_reads;
     }
+    // A failed plant's inputs hold their last reading.
+    for (std::size_t k = 0; k < bound_world_inputs_.size(); ++k) {
+      BoundWorldInput& w = bound_world_inputs_[k];
+      if (!plant_failed_) w.closed = plant_->input_closed(k);
+      state.digital_inputs[w.input].value =
+          w.closed ? w.closed_reads : !w.closed_reads;
+    }
     for (std::size_t i = 0; i < config_.digital_outputs.size(); ++i) {
       const auto id = config_.digital_outputs[i].id;
       const auto it = digital_outputs_.find(id);
@@ -711,6 +763,14 @@ class PhysicsSimBackend final : public SimBackendBase {
     for (std::size_t i = 0; i < config_.pwm_outputs.size(); ++i) {
       state.pwm_outputs[i] = PwmSampleOf(GetPwm(config_.pwm_outputs[i].id));
     }
+    if (plant_failed_) {
+      // No motion sample can be trusted: the gateway's total loss.
+      for (std::size_t i = 0; i < config_.motors.size(); ++i)
+        MarkInvalid(state.motors[i]);
+      for (std::size_t i = 0; i < config_.sensors.size(); ++i)
+        MarkInvalid(state.sensors[i]);
+      return false;
+    }
     return healthy;
   }
 
@@ -732,8 +792,21 @@ class PhysicsSimBackend final : public SimBackendBase {
   }
 
   // Deterministic stepping without a Gateway: advances the models
-  // by dt_s under the currently applied commands.
-  void Step(double dt_s) { StepModels(dt_s); }
+  // by dt_s under the currently applied commands. With a plant, dt_s rounded
+  // to whole microseconds goes to AdvancePlantTime as a Read's interval does.
+  void Step(double dt_s) {
+    if (plant_ == nullptr) {
+      StepModels(dt_s);
+    } else {
+      // Past the cap the time is dropped anyway; the bound keeps llround's
+      // result in range.
+      constexpr double kMaxStepS = 1e6;
+      AdvancePlantTime(std::isfinite(dt_s) && dt_s > 0.0
+                           ? static_cast<int64_t>(
+                                 std::llround(std::min(dt_s, kMaxStepS) * 1e6))
+                           : 0);
+    }
+  }
 
   // Controlled inputs/faults.
   void SetDigitalInput(uint16_t id, bool value) { digital_inputs_[id] = value; }
@@ -770,7 +843,8 @@ class PhysicsSimBackend final : public SimBackendBase {
     for (auto id : ids) {
       const int i = MotorIndex(id);
       if (i >= 0) {
-        axes_[i].rotor_velocity_rps = 0.0;
+        // The controller restarts; a bound motor's joint moves on.
+        if (!owned_[i]) axes_[i].rotor_velocity_rps = 0.0;
         profiles_[i] = Profile{};
         commands_[i] = MotorRequest{};
         applied_volts_[i] = 0.0;
@@ -814,7 +888,8 @@ class PhysicsSimBackend final : public SimBackendBase {
   // Zeroes rotor states, latched commands, reported gyro, and fault flags.
   // The physical field pose survives a controller restart; subsequent gyro
   // samples measure yaw relative to this restart. Drift restarts at zero.
-  // Config/output states and the gateway-owned boot id are unchanged.
+  // Config/output states and the gateway-owned boot id are unchanged. A
+  // plant's bound motors and chassis keep the plant's motion.
   void RestartController() {
     axes_.fill(AxisState{});
     profiles_.fill(Profile{});
@@ -841,6 +916,10 @@ class PhysicsSimBackend final : public SimBackendBase {
     chassis_vy_body_mps_ = 0.0;
     chassis_omega_radps_ = 0.0;
     for (auto& module : modules_) module.previous_surface_speed_mps = 0.0;
+    if (plant_bound_) {
+      SyncFromPlant();
+      gyro_zero_yaw_rad_ = truth_.yaw_rad;
+    }
   }
   // Explicit reported-gyro overrides, in rotations/s. These do not teleport
   // the physical robot or change the module-derived ground motion.
@@ -876,6 +955,55 @@ class PhysicsSimBackend final : public SimBackendBase {
   double applied_voltage(std::size_t motor_index) const {
     return motor_index < applied_volts_.size() ? applied_volts_[motor_index]
                                                : 0.0;
+  }
+
+  // The external plant (sim_plant.h), bound at the next Configure; nullptr
+  // detaches it. Not owned: it must outlive this backend's use of it. It
+  // survives every Configure, and its clock (plant_time()) restarts here.
+  void SetPlant(ExternalPlant* plant) {
+    plant_ = plant;
+    plant_bound_ = false;
+    plant_failed_ = false;
+    plant_failure_.clear();
+    plant_time_ = {};
+    plant_acc_us_ = 0;
+    previous_time_.reset();
+    owned_.fill(false);
+    bound_world_inputs_.clear();
+    plant_time_.max_steps = PlantMaxSteps();
+  }
+
+  // A digital input the plant's sensor of that name closes: the input named
+  // `input` reads `closed_reads` while ExternalPlant::input_closed says so,
+  // the opposite otherwise, and ignores SetDigitalInput. Matched by name at
+  // each Configure (a config the bridge pushes included); one whose input
+  // the config does not name is inactive.
+  struct WorldInput {
+    std::string input;
+    std::string sensor;
+    bool closed_reads{false};
+  };
+  void SetWorldInputs(std::vector<WorldInput> inputs) {
+    world_inputs_ = std::move(inputs);
+  }
+
+  // The plant's clock against the Reads' sample times. Each Read adds its
+  // interval to a signed remainder and steps the plant the nearest whole
+  // number of steps, at most max_steps; time beyond that cap is dropped
+  // (counted, never caught up). For non-decreasing sample times,
+  // stepped_us + dropped_us + lag_us equals the sample time since the first
+  // Read after SetPlant.
+  struct PlantTime {
+    uint64_t stepped_us{}, dropped_us{}, dropped_ticks{};
+    int32_t lag_us{};  // in [-step_us/2, step_us/2); ages are max(lag_us, 0)
+    uint32_t max_steps{};  // 2 * ceil(period_us / step_us)
+  };
+  const PlantTime& plant_time() const { return plant_time_; }
+
+  // Why the last Configure refused a plant binding; absent after one that
+  // succeeded.
+  std::optional<ConfigError> last_config_error() const override {
+    return config_error_;
   }
 
  private:
@@ -1110,6 +1238,324 @@ class PhysicsSimBackend final : public SimBackendBase {
     return -1;
   }
 
+  int MotorIndexByName(std::string_view name) const {
+    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+      if (config_.motors[i].name == name) return static_cast<int>(i);
+    }
+    return -1;
+  }
+
+  uint32_t PlantMaxSteps() const {
+    const uint32_t step_us = plant_ != nullptr ? plant_->step_us() : 0;
+    if (step_us == 0) return 0;
+    return 2 * ((config_.period_us + step_us - 1) / step_us);
+  }
+
+  // Binds plant_ to config_ (Configure's last step): the motors it
+  // integrates, the world inputs config_ names, then the refusals
+  // (PlantRefusal). On success the bound motors and the chassis read the
+  // plant's state and the gyro zeroes on it. A failed plant is refused
+  // without a call to it.
+  bool BindPlant() {
+    plant_bound_ = false;
+    if (plant_failed_) {
+      return RefusePlant({.device_name = "plant",
+                          .operation = "bind_plant",
+                          .message = "the plant failed: " + plant_failure_});
+    }
+    for (std::size_t a = 0; a < world_inputs_.size(); ++a) {
+      for (std::size_t b = a + 1; b < world_inputs_.size(); ++b) {
+        if (world_inputs_[a].input != world_inputs_[b].input) continue;
+        return RefusePlant(
+            {.device_name = world_inputs_[a].input,
+             .operation = "bind_plant",
+             .message = "[digital_inputs." + world_inputs_[a].input +
+                        "] sim_sensor: the input is bound to a plant sensor "
+                        "twice ('" +
+                        world_inputs_[a].sensor + "', '" +
+                        world_inputs_[b].sensor + "')"});
+      }
+    }
+    const uint32_t step_us = plant_->step_us();
+    if (step_us == 0 || step_us % 2 != 0) {
+      return RefusePlant(
+          {.device_name = "plant",
+           .operation = "bind_plant",
+           .message = "the plant's step_us must be even and positive, not " +
+                      std::to_string(step_us)});
+    }
+    const std::size_t n = config_.motors.size();
+    std::array<PlantMotor, kMaxMotors> motors{};
+    for (std::size_t i = 0; i < n; ++i) {
+      const MotorModel model =
+          MotorModelFor(config_.motors[i].motor_type.value);
+      motors[i] = {config_.motors[i].name.view(),
+                   Gear(i),
+                   model.torque_constant_nm_per_a(),
+                   model.back_emf_v_per_radps(),
+                   model.resistance_ohm(),
+                   model.no_load_damping_nm_per_radps()};
+    }
+    std::vector<PlantInput> inputs;
+    inputs.reserve(world_inputs_.size());
+    bound_world_inputs_.reserve(world_inputs_.size());
+    for (const WorldInput& w : world_inputs_) {
+      for (std::size_t d = 0; d < config_.digital_inputs.size(); ++d) {
+        if (config_.digital_inputs[d].name != w.input) continue;
+        inputs.push_back({w.input, w.sensor});
+        bound_world_inputs_.push_back({d, w.closed_reads, false});
+        break;
+      }
+    }
+    ConfigError error;
+    std::array<bool, kMaxMotors> owned{};
+    if (!plant_->Bind(std::span<const PlantMotor>(motors.data(), n), inputs,
+                      std::span<bool>(owned.data(), n), error)) {
+      return RefusePlant(std::move(error));
+    }
+    owned_ = owned;
+    if (auto refusal = PlantRefusal()) return RefusePlant(std::move(*refusal));
+    plant_time_.max_steps = PlantMaxSteps();
+    plant_bound_ = true;
+    SyncFromPlant();
+    gyro_zero_yaw_rad_ = truth_.yaw_rad;
+    return true;
+  }
+
+  bool RefusePlant(ConfigError error) {
+    config_error_ = std::move(error);
+    owned_.fill(false);
+    bound_world_inputs_.clear();
+    return false;
+  }
+
+  ConfigError MotorRefusal(std::size_t i, std::string message) const {
+    const auto& m = config_.motors[i];
+    return {.device_name = m.name.str(),
+            .bus = m.bus.str(),
+            .can_id = m.can_id,
+            .operation = "bind_plant",
+            .message = std::move(message)};
+  }
+
+  // What a bound motor or a model-owned chassis cannot keep (Configure).
+  std::optional<ConfigError> PlantRefusal() const {
+    const std::size_t n = config_.motors.size();
+    for (std::size_t i = 0; i < n; ++i) {
+      const auto& m = config_.motors[i];
+      const int master = m.master_id != 0 ? MotorIndex(m.master_id) : -1;
+      if (master >= 0 && owned_[i] != owned_[master]) {
+        const auto& lead = config_.motors[master];
+        return MotorRefusal(
+            i, "[motors." + m.name.str() + "] follow = '" + lead.name.str() +
+                   "': the plant binds '" +
+                   (owned_[i] ? m.name.str() : lead.name.str()) +
+                   "' but not '" +
+                   (owned_[i] ? lead.name.str() : m.name.str()) +
+                   "'; bind a follower chain whole or not at all");
+      }
+    }
+    for (const MechanismSpec& spec : mechanisms_) {
+      const int i = MotorIndexByName(spec.motor);
+      if (i >= 0 && owned_[i]) {
+        return MotorRefusal(i, "[[simulation.mechanisms]] names '" +
+                                   spec.motor +
+                                   "', which the plant binds: its inertia "
+                                   "comes from the model");
+      }
+    }
+    for (const HardStop& stop : hard_stops_) {
+      const int i = MotorIndexByName(stop.motor);
+      if (i >= 0 && owned_[i]) {
+        return MotorRefusal(i, "[[simulation.hard_stops]] names '" +
+                                   stop.motor +
+                                   "', which the plant binds: use its model "
+                                   "joint's range");
+      }
+    }
+    const bool owns_chassis = plant_->chassis().has_value();
+    for (const Module& module : modules_) {
+      for (const std::size_t i : {module.drive, module.steer}) {
+        if (owns_chassis && owned_[i]) continue;
+        const std::string name = config_.motors[i].name.str();
+        const std::string key =
+            configured_modules_.empty()
+                ? "[motors." + name + "] (a swerve module by its name)"
+                : std::string("[[simulation.swerve_modules]]");
+        return MotorRefusal(
+            i, key +
+                   (owns_chassis
+                        ? ": the model owns the chassis, but the plant does "
+                          "not bind swerve module motor '"
+                        : ": the model's root body has no freejoint, so it "
+                          "cannot carry swerve module motor '") +
+                   name + "'");
+      }
+    }
+    return std::nullopt;
+  }
+
+  // Bound motors' rotors, and the chassis when the model owns it, as the
+  // plant has them.
+  void SyncFromPlant() {
+    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+      if (!owned_[i]) continue;
+      const PlantRotor rotor = plant_->rotor(i);
+      axes_[i] = {rotor.position_rot, rotor.velocity_rps};
+    }
+    if (const std::optional<PlantChassis> chassis = plant_->chassis()) {
+      truth_ = {chassis->x_m,    chassis->y_m,    chassis->yaw_rad,
+                chassis->vx_mps, chassis->vy_mps, chassis->omega_radps};
+    }
+  }
+
+  // Adds `delta_us` (>= 0) of sample time to the plant's clock and advances
+  // every model by the whole steps it rounds to (PlantTime).
+  void AdvancePlantTime(int64_t delta_us) {
+    // Not stepped while unbound (no Configure yet, or a refused one) or
+    // after it failed.
+    if (!plant_bound_ || plant_failed_) return;
+    const int64_t step_us = plant_->step_us();
+    const int64_t half_us = step_us / 2;
+    plant_acc_us_ += delta_us;  // plant_acc_us_ + half_us >= 0 here
+    const int64_t steps =
+        std::min<int64_t>((plant_acc_us_ + half_us) / step_us,
+                          static_cast<int64_t>(plant_time_.max_steps));
+    plant_acc_us_ -= steps * step_us;
+    if (plant_acc_us_ >= half_us) {  // time beyond the cap
+      const int64_t dropped = (plant_acc_us_ + half_us) / step_us;
+      plant_time_.dropped_us += static_cast<uint64_t>(dropped * step_us);
+      ++plant_time_.dropped_ticks;
+      plant_acc_us_ -= dropped * step_us;
+    }
+    plant_time_.stepped_us += static_cast<uint64_t>(steps * step_us);
+    plant_time_.lag_us = static_cast<int32_t>(plant_acc_us_);
+    StepModels(static_cast<double>(steps * step_us) * 1e-6,
+               static_cast<int>(steps));
+  }
+
+  // Hands each bound motor its drive (DriveFor) and steps the plant; then the
+  // bound motors and chassis read the plant, and each powered bound motor's
+  // applied voltage is the drive's at the post-step speed, so its reported
+  // voltage and currents are the torque law the plant integrated. False when
+  // the plant failed (latched).
+  bool StepPlant(int steps, const std::array<double, kMaxMotors>& raw_volts) {
+    const std::size_t n = config_.motors.size();
+    for (std::size_t i = 0; i < n; ++i) {
+      drives_[i] = owned_[i] ? DriveFor(i, raw_volts[i]) : PlantDrive{};
+    }
+    if (!plant_->Step(steps, std::span<const PlantDrive>(drives_.data(), n))) {
+      plant_failed_ = true;
+      plant_bound_ = false;
+      plant_failure_ = std::string(plant_->failure());
+      return false;
+    }
+    SyncFromPlant();
+    for (std::size_t i = 0; i < n; ++i) {
+      if (!owned_[i] || !powered_[i]) continue;
+      const MotorModel motor =
+          MotorModelFor(config_.motors[i].motor_type.value);
+      const double r_ohm = motor.resistance_ohm();
+      const double kt = motor.torque_constant_nm_per_a();
+      const double ke_rad = motor.back_emf_v_per_radps();
+      const double omega = axes_[i].rotor_velocity_rps * kTau;
+      const PlantDrive& d = drives_[i];
+      const double amperes =
+          std::clamp((d.volts - (d.back_emf ? ke_rad * omega : 0.0)) / r_ohm,
+                     d.min_torque_nm / kt, d.max_torque_nm / kt);
+      applied_volts_[i] = Direction(i) * (r_ohm * amperes + ke_rad * omega);
+    }
+    return true;
+  }
+
+  // The drive a bound motor's winding gets over the next plant Step, in its
+  // physical rotor frame, from this tick's resolved command (raw_volts, at
+  // supply_v_ and the tick-start speed w0). Its regime is the one
+  // LimitWindingVoltageAt and TorqueCurrentVoltsAt are in at w0:
+  //   - unpowered: a shorted winding under brake, an open one under coast;
+  //   - a voltage mode (a follower included, fed its master's applied volts
+  //     at its own speed): the command clamped to the voltage ceiling;
+  //   - torque current I: the ceiling in I's direction, with I as the bound
+  //     on that side (0 A: the ceiling in the rotor's direction, no torque
+  //     unless it overspeeds the ceiling); while the rotor is back-driven
+  //     so hard that I*R + back-EMF is beyond the opposite ceiling, the
+  //     opposite ceiling, with I as the bound on the far side;
+  //   - a supply limit binding at w0 after the stator band: its limited
+  //     voltage, held for the tick, in every mode (torque current keeps I
+  //     as its bound).
+  // The stator limit bounds the torque on both sides in every powered mode.
+  // So the plant's torque at w0 is k_t times the analytic stator current at
+  // w0, except where that current exceeds stator_limit_a (back-EMF beyond
+  // the ceiling plus stator_limit_a * R): there the analytic model lets it
+  // exceed the limit, and the plant caps it at the limit (the design's Q12).
+  // The ceiling is max_voltage or the solved supply, whichever is lower, so
+  // the cap also applies when a sagging battery lowers it below back-EMF.
+  // At other speeds within the tick the regime stays the one chosen at w0.
+  PlantDrive DriveFor(std::size_t i, double raw_volts) const {
+    constexpr double kInf = std::numeric_limits<double>::infinity();
+    const auto& m = config_.motors[i];
+    if (!powered_[i]) return {0.0, m.brake, -kInf, kInf};
+    const MotorModel motor = MotorModelFor(m.motor_type.value);
+    const double kt = motor.torque_constant_nm_per_a();
+    const double dir = Direction(i);
+    const double rps = axes_[i].rotor_velocity_rps;
+    const double supply = std::max(0.0, supply_v_);
+    const double ceiling =
+        std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0, supply);
+    const double stator_nm =
+        m.stator_limit_a > 0.0 ? kt * m.stator_limit_a : kInf;
+    bool supply_limited = false;
+    const double limited_v =
+        LimitWindingVoltageAt(i, m, raw_volts, supply, rps, &supply_limited);
+    if (m.master_id != 0 || commands_[i].mode != Mode::kTorqueCurrent) {
+      const double volts = supply_limited
+                               ? dir * limited_v
+                               : std::clamp(dir * raw_volts, -ceiling, ceiling);
+      return {volts, true, -stator_nm, stator_nm};
+    }
+    const double peak_a =
+        std::max(0.0, std::min(m.max_torque_current_a, m.stator_limit_a));
+    const double amperes =
+        dir * std::clamp(commands_[i].demand, -peak_a, peak_a);
+    const double demand_nm = kt * amperes;
+    if (supply_limited) {
+      return {dir * limited_v, true, amperes < 0.0 ? demand_nm : -stator_nm,
+              amperes > 0.0 ? demand_nm : stator_nm};
+    }
+    // TorqueCurrentVoltsAt's volts before its ceiling clamp.
+    const double tc_volts =
+        amperes * motor.resistance_ohm() + motor.back_emf_v_per_rps() * rps;
+    if (amperes > 0.0) {
+      return tc_volts < -ceiling
+                 ? PlantDrive{-ceiling, true, demand_nm, stator_nm}
+                 : PlantDrive{ceiling, true, -stator_nm, demand_nm};
+    }
+    if (amperes < 0.0) {
+      return tc_volts > ceiling
+                 ? PlantDrive{ceiling, true, -stator_nm, demand_nm}
+                 : PlantDrive{-ceiling, true, demand_nm, stator_nm};
+    }
+    if (rps > 0.0) return {ceiling, true, -stator_nm, 0.0};
+    if (rps < 0.0) return {-ceiling, true, 0.0, stator_nm};
+    return {0.0, true, 0.0, 0.0};
+  }
+
+  // A bound motor's soft limits as the TalonFX applies them: output toward a
+  // limit its position has reached is neutral (torque current by its
+  // demand's sign, every other mode by its volts'), and the joint is left
+  // where it is. Analytic motors are clamped instead (EnforceSoftLimits).
+  bool SoftLimitBlocks(std::size_t i, double volts) const {
+    const auto& m = config_.motors[i];
+    if (!owned_[i] || !m.soft_limits) return false;
+    const double output =
+        commands_[i].mode == Mode::kTorqueCurrent ? commands_[i].demand : volts;
+    const double lo = std::min(m.reverse_limit_rot, m.forward_limit_rot);
+    const double hi = std::max(m.reverse_limit_rot, m.forward_limit_rot);
+    const double position_rot = MechPosition(i);
+    return (output > 0.0 && position_rot >= hi) ||
+           (output < 0.0 && position_rot <= lo);
+  }
+
   // Resolves home_switches_ by name against config_.
   void BindHomeSwitches() {
     bound_home_switches_.clear();
@@ -1312,10 +1758,12 @@ class PhysicsSimBackend final : public SimBackendBase {
   }
 
   // Effective winding voltage in motor i's configured direction at an explicit
-  // bus voltage and physical rotor velocity.
+  // bus voltage and physical rotor velocity. `supply_limited`, when given, is
+  // set when supply_limit_a bound (after the stator band).
   double LimitWindingVoltageAt(std::size_t i, const MotorConfig& m,
                                double volts, double supply_v,
-                               double rotor_velocity_rps) const {
+                               double rotor_velocity_rps,
+                               bool* supply_limited = nullptr) const {
     const MotorModel motor = MotorModelFor(m.motor_type.value);
     const double dir = Direction(i);
     const double supply = std::max(0.0, supply_v);
@@ -1339,6 +1787,7 @@ class PhysicsSimBackend final : public SimBackendBase {
         rotor_volts = rotor_volts > back_emf_v ? 0.5 * (back_emf_v + root)
                                                : 0.5 * (back_emf_v - root);
         rotor_volts = std::clamp(rotor_volts, -ceiling, ceiling);
+        if (supply_limited != nullptr) *supply_limited = true;
       }
     }
     return dir * rotor_volts;
@@ -1499,7 +1948,8 @@ class PhysicsSimBackend final : public SimBackendBase {
         want_power = FeedbackValid(i) &&
                      DriveVoltage(req, m, mech_pos, mech_vel, supply, volts);
       }
-      want_power = want_power && !LimitSwitchBlocks(i, volts);
+      want_power = want_power && !LimitSwitchBlocks(i, volts) &&
+                   !SoftLimitBlocks(i, volts);
       powered_out[i] = want_power;
       raw_volts_out[i] = want_power ? volts : 0.0;
       applied_volts_out[i] =
@@ -1876,7 +2326,10 @@ class PhysicsSimBackend final : public SimBackendBase {
     }
   }
 
-  void StepModels(double dt_s) {
+  // With a plant, dt_s is `plant_steps` plant steps (AdvancePlantTime), and
+  // the plant integrates the bound motors and its chassis in place of the
+  // models here.
+  void StepModels(double dt_s, int plant_steps = 0) {
     if (dt_s < 0.0) return;
 
     // Advance Motion Magic profiles once per tick before battery sag iteration
@@ -1956,7 +2409,13 @@ class PhysicsSimBackend final : public SimBackendBase {
                             raw_volts, applied_volts_);
 
     std::array<bool, kMaxMotors> stepped{};
-    const bool dynamic_chassis = DynamicChassisActive();
+    bool plant_chassis = false;
+    if (plant_ != nullptr) {
+      if (!StepPlant(plant_steps, raw_volts)) return;
+      stepped = owned_;
+      plant_chassis = plant_->chassis().has_value();
+    }
+    const bool dynamic_chassis = !plant_chassis && DynamicChassisActive();
     if (dynamic_chassis) {
       // Dynamic swerve drive motors are integrated together with chassis mass
       // and wheel traction in StepChassisDynamic().
@@ -1999,9 +2458,10 @@ class PhysicsSimBackend final : public SimBackendBase {
       }
     }
 
+    // A model-owned chassis: StepPlant read it into truth_.
     if (dynamic_chassis) {
       StepChassisDynamic(raw_volts, dt_s);
-    } else {
+    } else if (!plant_chassis) {
       StepChassis(dt_s);
     }
     elapsed_s_ += dt_s;
@@ -2464,6 +2924,30 @@ class PhysicsSimBackend final : public SimBackendBase {
   double supply_v_{kSimRestingSupplyV};
   double yaw_rot_{0.0};
   double yaw_rate_rps_{0.0};
+  // SetPlant; not owned.
+  ExternalPlant* plant_{nullptr};
+  // The last Configure bound plant_ and it has not failed since.
+  bool plant_bound_{false};
+  // A plant Step returned false: every later Read is total loss, and the
+  // plant is never called again. Its failure(), kept at that Step.
+  bool plant_failed_{false};
+  std::string plant_failure_;
+  PlantTime plant_time_{};
+  // Sample time not yet stepped, in [-step_us/2, step_us/2) between Reads.
+  int64_t plant_acc_us_{0};
+  // The motors the plant binds (Configure), and their last drives.
+  std::array<bool, kMaxMotors> owned_{};
+  std::array<PlantDrive, kMaxMotors> drives_{};
+  // SetWorldInputs, and those of them config_ names, in the plant's input
+  // order.
+  struct BoundWorldInput {
+    std::size_t input;
+    bool closed_reads;
+    bool closed;  // the plant's last reading
+  };
+  std::vector<WorldInput> world_inputs_;
+  std::vector<BoundWorldInput> bound_world_inputs_;
+  std::optional<ConfigError> config_error_;
 };
 
 }  // namespace talos::hardware::sim
