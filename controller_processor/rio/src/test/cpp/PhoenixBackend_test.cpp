@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <ctre/phoenix6/controls/DutyCycleOut.hpp>
 #include <ctre/phoenix6/controls/NeutralOut.hpp>
 #include <ctre/phoenix6/controls/TorqueCurrentFOC.hpp>
 #include <ctre/phoenix6/controls/VoltageOut.hpp>
@@ -47,6 +48,7 @@
 #include <utility>
 #include <vector>
 
+#include "hardware/feedback.h"
 #include "hardware/gate.h"
 #include "hardware/gateway.h"
 #include "hardware/sim_backend.h"
@@ -2695,6 +2697,253 @@ TEST_F(PhoenixBackendPeakVoltage, IsMaxVoltageAfterConfigureAndRestore) {
       RestorePass(backend, std::array<uint16_t, 2>{master.id, independent.id}));
   expect_peak_voltage(0, 2.0, "after master restore");
   expect_peak_voltage(2, 5.0, "after independent restore");
+}
+
+// DutyCycleOut bypasses TalonFX's PeakForwardVoltage/PeakReverseVoltage on
+// Phoenix 6, so Apply() clamps duty-cycle demands to +-max_voltage / battery_v
+// (matching TorqueCurrentFOC and PhysicsSimBackend): 0 before the first valid
+// (> 1 V, finite) battery reading, tracking battery voltage, held across lost
+// readings, and capped at +-1.0 when battery voltage falls below max_voltage.
+// REQ-SAFE-04
+// REQ-SAFE-44
+TEST_F(PhoenixBackendPeakVoltage, DutyCycleOutIsClampedToMaxVoltage) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  auto motor = TestMotor(1, "roller", 1);
+  motor.max_voltage = 4.0;
+  config.motors.push_back(motor);
+  PhoenixBackend backend(true);
+  // After the backend, which rests the simulated battery at 12.8 V.
+  SimBattery battery{0.0};  // No valid reading yet.
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  const auto expect_duty = [&](double demand, double expected_output,
+                               std::string_view why) {
+    const std::array<hw::MotorRequest, 1> cmd{
+        Request(1, hw::Mode::kDutyCycle, demand)};
+    ASSERT_TRUE(ApplySent(backend, cmd)) << why;
+    const auto applied = Motor(backend, 0).GetAppliedControl();
+    ASSERT_NE(applied, nullptr) << why;
+    const auto duty =
+        std::dynamic_pointer_cast<const ctre::phoenix6::controls::DutyCycleOut>(
+            applied);
+    ASSERT_NE(duty, nullptr) << why << ": got " << applied->GetName();
+    EXPECT_NEAR(duty->Output, expected_output, 1e-9) << why;
+    EXPECT_DOUBLE_EQ(duty->UpdateFreqHz.value(), 0.0) << why;
+  };
+
+  // Before any valid (> 1 V, finite) battery reading, duty cap is 0.0.
+  expect_duty(1.0, 0.0, "before first battery reading");
+  hw::State state;
+  for (const double invalid_v :
+       {1.0, std::numeric_limits<double>::quiet_NaN()}) {
+    battery.Set(invalid_v);
+    backend.Read(state);
+    expect_duty(1.0, 0.0, "invalid battery before first valid reading");
+  }
+
+  // At 12.0 V battery and 4.0 V max_voltage: cap is 4/12 = 1/3.
+  battery.Set(12.0);
+  backend.Read(state);
+  expect_duty(1.0, 4.0 / 12.0, "positive full duty at 12 V");
+  expect_duty(-1.0, -4.0 / 12.0, "negative full duty at 12 V");
+  expect_duty(0.2, 0.2, "in-range positive duty untouched");
+  expect_duty(-0.2, -0.2, "in-range negative duty untouched");
+
+  // Physical simulated motor voltage under full duty cycle stays capped at 4 V.
+  const std::array<hw::MotorRequest, 1> full_duty{
+      Request(1, hw::Mode::kDutyCycle, 1.0)};
+  PumpReads(backend, state, full_duty, 20);
+  EXPECT_LE(state.motors[0].voltage, 4.0 + 0.5);
+  EXPECT_GT(state.motors[0].voltage, 3.0);
+
+  // Lost/invalid battery readings keep the last valid battery voltage (12 V).
+  for (const double lost_v :
+       {0.0, 1.0, std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity()}) {
+    battery.Set(lost_v);
+    backend.Read(state);
+    expect_duty(1.0, 4.0 / 12.0, "lost battery reading keeps last cap");
+  }
+
+  // When battery voltage drops below max_voltage (2.0 V < 4.0 V), cap is 1.0.
+  battery.Set(2.0);
+  backend.Read(state);
+  expect_duty(1.0, 1.0, "2 V < 4 V max_voltage clamps cap to 1.0");
+  expect_duty(-1.0, -1.0, "2 V < 4 V max_voltage clamps reverse cap to -1.0");
+  expect_duty(1.5, 1.0, "out-of-range duty still clamped to 1.0");
+  backend.Neutral();
+}
+
+// On a valid slow-status bus (status_hz = 10 Hz at command_timeout_us = 500 ms,
+// 100 ms frame period), diagnostic signals (MotorVoltage, StatorCurrent,
+// SupplyCurrent, FaultField) are requested at 10 Hz and must remain valid
+// across the full 100 ms frame period rather than dropping to zero / flickering
+// limit switches once latency passes 50 ms, while still expiring past the
+// scaled 2.5-period (250 ms) bound.
+// REQ-SAFE-26
+// REQ-CONTRACT-32
+TEST_F(PhoenixBackendRecovery, LowStatusHzDiagnosticsStayValidAcrossFrames) {
+  EXPECT_EQ(hw::DiagnosticMaxAgeUs(200.0), 50'000u);
+  EXPECT_EQ(hw::DiagnosticMaxAgeUs(50.0), 50'000u);
+  EXPECT_EQ(hw::DiagnosticMaxAgeUs(25.0), 100'000u);
+  EXPECT_EQ(hw::DiagnosticMaxAgeUs(20.0), 125'000u);
+  EXPECT_EQ(hw::DiagnosticMaxAgeUs(10.0), 250'000u);
+  EXPECT_EQ(hw::DiagnosticMaxAgeUs(8.0), 312'500u);
+  EXPECT_EQ(hw::DiagnosticMaxAgeUs(0.0), 50'000u);
+  EXPECT_EQ(hw::DiagnosticMaxAgeUs(-10.0), 50'000u);
+  EXPECT_EQ(hw::DiagnosticMaxAgeUs(std::numeric_limits<double>::quiet_NaN()),
+            50'000u);
+
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  config.command_timeout_us = 500'000;
+  config.status_hz = 10.0;
+  config.motors.push_back(TestMotor(1, "motor", 1));
+
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  auto& motor = Motor(backend, 0);
+  auto& sim = motor.GetSimState();
+  struct SimReset {
+    ctre::phoenix6::sim::TalonFXSimState& sim;
+    ~SimReset() { sim.SetForwardLimit(false); }
+  } reset{sim};
+  // Phase 1: stall rotor at -6 V so voltage (~-2.6 V at 80 A stator limit),
+  // stator/supply current, and StatorCurrLimit (in kMotorNotFaultFlags) are
+  // simultaneously active.
+  StallRotor(backend);
+  const std::array<hw::MotorRequest, 1> drive_reverse{
+      Request(1, hw::Mode::kVoltage, -6.0)};
+  hw::State state;
+  ASSERT_TRUE(ReadUntil(backend, state, [&] {
+    backend.Apply(drive_reverse);
+    return state.motors[0].valid && std::abs(state.motors[0].voltage) > 1.0 &&
+           std::abs(state.motors[0].stator_current_a) > 10.0 &&
+           std::abs(state.motors[0].supply_current_a) > 1.0 &&
+           (state.motors[0].fault_flags & hw::kMotorCurrentLimitFlags) != 0;
+  })) << "initial low-rate diagnostics never became active";
+
+  auto& volts = motor.GetMotorVoltage(false);
+  auto& amps = motor.GetStatorCurrent(false);
+  auto& supply = motor.GetSupplyCurrent(false);
+  auto& faults = motor.GetFaultField(false);
+
+  // Sample via ReadUntil until at least 10 reads occur with latency > 55 ms
+  // (spanning multiple 100 ms periods at 10 Hz) and verify signals never drop
+  // while within the 250 ms scaled bound.
+  int reads_over_50ms = 0;
+  ASSERT_TRUE(ReadUntil(backend, state, [&] {
+    backend.Apply(drive_reverse);
+    const double max_diag_age_s =
+        std::max({volts.GetTimestamp().GetLatency().value(),
+                  amps.GetTimestamp().GetLatency().value(),
+                  supply.GetTimestamp().GetLatency().value(),
+                  faults.GetTimestamp().GetLatency().value()});
+    if (max_diag_age_s < 0.24) {
+      EXPECT_TRUE(state.motors[0].valid);
+      EXPECT_GT(std::abs(state.motors[0].voltage), 1.0)
+          << "voltage dropped to 0 at age " << max_diag_age_s * 1e3 << " ms";
+      EXPECT_GT(std::abs(state.motors[0].stator_current_a), 10.0)
+          << "stator current dropped to 0 at age " << max_diag_age_s * 1e3
+          << " ms";
+      EXPECT_GT(std::abs(state.motors[0].supply_current_a), 1.0)
+          << "supply current dropped to 0 at age " << max_diag_age_s * 1e3
+          << " ms";
+      EXPECT_NE(state.motors[0].fault_flags & hw::kMotorCurrentLimitFlags, 0u)
+          << "current limit bit flickered off at age " << max_diag_age_s * 1e3
+          << " ms";
+      if (max_diag_age_s >= 0.055) ++reads_over_50ms;
+    }
+    return reads_over_50ms >= 10;
+  })) << "test did not observe 10 Hz diagnostic frames older than 55 ms";
+
+  // Phase 2: drive into the asserted forward hard limit (+2 V) and verify
+  // kMotorForwardHardLimitFlag does not flicker off across 100 ms frames.
+  sim.SetForwardLimit(true);
+  const std::array<hw::MotorRequest, 1> drive_forward{
+      Request(1, hw::Mode::kVoltage, 2.0)};
+  ASSERT_TRUE(ReadUntil(backend, state, [&] {
+    backend.Apply(drive_forward);
+    return state.motors[0].valid &&
+           (state.motors[0].fault_flags & hw::kMotorForwardHardLimitFlag) != 0;
+  })) << "forward hard limit never became active";
+
+  int limit_reads_over_50ms = 0;
+  ASSERT_TRUE(ReadUntil(backend, state, [&] {
+    backend.Apply(drive_forward);
+    const double fault_age_s = faults.GetTimestamp().GetLatency().value();
+    if (fault_age_s < 0.24) {
+      EXPECT_NE(state.motors[0].fault_flags & hw::kMotorForwardHardLimitFlag,
+                0u)
+          << "forward hard limit flickered off at age " << fault_age_s * 1e3
+          << " ms";
+      if (fault_age_s >= 0.055) ++limit_reads_over_50ms;
+    }
+    return limit_reads_over_50ms >= 5;
+  })) << "test did not observe 10 Hz FaultField frames older than 55 ms";
+
+  // Phase 3: pause refreshing all four diagnostic signals while stalled at
+  // -6 V. Each must remain valid once aged past the old 50 ms bound (>= 70 ms,
+  // < 250 ms) — proving MotorVoltage, StatorCurrent, SupplyCurrent, and
+  // FaultField all use the scaled bound even when Phoenix sim coalesces effort
+  // onto a faster frame — and then expire once aged past 2.5 periods (250 ms)
+  // while motion feedback stays valid.
+  sim.SetForwardLimit(false);
+  ASSERT_TRUE(ReadUntil(backend, state, [&] {
+    backend.Apply(drive_reverse);
+    return state.motors[0].valid && std::abs(state.motors[0].voltage) > 1.0 &&
+           std::abs(state.motors[0].stator_current_a) > 10.0 &&
+           std::abs(state.motors[0].supply_current_a) > 1.0 &&
+           (state.motors[0].fault_flags & hw::kMotorCurrentLimitFlags) != 0 &&
+           volts.GetTimestamp().GetLatency().value() < 0.05 &&
+           amps.GetTimestamp().GetLatency().value() < 0.05 &&
+           supply.GetTimestamp().GetLatency().value() < 0.05 &&
+           faults.GetTimestamp().GetLatency().value() < 0.05;
+  }));
+  StopRefreshing(backend, volts);
+  StopRefreshing(backend, amps);
+  StopRefreshing(backend, supply);
+  StopRefreshing(backend, faults);
+
+  ASSERT_TRUE(ReadUntil(backend, state, [&] {
+    backend.Apply(drive_reverse);
+    return volts.GetTimestamp().GetLatency().value() >= 0.07 &&
+           amps.GetTimestamp().GetLatency().value() >= 0.07 &&
+           supply.GetTimestamp().GetLatency().value() >= 0.07 &&
+           faults.GetTimestamp().GetLatency().value() >= 0.07;
+  }));
+  const double mid_max_age_s =
+      std::max({volts.GetTimestamp().GetLatency().value(),
+                amps.GetTimestamp().GetLatency().value(),
+                supply.GetTimestamp().GetLatency().value(),
+                faults.GetTimestamp().GetLatency().value()});
+  ASSERT_LT(mid_max_age_s, 0.24)
+      << "host stall aged diagnostics past the 250 ms bound before mid-check";
+  EXPECT_TRUE(state.motors[0].valid);
+  EXPECT_GT(std::abs(state.motors[0].voltage), 1.0);
+  EXPECT_GT(std::abs(state.motors[0].stator_current_a), 10.0);
+  EXPECT_GT(std::abs(state.motors[0].supply_current_a), 1.0);
+  EXPECT_NE(state.motors[0].fault_flags & hw::kMotorCurrentLimitFlags, 0u);
+
+  ASSERT_TRUE(ReadUntil(backend, state, [&] {
+    backend.Apply(drive_reverse);
+    return volts.GetTimestamp().GetLatency().value() >= 0.26 &&
+           amps.GetTimestamp().GetLatency().value() >= 0.26 &&
+           supply.GetTimestamp().GetLatency().value() >= 0.26 &&
+           faults.GetTimestamp().GetLatency().value() >= 0.26;
+  }));
+  EXPECT_TRUE(state.motors[0].valid);
+  EXPECT_DOUBLE_EQ(state.motors[0].voltage, 0.0);
+  EXPECT_DOUBLE_EQ(state.motors[0].stator_current_a, 0.0);
+  EXPECT_DOUBLE_EQ(state.motors[0].supply_current_a, 0.0);
+  EXPECT_EQ(state.motors[0].fault_flags & hw::kMotorNotFaultFlags, 0u);
+  backend.Neutral();
 }
 
 // Asynchronous configuration runs on a worker thread and is polled on the

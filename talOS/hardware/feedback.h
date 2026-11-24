@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 
 #include "messages.h"
@@ -19,13 +20,32 @@ namespace talos::hardware {
 
 // PhoenixBackend::Read reports a motor's temperature as 0 once its signal is
 // this old (Fresh(temperature, 500_ms), controller_processor/rio/src/main/
-// cpp/PhoenixBackend.cpp:975). testing::SimHardware and PhysicsSimBackend
+// cpp/PhoenixBackend.cpp). testing::SimHardware and PhysicsSimBackend
 // age a device that stopped answering by it.
 inline constexpr uint64_t kTemperatureMaxAgeUs = 500'000;
-// PhoenixBackend::Read clears a motor's limit and limiter bits
-// (kMotorNotFaultFlags) and keeps its fault bits once its FaultField is this
-// old (Fresh's 50 ms default, PhoenixBackend.cpp:53 and :953).
+// Baseline diagnostic freshness bound (50 ms = 2.5 periods at the 50 Hz
+// diagnostic rate cap). PhoenixBackend::Read scales this with status_hz via
+// DiagnosticMaxAgeUs so valid slow buses (< 50 Hz) do not clear limit/limiter
+// bits or zero effort every period.
 inline constexpr uint64_t kFaultFieldMaxAgeUs = 50'000;
+
+// Maximum age for motor diagnostic signals (FaultField, MotorVoltage,
+// StatorCurrent, SupplyCurrent), which PhoenixBackend requests at
+// min(status_hz, 50.0) Hz: 50 ms at status_hz >= 50 Hz, scaling to 2.5
+// diagnostic periods for slower valid rates (8..50 Hz, staying strictly below
+// the 4-period command_timeout_us floor).
+inline uint64_t DiagnosticMaxAgeUs(double status_hz) {
+  if (!std::isfinite(status_hz) || status_hz <= 0.0) {
+    return kFaultFieldMaxAgeUs;
+  }
+  const double diag_hz = std::min(status_hz, 50.0);
+  const double scaled_us = std::ceil(2'500'000.0 / diag_hz);
+  if (!std::isfinite(scaled_us) ||
+      scaled_us >= static_cast<double>(std::numeric_limits<uint64_t>::max())) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return std::max(kFaultFieldMaxAgeUs, static_cast<uint64_t>(scaled_us));
+}
 
 // An invalid motor or CAN-sensor sample: `valid` false and zero in every
 // measured field (position, velocity, applied voltage, stator and supply
