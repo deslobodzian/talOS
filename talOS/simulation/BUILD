@@ -94,10 +94,10 @@ py_test(
 )
 
 # The simulator alone, as a child process: --describe and its flag checks,
-# a run without a config, and its Driver Station and State datagrams over
-# loopback UDP for configs the cases write (REQ-DEV-10: home switches).
-# Over 1 s, integration lane: two cases run the simulator for 0.6 s and
-# 0.3 s of real time.
+# a run without a config, its Driver Station and State datagrams over
+# loopback UDP (REQ-DEV-05, REQ-DEV-10, REQ-CONTRACT-30), and /sim/state
+# truth publication under --physics. Over 1 s, integration lane: cases run
+# the simulator for 0.3 s to 0.6 s of real time each.
 py_test(
     name = "sim_gateway_test",
     size = "small",
@@ -105,7 +105,11 @@ py_test(
     data = [":sim_gateway"],
     env = {"SIM_GATEWAY": "$(rlocationpath :sim_gateway)"},
     tags = ["integration"],
-    deps = ["@rules_python//python/runfiles"],
+    deps = [
+        "//talOS/build:udp_ports",
+        "//talOS/memory:shm_name",
+        "@rules_python//python/runfiles",
+    ],
 )
 
 # Fail-closed CLI flag parsing for sim_gateway (fast lane: no sockets/waits).
