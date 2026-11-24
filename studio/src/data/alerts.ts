@@ -41,8 +41,13 @@
 // plus transport and render. REQ-OPS-37's 100 ms activation therefore needs
 // samples no further than 100 ms apart (10 Hz or faster; telemetry reads
 // status at 100 Hz and the drive feed updates at 20 Hz), and its 1 s bound
-// is then the feed's latency plus under 100 ms. A sample lost before push()
-// (a frame the bridge coalesced or the worker dropped) cannot be latched.
+// is then the feed's latency plus under 100 ms. The bridge pulses alert
+// activations that rise and clear while updates are coalesced
+// (studio/bridge/telemetry.h ClientFeed::Pump), and Studio's browser worker
+// feeds AlertTracker ahead of WorkerUpdateStream so UI stalls that drop
+// buffered frames still deliver the latch; only a sample lost before reaching
+// AlertTracker.push() (before the bridge or on a dropped socket) cannot be
+// latched.
 
 import {AlertLevel} from '../generated/talos/telemetry/alert-level';
 import type {Snapshot} from '../core';

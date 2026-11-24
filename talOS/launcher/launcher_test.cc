@@ -294,6 +294,7 @@ speed_rps = 40.0
 // another node's param_of all count as read, but a read under a scalar
 // (`recording.enabled` where `recording = false`, `count[1]` where
 // `count = 5`) does not.
+// REQ-CONTRACT-10
 TEST(LauncherTest, ASubsystemKeyNoNodeReadsIsAnErrorNamingTheNearestReadKey) {
   constexpr std::string_view kToml = R"(
 [subsystems.elevator]
@@ -4682,18 +4683,45 @@ TEST(LauncherSessions, AOneOffLockFailureLeavesARunningSession) {
   std::filesystem::remove_all(root);
 }
 
+// Fixture TOML with `log_keep_sessions = 1` so pre-seeded finished sessions
+// exceed the retention cap and would be pruned if ApplyRetention ran.
+std::string FixtureTomlWithRetentionCap() {
+  std::string configuration{kFixtureToml};
+  configuration.insert(configuration.find("period_us"),
+                       "log_keep_sessions = 1\n");
+  return configuration;
+}
+
+// Seeds two older finished sessions under `root` above `log_keep_sessions = 1`
+// and returns each directory's path and file contents.
+std::map<std::string, std::map<std::string, std::string>>
+SeedSessionsAboveRetentionCap(const std::string& root) {
+  std::map<std::string, std::map<std::string, std::string>> seeded;
+  const auto now = std::filesystem::file_time_type::clock::now();
+  for (const auto& [id, age] : {std::pair{100, 3}, std::pair{101, 2}}) {
+    const std::string dir = root + "/" + std::to_string(id);
+    WriteSessionManifest(dir, static_cast<uint64_t>(id), 1000 + id, 1100 + id);
+    WriteTestLog(dir + "/alpha.tlog", "alpha", static_cast<uint64_t>(id),
+                 {1'000'000});
+    std::filesystem::last_write_time(dir, now - std::chrono::hours{age});
+    seeded[dir] = DirectoryContents(dir);
+  }
+  return seeded;
+}
+
 // `studio_bridge` is a valid subsystem name. A robot's own subsystem of
 // that name is an ordinary node: critical, its failed probe is an error that
 // refuses the launch, not the Studio bridge's warning that leaves it out of
 // the session. With --start-studio-bridge, the launcher's bridge would be a
-// second roster member of that name: the launch is refused naming the key.
+// second roster member of that name: the launch is refused before retention,
+// probes, and spawn naming the key, even with --sim --allow-graph-errors.
 // REQ-OPS-30, REQ-OPS-01, REQ-CONTRACT-42
 TEST(LauncherSessions, ASubsystemNamedStudioBridgeIsAnOrdinaryNode) {
   auto options = SessionFixture("user_studio_bridge");
   const std::string root = options.output_dir;
   std::filesystem::remove_all(root);
   std::ofstream{options.config_path}
-      << kFixtureToml
+      << FixtureTomlWithRetentionCap()
       << "\n[subsystems.studio_bridge]\nnode = \"//example/studio:node\"\n"
          "period_us = 5000\n";
   options.binary_overrides["//example/studio:node"] =
@@ -4718,7 +4746,34 @@ TEST(LauncherSessions, ASubsystemNamedStudioBridgeIsAnOrdinaryNode) {
   const std::string twice = ::testing::internal::GetCapturedStderr();
   EXPECT_NE(twice.find("[subsystems.studio_bridge]"), std::string::npos)
       << twice;
+
+  // Non-describe launch with --sim --allow-graph-errors is still refused
+  // before ApplyRetention, probes, and spawn.
+  const std::string invoked = root + "_invoked";
+  std::filesystem::remove(invoked);
+  options.binary_overrides["//example/studio:node"] = WriteStubNode(
+      "user_studio_bridge_recorded",
+      RecordingStub("studio_bridge", "//example/studio:node", invoked));
+  const auto seeded = SeedSessionsAboveRetentionCap(root);
+  options.session_id = 3;
+  options.describe_only = false;
+  options.simulation = true;
+  options.remote = "127.0.0.1";
+  options.allow_graph_errors = true;
+  ::testing::internal::CaptureStderr();
+  EXPECT_EQ(Launcher{options}.Run(), 1);
+  const std::string allowed_refused = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(allowed_refused.find("[subsystems.studio_bridge]"),
+            std::string::npos)
+      << allowed_refused;
+  EXPECT_EQ(ReadFile(invoked), "") << "the subsystem's binary was run";
+  EXPECT_FALSE(std::filesystem::exists(root + "/3"));
+  for (const auto& [dir, contents] : seeded) {
+    EXPECT_TRUE(std::filesystem::exists(dir)) << "retention pruned " << dir;
+    EXPECT_EQ(DirectoryContents(dir), contents) << "retention altered " << dir;
+  }
   std::filesystem::remove_all(root);
+  std::filesystem::remove(invoked);
 }
 
 // A bundle registers its Studio bridge under the name `studio_bridge` too,
@@ -4754,7 +4809,7 @@ TEST(LauncherSessions, ASubsystemNamedStudioBridgeNeverRunsTheBundledBridge) {
 // writer exemption, "always critical" and the bridge's log share all follow
 // it. A subsystem keyed `hardware_node` (non-critical, its own binary
 // claiming the bridge's name and `/hw/state`) would be a second member of that
-// name; it is refused before anything is probed or spawned, naming the key,
+// name; it is refused before retention, probes, or spawn, naming the key,
 // even with --sim --allow-graph-errors, which would override the lint's `hw`
 // writer error.
 // REQ-SAFE-28, REQ-CONTRACT-09, REQ-CONTRACT-42
@@ -4763,7 +4818,7 @@ TEST(LauncherSessions, ASubsystemCannotTakeTheHardwareBridgesName) {
   std::filesystem::remove_all(options.output_dir);
   const std::string invoked = options.output_dir + "_invoked";
   std::filesystem::remove(invoked);
-  std::ofstream{options.config_path} << kFixtureToml
+  std::ofstream{options.config_path} << FixtureTomlWithRetentionCap()
                                      << "\n[subsystems.hardware_node]\nnode = "
                                         "\"//example/hardware_node:node\"\n"
                                         "period_us = 5000\ncritical = false\n";
@@ -4771,6 +4826,7 @@ TEST(LauncherSessions, ASubsystemCannotTakeTheHardwareBridgesName) {
       "subsystem_hardware_node",
       RecordingStub("hardware_node", "//example/hardware_node:node", invoked,
                     {Sender("/hw/state")}));
+  const auto seeded = SeedSessionsAboveRetentionCap(options.output_dir);
   options.simulation = true;
   options.remote = "127.0.0.1";
   options.allow_graph_errors = true;
@@ -4780,7 +4836,13 @@ TEST(LauncherSessions, ASubsystemCannotTakeTheHardwareBridgesName) {
   EXPECT_NE(refused.find("[subsystems.hardware_node]"), std::string::npos)
       << refused;
   EXPECT_EQ(ReadFile(invoked), "") << "the subsystem's binary was run";
+  EXPECT_FALSE(std::filesystem::exists(options.output_dir + "/1"));
+  for (const auto& [dir, contents] : seeded) {
+    EXPECT_TRUE(std::filesystem::exists(dir)) << "retention pruned " << dir;
+    EXPECT_EQ(DirectoryContents(dir), contents) << "retention altered " << dir;
+  }
   std::filesystem::remove_all(options.output_dir);
+  std::filesystem::remove(invoked);
 }
 
 // The sim gateway is known by the roster flag --start-sim-gateway sets, not by
@@ -4788,7 +4850,8 @@ TEST(LauncherSessions, ASubsystemCannotTakeTheHardwareBridgesName) {
 // launcher adds no gateway, is an ordinary node: started under --sim with
 // --log (its event log in the manifest) and --sim, and replayable. The
 // launcher's own gateway is still started with --config and no --log, and
-// with it such a subsystem is refused, naming the key.
+// with it such a subsystem is refused before retention, probes, and spawn,
+// naming the key, whether or not --allow-graph-errors is passed.
 // REQ-OPS-09, REQ-OPS-14, REQ-CONTRACT-42
 TEST(LauncherSessions, ASubsystemNamedSimGatewayIsAnOrdinaryNode) {
   struct Outcome {
@@ -4800,20 +4863,28 @@ TEST(LauncherSessions, ASubsystemNamedSimGatewayIsAnOrdinaryNode) {
     int replay_status{-1};
     std::string replay_err;
     std::string replay_line;  // the invocation --replay-inputs made
+    bool retention_untouched{true};
+    bool session_dir_created{false};
   };
-  const auto run = [](std::string_view tag, bool subsystem, bool gateway) {
+  const auto run = [](std::string_view tag, bool subsystem, bool gateway,
+                      bool allow_graph_errors = false) {
     Outcome out;
     auto options = SessionFixture(tag);
     std::filesystem::remove_all(options.output_dir);
     const std::string invoked = options.output_dir + "_invoked";
     std::filesystem::remove(invoked);
     std::ofstream config{options.config_path};
-    config << kFixtureToml;
+    config << (subsystem && gateway ? FixtureTomlWithRetentionCap()
+                                    : std::string{kFixtureToml});
     if (subsystem) {
       config << "\n[subsystems.sim_gateway]\nnode = "
                 "\"//example/sim_gateway:node\"\nperiod_us = 5000\n";
     }
     config.close();
+    std::map<std::string, std::map<std::string, std::string>> seeded;
+    if (subsystem && gateway) {
+      seeded = SeedSessionsAboveRetentionCap(options.output_dir);
+    }
     options.binary_overrides["//example/sim_gateway:node"] = WriteStubNode(
         std::string{tag} + "_subsystem",
         RecordingStub("sim_gateway", "//example/sim_gateway:node", invoked));
@@ -4825,10 +4896,18 @@ TEST(LauncherSessions, ASubsystemNamedSimGatewayIsAnOrdinaryNode) {
     options.simulation = true;
     options.remote = "127.0.0.1";
     options.start_sim_gateway = gateway;
+    options.allow_graph_errors = allow_graph_errors;
     ::testing::internal::CaptureStderr();
     out.status = Launcher{options}.Run();
     out.err = ::testing::internal::GetCapturedStderr();
     out.record = ReadFile(invoked);
+    for (const auto& [dir, contents] : seeded) {
+      if (!std::filesystem::exists(dir) || DirectoryContents(dir) != contents) {
+        out.retention_untouched = false;
+      }
+    }
+    out.session_dir_created =
+        std::filesystem::exists(options.output_dir + "/1");
     std::istringstream lines{out.record};
     for (std::string line; std::getline(lines, line);) {
       if (line.find("--describe") == std::string::npos) out.launched = line;
@@ -4876,11 +4955,18 @@ TEST(LauncherSessions, ASubsystemNamedSimGatewayIsAnOrdinaryNode) {
   EXPECT_EQ(own.manifest.find("sim_gateway.tlog"), std::string::npos)
       << own.manifest;
 
-  const Outcome both = run("both_sim_gateway", true, true);
-  EXPECT_EQ(both.status, 1);
-  EXPECT_NE(both.err.find("[subsystems.sim_gateway]"), std::string::npos)
-      << both.err;
-  EXPECT_EQ(both.record, "") << "a member was run or probed";
+  for (const bool allow : {false, true}) {
+    const Outcome both =
+        run(allow ? "both_sim_gateway_allowed" : "both_sim_gateway", true, true,
+            allow);
+    EXPECT_EQ(both.status, 1) << "allow_graph_errors=" << allow;
+    EXPECT_NE(both.err.find("[subsystems.sim_gateway]"), std::string::npos)
+        << both.err;
+    EXPECT_EQ(both.record, "") << "a member was run or probed";
+    EXPECT_TRUE(both.retention_untouched)
+        << "retention pruned or altered pre-seeded sessions";
+    EXPECT_FALSE(both.session_dir_created);
+  }
 }
 
 // REQ-OPS-08

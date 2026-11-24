@@ -1913,9 +1913,9 @@ bool Launcher::RosterContinues(const std::vector<NodeProcessInfo>& procs,
                                std::size_t self) {
   for (std::size_t j = 0; j < procs.size(); ++j) {
     if (j == self || (studio && j == studio->index())) continue;
+    if (procs[j].pid > 0 && !procs[j].exited) return true;
     if (launches[j].restart.last_exit_clean()) continue;
     if (launches[j].restart.pending()) return true;
-    if (procs[j].pid > 0 && !procs[j].exited) return true;
   }
   return false;
 }
