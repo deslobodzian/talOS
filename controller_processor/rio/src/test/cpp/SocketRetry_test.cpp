@@ -1197,6 +1197,94 @@ TEST(SocketRetry, TickSocketLinkUsesDistinctRioLogKeyForSendRecovery) {
   ASSERT_EQ(lines.size(), 1u);
   EXPECT_NE(lines[0].find("socket send failed"), std::string::npos) << lines[0];
 }
+
+// REQ-OPS-28, REQ-RT-22: When a permanent receive error closes the socket on a
+// tick whose State send still returned kOk after >= kSpellQuietUs of an open
+// failing-send spell, SendSucceeded()/ObserveSend() must ignore the closed
+// socket (SendEvent::kNone) so TickSocketLink() logs "cannot receive" without
+// a bogus "socket sending again" recovery line until the replacement sends.
+TEST(SocketRetry, PermanentReceiveErrorSuppressesSendRecoveryOnClosedSocket) {
+  using SendEvent = SocketRetry::SendEvent;
+  namespace protocol = talos::protocol;
+
+  // Direct SocketRetry check: SendSucceeded() and ObserveSend(kOk) return
+  // kNone while closed after a permanent receive error, and the open spell
+  // recovers only after Poll() replaces the socket and a send succeeds on it.
+  {
+    SocketRetry retry;
+    ASSERT_EQ(retry.Poll(kStartUs, [] { return true; }),
+              SocketRetry::Event::kOpened);
+    const uint64_t fail_us = kStartUs + kLoopPeriodUs;
+    ASSERT_EQ(retry.ObserveSend(fail_us, protocol::UdpStatus::kSocketError,
+                                ECONNREFUSED),
+              SendEvent::kFailing);
+    const uint64_t loss_us = fail_us + SocketRetry::kSpellQuietUs;
+    retry.ObserveReceive(loss_us, protocol::UdpStatus::kSocketError, EBADF);
+    ASSERT_FALSE(retry.open());
+    ASSERT_TRUE(retry.replacing());
+
+    EXPECT_EQ(retry.SendSucceeded(loss_us), SendEvent::kNone);
+    EXPECT_EQ(retry.ObserveSend(loss_us, protocol::UdpStatus::kOk, 0),
+              SendEvent::kNone);
+
+    const uint64_t replaced_us = loss_us + kLoopPeriodUs;
+    ASSERT_EQ(retry.Poll(replaced_us, [] { return true; }),
+              SocketRetry::Event::kReplaced);
+    EXPECT_EQ(retry.ObserveSend(replaced_us, protocol::UdpStatus::kOk, 0),
+              SendEvent::kRecovered);
+  }
+
+  // Production TickSocketLink() path: permanent receive error (EBADF) on the
+  // same tick as a kOk State send after >= kSpellQuietUs logs "cannot receive"
+  // and must not emit "sending again" on the closed socket.
+  std::vector<std::string> lines;
+  SocketLinkHarness h{[&](std::string_view line) { lines.emplace_back(line); }};
+  ASSERT_NE(h.companion.port(), 0);
+  ScopedReceiveErrorSeam recv_seam{h.endpoint.inner()};
+
+  uint64_t now_us = kStartUs;
+  h.Tick(now_us, /*ds_flags=*/0u);
+  ASSERT_TRUE(h.socket_retry.open());
+
+  // Open a kept-socket failing-send spell (ECONNREFUSED).
+  now_us += kLoopPeriodUs;
+  h.endpoint.InjectNextTickSend(protocol::UdpStatus::kSocketError,
+                                ECONNREFUSED);
+  h.Tick(now_us, /*ds_flags=*/0u);
+  ASSERT_TRUE(h.socket_retry.open());
+  h.log.Drain(1'000'000ULL);
+  ASSERT_EQ(lines.size(), 1u);
+  EXPECT_NE(lines[0].find("socket send failed"), std::string::npos) << lines[0];
+  lines.clear();
+
+  // Advance >= kSpellQuietUs and inject a permanent receive error (EBADF) on a
+  // tick whose loopback State send succeeds (kOk).
+  now_us += SocketRetry::kSpellQuietUs;
+  g_injected_recv_errno = EBADF;
+  h.Tick(now_us, /*ds_flags=*/0u);
+  EXPECT_FALSE(h.socket_retry.open());
+  EXPECT_TRUE(h.socket_retry.replacing());
+  EXPECT_TRUE(h.endpoint.closed);
+
+  h.log.Drain(2'000'000ULL);
+  for (const auto& line : lines) {
+    EXPECT_EQ(line.find("sending again"), std::string::npos) << line;
+  }
+  ASSERT_EQ(lines.size(), 1u);
+  EXPECT_NE(lines[0].find("cannot receive"), std::string::npos) << lines[0];
+
+  // Next tick replaces the socket and sends State on the reopened socket,
+  // emitting both replacement and send-recovery lines.
+  lines.clear();
+  now_us += kLoopPeriodUs;
+  h.Tick(now_us, /*ds_flags=*/0u);
+  EXPECT_TRUE(h.socket_retry.open());
+  h.log.Drain(2'100'000ULL);
+  ASSERT_EQ(lines.size(), 2u);
+  EXPECT_NE(lines[0].find("socket replaced"), std::string::npos) << lines[0];
+  EXPECT_NE(lines[1].find("socket sending again"), std::string::npos)
+      << lines[1];
+}
 #endif
 
 // Backward clock steps must not underflow now_us - last_attempt_us_ (bypassing

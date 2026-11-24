@@ -6,6 +6,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <typeinfo>
 
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
@@ -412,6 +413,29 @@ TEST_F(SafetyAbiTest, HostCppNodeGuardsDuplicateUafAndPropagatesLastError) {
   // failed second HostCppNode overwrote update() with a freed instance.
   ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK) << talos_last_error();
   EXPECT_EQ(talos_node_tick(talos_sim_node(sim_, "roller")), 3u);
+}
+
+// REQ-DEV-09: HostCppNode<T> invoked after node start returns -1 with a
+// constructor-only error and does not leave T orphaned in node extensions.
+TEST_F(SafetyAbiTest, HostCppNodeAfterStartDoesNotOrphanExtension) {
+  struct HostedCounter {
+    explicit HostedCounter(talos::Node&) {}
+    void update() { ++ticks; }
+    int ticks = 0;
+  };
+
+  TalosNode* node = talos_sim_add(
+      sim_, "roller", [](TalosNode*, void*) -> int32_t { return 0; }, nullptr);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+
+  const int32_t rc = talos::detail::HostCppNode<HostedCounter>(node);
+  EXPECT_EQ(rc, -1);
+  const std::string err = talos_last_error();
+  EXPECT_NE(err.find("constructor"), std::string::npos) << err;
+  const auto& cpp_node = *reinterpret_cast<const talos::Node*>(node);
+  EXPECT_EQ(talos::detail::NodeDetail::find_extension(cpp_node,
+                                                      typeid(HostedCounter)),
+            nullptr);
 }
 
 // REQ-RT-05: talos_sim_resume guards overdue callbacks with Stepping so

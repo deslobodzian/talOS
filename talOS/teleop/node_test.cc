@@ -1907,5 +1907,101 @@ TEST(TeleopNode,
   EXPECT_EQ(arm_lane()->active, 1);
 }
 
+// REQ-CONTRACT-24: an overflowing axis binding releases the lane while still
+// tracking later on_toggle button edges and clearing any latched toggle on
+// that subsystem, in either binding order.
+TEST(TeleopNode, OverflowingAxisUpdatesToggleEdgesAndClearsLatchedToggle) {
+  const std::string axis_binding =
+      "[[subsystems.mechanism.teleop.bindings]]\n"
+      "axis = 0\nfield = \"inner/offset_m\"\nscale = 1e40\n";
+  const std::string toggle_binding =
+      "[[subsystems.mechanism.teleop.bindings]]\n"
+      "button = 1\non_toggle = { flag = true }\n";
+
+  for (const bool toggle_first : {false, true}) {
+    SCOPED_TRACE(toggle_first ? "toggle_first" : "axis_first");
+    const std::string config =
+        "[robot]\nperiod_us = 20000\ncommand_timeout_us = 100000\n"
+        "[subsystems.mechanism]\n"
+        "[subsystems.mechanism.teleop]\n"
+        "defaults = { flag = false, position_m = 0.0, level = 'NONE', "
+        "sample_count = 0, speed_frac = 0.0, "
+        "'inner/mode' = 'OFF', 'inner/offset_m' = 0.0 }\n" +
+        (toggle_first ? toggle_binding + axis_binding
+                      : axis_binding + toggle_binding) +
+        "[subsystems.teleop]\nperiod_us = 20000\n";
+
+    Sim sim = MakeSim(config);
+    auto& mechanism = sim.add<ConsumerNode<schema_test::Mixed>>("mechanism");
+    sim.add<Teleop>("teleop");
+    SimHardware hw{sim};
+    hw.enable();
+    const auto expect_lane_active = [&](int expected) {
+      const auto lane = talos::testing::LatestTarget<schema_test::Mixed>(
+          sim, "mechanism", "teleop");
+      ASSERT_TRUE(lane.has_value());
+      EXPECT_EQ(lane->active, expected);
+    };
+
+    // Arm with neutral inputs.
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+    EXPECT_FALSE(mechanism.seen.has_value());
+
+    // (a) Press and hold the toggle button during an overflowing-axis tick:
+    // the lane releases, was_pressed updates, and no toggle is latched or
+    // synthesized when the axis returns to deadband with the button still held.
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(4.0f, 0, 0, 1)));
+    EXPECT_FALSE(mechanism.seen.has_value());
+    expect_lane_active(0);
+
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.0f, 0, 0, 1)));
+    EXPECT_FALSE(mechanism.seen.has_value());
+    expect_lane_active(0);
+
+    // Release the button so the next press is a fresh rising edge.
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.0f, 0, 0, 0)));
+    EXPECT_FALSE(mechanism.seen.has_value());
+
+    // (b) Latch the toggle ON and release the button; verify it stays live.
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.0f, 0, 0, 1)));
+    ASSERT_TRUE(mechanism.seen.has_value());
+    EXPECT_TRUE(mechanism.seen->flag());
+    expect_lane_active(1);
+
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.0f, 0, 0, 0)));
+    ASSERT_TRUE(mechanism.seen.has_value());
+    EXPECT_TRUE(mechanism.seen->flag());
+    expect_lane_active(1);
+
+    // Overflowing axis clears the latched toggle and releases the lane.
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(4.0f, 0, 0, 0)));
+    EXPECT_FALSE(mechanism.seen.has_value());
+    expect_lane_active(0);
+
+    // Returning the axis to deadband keeps the lane released (latch stayed
+    // cleared) until a fresh press.
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.0f, 0, 0, 0)));
+    EXPECT_FALSE(mechanism.seen.has_value());
+    expect_lane_active(0);
+
+    // Fresh press latches the toggle back ON.
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.0f, 0, 0, 1)));
+    ASSERT_TRUE(mechanism.seen.has_value());
+    EXPECT_TRUE(mechanism.seen->flag());
+    expect_lane_active(1);
+
+    // Releasing the button during an overflowing-axis tick still updates
+    // was_pressed so a fresh press after recovery is not swallowed.
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(4.0f, 0, 0, 0)));
+    EXPECT_FALSE(mechanism.seen.has_value());
+    expect_lane_active(0);
+
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.0f, 0, 0, 1)));
+    ASSERT_TRUE(mechanism.seen.has_value());
+    EXPECT_TRUE(mechanism.seen->flag());
+    expect_lane_active(1);
+  }
+}
+
 }  // namespace
 }  // namespace talos::teleop

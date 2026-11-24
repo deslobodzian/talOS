@@ -7,6 +7,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <typeinfo>
 #include <vector>
 
 #include "talOS/configuration/config_parser.h"
@@ -65,33 +66,38 @@ struct Targets {
   std::deque<ArmingState> armings;
 };
 
+Targets* FindTargets(Node& node) {
+  return static_cast<Targets*>(
+      NodeAccess::find_extension(node, typeid(Targets)));
+}
+
 TargetState& TargetAt(Node& node, std::size_t index) {
-  auto& targets = node.extension<Targets>().targets;
-  if (index >= targets.size()) {
+  Targets* all = FindTargets(node);
+  if (all == nullptr || index >= all->targets.size()) {
     throw std::out_of_range(std::string{node.name()} + ": no target at index " +
                             std::to_string(index));
   }
-  return targets[index];
+  return all->targets[index];
 }
 
 LaneState& LaneAt(Node& node, std::size_t index) {
-  auto& lanes = node.extension<Targets>().lanes;
-  if (index >= lanes.size()) {
+  Targets* all = FindTargets(node);
+  if (all == nullptr || index >= all->lanes.size()) {
     throw std::out_of_range(std::string{node.name()} +
                             ": no target lane at index " +
                             std::to_string(index));
   }
-  return lanes[index];
+  return all->lanes[index];
 }
 
 ArmingState& ArmingAt(Node& node, std::size_t index) {
-  auto& armings = node.extension<Targets>().armings;
-  if (index >= armings.size()) {
+  Targets* all = FindTargets(node);
+  if (all == nullptr || index >= all->armings.size()) {
     throw std::out_of_range(std::string{node.name()} +
                             ": no operator arming at index " +
                             std::to_string(index));
   }
-  return armings[index];
+  return all->armings[index];
 }
 
 // Armed, and nothing has happened since that the arming evaluation did not
@@ -216,6 +222,13 @@ const void* TargetAccess::target_get(Node& node, std::size_t target,
   TargetState& state = TargetAt(node, target);
   const ReportSelection report{node, state.selection, source};
   if (!robot_enabled(node)) return nullptr;
+  // Reject cross-boot actuation during a gateway reboot window where the new
+  // boot's State arrives before its first Driver Station packet (REQ-SAFE-07,
+  // REQ-SAFE-11, REQ-SAFE-13). ds_boot == 0 (send_joystick) stays allowed.
+  const std::uint64_t hw_boot =
+      HardwareAccess::boot_id(node.extension<HardwareLink>());
+  const std::uint64_t ds_boot = state.ds.data().boot_id;
+  if (hw_boot != 0 && ds_boot != 0 && hw_boot != ds_boot) return nullptr;
   const std::vector<std::int32_t>* lanes = nullptr;
   switch (DriverStationAccess::mode(state.ds)) {
     case DsMode::kTeleop:
@@ -271,10 +284,12 @@ const void* TargetAccess::target_get(Node& node, std::size_t target,
 
 std::span<const std::string> TargetAccess::target_sources(Node& node,
                                                           std::size_t target) {
+  NodeAccess::require_loop_thread(node, "Target::source");
   return TargetAt(node, target).sources;
 }
 
 std::size_t TargetAccess::target_bytes(Node& node, std::size_t target) {
+  NodeAccess::require_loop_thread(node, "Target::bytes");
   return TargetAt(node, target).bytes;
 }
 
@@ -283,6 +298,7 @@ std::size_t TargetAccess::open_lane(Node& node, std::string_view subsystem,
                                     std::size_t alignment,
                                     const schema::Identity& message,
                                     std::optional<std::size_t> arming) {
+  NodeAccess::require_loop_thread(node, "TargetLane");
   const std::size_t envelope = TargetEnvelopeBytes(bytes, alignment);
   if (arming) ArmingAt(node, *arming);  // throws unless this node has it
   if (auto problem = introspect::naming::CheckTargetLane(subsystem, source)) {
@@ -290,16 +306,20 @@ std::size_t TargetAccess::open_lane(Node& node, std::string_view subsystem,
   }
   const std::string topic =
       introspect::naming::TargetLaneTopic(subsystem, source);
+  // Register the publisher and Driver Station before attaching Targets so a
+  // post-start or arming refusal leaves node extensions untouched.
+  const std::size_t publisher = NodeAccess::add_target_lane_publisher(
+      node, topic, envelope, kMessageAlignment, schema::Envelope(message),
+      /*operator_arming=*/arming.has_value());
+  DriverStation ds = DriverStationAccess::internal(node);
   auto& lanes = node.extension<Targets>().lanes;
   lanes.push_back(LaneState{
-      .publisher = NodeAccess::add_target_lane_publisher(
-          node, topic, envelope, kMessageAlignment, schema::Envelope(message),
-          /*operator_arming=*/arming.has_value()),
+      .publisher = publisher,
       .bytes = bytes,
       .alignment = alignment,
       // Subscribed here, so the producer drains the Driver Station right
       // before its timer and send() stamps the packet it saw last.
-      .ds = DriverStationAccess::internal(node),
+      .ds = ds,
       .envelope = std::vector<std::byte>(envelope),
       .arming = arming,
   });
@@ -340,8 +360,24 @@ bool TargetAccess::lane_release(Node& node, std::size_t lane) {
 }
 
 std::size_t TargetAccess::open_arming(Node& node) {
+  NodeAccess::require_loop_thread(node, "OperatorArming");
+  // Refuse post-start registration without mutating node state:
+  // Node::after_update checks `started` (throwing std::logic_error) before
+  // rejecting an empty callback (throwing std::invalid_argument).
+  bool in_construction = false;
+  try {
+    node.after_update({});
+  } catch (const std::invalid_argument&) {
+    in_construction = true;
+  } catch (const std::logic_error&) {
+    throw std::logic_error(
+        std::string{node.name()} +
+        ": OperatorArming must be opened in the constructor");
+  }
+  (void)in_construction;
+  DriverStation ds = DriverStationAccess::internal(node);
   auto& armings = node.extension<Targets>().armings;
-  armings.push_back(ArmingState{.ds = DriverStationAccess::internal(node)});
+  armings.push_back(ArmingState{.ds = ds});
   return armings.size() - 1;
 }
 

@@ -194,17 +194,19 @@ struct Node::Impl {
   }
 
   // REQ-SAFE-14: an explicit Driver Station reader writing any target lane in
-  // the target subsystem's teleop policy must open it with OperatorArming.
+  // the target subsystem's teleop policy (including ShmObjectName-colliding
+  // spellings) must open it with OperatorArming.
   void CheckTargetLaneArming(std::string_view topic) const {
-    if (!introspect::naming::IsTargetLane(topic)) return;
-    const auto segments = introspect::naming::detail::Segments(topic);
-    const auto& teleop = config->TargetsFor(segments[0]).teleop;
-    if (std::find(teleop.begin(), teleop.end(), segments[2]) == teleop.end()) {
+    const auto parts = introspect::naming::TargetLaneCollisionParts(topic);
+    if (!parts) return;
+    const auto& teleop = config->TargetsFor(parts->subsystem).teleop;
+    if (std::find(teleop.begin(), teleop.end(), parts->source) ==
+        teleop.end()) {
       return;
     }
     throw std::invalid_argument(
         name + ": target lane '" + std::string{topic} + "' is in " +
-        std::string{segments[0]} +
+        std::string{parts->subsystem} +
         "'s teleop target policy and this node reads the Driver Station; open "
         "it with a talos::OperatorArming (talos.OperatorArming in Python) so "
         "an input held through a disable, reboot, Driver Station dropout or "
@@ -694,6 +696,25 @@ void NodeDetail::add_extension(Node& node, std::type_index type,
   node.impl_->extensions.emplace_back(type, std::move(object));
 }
 
+void CheckHostNodeOpen(const Node& node) {
+  node.impl_->CheckOpen("HostCppNode");
+}
+
+void AttachHostedNode(Node& node, std::type_index type,
+                      std::shared_ptr<void> object,
+                      std::function<void()> update) {
+  Node::Impl& impl = *node.impl_;
+  impl.CheckOpen("HostCppNode");
+  if (NodeDetail::find_extension(node, type) != nullptr) {
+    throw std::logic_error(impl.name + ": extension added twice");
+  }
+  impl.extensions.emplace_back(type, std::move(object));
+  if (update) {
+    impl.update = std::move(update);
+    impl.abi_update = false;
+  }
+}
+
 namespace {
 thread_local std::string g_host_error;
 std::atomic<NodeAccess::HostErrorCallback> g_host_error_callback{nullptr};
@@ -891,13 +912,19 @@ void CheckLayout(const std::string& node, std::string_view topic,
   }
 }
 
+bool IsHashedShmTopic(std::string_view topic) {
+  if (!topic.starts_with('/')) return false;
+  while (topic.starts_with('/')) topic.remove_prefix(1);
+  return topic.starts_with('~');
+}
+
 // RULES.md 2: a hardware request leaves only through the devices layer's flush
 // after update() (add_hardware_request), which gates it on robot_enabled and
 // update() and applies the motor limits and position frames. A plain
 // publisher there would skip all of that, so none is opened, however the
 // topic was spelled or remapped, whatever --allow-graph-errors says.
 void RefuseHardwareRequest(const std::string& node, std::string_view topic) {
-  if (introspect::naming::IsHardwareRequest(topic) || topic.starts_with("/~")) {
+  if (introspect::naming::IsHardwareRequest(topic) || IsHashedShmTopic(topic)) {
     throw std::invalid_argument(
         node + ": cannot publish '" + std::string{topic} +
         "': hardware requests are sent only by the devices layer's flush "
@@ -913,14 +940,19 @@ std::size_t Node::Impl::AddSubscription(
     std::string_view topic, std::size_t bytes, std::size_t alignment,
     const schema::Identity& schema, bool optional, bool observer,
     bool internal_ds, detail::MessageCallback on_message, bool prompt) {
-  if (prompt) CheckOpen("subscribe with a callback");
   std::string resolved = ResolveTopic(topic);
+  if (detail::IsHashedShmTopic(resolved)) {
+    throw std::invalid_argument(
+        name + ": cannot subscribe to '" + resolved +
+        "': pre-hashed shared-memory names ('/~...') are reserved");
+  }
   detail::CheckLayout(name, resolved, bytes, alignment);
   const bool explicit_ds = !observer && !internal_ds &&
-                           resolved == introspect::naming::kDriverStationTopic;
+                           introspect::naming::IsDriverStationTopic(resolved);
   if (explicit_ds && started && !describing) {
     CheckOperatorArming(/*explicit_ds=*/true);
   }
+  CheckOpen(prompt ? "subscribe with a callback" : "subscribe");
   auto slot = std::make_unique<SubscriptionSlot>();
   slot->topic = std::move(resolved);
   slot->bytes = bytes;
@@ -950,6 +982,7 @@ std::size_t Node::Impl::AddPublisher(std::string_view topic, std::size_t bytes,
   if (started && !describing && explicit_driver_station && !operator_arming) {
     CheckTargetLaneArming(resolved);
   }
+  CheckOpen("publish");
   const std::uint16_t id =
       loop->register_sender(resolved, static_cast<std::uint32_t>(bytes),
                             static_cast<std::uint32_t>(alignment), schema);
@@ -959,7 +992,7 @@ std::size_t Node::Impl::AddPublisher(std::string_view topic, std::size_t bytes,
                         .is_hardware_request = false,
                         .is_target_lane = is_target_lane,
                         .operator_arming = operator_arming});
-  if (introspect::naming::IsTargetLane(resolved)) {
+  if (introspect::naming::TargetLaneCollisionParts(resolved)) {
     writes_target_lane = true;
   }
   return publishers.size() - 1;

@@ -92,5 +92,17 @@ TEST(DeadbandTest, ArmingNeutralRejectsNonFiniteAndMatchesDeadbandZeroZone) {
   }
 }
 
+// REQ-SAFE-14, REQ-CONTRACT-24
+TEST(DeadbandTest, NegativeAndNanDeadbandFailSafeToZeroAndNeverArm) {
+  constexpr double kNan = std::numeric_limits<double>::quiet_NaN();
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  for (const double db : {-0.1, -1.0, -kInf, kNan}) {
+    for (const double x : {0.0, -0.0, 0.5, -0.5, 1.0, kNan, kInf, -kInf}) {
+      EXPECT_DOUBLE_EQ(Deadband(x, db), 0.0) << "x=" << x << " db=" << db;
+    }
+    EXPECT_FALSE(ArmingNeutral(0.0, db)) << "db=" << db;
+  }
+}
+
 }  // namespace
 }  // namespace talos::teleop
