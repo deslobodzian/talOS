@@ -193,6 +193,7 @@ class MujocoPlant final : public hardware::sim::ExternalPlant {
   std::vector<WorldRules*> rules_;
   MatchInput match_input_{};
   uint64_t steps_{};  // MuJoCo steps taken, the rules' step count
+  bool in_hook_{false};
   bool failed_{false};
   std::array<char, 768> failure_{};
 };
