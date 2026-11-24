@@ -70,7 +70,7 @@ install.
 | Flag | Effect |
 |---|---|
 | `--check` | report each component ok/missing/wrong-version; install nothing; exit 1 if anything required is missing |
-| `--yes` | non-interactive: answers prompts (incl. Homebrew install on macOS), passes `-y`/`--noconfirm` to package managers |
+| `--yes`, `-y` | non-interactive: answers prompts (incl. Homebrew install on macOS), passes `-y`/`--noconfirm` to package managers |
 | `--no-studio` | skip Node 22/pnpm |
 | `--no-rio` | skip JDK 17 and `./gradlew installRoboRioToolchain` |
 | `--no-lint` | skip clang-format/clang-tidy 18 wheels, buildifier |
@@ -186,10 +186,6 @@ Third-party patches in `third_party/` that sanitizer runs depend on:
   welded robot) gives them NULL, empty arrays when it compiles and steps,
   which UBSan reports. A zero-length copy does nothing either way, so
   behaviour is unchanged.
-
-The three MuJoCo patches are, like OpenCV's, a root-only
-`single_version_override`: a repository that depends on talOS builds MuJoCo
-unpatched, and only its `--config=asan` runs report these.
 - `third_party/apriltag_pjpeg_bounds.patch`: bounds, overflow, malformed-header/file,
   and restart-marker (`RST`) DC-predictor fixes in AprilTag's JPEG decoder (`pjpeg.c`),
   used only by the offline `DetectImageFile` API; live capture passes raw GREY/YUYV
@@ -198,6 +194,10 @@ unpatched, and only its `--config=asan` runs report these.
   regression cases for empty/missing-scan inputs, marker lengths < 2, truncated DHT
   segments, and directory paths, plus a multi-component `RST` decode check; intact
   photographs are decoded in `//talOS/vision/apriltag:cpu_apriltag_backend_test`.
+
+The three MuJoCo patches are, like OpenCV's, a root-only
+`single_version_override`: a repository that depends on talOS builds MuJoCo
+unpatched, and only its `--config=asan` runs report these.
 
 ## Building without a network
 
