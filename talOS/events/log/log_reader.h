@@ -52,6 +52,15 @@ struct LogDamage {
 // reader allocate.
 inline constexpr std::uint64_t kMaxRecordPayloadBytes = std::uint64_t{1} << 20;
 
+// Bounds on a log file's header, manifest and schema block (REQ-OPS-42).
+// FileHeader's fields are wider than any real log needs (manifest_count is
+// uint32_t though ManifestEntry::id is uint16_t; schema_bytes is uint64_t), so
+// a crafted or damaged header is refused before a reader reads or allocates for
+// it.
+inline constexpr std::uint32_t kMaxFileHeaderBytes = std::uint32_t{64} << 10;
+inline constexpr std::uint32_t kMaxManifestEntries = std::uint32_t{65536};
+inline constexpr std::uint64_t kMaxSchemaBlockBytes = std::uint64_t{16} << 20;
+
 namespace detail {
 // The most bytes each record may claim: a record carrying its topic's
 // message (a MESSAGE of a watcher or fetcher, a SEND of a sender) that
@@ -144,7 +153,9 @@ class LogReader {
   // Reads and validates the header and manifest block. Throws
   // std::runtime_error on a bad magic, a format version outside
   // OLDEST_READABLE_VERSION to FORMAT_VERSION (naming the version read and
-  // those supported), a checksum mismatch, or a short file.
+  // those supported), header/manifest/schema sizes above kMaxFileHeaderBytes,
+  // kMaxManifestEntries or kMaxSchemaBlockBytes, a checksum mismatch, or a
+  // short file.
   explicit LogReader(std::string_view path);
 
   const Manifest& manifest() const noexcept { return manifest_; }
