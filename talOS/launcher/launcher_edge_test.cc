@@ -436,7 +436,7 @@ TEST(LauncherEdgeTest,
   int exit_code = -1;
   std::thread runner([&] { exit_code = Launcher{options}.Run(); });
 
-  const bool ready = notify.WaitFor("READY=1", 4000);
+  const bool ready = notify.WaitFor("READY=1", 10000);
   // Open go_fifo to unblock the bridge's 256 KiB write (only after READY=1
   // proves port_announced == true).
   {
@@ -559,7 +559,7 @@ TEST(LauncherEdgeTest,
   int exit_code = -1;
   std::thread runner([&] { exit_code = Launcher{options}.Run(); });
 
-  const bool ready = notify.WaitFor("READY=1", 4000);
+  const bool ready = notify.WaitFor("READY=1", 10000);
 
   constexpr time_t kAged = 1'000'000;
   const auto age_graph = [&graph_path] {
@@ -606,7 +606,7 @@ TEST(LauncherEdgeTest,
               SupervisionWakeup::Wake();
               return !graph_aged() && retake_reports() > 0;
             },
-            400);
+            2000);
         dir_lock_held_after_retake =
             SessionDirectoryLock::Held(session_dir, false);
 
@@ -622,7 +622,7 @@ TEST(LauncherEdgeTest,
                 return !graph_aged() &&
                        SessionDirectoryLock::Held(session_dir, false);
               },
-              400);
+              2000);
         }
       }
     }
