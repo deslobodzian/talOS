@@ -511,7 +511,9 @@ TEST(ProcessTest, RealtimeReportsWhatTheOsGrantedForEveryTier) {
 // REQ-RT-08, REQ-RT-09
 TEST(ProcessTest, LongControlPeriodsGrantTimeConstraintOnMacOs) {
   ::unsetenv("TALOS_REALTIME");
-  for (const std::chrono::nanoseconds period : {50us, 125ms, 200ms}) {
+  for (const std::chrono::nanoseconds period :
+       {std::chrono::nanoseconds{50us}, std::chrono::nanoseconds{125ms},
+        std::chrono::nanoseconds{200ms}}) {
     SCOPED_TRACE(period.count());
     const Outcome outcome = ConfigureOnFreshThread(LoopTier::kControl, period);
     EXPECT_EQ((outcome.returned.refused & kStepPolicy) == 0, outcome.applied)
