@@ -22,8 +22,10 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <span>
@@ -41,6 +43,38 @@
 
 namespace studio {
 
+namespace detail {
+
+// Guards EgressBudget::available against non-finite or non-positive rates,
+// which would corrupt tokens or divide by zero in wait_ns.
+inline bool SafeAvailable(EgressBudget& bucket, std::size_t bytes, double rate,
+                          std::int64_t now_ns) {
+  if (!std::isfinite(rate) || rate <= 0.0) return false;
+  return bucket.available(bytes, rate, now_ns);
+}
+
+// Guards EgressBudget::wait_ns against non-finite/non-positive rates, int64
+// conversion overflow on tiny rates, and now_ns + wait_ns overflow in
+// WakeSchedule::Deferred.
+inline std::int64_t SafeWaitNs(const EgressBudget& bucket, std::size_t bytes,
+                               double rate, std::int64_t now_ns) {
+  if (!std::isfinite(rate) || rate <= 0.0) return kNeverNs;
+  const auto needed = static_cast<double>(bytes);
+  if (needed > EgressBudget::kBurstBytes) return kNeverNs;
+  if (bucket.tokens >= needed) return 0;
+  const double wait = std::ceil((needed - bucket.tokens) / rate * 1e9);
+  if (!std::isfinite(wait) || wait < 0.0 ||
+      wait >= static_cast<double>(kNeverNs)) {
+    return kNeverNs;
+  }
+  const auto wait_i64 =
+      std::max<std::int64_t>(1, static_cast<std::int64_t>(wait));
+  if (now_ns > 0 && wait_i64 > kNeverNs - now_ns) return kNeverNs;
+  return wait_i64;
+}
+
+}  // namespace detail
+
 // The egress rates, B/s
 // (docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary). Without a
 // dashboard layout nothing is reserved and programmer clients share the whole
@@ -56,7 +90,8 @@ struct EgressPlan {
   // `drive_clients` x `drive_budget_bytes_per_s` is reserved (the layout's
   // `drive_clients` and `budget_bytes_per_s`; 0 and 0 without a layout).
   // Throws std::invalid_argument when the reservation leaves programmer
-  // clients nothing (the layout parser already refuses over 80,000 B/s).
+  // clients nothing (the layout parser already refuses over 80,000 B/s), or
+  // when drive slots are requested with a zero budget.
   static EgressPlan Of(std::size_t max_clients, std::uint32_t drive_clients,
                        std::uint32_t drive_budget_bytes_per_s) {
     const double reserved = static_cast<double>(drive_clients) *
@@ -65,6 +100,10 @@ struct EgressPlan {
       throw std::invalid_argument(
           "studio_bridge: drive reservation leaves programmer clients no "
           "budget");
+    }
+    if (drive_clients > 0 && drive_budget_bytes_per_s == 0) {
+      throw std::invalid_argument(
+          "studio_bridge: drive clients require a positive budget");
     }
     EgressPlan plan;
     plan.programmer_bytes_per_s = kTotalBytesPerSecond - reserved;
@@ -95,14 +134,17 @@ class BridgeEgress {
                   std::int64_t now_ns, std::int64_t& wait_ns) {
     const double rate = drive ? plan_.drive_client_bytes_per_s
                               : plan_.programmer_client_bytes_per_s;
-    const bool fits_own = own.available(framed_bytes, rate, now_ns);
-    wait_ns = fits_own ? 0 : own.wait_ns(framed_bytes, rate);
+    const bool fits_own =
+        detail::SafeAvailable(own, framed_bytes, rate, now_ns);
+    wait_ns =
+        fits_own ? 0 : detail::SafeWaitNs(own, framed_bytes, rate, now_ns);
     if (drive) return fits_own;
-    const bool fits_shared =
-        shared_.available(framed_bytes, plan_.programmer_bytes_per_s, now_ns);
+    const bool fits_shared = detail::SafeAvailable(
+        shared_, framed_bytes, plan_.programmer_bytes_per_s, now_ns);
     if (!fits_shared) {
       wait_ns = std::max(
-          wait_ns, shared_.wait_ns(framed_bytes, plan_.programmer_bytes_per_s));
+          wait_ns, detail::SafeWaitNs(shared_, framed_bytes,
+                                      plan_.programmer_bytes_per_s, now_ns));
     }
     return fits_own && fits_shared;
   }
@@ -135,18 +177,25 @@ bool AffordProgrammerSend(SharedReservation<Client>& reservation,
                           ClientFeeds::Feed feed, std::int64_t now_ns,
                           bool buffered, std::uint64_t& held) {
   const double rate = egress.plan().programmer_client_bytes_per_s;
+  if (!std::isfinite(rate) || rate <= 0.0) return false;
   if (!reservation.MaySpend(client, framed_bytes, own, rate, now_ns)) {
     return false;
   }
-  if (own_room != 0 && !own.available(framed_bytes + own_room, rate, now_ns)) {
-    schedule.Deferred(now_ns, own.wait_ns(framed_bytes + own_room, rate));
-    return false;
+  if (own_room != 0) {
+    if (own_room > std::numeric_limits<std::size_t>::max() - framed_bytes) {
+      return false;
+    }
+    const std::size_t needed = framed_bytes + own_room;
+    if (!own.available(needed, rate, now_ns)) {
+      schedule.Deferred(now_ns, detail::SafeWaitNs(own, needed, rate, now_ns));
+      return false;
+    }
   }
   const bool fits_own = own.available(framed_bytes, rate, now_ns);
   std::int64_t wait_ns = 0;
   if (!egress.Affordable(own, false, framed_bytes, now_ns, wait_ns)) {
     schedule.Deferred(now_ns, wait_ns);
-    if (fits_own && !buffered) {
+    if (fits_own && !buffered && wait_ns != kNeverNs) {
       reservation.BlockedOnShared(client, framed_bytes, feed);
     }
     return false;
@@ -190,9 +239,17 @@ class DriveSlots {
 
   // Holds `client` as the newest, in a free slot, or else in the oldest's,
   // which is then no longer held and is returned for the caller to close.
-  // With no slots at all, `client` itself is returned and nothing is held.
+  // Re-admitting an already-held client refreshes its recency without
+  // duplicating its slot or resetting its bucket. With no slots at all,
+  // `client` itself is returned and nothing is held.
   Admission Admit(Client client) {
     if (slots_.empty()) return {kNoSlot, client};
+    if (const std::size_t existing = SlotOf(client); existing != kNoSlot) {
+      order_.erase(std::remove(order_.begin(), order_.end(), client),
+                   order_.end());
+      order_.push_back(client);
+      return {existing, std::nullopt};
+    }
     Admission admission;
     if (order_.size() == slots_.size()) {
       admission.evicted = order_.front();
