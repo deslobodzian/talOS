@@ -125,6 +125,9 @@ inline constexpr std::size_t kMaxTopicChannels = telemetry_wire::kMaxChannels;
 // Struct instances visited, arrays of structs counted per element: bounds a
 // walk of structs that hold no scalar.
 inline constexpr std::size_t kMaxTopicStructs = 4096;
+// Scalar fields and scalar-array elements visited per topic, excluded or
+// truncated channels included: bounds a crafted schema with huge scalar arrays.
+inline constexpr std::size_t kMaxTopicElements = 16384;
 
 // What a caller keeps of a topic. The review server takes the defaults: a
 // recorded schema past the cap is refused. Live telemetry keeps only the
@@ -151,9 +154,10 @@ AlertLevel AlertLevelOf(std::string_view field);
 // Throws std::invalid_argument
 // naming the topic when `bfbs` does not verify or lacks the struct, or when
 // a field names an object the schema does not hold, a struct contains
-// itself, structs nest deeper than kMaxNestingDepth, the walk passes
-// kMaxTopicStructs struct instances, or (unless options.truncate) the kept
-// channels pass options.max_channels. `kept`, when given, is set to how many
+// itself, an array has zero length, structs nest deeper than kMaxNestingDepth,
+// the walk passes kMaxTopicStructs struct instances or kMaxTopicElements
+// scalar elements, or (unless options.truncate) the kept channels pass
+// options.max_channels. `kept`, when given, is set to how many
 // channels `options` kept, those past a truncating flattening's cap
 // included.
 std::vector<Channel> FlattenTopic(std::string_view topic,

@@ -693,9 +693,10 @@ std::vector<naming::Diagnostic> LintTelemetryConfig(
 
     if (!have_graph || !globs_ok) continue;
     try {
+      std::map<std::string, std::size_t> uncounted;
       std::vector<telemetry::ChannelDef> dict =
           telemetry::BuildTelemetryDictionary(graph, include_globs,
-                                              exclude_globs);
+                                              exclude_globs, &uncounted);
       if (labels_parsed) {
         try {
           telemetry::ApplyLabelSpecs(label_specs, dict);
@@ -704,8 +705,8 @@ std::vector<naming::Diagnostic> LintTelemetryConfig(
               name, StripTelemetryPrefix(error.what()), unanswered));
         }
       }
-      telemetry::CheckDictionaryChannelCap(dict);
-      static_cast<void>(telemetry::MeasurePages(dict));
+      telemetry::CheckDictionaryChannelCap(dict, uncounted);
+      static_cast<void>(telemetry::CheckDictionaryPageBudget(dict));
       dictionaries.push_back(std::move(dict));
     } catch (const std::exception& error) {
       findings.push_back(DictionaryFinding(
