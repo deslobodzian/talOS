@@ -1203,24 +1203,36 @@ TEST(Gateway, RejectsOldBootEpochSequenceAndDelayedCommands) {
   g.Tick(1000, true);
   auto command = Request(g);
   EXPECT_TRUE(g.Accept(command, 7, 1000));
-  EXPECT_FALSE(g.Accept(command, 7, 1001));
-  EXPECT_FALSE(g.Accept(command, 6, 1001));
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 0u);
+  uint32_t expected_rejections = 0;
+  const auto expect_rejected = [&](const Command& c, uint64_t seq,
+                                   uint64_t now) {
+    EXPECT_FALSE(g.Accept(c, seq, now));
+    EXPECT_EQ(g.snapshot().counters.rejected_command_count,
+              ++expected_rejections);
+  };
+  expect_rejected(command, 7, 1001);
+  expect_rejected(command, 6, 1001);
   auto bad = command;
   ++bad.boot_id;
-  EXPECT_FALSE(g.Accept(bad, 8, 1001));
+  expect_rejected(bad, 8, 1001);
   bad = command;
   ++bad.epoch;
-  EXPECT_FALSE(g.Accept(bad, 8, 1001));
+  expect_rejected(bad, 8, 1001);
   bad = command;
   bad.observed_time_us = 2000;
-  EXPECT_FALSE(g.Accept(bad, 8, 1001));
-  EXPECT_FALSE(g.Accept(command, 8, 101000));
+  expect_rejected(bad, 8, 1001);
+  // sample_time_us < observed_time_us <= now: future vs the gateway's last
+  // State even though not future vs Accept's `now`.
+  expect_rejected(bad, 8, 5000);
+  expect_rejected(command, 8, 101000);
   g.Tick(101000, true);
   EXPECT_FALSE(g.snapshot().flags & kCommandActive);
   EXPECT_NE(g.snapshot().epoch, command.epoch);
-  EXPECT_FALSE(g.Accept(command, 100, 101000));
+  expect_rejected(command, 100, 101000);
   EXPECT_TRUE(
       g.Accept(Request(g), 0, 101000));  // A restarted companion can reconnect.
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, expected_rejections);
 }
 // `c` with every motor neutral at zero demand and feedforward.
 Command AllMotorsNeutral(Command c) {
@@ -2355,22 +2367,36 @@ TEST(Gateway, ACommandObservingTotalLossDrivesNoOutputAfterIt) {
   backend.healthy = false;
   g.Tick(6000, true);
   ASSERT_TRUE(g.snapshot().flags & kHardwareFault);
-  const auto during = with_outputs(Request(g));
-  backend.healthy = true;
+  const auto during_first = with_outputs(Request(g));
+  // A second loss tick in the same epoch advances outputs_drive_from_ past
+  // 11000; commands observing either loss tick (6000 or 11000) must hold
+  // motors neutral, DIO false, and PWM off once the loss clears.
   g.Tick(11000, true);
+  ASSERT_TRUE(g.snapshot().flags & kHardwareFault);
+  const auto during_second = with_outputs(Request(g));
+  ASSERT_EQ(during_second.epoch, during_first.epoch);
+  backend.healthy = true;
+  g.Tick(16000, true);
   ASSERT_FALSE(g.snapshot().flags & kHardwareFault);
-  ASSERT_EQ(g.snapshot().epoch, during.epoch);
-  ASSERT_TRUE(g.Accept(during, 1, 11000));
-  for (const auto& request : backend.last_requests) {
-    EXPECT_EQ(request.mode, Mode::kNeutral);
+  ASSERT_EQ(g.snapshot().epoch, during_first.epoch);
+  uint64_t seq = 0;
+  for (const auto& during : {during_first, during_second}) {
+    SCOPED_TRACE(during.observed_time_us);
+    ASSERT_TRUE(g.Accept(during, ++seq, 16000));
+    for (const auto& request : backend.last_requests) {
+      EXPECT_EQ(request.mode, Mode::kNeutral);
+    }
+    ASSERT_EQ(backend.last_digital_outputs.size(), 1u);
+    EXPECT_FALSE(backend.last_digital_outputs[0].value);
+    ASSERT_EQ(backend.last_pwm_outputs.size(), 1u);
+    EXPECT_EQ(backend.last_pwm_outputs[0].mode, PwmMode::kOff);
+    EXPECT_EQ(backend.last_pwm_outputs[0].output, 0.0);
   }
-  ASSERT_EQ(backend.last_digital_outputs.size(), 1u);
-  EXPECT_FALSE(backend.last_digital_outputs[0].value);
-  ASSERT_EQ(backend.last_pwm_outputs.size(), 1u);
-  EXPECT_EQ(backend.last_pwm_outputs[0].mode, PwmMode::kOff);
-  EXPECT_EQ(backend.last_pwm_outputs[0].output, 0.0);
 
-  ASSERT_TRUE(g.Accept(with_outputs(Request(g)), 2, 11000));
+  ASSERT_TRUE(g.Accept(with_outputs(Request(g)), ++seq, 16000));
+  for (const auto& request : backend.last_requests) {
+    EXPECT_EQ(request.mode, Mode::kVelocity);
+  }
   EXPECT_TRUE(backend.last_digital_outputs[0].value);
   EXPECT_EQ(backend.last_pwm_outputs[0],
             (PwmRequest{41, PwmMode::kPulse, 0.5}));
@@ -4846,6 +4872,296 @@ TEST(ConfigWire, RefusalsPreserveHeaderConfigIdAndRejectIdMismatch) {
     EXPECT_EQ(assembler.config_id(), valid_id);
     assembler.Reset();
     EXPECT_EQ(assembler.config_id(), 0u);
+  }
+}
+
+uint64_t stalling_clock_us = 0;
+uint64_t StallingClock() { return stalling_clock_us; }
+
+// If Backend::Read() stalls or the loop is preempted past command_timeout_us
+// after Tick's entry timestamp `now`, Tick() must re-check command expiry
+// against the post-Read clock and neutralize the active command, and Accept()
+// must reject a command whose observation is already aged >= command_timeout_us
+// at the current clock even when called with the stale pre-Read `now`.
+// REQ-SAFE-17, REQ-SAFE-18, REQ-SAFE-25
+TEST(Gateway,
+     ClockAdvancingAcrossReadExpiresActiveCommandAndRejectsAgedAccept) {
+  class StallingReadBackend : public FakeBackend {
+   public:
+    bool Read(State& s) override {
+      if (stall_us != 0) stalling_clock_us += stall_us;
+      return FakeBackend::Read(s);
+    }
+    uint64_t stall_us{0};
+  } backend;
+
+  const auto config = SwerveConfig(true);
+  Gateway g{config, backend, 1};
+  g.SetClock(StallingClock);
+
+  // 1. Active command expires during a stalled Backend::Read().
+  stalling_clock_us = 1000;
+  g.Tick(1000, true);
+  const auto cmd_t1000 = Request(g);
+  ASSERT_TRUE(g.Accept(cmd_t1000, 1, 1000));
+  ASSERT_TRUE(g.snapshot().flags & kCommandActive);
+  const uint64_t epoch_before = g.snapshot().epoch;
+  const int neutrals_before = backend.neutral;
+
+  // Tick enters at 90000 (< 101000 expiry), but Read() stalls 20000 us so the
+  // clock reaches 110000 (>= 101000) before Read() returns.
+  stalling_clock_us = 90000;
+  backend.stall_us = 20000;
+  g.Tick(90000, true);
+  EXPECT_EQ(g.snapshot().sample_time_us, 110000u);
+  EXPECT_FALSE(g.snapshot().flags & kCommandActive);
+  EXPECT_GT(g.snapshot().epoch, epoch_before);
+  EXPECT_GT(backend.neutral, neutrals_before);
+  EXPECT_EQ(g.last_command_expiry().count, 1u);
+  EXPECT_EQ(g.last_command_expiry().neutral_us, 110000u);
+  EXPECT_EQ(g.command_expiry_us(), 0u);
+
+  // 2. Accept() called with the stale pre-Read `now` rejects a command whose
+  // observation is already >= command_timeout_us old at the post-Read clock.
+  backend.stall_us = 0;
+  stalling_clock_us = 200000;
+  g.Tick(200000, true);
+  const auto cmd_t200000 = Request(g);
+  stalling_clock_us = 290000;
+  backend.stall_us = 20000;  // Post-Read clock = 310000 (>= 200000 + 100000).
+  g.Tick(290000, true);
+  ASSERT_EQ(g.snapshot().epoch, cmd_t200000.epoch);
+  const int applied_before = backend.applied;
+  EXPECT_FALSE(g.Accept(cmd_t200000, 2, 290000));
+  EXPECT_EQ(backend.applied, applied_before);
+  EXPECT_FALSE(g.snapshot().flags & kCommandActive);
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 1u);
+
+  // 3. A command that is still fresh at the post-Read clock is accepted and
+  // records accepted_at_ = check_now (the post-Read clock).
+  backend.stall_us = 0;
+  stalling_clock_us = 400000;
+  g.Tick(400000, true);
+  const auto fresh = Request(g);
+  stalling_clock_us = 405000;
+  EXPECT_TRUE(g.Accept(fresh, 3, 400000));
+  EXPECT_TRUE(g.snapshot().flags & kCommandActive);
+  // Advance past expiry and verify last_command_expiry_ reports accepted_us =
+  // 405000 (check_now), not the stale 400000.
+  stalling_clock_us = 400000 + config.command_timeout_us;
+  g.Tick(stalling_clock_us, true);
+  EXPECT_FALSE(g.snapshot().flags & kCommandActive);
+  EXPECT_EQ(g.last_command_expiry().accepted_us, 405000u);
+}
+
+// When a previous restore succeeds and empties `unavailable_`, backoff and
+// retry deadline reset so a later device-local apply failure on a healthy
+// motor starts its first restore immediately instead of waiting up to 2 s.
+// REQ-SAFE-23, REQ-SAFE-24
+TEST(Gateway, DeviceLocalIsolationDoesNotInheritStaleRestoreBackoff) {
+  FakeBackend backend;
+  const auto config = SwerveConfig(true);
+  const uint16_t motor0 = config.motors[0].id;
+  const uint16_t motor1 = config.motors[1].id;
+  Gateway g{config, backend, 1};
+
+  // Drive restore backoff up to kRestoreMaxBackoffUs (2 s) on motor0, then let
+  // motor0 recover so unavailable_ becomes empty.
+  uint64_t now = 1000;
+  g.Tick(now, true);
+  backend.restore_ok = false;
+  backend.resets = {motor0};
+  now += 5000;
+  g.Tick(now, true);  // Attempt 1 (backoff 250 ms after failure).
+  while (g.restore_attempt_count() < 5 && now < 5000000) {
+    now += 5000;
+    g.Tick(now, true);
+  }
+  ASSERT_EQ(g.restore_attempt_count(), 5u);
+  backend.restore_ok = true;
+  now += 5000;
+  g.Tick(now, true);  // Attempt 5 finishes kDone -> unavailable_ empty.
+  now += 5000;
+  g.Tick(now, true);
+  ASSERT_TRUE(g.snapshot().motors[0].valid);
+  ASSERT_TRUE(g.snapshot().motors[1].valid);
+
+  // Immediately after recovery, motor1 hits a transient device-local apply
+  // failure. Its first restore must begin on the very next tick, not 2 s later.
+  backend.failing_motors = {motor1};
+  ASSERT_TRUE(g.Accept(Request(g), 1, now));
+  EXPECT_FALSE(g.snapshot().motors[1].valid);
+  backend.failing_motors.clear();
+  const uint32_t attempts_before = g.restore_attempt_count();
+  now += 5000;
+  g.Tick(now, true);
+  EXPECT_EQ(g.restore_attempt_count(), attempts_before + 1);
+  EXPECT_EQ(backend.restoring_ids, std::vector<uint16_t>{motor1});
+}
+
+// While one offline device is in the middle of a backed-off restore, a newly
+// reset healthy device queued into `unavailable_` must be attempted as soon as
+// the in-flight restore finishes instead of being pushed behind the offline
+// device's 2 s backoff.
+// REQ-SAFE-23, REQ-SAFE-24
+TEST(Gateway,
+     PendingRestoreCompletionDoesNotPushNewlyResetDeviceBehindBackoff) {
+  FakeBackend backend;
+  const auto config = SwerveConfig(true);
+  const uint16_t motor0 = config.motors[0].id;
+  const uint16_t motor1 = config.motors[1].id;
+  Gateway g{config, backend, 1};
+
+  uint64_t now = 1000;
+  g.Tick(now, true);
+  backend.restore_ok = false;
+  backend.resets = {motor0};
+  now += 5000;
+  g.Tick(now, true);  // Attempt 1 starts.
+  while (g.restore_attempt_count() < 4 && now < 5000000) {
+    now += 5000;
+    g.Tick(now, true);
+  }
+  ASSERT_EQ(g.restore_attempt_count(), 4u);
+  // Let attempt 4 finish (pending_ticks == 0 -> kFailed) before arming
+  // pending_ticks = 2 for attempt 5 so attempt 5 stays in flight while motor1
+  // resets.
+  now += 5000;
+  g.Tick(now, true);  // Attempt 4 polls kFailed; backoff is now 2 s.
+  backend.pending_ticks = 2;
+  while (g.restore_attempt_count() < 5 && now < 10000000) {
+    now += 5000;
+    g.Tick(now, true);
+  }
+  ASSERT_EQ(g.restore_attempt_count(), 5u);
+  ASSERT_EQ(backend.restoring_ids, std::vector<uint16_t>{motor0});
+
+  // Motor1 resets while motor0's restore is pending.
+  backend.resets = {motor1};
+  now += 5000;
+  g.Tick(now, true);  // pending_ticks: 2 -> 1 (kPending); motor1 queued.
+  EXPECT_EQ(g.restore_attempt_count(), 5u);
+
+  // Next tick still pending (pending_ticks: 1 -> 0).
+  now += 5000;
+  g.Tick(now, true);
+  EXPECT_EQ(g.restore_attempt_count(), 5u);
+
+  // Next tick finishes motor0's restore (kFailed): motor1 has never been
+  // attempted yet, so a new restore including motor1 must start on THIS tick
+  // rather than waiting motor0's 2 s backoff.
+  now += 5000;
+  g.Tick(now, true);
+  EXPECT_EQ(g.restore_attempt_count(), 6u);
+  EXPECT_NE(std::find(backend.restoring_ids.begin(),
+                      backend.restoring_ids.end(), motor1),
+            backend.restoring_ids.end());
+}
+
+// Validate() rejects non-finite EncoderConfig fields regardless of encoder
+// kind (offset_rot on kQuadrature, counts_per_rev on kDutyCycle) so invalid
+// values never pass ConfigurationId() and fail later on wire decode.
+// REQ-CONTRACT-17
+TEST(Config, ValidateRejectsNonFiniteEncoderConfigFields) {
+  const double non_finite[] = {
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(),
+      -std::numeric_limits<double>::infinity(),
+  };
+  for (const double bad : non_finite) {
+    {
+      Config c = SwerveConfig(true);
+      c.encoders.push_back(
+          {40, "quad_enc", EncoderKind::kQuadrature, 0, 1, 2048, bad});
+      EXPECT_THROW(Validate(c), std::invalid_argument);
+      EXPECT_FALSE(IsValid(c));
+      EXPECT_EQ(TryConfigurationId(c), 0u);
+    }
+    {
+      Config c = SwerveConfig(true);
+      c.encoders.push_back(
+          {41, "duty_enc", EncoderKind::kDutyCycle, 2, -1, bad, 0.25});
+      EXPECT_THROW(Validate(c), std::invalid_argument);
+      EXPECT_FALSE(IsValid(c));
+      EXPECT_EQ(TryConfigurationId(c), 0u);
+    }
+  }
+}
+
+// When a follower's own feedback (local sample or remote CANcoder) becomes
+// invalid or aged while its master stays healthy, the master keeps driving
+// while the follower goes neutral on that tick and stays neutral on a command
+// observing the invalid-follower State after recovery, resuming only on a
+// command observing a post-recovery State.
+// REQ-SAFE-22
+TEST(Gateway, InvalidFollowerFeedbackNeutralizesOnlyFollowerUntilPostRecovery) {
+  for (const bool remote_aged : {false, true}) {
+    SCOPED_TRACE(remote_aged ? "follower remote CANcoder aged"
+                             : "follower own sample invalid");
+    Config config;
+    config.commissioned = true;
+    MotorConfig master;
+    master.id = 1;
+    master.name = "master";
+    master.can_id = 1;
+    master.max_velocity_rps = 20;
+    MotorConfig follower = master;
+    follower.id = 2;
+    follower.name = "follower";
+    follower.can_id = 2;
+    follower.master_id = master.id;
+    if (remote_aged) {
+      config.sensors.push_back(
+          {3, "follower_enc", SensorKind::kCANcoder, 3, "rio"});
+      follower.feedback = Feedback::kRemoteCANcoder;
+      follower.feedback_sensor_id = 3;
+    }
+    config.motors = {master, follower};
+
+    FakeBackend backend;
+    Gateway g{config, backend, 1};
+    g.Tick(1000, true);
+    ASSERT_TRUE(g.Accept(Request(g), 1, 1000));
+    ASSERT_EQ(backend.last_requests.size(), 2u);
+    ASSERT_EQ(backend.last_requests[0].mode, Mode::kVelocity);
+    ASSERT_EQ(backend.last_requests[1].mode, Mode::kVelocity);
+
+    // Invalidate ONLY the follower's feedback while the master stays healthy.
+    if (remote_aged) {
+      backend.position_ages[3] = config.command_timeout_us;
+    } else {
+      backend.invalid_motor = follower.id;
+    }
+    g.Tick(6000, true);
+    const auto during_state = g.snapshot();
+    EXPECT_TRUE(during_state.motors[0].valid);
+    EXPECT_FALSE(during_state.flags & kHardwareFault);
+    EXPECT_TRUE(during_state.flags & kCommandActive);
+    // Neutralized on the tick that found it invalid; master keeps driving.
+    EXPECT_EQ(backend.last_requests[0].mode, Mode::kVelocity);
+    EXPECT_EQ(backend.last_requests[1].mode, Mode::kNeutral);
+    const auto observing_bad = Request(g);
+
+    // Recover follower feedback on the next tick.
+    backend.invalid_motor = 0;
+    backend.position_ages.clear();
+    g.Tick(11000, true);
+    EXPECT_TRUE(g.snapshot().motors[0].valid);
+    EXPECT_TRUE(g.snapshot().motors[1].valid);
+    if (remote_aged) {
+      EXPECT_TRUE(g.snapshot().sensors[0].valid);
+    }
+
+    // A command observing the invalid-follower State still holds the follower
+    // neutral while driving the master.
+    ASSERT_TRUE(g.Accept(observing_bad, 2, 11000));
+    EXPECT_EQ(backend.last_requests[0].mode, Mode::kVelocity);
+    EXPECT_EQ(backend.last_requests[1].mode, Mode::kNeutral);
+
+    // A command observing the post-recovery State resumes both.
+    ASSERT_TRUE(g.Accept(Request(g), 3, 11000));
+    EXPECT_EQ(backend.last_requests[0].mode, Mode::kVelocity);
+    EXPECT_EQ(backend.last_requests[1].mode, Mode::kVelocity);
   }
 }
 

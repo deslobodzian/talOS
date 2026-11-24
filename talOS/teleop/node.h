@@ -84,7 +84,10 @@ struct SubsystemState {
   std::vector<std::byte> buffer;
   std::vector<std::byte> defaults;
   std::vector<uint8_t> field_set;
-  bool commanding{false};
+  // Start true so a newly started or restarted Teleop releases its lane once
+  // on its first disarmed tick, immediately clearing any pre-restart active
+  // envelope still within command_timeout_us (REQ-SAFE-31).
+  bool commanding{true};
 };
 
 }  // namespace detail

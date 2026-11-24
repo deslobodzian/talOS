@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -897,6 +898,95 @@ TEST(Devices, RezeroRefusesAPositionOlderThanTwoStatusPeriods) {
   mech.b.rezero(1);
   EXPECT_TRUE(mech.b.zeroed());
   EXPECT_DOUBLE_EQ(mech.b.position(), 1);
+}
+
+// REQ-SAFE-05: non-finite, disconnected, and stale-state rezero() calls on an
+// unzeroed rezero-frame motor leave zeroed() false and keep set_position and
+// set_motion_magic neutral.
+TEST(Devices, InvalidRezeroLeavesUnzeroedMotorNeutralInPositionModes) {
+  struct PositionMotor {
+    explicit PositionMotor(Node& n) : m{n, "b"} { AllowUntargetedOutputs(n); }
+    void update() {
+      if (mode == Mode::kPosition) {
+        m.set_position(1.0);
+      } else {
+        m.set_motion_magic(1.0);
+      }
+    }
+    Motor m;
+    Mode mode = Mode::kPosition;
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<PositionMotor>("mech");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_motor("mech", "b", 3.0, 0.0);
+  sim.step(10ms);
+  ASSERT_TRUE(mech.m.connected());
+  ASSERT_FALSE(mech.m.zeroed());
+
+  const auto expect_unzeroed_and_neutral = [&](const char* stage) {
+    EXPECT_FALSE(mech.m.zeroed()) << stage;
+    mech.mode = Mode::kPosition;
+    sim.step(10ms);
+    auto cmd = LastCommand(sim);
+    ASSERT_TRUE(cmd.has_value()) << stage;
+    EXPECT_EQ(cmd->motors[0].mode, Mode::kNeutral) << stage << " (position)";
+    mech.mode = Mode::kMotionMagic;
+    sim.step(10ms);
+    cmd = LastCommand(sim);
+    ASSERT_TRUE(cmd.has_value()) << stage;
+    EXPECT_EQ(cmd->motors[0].mode, Mode::kNeutral)
+        << stage << " (motion magic)";
+  };
+
+  mech.m.rezero(std::numeric_limits<double>::quiet_NaN());
+  expect_unzeroed_and_neutral("rezero(NaN)");
+
+  mech.m.rezero(std::numeric_limits<double>::infinity());
+  expect_unzeroed_and_neutral("rezero(+Inf)");
+
+  hw.set_connected("mech", "b", false);
+  sim.step(10ms);
+  ASSERT_FALSE(mech.m.connected());
+  mech.m.rezero(0.0);
+  EXPECT_FALSE(mech.m.zeroed());
+  hw.set_connected("mech", "b", true);
+  sim.step(10ms);
+  ASSERT_TRUE(mech.m.connected());
+  expect_unzeroed_and_neutral("rezero(0) while disconnected");
+
+  hw.lose_states(25);  // 125 ms > 100 ms command_timeout_us
+  sim.step(110ms);
+  ASSERT_FALSE(sim.node("mech").extension<HardwareLink>().fresh());
+  mech.m.rezero(0.0);
+  EXPECT_FALSE(mech.m.zeroed());
+  // Neutral while stale, and still unzeroed/neutral once fresh enabled
+  // /hw/state resumes (same boot, no device reset).
+  mech.mode = Mode::kPosition;
+  sim.step(5ms);
+  auto stale_cmd = LastCommand(sim);
+  ASSERT_TRUE(stale_cmd.has_value());
+  EXPECT_EQ(stale_cmd->motors[0].mode, Mode::kNeutral);
+  mech.mode = Mode::kMotionMagic;
+  sim.step(5ms);
+  stale_cmd = LastCommand(sim);
+  ASSERT_TRUE(stale_cmd.has_value());
+  EXPECT_EQ(stale_cmd->motors[0].mode, Mode::kNeutral);
+
+  sim.step(20ms);  // past the 25 lost ticks; /hw/state is fresh and enabled
+  ASSERT_TRUE(robot_enabled(sim.node("mech")));
+  expect_unzeroed_and_neutral("rezero(0) while /hw/state stale");
+
+  // Control: a valid rezero(0) now zeroes the motor and unlocks both modes.
+  mech.m.rezero(0.0);
+  EXPECT_TRUE(mech.m.zeroed());
+  mech.mode = Mode::kPosition;
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kPosition);
+  mech.mode = Mode::kMotionMagic;
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kMotionMagic);
 }
 
 // REQ-SAFE-05
@@ -1856,6 +1946,47 @@ TEST(Devices, UnknownDeviceThrows) {
                std::invalid_argument);
 }
 
+struct OutputSetterCase {
+  const char* name;
+  const char* device;
+  void (*call)(Motor&, DigitalOutput&, PwmOutput&);
+};
+
+constexpr std::array<OutputSetterCase, 10> kOutputSetterCases = {{
+    {"Motor::set_duty_cycle", "'a'",
+     [](Motor& m, DigitalOutput&, PwmOutput&) { m.set_duty_cycle(0.5); }},
+    {"Motor::set_voltage", "'a'",
+     [](Motor& m, DigitalOutput&, PwmOutput&) { m.set_voltage(6.0); }},
+    {"Motor::set_velocity", "'a'",
+     [](Motor& m, DigitalOutput&, PwmOutput&) { m.set_velocity(10.0); }},
+    {"Motor::set_position", "'a'",
+     [](Motor& m, DigitalOutput&, PwmOutput&) { m.set_position(1.0); }},
+    {"Motor::set_motion_magic", "'a'",
+     [](Motor& m, DigitalOutput&, PwmOutput&) { m.set_motion_magic(1.0); }},
+    {"Motor::set_torque_current", "'a'",
+     [](Motor& m, DigitalOutput&, PwmOutput&) { m.set_torque_current(2.0); }},
+    {"Motor::stop", "'a'",
+     [](Motor& m, DigitalOutput&, PwmOutput&) { m.stop(); }},
+    {"DigitalOutput::set", "'led'",
+     [](Motor&, DigitalOutput& d, PwmOutput&) { d.set(true); }},
+    {"PwmOutput::set", "'servo'",
+     [](Motor&, DigitalOutput&, PwmOutput& p) { p.set(0.5); }},
+    {"PwmOutput::stop", "'servo'",
+     [](Motor&, DigitalOutput&, PwmOutput& p) { p.stop(); }},
+}};
+
+template <class Fn>
+void ExpectLogicErrorNaming(Fn&& fn, std::string_view device,
+                            std::string_view context) {
+  try {
+    fn();
+    ADD_FAILURE() << context << " was accepted for " << device;
+  } catch (const std::logic_error& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find(device), std::string::npos) << what;
+  }
+}
+
 // The flush after each update() sends neutral for every output that update()
 // did not set, so a 20 ms every() on a 5 ms node would drive its motor one
 // tick in four. Outputs set outside update() are refused, naming the device;
@@ -1886,71 +2017,52 @@ TEST(Devices, OutputSettersOutsideUpdateThrow) {
     void update() {}
     Motor motor;
   };
-  const auto expect_throws_naming = [](auto fn, std::string_view device) {
-    try {
-      fn();
-      ADD_FAILURE() << "output setter outside update() was accepted for "
-                    << device;
-    } catch (const std::logic_error& error) {
-      const std::string what = error.what();
-      EXPECT_NE(what.find(device), std::string::npos) << what;
-    }
-  };
-  expect_throws_naming(
+  ExpectLogicErrorNaming(
       [] {
         auto sim = Sim::FromToml(kRobotToml);
         sim.add<EagerServoSet>("mech");
       },
-      "'servo'");
-  expect_throws_naming(
+      "'servo'", "output setter in constructor");
+  ExpectLogicErrorNaming(
       [] {
         auto sim = Sim::FromToml(kRobotToml);
         sim.add<EagerServoStop>("mech");
       },
-      "'servo'");
-  expect_throws_naming(
+      "'servo'", "output setter in constructor");
+  ExpectLogicErrorNaming(
       [] {
         auto sim = Sim::FromToml(kRobotToml);
         sim.add<EagerLed>("mech");
       },
-      "'led'");
-  expect_throws_naming(
+      "'led'", "output setter in constructor");
+  ExpectLogicErrorNaming(
       [] {
         auto sim = Sim::FromToml(kRobotToml);
         sim.add<EagerMotor>("mech");
       },
-      "'a'");
+      "'a'", "output setter in constructor");
 
-  // Every Motor output setter called from every() throws std::logic_error
-  // naming the motor (with torque current configured so the update()-gate
-  // fires before any config check).
-  struct MotorSetterCase {
-    const char* name;
-    void (*call)(Motor&);
-  };
-  const MotorSetterCase motor_cases[] = {
-      {"set_duty_cycle", [](Motor& m) { m.set_duty_cycle(0.5); }},
-      {"set_voltage", [](Motor& m) { m.set_voltage(6.0); }},
-      {"set_velocity", [](Motor& m) { m.set_velocity(10.0); }},
-      {"set_position", [](Motor& m) { m.set_position(1.0); }},
-      {"set_motion_magic", [](Motor& m) { m.set_motion_magic(1.0); }},
-      {"set_torque_current", [](Motor& m) { m.set_torque_current(2.0); }},
-      {"stop", [](Motor& m) { m.stop(); }},
-  };
+  // Every Motor, DigitalOutput and PwmOutput setter called from every() throws
+  // std::logic_error naming the device (with torque current configured so the
+  // update()-gate fires before any config check).
   struct Pulser {
-    explicit Pulser(Node& node) : motor{node, "a"} {
-      node.every(20ms, [this] { call(motor); });
+    explicit Pulser(Node& node)
+        : motor{node, "a"}, led{node, "led"}, servo{node, "servo"} {
+      node.every(20ms, [this] { call(motor, led, servo); });
     }
     void update() {}
     Motor motor;
-    void (*call)(Motor&) = nullptr;
+    DigitalOutput led;
+    PwmOutput servo;
+    void (*call)(Motor&, DigitalOutput&, PwmOutput&) = nullptr;
   };
   const std::string torque_toml = WithMotorAKeys(kTorqueKeys);
-  for (const auto& [name, call] : motor_cases) {
+  for (const auto& [name, device, call] : kOutputSetterCases) {
     SCOPED_TRACE(name);
     auto sim = Sim::FromToml(torque_toml);
     sim.add<Pulser>("mech").call = call;
-    expect_throws_naming([&] { sim.step(50ms); }, "'a'");
+    ExpectLogicErrorNaming([&] { sim.step(50ms); }, device,
+                           "output setter in every()");
   }
 }
 
@@ -1962,15 +2074,21 @@ TEST(Devices, OutputSettersOutsideUpdateThrow) {
 TEST(Devices, OutputSettersFromACallbackOrAnotherThreadThrow) {
   struct Listener {
     explicit Listener(Node& n)
-        : led{n, "led"},
+        : motor{n, "a"},
+          led{n, "led"},
+          servo{n, "servo"},
           poke{n.subscribe<::bridge::BridgeStatus>(
-              "/test/poke",
-              [this](const ::bridge::BridgeStatus&) { led.set(true); })} {
+              "/test/poke", [this](const ::bridge::BridgeStatus&) {
+                call(motor, led, servo);
+              })} {
       AllowUntargetedOutputs(n);
     }
     void update() {}
+    Motor motor;
     DigitalOutput led;
+    PwmOutput servo;
     Subscription<::bridge::BridgeStatus> poke;
+    void (*call)(Motor&, DigitalOutput&, PwmOutput&) = nullptr;
   };
   struct Threaded {
     explicit Threaded(Node& n)
@@ -1979,52 +2097,40 @@ TEST(Devices, OutputSettersFromACallbackOrAnotherThreadThrow) {
     }
     void update() {
       std::thread other{[this] {
-        auto capture = [](auto fn, std::string& out) {
+        for (std::size_t i = 0; i < kOutputSetterCases.size(); ++i) {
           try {
-            fn();
-            out = "accepted";
+            kOutputSetterCases[i].call(motor, led, servo);
+            errors[i] = "accepted";
           } catch (const std::logic_error& thrown) {
-            out = thrown.what();
+            errors[i] = thrown.what();
           }
-        };
-        capture([this] { motor.set_voltage(1.0); }, motor_error);
-        capture([this] { led.set(true); }, led_error);
-        capture([this] { servo.set(0.5); }, servo_set_error);
-        capture([this] { servo.stop(); }, servo_stop_error);
+        }
       }};
       other.join();
     }
     Motor motor;
     DigitalOutput led;
     PwmOutput servo;
-    std::string motor_error;
-    std::string led_error;
-    std::string servo_set_error;
-    std::string servo_stop_error;
+    std::array<std::string, kOutputSetterCases.size()> errors;
   };
-  {
-    auto sim = Sim::FromToml(kRobotToml);
-    sim.add<Listener>("mech");
+  const std::string torque_toml = WithMotorAKeys(kTorqueKeys);
+  for (const auto& [name, device, call] : kOutputSetterCases) {
+    SCOPED_TRACE(name);
+    auto sim = Sim::FromToml(torque_toml);
+    sim.add<Listener>("mech").call = call;
     sim.publish("/test/poke", ::bridge::BridgeStatus{});
-    try {
-      sim.step(10ms);
-      ADD_FAILURE() << "a digital output set in a callback was accepted";
-    } catch (const std::logic_error& error) {
-      EXPECT_NE(std::string{error.what()}.find("'led'"), std::string::npos)
-          << error.what();
-    }
+    ExpectLogicErrorNaming([&] { sim.step(10ms); }, device,
+                           "output setter in a subscription callback");
   }
-  auto sim = Sim::FromToml(kRobotToml);
+  auto sim = Sim::FromToml(torque_toml);
   auto& threaded = sim.add<Threaded>("mech");
   sim.step(10ms);
-  EXPECT_NE(threaded.motor_error.find("'a'"), std::string::npos)
-      << threaded.motor_error;
-  EXPECT_NE(threaded.led_error.find("'led'"), std::string::npos)
-      << threaded.led_error;
-  EXPECT_NE(threaded.servo_set_error.find("'servo'"), std::string::npos)
-      << threaded.servo_set_error;
-  EXPECT_NE(threaded.servo_stop_error.find("'servo'"), std::string::npos)
-      << threaded.servo_stop_error;
+  for (std::size_t i = 0; i < kOutputSetterCases.size(); ++i) {
+    SCOPED_TRACE(kOutputSetterCases[i].name);
+    EXPECT_NE(threaded.errors[i].find(kOutputSetterCases[i].device),
+              std::string::npos)
+        << threaded.errors[i];
+  }
 }
 
 // The opt-out is fixed with the node: from update() it is refused, naming
@@ -2437,6 +2543,7 @@ TEST(Devices, DriverStationDropsACorruptPacket) {
   EXPECT_EQ(pilot.packets, 0);
   EXPECT_FALSE(pilot.ds.connected());
 }
+// REQ-SAFE-11
 TEST(Devices, DriverStationRejectsReorderedSampleAndModeTimes) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& pilot = sim.add<Pilot>("watcher");
@@ -2456,12 +2563,26 @@ TEST(Devices, DriverStationRejectsReorderedSampleAndModeTimes) {
   data.sample_time_us = 201;
   data.mode_since_us = 99;
   publish();
+  // A zero mode_since_us cannot zero out an established generation in the
+  // same boot (which would admit an older generation later).
+  data.sample_time_us = 201;
+  data.mode_since_us = 0;
+  publish();
   EXPECT_EQ(pilot.packets, 1);
   EXPECT_EQ(pilot.ds.data().sample_time_us, 200u);
   EXPECT_EQ(pilot.ds.data().mode_since_us, 100u);
   data.mode_since_us = 100;
   publish();
+  ASSERT_EQ(pilot.packets, 2);
+  ASSERT_TRUE(pilot.ds.connected());
+  ASSERT_TRUE(pilot.ds.enabled());
+
+  // Replaying the same nonzero sample_time_us is rejected and must not
+  // refresh freshness past [robot] command_timeout_us (100 ms).
+  for (int i = 0; i < 12; ++i) publish();
   EXPECT_EQ(pilot.packets, 2);
+  EXPECT_FALSE(pilot.ds.connected());
+  EXPECT_FALSE(pilot.ds.enabled());
 }
 
 // REQ-SAFE-11
@@ -2510,12 +2631,18 @@ TEST(Devices, DriverStationFollowsAGatewayRebootAndRetiresTheOldBoot) {
   EXPECT_TRUE(pilot.ds.autonomous());
   EXPECT_EQ(pilot.ds.data().boot_id, kBootB);
 
-  // Within boot B, ordering holds again.
+  // Within boot B, ordering holds again, including a delayed sample_time_us=0
+  // packet from the start of boot B.
   publish(kBootB, 21000, 1000, kAuto);
   EXPECT_EQ(pilot.packets, 3);
   publish(kBootB, 11000, 1000, kTeleop);
   EXPECT_EQ(pilot.packets, 3);
   EXPECT_TRUE(pilot.ds.autonomous());
+  publish(kBootB, 0, 0, kTeleop);
+  EXPECT_EQ(pilot.packets, 3);
+  EXPECT_TRUE(pilot.ds.autonomous());
+  EXPECT_EQ(pilot.ds.data().sample_time_us, 21000u);
+  EXPECT_EQ(pilot.ds.data().mode_since_us, 1000u);
 
   // Disabled in boot B reads disabled; silence reads disconnected.
   publish(kBootB, 41000, 41000, driver_station::kDsAttached);
