@@ -343,21 +343,34 @@ class SessionDirectoryLock {
   }
 
   // Whether a launch (or a retention removing it) holds `dir`'s lock now.
-  // False when `dir` holds no lock file: a launch holds one from before its
-  // directory holds anything; and on a root without advisory locks
-  // (`root_takes_no_locks`, LogRootTakesNoLocks). On a root whose locks
-  // work, a flock failing as FlockUnsupported or ENOLCK cannot say, and counts
-  // as held. ENOLCK always counts as held. Creates nothing.
+  // False only when `dir` holds no lock file (ENOENT or ENOTDIR — a launch
+  // holds one from before its directory holds anything), when flock succeeds,
+  // or on a root without advisory locks (`root_takes_no_locks`,
+  // LogRootTakesNoLocks) when flock fails as FlockUnsupported. Any other open
+  // failure (EACCES, EMFILE, ELOOP, ...) or flock refusal (after retrying
+  // EINTR) cannot prove the lock absent, and fails closed (counts as held).
+  // ENOLCK always counts as held. Creates nothing.
   static bool Held(const std::filesystem::path& dir, bool root_takes_no_locks,
                    const FlockFunction& lock = ::flock) {
-    const int fd = ::open((dir / kSessionDirectoryLockFile).c_str(),
-                          O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) return false;
-    const bool refused = lock(fd, LOCK_SH | LOCK_NB) != 0;
-    const int code = errno;
+    int fd = -1;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+      fd = ::open((dir / kSessionDirectoryLockFile).c_str(),
+                  O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+      if (fd >= 0 || errno != EINTR) break;
+    }
+    if (fd < 0) return errno != ENOENT && errno != ENOTDIR;
+    int result = -1;
+    int code = 0;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+      errno = 0;
+      result = lock(fd, LOCK_SH | LOCK_NB);
+      code = errno;
+      if (result == 0 || code != EINTR) break;
+    }
     ::close(fd);
-    return refused && (code == EWOULDBLOCK || code == ENOLCK ||
-                       (FlockUnsupported(code) && !root_takes_no_locks));
+    if (result == 0) return false;
+    if (FlockUnsupported(code) && root_takes_no_locks) return false;
+    return true;
   }
 
   // Takes `dir`'s lock to remove `dir`, creating the lock file when it is
