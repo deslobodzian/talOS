@@ -6,7 +6,9 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -58,6 +60,23 @@ std::vector<CameraMode> Modes(AVCaptureDevice* device) {
     }
   }
   return modes;
+}
+struct DetachedSession {
+  std::mutex op_mutex;
+  bool stopped = false;
+  AVCaptureSession* session = nil;
+  AVCaptureVideoDataOutput* output = nil;
+  TalosCaptureDelegate* delegate = nil;
+  dispatch_queue_t dispatch = nullptr;
+};
+void StopSessionOnce(DetachedSession& detached) {
+  std::lock_guard<std::mutex> lock(detached.op_mutex);
+  if (detached.stopped) return;
+  detached.stopped = true;
+  @autoreleasepool {
+    [detached.session stopRunning];
+    [detached.output setSampleBufferDelegate:nil queue:nullptr];
+  }
 }
 class Source final : public CameraSource {
  public:
@@ -126,18 +145,20 @@ class Source final : public CameraSource {
       return device != nil && device.connected;
     }
   }
-  bool controls_applied() const override { return controls_applied_; }
+  bool controls_applied() const override {
+    return controls_applied_.load(std::memory_order_acquire);
+  }
   bool Start() override {
     if (IsSelfReceive()) return false;
     std::unique_lock<std::mutex> lifecycle(lifecycle_mutex_);
     for (;;) {
       if (running_.load(std::memory_order_acquire)) return true;
-      std::vector<DetachedSession> to_drain;
+      std::vector<std::shared_ptr<DetachedSession>> to_drain;
       CollectRetiredLocked(to_drain);
       if (!to_drain.empty()) {
         ++active_teardowns_;
         lifecycle.unlock();
-        for (auto& d : to_drain) TeardownDetached(d);
+        for (const auto& d : to_drain) TeardownDetached(d);
         to_drain.clear();
         lifecycle.lock();
         --active_teardowns_;
@@ -155,12 +176,11 @@ class Source final : public CameraSource {
       break;
     }
     auto fail = [&](ConnectionState state, const std::string& message) {
-      DetachedSession detached = DetachSessionLocked();
-      const bool has_detached = HasSession(detached);
-      if (has_detached) ++active_teardowns_;
+      std::shared_ptr<DetachedSession> detached = DetachSessionLocked();
+      if (detached) ++active_teardowns_;
       const std::string full = device_id() + ": " + message;
       lifecycle.unlock();
-      if (has_detached) {
+      if (detached) {
         TeardownDetached(detached);
         lifecycle.lock();
         --active_teardowns_;
@@ -261,11 +281,12 @@ class Source final : public CameraSource {
       }
       // macOS exposes exposure-mode selection, but not custom duration/ISO.
       // Keep streaming when unsupported and surface the failed request.
-      controls_applied_ =
+      const bool controls_applied =
           controls.auto_exposure && controls.auto_gain &&
           [device_ isExposureModeSupported:
                        AVCaptureExposureModeContinuousAutoExposure];
-      if (controls_applied_)
+      controls_applied_.store(controls_applied, std::memory_order_release);
+      if (controls_applied)
         device_.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
       [device_ unlockForConfiguration];
       if (!selected) {
@@ -336,32 +357,30 @@ class Source final : public CameraSource {
     running_.store(false, std::memory_order_release);
     connected_.store(false, std::memory_order_release);
     if (IsSelfReceive()) {
-      DetachedSession detached = DetachSessionLocked();
-      if (HasSession(detached)) {
+      std::shared_ptr<DetachedSession> detached = DetachSessionLocked();
+      if (detached) {
         retired_sessions_.push_back(detached);
       }
       lifecycle.unlock();
-      if (HasSession(detached)) {
-        @autoreleasepool {
-          [detached.session stopRunning];
-          [detached.output setSampleBufferDelegate:nil queue:nullptr];
-        }
+      if (detached) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+          StopSessionOnce(*detached);
+        });
       }
       return;
     }
     for (;;) {
       running_.store(false, std::memory_order_release);
       connected_.store(false, std::memory_order_release);
-      std::vector<DetachedSession> to_drain;
-      DetachedSession active = DetachSessionLocked();
-      if (HasSession(active)) {
-        to_drain.push_back(active);
+      std::vector<std::shared_ptr<DetachedSession>> to_drain;
+      if (auto active = DetachSessionLocked()) {
+        to_drain.push_back(std::move(active));
       }
       CollectRetiredLocked(to_drain);
       if (!to_drain.empty()) {
         ++active_teardowns_;
         lifecycle.unlock();
-        for (auto& d : to_drain) TeardownDetached(d);
+        for (const auto& d : to_drain) TeardownDetached(d);
         to_drain.clear();
         lifecycle.lock();
         --active_teardowns_;
@@ -386,19 +405,10 @@ class Source final : public CameraSource {
 
   bool IsSelfReceive() const { return t_current_receive_source == this; }
 
-  struct DetachedSession {
-    AVCaptureSession* session = nil;
-    AVCaptureVideoDataOutput* output = nil;
-    TalosCaptureDelegate* delegate = nil;
-    dispatch_queue_t dispatch = nullptr;
-  };
-  static bool HasSession(const DetachedSession& d) {
-    return d.session != nil || d.output != nil || d.delegate != nil ||
-           d.dispatch != nullptr;
-  }
-  void CollectRetiredLocked(std::vector<DetachedSession>& out) {
+  void CollectRetiredLocked(
+      std::vector<std::shared_ptr<DetachedSession>>& out) {
     for (auto& d : retired_sessions_) {
-      if (HasSession(d)) out.push_back(d);
+      if (d) out.push_back(std::move(d));
     }
     retired_sessions_.clear();
   }
@@ -407,12 +417,12 @@ class Source final : public CameraSource {
     if (IsSelfReceive()) return false;
     for (;;) {
       if (running_.load(std::memory_order_acquire)) return false;
-      std::vector<DetachedSession> to_drain;
+      std::vector<std::shared_ptr<DetachedSession>> to_drain;
       CollectRetiredLocked(to_drain);
       if (!to_drain.empty()) {
         ++active_teardowns_;
         lifecycle.unlock();
-        for (auto& d : to_drain) TeardownDetached(d);
+        for (const auto& d : to_drain) TeardownDetached(d);
         to_drain.clear();
         lifecycle.lock();
         --active_teardowns_;
@@ -430,14 +440,18 @@ class Source final : public CameraSource {
       return !running_.load(std::memory_order_acquire);
     }
   }
-  DetachedSession DetachSessionLocked() {
+  std::shared_ptr<DetachedSession> DetachSessionLocked() {
     running_.store(false, std::memory_order_release);
     connected_.store(false, std::memory_order_release);
-    DetachedSession detached;
-    detached.session = session_;
-    detached.output = output_;
-    detached.delegate = delegate_;
-    detached.dispatch = dispatch_;
+    std::shared_ptr<DetachedSession> detached;
+    if (session_ != nil || output_ != nil || delegate_ != nil ||
+        dispatch_ != nullptr) {
+      detached = std::make_shared<DetachedSession>();
+      detached->session = session_;
+      detached->output = output_;
+      detached->delegate = delegate_;
+      detached->dispatch = dispatch_;
+    }
     session_ = nil;
     output_ = nil;
     delegate_ = nil;
@@ -448,23 +462,24 @@ class Source final : public CameraSource {
     }
     return detached;
   }
-  void TeardownDetached(DetachedSession& detached) {
+  void TeardownDetached(const std::shared_ptr<DetachedSession>& detached) {
+    if (!detached) return;
     @autoreleasepool {
-      [detached.session stopRunning];
-      [detached.output setSampleBufferDelegate:nil queue:nullptr];
+      StopSessionOnce(*detached);
       const bool on_this_queue =
-          detached.dispatch &&
+          detached->dispatch &&
           dispatch_get_specific(&kDispatchQueueKey) ==
-              (__bridge void*)detached.dispatch;
-      if (detached.dispatch && !on_this_queue) {
-        dispatch_sync(detached.dispatch, ^{
+              (__bridge void*)detached->dispatch;
+      if (detached->dispatch && !on_this_queue) {
+        dispatch_sync(detached->dispatch, ^{
                       });
       }
-      if (detached.delegate) detached.delegate->callback = {};
-      detached.delegate = nil;
-      detached.output = nil;
-      detached.session = nil;
-      detached.dispatch = nullptr;
+      if (detached->delegate) detached->delegate->callback = {};
+      std::lock_guard<std::mutex> lock(detached->op_mutex);
+      detached->delegate = nil;
+      detached->output = nil;
+      detached->session = nil;
+      detached->dispatch = nullptr;
     }
   }
   void NotifyConnection(ConnectionState state, const std::string& message) {
@@ -491,7 +506,7 @@ class Source final : public CameraSource {
     } scope{this};
     if (!running_.load(std::memory_order_acquire)) return;
     CVPixelBufferRef pixels = CMSampleBufferGetImageBuffer(sample);
-    if (!pixels ||
+    if (!pixels || CVPixelBufferIsPlanar(pixels) ||
         CVPixelBufferLockBaseAddress(pixels, kCVPixelBufferLock_ReadOnly) !=
             kCVReturnSuccess) {
       // Counted by the consumer through dropped_frames().
@@ -504,25 +519,56 @@ class Source final : public CameraSource {
         CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
       }
     } unlock_guard{pixels};
-    const size_t size =
-        CVPixelBufferGetBytesPerRow(pixels) * CVPixelBufferGetHeight(pixels);
-    const auto pixel_type = CVPixelBufferGetPixelFormatType(pixels);
-    const auto format = pixel_type == kCVPixelFormatType_OneComponent8
-                            ? PixelFormat::kGray8
-                        : pixel_type == kCVPixelFormatType_422YpCbCr8_yuvs
-                            ? PixelFormat::kYuyv
-                            : PixelFormat::kBgra8;
+    PixelFormat format{};
+    switch (CVPixelBufferGetPixelFormatType(pixels)) {
+      case kCVPixelFormatType_OneComponent8:
+        format = PixelFormat::kGray8;
+        break;
+      case kCVPixelFormatType_422YpCbCr8_yuvs:
+        format = PixelFormat::kYuyv;
+        break;
+      case kCVPixelFormatType_32BGRA:
+        format = PixelFormat::kBgra8;
+        break;
+      default:
+        ++dropped_frames_;
+        return;
+    }
+    const auto* base =
+        static_cast<const uint8_t*>(CVPixelBufferGetBaseAddress(pixels));
+    const size_t width = CVPixelBufferGetWidth(pixels);
+    const size_t height = CVPixelBufferGetHeight(pixels);
+    const size_t bytes_per_row = CVPixelBufferGetBytesPerRow(pixels);
+    const size_t bpp = BytesPerPixel(format);
+    constexpr size_t kMaxUint32 = std::numeric_limits<uint32_t>::max();
+    if (base == nullptr || width == 0 || height == 0 || width > kMaxUint32 ||
+        height > kMaxUint32 || bytes_per_row > kMaxUint32 ||
+        width > std::numeric_limits<size_t>::max() / bpp ||
+        bytes_per_row < width * bpp ||
+        bytes_per_row > std::numeric_limits<size_t>::max() / height) {
+      ++dropped_frames_;
+      return;
+    }
+    const size_t size = bytes_per_row * height;
     // The frame borrows the locked pixel buffer until the callback returns;
     // the consumer copies what it keeps (FrameMailbox).
-    Frame frame(
-        id_, session_id_, sequence_++, event::Poller::now(),
-        static_cast<uint32_t>(CVPixelBufferGetWidth(pixels)),
-        static_cast<uint32_t>(CVPixelBufferGetHeight(pixels)),
-        static_cast<uint32_t>(CVPixelBufferGetBytesPerRow(pixels)), format,
-        static_cast<const uint8_t*>(CVPixelBufferGetBaseAddress(pixels)), size);
+    Frame frame(id_, session_id_, sequence_++, event::Poller::now(),
+                static_cast<uint32_t>(width), static_cast<uint32_t>(height),
+                static_cast<uint32_t>(bytes_per_row), format, base, size);
     const CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);
-    frame.set_raw_timestamp_ns(
-        CMTIME_IS_NUMERIC(pts) ? CMTimeGetSeconds(pts) * 1e9 : 0);
+    int64_t raw_timestamp_ns = 0;
+    if (CMTIME_IS_NUMERIC(pts)) {
+      const double pts_ns = CMTimeGetSeconds(pts) * 1e9;
+      constexpr double kMinInt64 =
+          static_cast<double>(std::numeric_limits<int64_t>::min());
+      constexpr double kMaxInt64Exclusive =
+          -static_cast<double>(std::numeric_limits<int64_t>::min());
+      if (std::isfinite(pts_ns) && pts_ns >= kMinInt64 &&
+          pts_ns < kMaxInt64Exclusive) {
+        raw_timestamp_ns = static_cast<int64_t>(pts_ns);
+      }
+    }
+    frame.set_raw_timestamp_ns(raw_timestamp_ns);
     frame.set_timestamp_kind(TimestampKind::kDelivery);
     frame.set_mapping_quality(TimestampMappingQuality::kEstimated);
     if (session.synchronizationClock && CMTIME_IS_NUMERIC(pts)) {
@@ -554,12 +600,12 @@ class Source final : public CameraSource {
   std::atomic<bool> running_{false};
   std::atomic<bool> connected_{false};
   std::atomic<uint64_t> dropped_frames_{0};
-  bool controls_applied_{true};
+  std::atomic<bool> controls_applied_{true};
   uint64_t session_id_ = 0, sequence_ = 0;
   mutable std::mutex lifecycle_mutex_;
   std::condition_variable lifecycle_cv_;
   size_t active_teardowns_{0};
-  std::vector<DetachedSession> retired_sessions_;
+  std::vector<std::shared_ptr<DetachedSession>> retired_sessions_;
   mutable std::mutex device_mutex_;
   static constexpr char kDispatchQueueKey = 0;
   AVCaptureDevice* device_ = nil;

@@ -388,11 +388,14 @@ TEST(Capture, LinuxDisconnectReleasesDeviceAllowsSelfStopAndSetMode) {
     std::mutex mu;
     std::condition_variable cv;
     bool cb_ran = false;
+    bool set_mode_in_frame_cb = true;
     int open_fds_after_self_stop = -1;
     int active_mmaps_after_self_stop = -1;
     source->SetFrameCallback([&](const Frame&) {
       frame_delivered.store(true);
       source->Stop();
+      set_mode_in_frame_cb =
+          source->SetMode({160, 120, 60.0, PixelFormat::kGray8});
       {
         std::lock_guard lock(state.mu);
         open_fds_after_self_stop = state.open_fds;
@@ -410,6 +413,7 @@ TEST(Capture, LinuxDisconnectReleasesDeviceAllowsSelfStopAndSetMode) {
       ASSERT_TRUE(
           cv.wait_for(lock, std::chrono::seconds{10}, [&] { return cb_ran; }));
     }
+    EXPECT_FALSE(set_mode_in_frame_cb);
     EXPECT_GT(open_fds_after_self_stop, 0);
     EXPECT_GT(active_mmaps_after_self_stop, 0);
     // External Stop() joins the retired worker after Capture() finishes
@@ -482,6 +486,52 @@ TEST(Capture, LinuxDisconnectReleasesDeviceAllowsSelfStopAndSetMode) {
     });
     stopper.join();
     EXPECT_FALSE(source->IsRunning());
+    {
+      std::lock_guard lock(state.mu);
+      EXPECT_EQ(state.open_fds, 0);
+      EXPECT_EQ(state.active_mmaps, 0);
+    }
+  }
+
+  // Case 5: Calling SetMode() and SetControls() directly inside the
+  // kDisconnected callback (without calling Stop() first) succeeds on the
+  // worker thread after the device has been released.
+  {
+    FakeV4L2State state;
+    auto source = CreateV4L2CameraSourceForTest(
+        config, state.Syscalls([](pollfd* fds, nfds_t, int) {
+          fds[0].revents = POLLHUP;
+          return 1;
+        }));
+    std::mutex mu;
+    std::condition_variable cv;
+    bool disconnected = false;
+    bool set_mode_ok = false;
+    bool set_controls_ok = false;
+    source->SetConnectionCallback([&](ConnectionState conn, std::string_view) {
+      if (conn != ConnectionState::kDisconnected) return;
+      set_mode_ok = source->SetMode({160, 120, 60.0, PixelFormat::kGray8});
+      set_controls_ok = source->SetControls({.exposure_ms = 3.5, .gain = 7.0});
+      {
+        std::lock_guard lock(mu);
+        disconnected = true;
+      }
+      cv.notify_one();
+    });
+    ASSERT_TRUE(source->Start());
+    {
+      std::unique_lock lock(mu);
+      ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds{10},
+                              [&] { return disconnected; }));
+    }
+    EXPECT_TRUE(set_mode_ok);
+    EXPECT_TRUE(set_controls_ok);
+    EXPECT_EQ(source->CurrentMode().width, 160u);
+    EXPECT_EQ(source->CurrentMode().height, 120u);
+    EXPECT_DOUBLE_EQ(source->CurrentMode().fps, 60.0);
+    EXPECT_DOUBLE_EQ(source->GetControls().exposure_ms, 3.5);
+    EXPECT_DOUBLE_EQ(source->GetControls().gain, 7.0);
+    source->Stop();
     {
       std::lock_guard lock(state.mu);
       EXPECT_EQ(state.open_fds, 0);
