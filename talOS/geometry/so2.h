@@ -17,7 +17,7 @@ class SO2 {
   SO2() : theta_(Scalar(0)) {}
   explicit SO2(Scalar theta) : theta_(Wrap(theta)) {}
   SO2(Scalar cos_theta, Scalar sin_theta)
-      : SO2(std::atan2(sin_theta, cos_theta)) {}
+      : theta_(FromCosSinAngle(cos_theta, sin_theta)) {}
 
   static SO2 Identity() { return SO2(Scalar(0)); }
   static SO2 FromAngle(Scalar theta) { return SO2(theta); }
@@ -63,9 +63,20 @@ class SO2 {
 
  private:
   static constexpr double kPi = 3.14159265358979323846;
-  static Scalar Wrap(Scalar theta) {
-    const Scalar wrapped = std::atan2(std::sin(theta), std::cos(theta));
+  static Scalar CanonicalizePrincipal(Scalar wrapped) {
     return wrapped <= -Scalar(kPi) ? Scalar(kPi) : wrapped;
+  }
+  static Scalar FromCosSinAngle(Scalar cos_theta, Scalar sin_theta) {
+    // IEEE 754 atan2(-0.0, -x) returns -pi (which on some libm float
+    // implementations rounds toward zero to nextafter(-kPi, 0)), so map the
+    // negative real axis explicitly to +kPi to keep (-pi, pi] canonical.
+    if (sin_theta == Scalar(0) && cos_theta < Scalar(0)) return Scalar(kPi);
+    return CanonicalizePrincipal(std::atan2(sin_theta, cos_theta));
+  }
+  static Scalar Wrap(Scalar theta) {
+    if (theta > -Scalar(kPi) && theta <= Scalar(kPi)) return theta;
+    if (theta == -Scalar(kPi)) return Scalar(kPi);
+    return CanonicalizePrincipal(std::atan2(std::sin(theta), std::cos(theta)));
   }
   Scalar theta_;
 };

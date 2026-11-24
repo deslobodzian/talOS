@@ -1,13 +1,17 @@
 #include "talOS/vision/recording/recorder.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <deque>
-#include <fstream>
 #include <limits>
 #include <mutex>
 #include <opencv2/imgcodecs.hpp>
@@ -26,6 +30,68 @@ namespace talos::vision::recording {
 namespace {
 
 constexpr std::uint64_t kNsPerSecond = 1'000'000'000;
+constexpr std::size_t kMaxReasonLength = 64;
+
+bool IsSupportedPixelFormat(PixelFormat format) {
+  switch (format) {
+    case PixelFormat::kGray8:
+    case PixelFormat::kRgb8:
+    case PixelFormat::kBgr8:
+    case PixelFormat::kYuyv:
+    case PixelFormat::kBgra8:
+      return true;
+  }
+  return false;
+}
+
+class ScopedFd {
+ public:
+  explicit ScopedFd(int fd = -1) noexcept : fd_(fd) {}
+  ~ScopedFd() { Reset(); }
+  ScopedFd(const ScopedFd&) = delete;
+  ScopedFd& operator=(const ScopedFd&) = delete;
+  ScopedFd(ScopedFd&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+  ScopedFd& operator=(ScopedFd&& other) noexcept {
+    if (this != &other) {
+      Reset();
+      fd_ = std::exchange(other.fd_, -1);
+    }
+    return *this;
+  }
+
+  int get() const noexcept { return fd_; }
+  int Release() noexcept { return std::exchange(fd_, -1); }
+  void Reset() noexcept {
+    if (fd_ >= 0) {
+      ::close(fd_);
+      fd_ = -1;
+    }
+  }
+
+ private:
+  int fd_{-1};
+};
+
+std::filesystem::path StripTrailingSlashes(const std::filesystem::path& path) {
+  std::string s = path.string();
+  while (s.size() > 1 && s.back() == '/') {
+    s.pop_back();
+  }
+  return std::filesystem::path(std::move(s));
+}
+
+ScopedFd OpenOutputDirNoFollow(const std::filesystem::path& dir) {
+  int fd = -1;
+  do {
+    fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  } while (fd < 0 && errno == EINTR);
+  if (fd < 0) {
+    const int err = errno;
+    throw std::runtime_error("cannot open output directory " + dir.string() +
+                             ": " + std::strerror(err));
+  }
+  return ScopedFd(fd);
+}
 
 // Converts `frame`'s pixels to 8-bit grayscale into `dst` (width*height
 // bytes). Reads the caller's frame once, writes the preallocated slot once.
@@ -89,43 +155,82 @@ void ToGray(const Frame& frame, std::uint8_t* dst) {
         for (std::uint32_t x = 0; x < w; ++x) {
           // YUYV: [Y0 U Y1 V] groups; the luminance is the even byte of each
           // two-byte pixel.
-          out[x] = row[(x / 2) * 4 + (x % 2) * 2];
+          out[x] = row[static_cast<std::size_t>(x) * 2];
         }
       }
       break;
   }
 }
 
-void WriteFileAtomic(const std::filesystem::path& path, const void* data,
+void WriteFileAtomic(const std::filesystem::path& dir,
+                     const std::string& filename, const void* data,
                      std::size_t size) {
-  const std::filesystem::path tmp = path.string() + ".tmp";
-  {
-    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-    if (!out) {
-      throw std::runtime_error("cannot create " + tmp.string());
-    }
-    out.write(static_cast<const char*>(data),
-              static_cast<std::streamsize>(size));
-    if (!out) {
-      throw std::runtime_error("cannot write " + tmp.string());
-    }
-    out.close();
-    if (!out) {
-      throw std::runtime_error("cannot close " + tmp.string());
-    }
+  const ScopedFd dir_fd = OpenOutputDirNoFollow(dir);
+  struct stat target_st {};
+  if (::fstatat(dir_fd.get(), filename.c_str(), &target_st,
+                AT_SYMLINK_NOFOLLOW) == 0 &&
+      S_ISLNK(target_st.st_mode)) {
+    throw std::runtime_error("refusing to overwrite symlink " +
+                             (dir / filename).string());
   }
-  std::error_code ec;
-  std::filesystem::rename(tmp, path, ec);
-  if (ec) {
-    std::error_code cleanup_ec;
-    std::filesystem::remove(tmp, cleanup_ec);
-    throw std::runtime_error("cannot rename " + tmp.string() + " -> " +
-                             path.string() + ": " + ec.message());
+
+  const std::string tmp_name = filename + ".tmp";
+  int raw_fd = -1;
+  do {
+    raw_fd =
+        ::openat(dir_fd.get(), tmp_name.c_str(),
+                 O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+  } while (raw_fd < 0 && errno == EINTR);
+  if (raw_fd < 0) {
+    const int err = errno;
+    throw std::runtime_error("cannot create " + (dir / tmp_name).string() +
+                             ": " + std::strerror(err));
+  }
+  ScopedFd fd(raw_fd);
+
+  const auto* bytes = static_cast<const std::uint8_t*>(data);
+  std::size_t written_total = 0;
+  while (written_total < size) {
+    const ssize_t n =
+        ::write(fd.get(), bytes + written_total, size - written_total);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      const int err = errno;
+      fd.Reset();
+      ::unlinkat(dir_fd.get(), tmp_name.c_str(), 0);
+      throw std::runtime_error("cannot write " + (dir / tmp_name).string() +
+                               ": " + std::strerror(err));
+    }
+    if (n == 0) {
+      fd.Reset();
+      ::unlinkat(dir_fd.get(), tmp_name.c_str(), 0);
+      throw std::runtime_error("short write to " + (dir / tmp_name).string());
+    }
+    written_total += static_cast<std::size_t>(n);
+  }
+
+  // Always check close(): filesystems can report ENOSPC/EIO on close.
+  // Never retry close() on EINTR (Linux closes the fd even on EINTR).
+  if (::close(fd.Release()) != 0) {
+    const int err = errno;
+    ::unlinkat(dir_fd.get(), tmp_name.c_str(), 0);
+    throw std::runtime_error("cannot close " + (dir / tmp_name).string() +
+                             ": " + std::strerror(err));
+  }
+
+  if (::renameat(dir_fd.get(), tmp_name.c_str(), dir_fd.get(),
+                 filename.c_str()) != 0) {
+    const int err = errno;
+    ::unlinkat(dir_fd.get(), tmp_name.c_str(), 0);
+    throw std::runtime_error("cannot rename " + (dir / tmp_name).string() +
+                             " -> " + (dir / filename).string() + ": " +
+                             std::strerror(err));
   }
 }
 
 bool IsValidReason(std::string_view reason) {
-  if (reason.empty() || reason.find("..") != std::string_view::npos) {
+  if (reason.empty() || reason.size() > kMaxReasonLength || reason == "." ||
+      reason.find("..") != std::string_view::npos) {
     return false;
   }
   for (const char c : reason) {
@@ -134,6 +239,13 @@ bool IsValidReason(std::string_view reason) {
     }
   }
   return true;
+}
+
+std::uint64_t SaturatingAdd(std::uint64_t a, std::uint64_t b) {
+  if (a > std::numeric_limits<std::uint64_t>::max() - b) {
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  return a + b;
 }
 
 }  // namespace
@@ -199,14 +311,39 @@ struct FrameRecorder::Impl {
     if (options.output_dir.empty()) {
       throw std::invalid_argument("recorder: output_dir required");
     }
-    const std::size_t pixels =
-        static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    const auto w_sz = static_cast<std::size_t>(width);
+    const auto h_sz = static_cast<std::size_t>(height);
+    if (w_sz > std::numeric_limits<std::size_t>::max() / h_sz) {
+      throw std::invalid_argument("recorder: frame dimensions overflow");
+    }
+    const std::size_t pixels = w_sz * h_sz;
     slots.resize(options.queue_slots);
     for (auto& slot : slots) {
       slot.gray.resize(pixels);
       slot.detections.reserve(kMaxDetections);
     }
+    options.output_dir = StripTrailingSlashes(options.output_dir);
+    std::error_code ec;
+    const auto pre_status =
+        std::filesystem::symlink_status(options.output_dir, ec);
+    if (!ec && std::filesystem::is_symlink(pre_status)) {
+      throw std::filesystem::filesystem_error(
+          "recorder: output_dir must not be a symlink", options.output_dir,
+          std::make_error_code(std::errc::too_many_symbolic_link_levels));
+    }
     std::filesystem::create_directories(options.output_dir);
+    // Verify the final directory is a real directory, not a symlink swapped in.
+    int check_fd = -1;
+    do {
+      check_fd = ::open(options.output_dir.c_str(),
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    } while (check_fd < 0 && errno == EINTR);
+    if (check_fd < 0) {
+      throw std::filesystem::filesystem_error(
+          "recorder: cannot open output_dir", options.output_dir,
+          std::error_code(errno, std::generic_category()));
+    }
+    ::close(check_fd);
     ScanExisting();
     writer = std::thread([this] {
       // PNG encoding and disk writes run below every node loop.
@@ -226,7 +363,10 @@ struct FrameRecorder::Impl {
       if (ec) {
         break;
       }
-      if (!entry.is_regular_file()) {
+      std::error_code ec2;
+      const auto json_status = entry.symlink_status(ec2);
+      if (ec2 || std::filesystem::is_symlink(json_status) ||
+          !std::filesystem::is_regular_file(json_status)) {
         continue;
       }
       const std::string name = entry.path().filename().string();
@@ -234,9 +374,14 @@ struct FrameRecorder::Impl {
         continue;
       }
       const std::string stem = name.substr(0, name.size() - 5);
-      std::error_code ec2;
-      const std::uint64_t png =
-          std::filesystem::file_size(options.output_dir / (stem + ".png"), ec2);
+      const std::filesystem::path png_path =
+          options.output_dir / (stem + ".png");
+      const auto png_status = std::filesystem::symlink_status(png_path, ec2);
+      if (ec2 || std::filesystem::is_symlink(png_status) ||
+          !std::filesystem::is_regular_file(png_status)) {
+        continue;
+      }
+      const std::uint64_t png = std::filesystem::file_size(png_path, ec2);
       if (ec2) {
         continue;
       }
@@ -244,14 +389,14 @@ struct FrameRecorder::Impl {
       if (ec2) {
         continue;
       }
-      found.emplace_back(stem, png + json);
+      found.emplace_back(stem, SaturatingAdd(png, json));
     }
     std::sort(found.begin(), found.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
     for (auto& [stem, bytes] : found) {
       active_stems.insert(stem);
       files.push_back(FileEntry{std::move(stem), bytes});
-      total_bytes += bytes;
+      total_bytes = SaturatingAdd(total_bytes, bytes);
     }
     TrimToBudget();
   }
@@ -272,12 +417,25 @@ struct FrameRecorder::Impl {
   }
 
   void TrimToBudget() {
-    std::error_code ec;
+    if (total_bytes <= options.max_bytes || files.empty()) {
+      return;
+    }
+    int raw_fd = -1;
+    do {
+      raw_fd = ::open(options.output_dir.c_str(),
+                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    } while (raw_fd < 0 && errno == EINTR);
+    ScopedFd dir_fd(raw_fd);
     while (total_bytes > options.max_bytes && !files.empty()) {
       const FileEntry& oldest = files.front();
-      std::filesystem::remove(options.output_dir / (oldest.stem + ".png"), ec);
-      std::filesystem::remove(options.output_dir / (oldest.stem + ".json"), ec);
-      total_bytes -= oldest.bytes;
+      if (dir_fd.get() >= 0) {
+        const std::string png_name = oldest.stem + ".png";
+        const std::string json_name = oldest.stem + ".json";
+        ::unlinkat(dir_fd.get(), png_name.c_str(), 0);
+        ::unlinkat(dir_fd.get(), json_name.c_str(), 0);
+      }
+      total_bytes =
+          total_bytes > oldest.bytes ? (total_bytes - oldest.bytes) : 0;
       active_stems.erase(oldest.stem);
       files.pop_front();
     }
@@ -373,15 +531,16 @@ struct FrameRecorder::Impl {
   }
 
   void StopAfterWriteFailure(const char* reason) {
-    if (!pending_stem.empty()) {
-      std::error_code ec;
-      std::filesystem::remove(options.output_dir / (pending_stem + ".png.tmp"),
-                              ec);
-      std::filesystem::remove(options.output_dir / (pending_stem + ".json.tmp"),
-                              ec);
-      if (pending_png_written) {
-        std::filesystem::remove(options.output_dir / (pending_stem + ".png"),
-                                ec);
+    if (!pending_stem.empty() && pending_png_written) {
+      int raw_fd = -1;
+      do {
+        raw_fd = ::open(options.output_dir.c_str(),
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      } while (raw_fd < 0 && errno == EINTR);
+      if (raw_fd >= 0) {
+        ScopedFd dir_fd(raw_fd);
+        const std::string png_name = pending_stem + ".png";
+        ::unlinkat(dir_fd.get(), png_name.c_str(), 0);
       }
     }
     pending_stem.clear();
@@ -428,19 +587,19 @@ struct FrameRecorder::Impl {
     }
     const std::string json = SerializeRecord(options.context, record);
 
-    const std::filesystem::path png_path = options.output_dir / (stem + ".png");
-    const std::filesystem::path json_path =
-        options.output_dir / (stem + ".json");
-    WriteFileAtomic(png_path, png.data(), png.size());
+    const std::string png_name = stem + ".png";
+    const std::string json_name = stem + ".json";
+    WriteFileAtomic(options.output_dir, png_name, png.data(), png.size());
     pending_png_written = true;
-    WriteFileAtomic(json_path, json.data(), json.size());
+    WriteFileAtomic(options.output_dir, json_name, json.data(), json.size());
     pending_png_written = false;
 
     // files/total_bytes are writer-owned (Record() never touches them), so no
     // lock is needed; trimming does disk I/O and must not hold the queue lock.
     active_stems.insert(stem);
-    files.push_back(FileEntry{stem, png.size() + json.size()});
-    total_bytes += png.size() + json.size();
+    const std::uint64_t pair_bytes = SaturatingAdd(png.size(), json.size());
+    files.push_back(FileEntry{stem, pair_bytes});
+    total_bytes = SaturatingAdd(total_bytes, pair_bytes);
     TrimToBudget();
   }
 };
@@ -460,7 +619,8 @@ FrameRecorder::~FrameRecorder() {
 }
 
 bool FrameRecorder::Record(const Frame& frame, const FrameRecord& record) {
-  if (!IsValidReason(record.reason) || !frame.holds_image() ||
+  if (!IsValidReason(record.reason) ||
+      !IsSupportedPixelFormat(frame.format()) || !frame.holds_image() ||
       frame.data() == nullptr ||
       frame.width() !=
           static_cast<std::uint32_t>(impl_->options.context.width) ||

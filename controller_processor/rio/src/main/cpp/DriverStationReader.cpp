@@ -81,33 +81,36 @@ void SnapshotDriverStation(DriverStationData& out) {
   out.fms.flags = FlagsOf(word);
 
   int32_t status = 0;
-  switch (HAL_GetAllianceStation(&status)) {
-    case HAL_AllianceStationID_kRed1:
-      out.fms.alliance = Alliance::kRed;
-      out.fms.station = 1;
-      break;
-    case HAL_AllianceStationID_kRed2:
-      out.fms.alliance = Alliance::kRed;
-      out.fms.station = 2;
-      break;
-    case HAL_AllianceStationID_kRed3:
-      out.fms.alliance = Alliance::kRed;
-      out.fms.station = 3;
-      break;
-    case HAL_AllianceStationID_kBlue1:
-      out.fms.alliance = Alliance::kBlue;
-      out.fms.station = 1;
-      break;
-    case HAL_AllianceStationID_kBlue2:
-      out.fms.alliance = Alliance::kBlue;
-      out.fms.station = 2;
-      break;
-    case HAL_AllianceStationID_kBlue3:
-      out.fms.alliance = Alliance::kBlue;
-      out.fms.station = 3;
-      break;
-    default:
-      break;
+  const auto alliance_station = HAL_GetAllianceStation(&status);
+  if (status == 0) {
+    switch (alliance_station) {
+      case HAL_AllianceStationID_kRed1:
+        out.fms.alliance = Alliance::kRed;
+        out.fms.station = 1;
+        break;
+      case HAL_AllianceStationID_kRed2:
+        out.fms.alliance = Alliance::kRed;
+        out.fms.station = 2;
+        break;
+      case HAL_AllianceStationID_kRed3:
+        out.fms.alliance = Alliance::kRed;
+        out.fms.station = 3;
+        break;
+      case HAL_AllianceStationID_kBlue1:
+        out.fms.alliance = Alliance::kBlue;
+        out.fms.station = 1;
+        break;
+      case HAL_AllianceStationID_kBlue2:
+        out.fms.alliance = Alliance::kBlue;
+        out.fms.station = 2;
+        break;
+      case HAL_AllianceStationID_kBlue3:
+        out.fms.alliance = Alliance::kBlue;
+        out.fms.station = 3;
+        break;
+      default:
+        break;
+    }
   }
 
   HAL_MatchInfo info{};
@@ -130,7 +133,8 @@ void SnapshotDriverStation(DriverStationData& out) {
   out.fms.replay_number = info.replayNumber;
   status = 0;
   const float match_time_s = static_cast<float>(HAL_GetMatchTime(&status));
-  out.fms.match_time_s = std::isfinite(match_time_s) ? match_time_s : 0.0f;
+  out.fms.match_time_s =
+      (status == 0 && std::isfinite(match_time_s)) ? match_time_s : 0.0f;
   CopyString(
       std::string_view{reinterpret_cast<const char*>(info.gameSpecificMessage),
                        std::min<std::size_t>(info.gameSpecificMessageSize,
@@ -152,11 +156,14 @@ void SnapshotDriverStation(DriverStationData& out) {
         std::clamp<int>(axes[i].count, 0, static_cast<int>(kMaxAxes)));
     for (std::size_t a = 0; a < j.axis_count; ++a) {
       const float axis = axes[i].axes[a];
-      j.axes[a] = std::isfinite(axis) ? axis : 0.0f;
+      j.axes[a] = std::isfinite(axis) ? std::clamp(axis, -1.0f, 1.0f) : 0.0f;
     }
     j.button_count = static_cast<uint8_t>(
         std::clamp<int>(buttons[i].count, 0, static_cast<int>(kMaxButtons)));
-    j.buttons = buttons[i].buttons;
+    const uint32_t button_mask = j.button_count >= 32
+                                     ? ~uint32_t{0}
+                                     : (uint32_t{1} << j.button_count) - 1u;
+    j.buttons = buttons[i].buttons & button_mask;
     j.pov_count = static_cast<uint8_t>(
         std::clamp<int>(povs[i].count, 0, static_cast<int>(kMaxPovs)));
     for (std::size_t p = 0; p < j.pov_count; ++p) {
@@ -304,9 +311,10 @@ const ds::DriverStationData& DriverStationReader::Read(uint64_t now_us,
   refreshed_us_ = 0;
   if (!snapshot.refreshed) return kNoDriverStation;
   // A refresh completed after this tick's clock reading is current; one
-  // command_timeout_us old is stale, as the gateway's own command expiry is.
-  if (snapshot.refreshed_us < now_us &&
-      now_us - snapshot.refreshed_us >= stale_us) {
+  // command_timeout_us old (or any zero staleness bound) is stale, as the
+  // gateway's own command expiry is.
+  if (stale_us == 0 || (snapshot.refreshed_us < now_us &&
+                        now_us - snapshot.refreshed_us >= stale_us)) {
     return kNoDriverStation;
   }
   refreshed_us_ = snapshot.refreshed_us;

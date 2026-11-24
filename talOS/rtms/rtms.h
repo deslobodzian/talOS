@@ -334,6 +334,7 @@ class RTMSQueue {
   }
 
   std::uint64_t reader_sequence(std::uint64_t reader_id) const {
+    if (header_ == nullptr || reader_id >= MAX_READERS) return 0;
     return header_->readers[reader_id].sequence.load(std::memory_order_acquire);
   }
 

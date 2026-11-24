@@ -282,5 +282,31 @@ TEST(FrameTest, ConcurrentConstShareIsRaceFreeAndPreservesCow) {
   EXPECT_EQ(orig.data()[kBytes - 1], 22);
 }
 
+TEST(FrameTest, CaptureMidpointCancelsStartOfExposureAgainstLatencyNearMax) {
+  constexpr uint64_t kMax = std::numeric_limits<uint64_t>::max();
+  // stamp_ns + exposure/2 would overflow uint64_t on its own, but subtracting a
+  // larger latency_offset_ns keeps the true midpoint in range.
+  EXPECT_EQ(
+      CaptureMidpoint(kMax, TimestampKind::kStartOfExposure, 200, 0, 1000),
+      kMax - 900);
+  EXPECT_EQ(CaptureMidpoint(kMax, TimestampKind::kStartOfExposure, 200, 0, 100),
+            kMax);
+  EXPECT_EQ(CaptureMidpoint(kMax, TimestampKind::kStartOfExposure, 200, 0, 99),
+            std::nullopt);
+}
+
+TEST(FrameTest, OverflowingBorrowedSizeDoesNotWrapOnMutableData) {
+  const auto t0 = talos::event::MonotonicTime::from_nanos(1);
+  const uint8_t sentinel = 0x5A;
+  Frame borrowed(0, 1, 1, t0, 1, 1, 1, PixelFormat::kGray8, &sentinel,
+                 std::numeric_limits<size_t>::max() - 16);
+  EXPECT_TRUE(borrowed.is_borrowed());
+  // Detaching into owned storage must reject bytes + kPageAlignment overflow
+  // cleanly instead of wrapping to a tiny allocation and reading out of bounds.
+  EXPECT_EQ(borrowed.mutable_data(), nullptr);
+  EXPECT_FALSE(borrowed.is_borrowed());
+  EXPECT_FALSE(borrowed.holds_image());
+}
+
 }  // namespace
 }  // namespace talos::vision

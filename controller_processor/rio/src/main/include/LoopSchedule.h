@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 
 // When the RoboRIO loop (Robot.cpp) wakes for its next tick. Each tick moves
 // the loop's deadline on by one period; the loop then sleeps to the time this
@@ -24,7 +25,12 @@ inline constexpr uint64_t kOverrunSleepUs = 500;
 // would starve the Driver Station refresh, and the next period counts from
 // that wake, so the loop's phase moves by the overrun.
 constexpr uint64_t NextWakeUs(uint64_t deadline_us, uint64_t end_us) {
-  return end_us <= deadline_us ? deadline_us : end_us + kOverrunSleepUs;
+  if (end_us <= deadline_us) return deadline_us;
+  // Saturate instead of wrapping into the past, which would make a SCHED_FIFO
+  // loop spin without yielding.
+  return std::numeric_limits<uint64_t>::max() - end_us < kOverrunSleepUs
+             ? std::numeric_limits<uint64_t>::max()
+             : end_us + kOverrunSleepUs;
 }
 
 }  // namespace talos::rio

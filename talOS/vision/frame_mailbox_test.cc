@@ -104,5 +104,42 @@ TEST(FrameMailboxTest, ConcurrentHandoffNeverTearsOrLosesCount) {
   EXPECT_EQ(taken + mailbox.dropped(), kFrames);
 }
 
+TEST(FrameMailboxTest,
+     RetainedShallowCopySurvivesSubsequentPublishesAndDestruction) {
+  Frame kept;
+  {
+    FrameMailbox mailbox;
+    mailbox.Reserve(std::size_t{kWidth} * kHeight);
+    std::vector<uint8_t> driver(std::size_t{kWidth} * kHeight);
+
+    ASSERT_TRUE(mailbox.Publish(Borrowed(driver, 1)));
+    const Frame* first = mailbox.TakeNewest();
+    ASSERT_NE(first, nullptr);
+    kept = *first;  // Shallow copy sharing slot storage.
+    ASSERT_TRUE(kept.is_shared());
+    ASSERT_TRUE(Uniform(kept, 1));
+
+    // Rotate through all three slots, including a larger frame that would
+    // reallocate the underlying vector if the slot were not detached.
+    std::vector<uint8_t> bigger(std::size_t{kWidth} * kHeight * 4, 0xAB);
+    const Frame big_frame(0, 1, 99, talos::event::MonotonicTime::from_nanos(99),
+                          kWidth, kHeight * 4, kWidth, PixelFormat::kGray8,
+                          bigger.data(), bigger.size());
+    for (uint64_t seq = 2; seq <= 8; ++seq) {
+      ASSERT_TRUE(
+          mailbox.Publish(seq == 5 ? big_frame : Borrowed(driver, seq)));
+      const Frame* taken = mailbox.TakeNewest();
+      ASSERT_NE(taken, nullptr);
+    }
+
+    EXPECT_EQ(kept.sequence_number(), 1u);
+    EXPECT_EQ(kept.width(), kWidth);
+    EXPECT_EQ(kept.height(), kHeight);
+    EXPECT_TRUE(Uniform(kept, 1));
+  }
+  // Retained copy still owns its shared_ptr after mailbox destruction.
+  EXPECT_TRUE(Uniform(kept, 1));
+}
+
 }  // namespace
 }  // namespace talos::vision

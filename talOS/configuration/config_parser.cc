@@ -54,8 +54,10 @@ T Read(const toml::table& tbl, std::string_view key, T def) {
     }
     throw std::invalid_argument(field + " must be an integer in range");
   } else if constexpr (std::is_floating_point_v<T>) {
-    if (auto v = node.value<double>()) return static_cast<T>(*v);
-    throw std::invalid_argument(field + " must be a number");
+    if (auto v = node.value<double>(); v && std::isfinite(*v)) {
+      return static_cast<T>(*v);
+    }
+    throw std::invalid_argument(field + " must be a finite number");
   } else {
     if (auto v = node.value<std::string_view>()) return std::string(*v);
     throw std::invalid_argument(field + " must be a string");
@@ -127,12 +129,46 @@ uint16_t ReadPort(const toml::table& tbl, const char* key, uint16_t def,
   return static_cast<uint16_t>(*v);
 }
 
-void CheckTopLevelKeys(const toml::table& tbl) {
+bool HasParentTraversal(const std::filesystem::path& path) {
+  for (const auto& component : path) {
+    if (component == "..") return true;
+  }
+  return false;
+}
+
+void CheckNoNulByte(std::string_view path, const std::string& context) {
+  if (path.find('\0') != std::string_view::npos) {
+    throw std::invalid_argument(context + ": invalid path containing NUL byte");
+  }
+}
+
+std::string PrefixWhere(const std::string& where, const std::string& message) {
+  return where.empty() ? message : where + ": " + message;
+}
+
+void CheckTopLevelKeys(const toml::table& tbl, const std::string& where = {}) {
   for (auto&& [k, v] : tbl) {
-    if (k.str() != "include" && k.str() != "robot" && k.str() != "studio" &&
-        k.str() != "simulation" && k.str() != "subsystems") {
-      throw std::invalid_argument("unknown top-level key '" +
-                                  std::string(k.str()) + "'");
+    const std::string_view key = k.str();
+    if (key == "include") {
+      const auto inc = v.value_exact<std::string>();
+      if (!inc || inc->empty()) {
+        throw std::invalid_argument(PrefixWhere(
+            where, "top-level field 'include' must be a non-empty string"));
+      }
+      CheckNoNulByte(*inc, PrefixWhere(where, "top-level field 'include'"));
+    } else if (key == "robot" || key == "studio" || key == "simulation") {
+      if (!v.is_table()) {
+        throw std::invalid_argument(
+            PrefixWhere(where, "[" + std::string(key) + "] must be a table"));
+      }
+    } else if (key == "subsystems") {
+      if (!v.is_table() && !v.is_array()) {
+        throw std::invalid_argument(
+            PrefixWhere(where, "'subsystems' must be a table or array"));
+      }
+    } else {
+      throw std::invalid_argument(PrefixWhere(
+          where, "unknown top-level key '" + std::string(key) + "'"));
     }
   }
 }
@@ -166,6 +202,60 @@ void CheckSubsystemFileKeys(const toml::table& file, const std::string& path) {
   }
 }
 
+// Checks singular structural section types on an individual config document
+// before include merging so an overlay cannot silently overwrite a malformed
+// scalar in an included base file.
+void CheckDocumentStructure(const toml::table& tbl,
+                            const std::string& where = {}) {
+  CheckTopLevelKeys(tbl, where);
+  if (const auto* robot = tbl["robot"].as_table()) {
+    if (robot->contains("targets") && !(*robot)["targets"].is_table()) {
+      throw std::invalid_argument(
+          PrefixWhere(where, "[robot.targets] must be a table"));
+    }
+  }
+  if (const auto* sim = tbl["simulation"].as_table()) {
+    for (const char* table_key :
+         {"battery", "chassis", "start_pose", "mujoco"}) {
+      if (sim->contains(table_key) && !(*sim)[table_key].is_table()) {
+        throw std::invalid_argument(PrefixWhere(
+            where,
+            std::string("[simulation.") + table_key + "] must be a table"));
+      }
+    }
+    for (const char* array_key :
+         {"swerve_modules", "hard_stops", "mechanisms"}) {
+      if (sim->contains(array_key) && !(*sim)[array_key].is_array()) {
+        throw std::invalid_argument(
+            PrefixWhere(where, std::string("[simulation] field '") + array_key +
+                                   "' must be an array of tables"));
+      }
+    }
+  }
+  if (const auto* subs = tbl["subsystems"].as_table()) {
+    for (auto&& [sub_key, sub_val] : *subs) {
+      const std::string sub_name(sub_key.str());
+      const std::string sub_where =
+          where.empty() ? "[subsystems." + sub_name + "]"
+                        : where + " [subsystems." + sub_name + "]";
+      const auto* sub_tbl = sub_val.as_table();
+      if (sub_tbl == nullptr) {
+        throw std::invalid_argument(sub_where + " must be a table");
+      }
+      CheckSubsystemKeys(*sub_tbl, sub_where);
+      for (const char* section :
+           {"targets", "teleop", "motors", "sensors", "encoders",
+            "digital_inputs", "digital_outputs", "analog_inputs",
+            "pwm_outputs"}) {
+        if (sub_tbl->contains(section) && !(*sub_tbl)[section].is_table()) {
+          throw std::invalid_argument(sub_where + ": '" + section +
+                                      "' must be a table");
+        }
+      }
+    }
+  }
+}
+
 // The entries of `holder`'s [trajectories] table as (name, path), refusing a
 // non-table section, a name that is not a topic segment (talOS/NAMING.md) and
 // a value that is not a non-empty string. `where` names the file or table.
@@ -189,6 +279,7 @@ std::vector<std::pair<std::string, std::string>> ReadTrajectories(
     if (!path || path->empty()) {
       throw std::invalid_argument(field + " must be a non-empty string path");
     }
+    CheckNoNulByte(*path, field);
     out.emplace_back(name, *path);
   }
   return out;
@@ -272,6 +363,7 @@ std::string RebaseStudioDashboard(toml::table& document,
     throw std::invalid_argument(
         file + ": [studio] dashboard must be a non-empty string path");
   }
+  CheckNoNulByte(*value, file + ": [studio] dashboard");
   const std::filesystem::path base = std::filesystem::path(file).parent_path();
   const std::filesystem::path rel{*value};
   studio->insert_or_assign(
@@ -343,7 +435,7 @@ void CheckStartPoseOnField(const toml::table& tbl, const std::string& where) {
   if (field == nullptr) return;  // CheckSimulationMujoco refuses it
   const auto check = [&](const char* key, double extent_m) {
     const double value = (*pose)[key].value<double>().value_or(0.0);
-    if (value < 0.0 || value > extent_m) {
+    if (!(value >= 0.0 && value <= extent_m)) {
       std::ostringstream message;
       message << where << ": [simulation.start_pose] " << key << " = " << value
               << " is off field '" << field->name << "', whose floor spans "
@@ -357,13 +449,13 @@ void CheckStartPoseOnField(const toml::table& tbl, const std::string& where) {
 
 // [simulation.mujoco] as set in `where` (the file that sets it, or "config"
 // for a parsed table): refuses an unknown key, a robot_model or
-// robot_model_files entry that is not a non-empty string, a
-// robot_model_files that is not an array, a field that is not a string or
+// robot_model_files entry that is not a non-empty string (or has a NUL byte),
+// a robot_model_files that is not an array, a field that is not a string or
 // names no known field model, a seed that is not a non-negative integer,
-// a sleeping that is not a boolean, and, when `refuse_absolute` (paths as
-// written in a file, before they are resolved), an absolute path.
+// a sleeping that is not a boolean, and, when `check_relative` (paths as
+// written before rebasing), an absolute path or `..` parent traversal.
 void CheckSimulationMujoco(const toml::table& mujoco, const std::string& where,
-                           bool refuse_absolute) {
+                           bool check_relative) {
   const std::string table = where + ": [simulation.mujoco] ";
   for (auto&& [k, v] : mujoco) {
     if (k.str() != "robot_model" && k.str() != "robot_model_files" &&
@@ -378,10 +470,19 @@ void CheckSimulationMujoco(const toml::table& mujoco, const std::string& where,
       throw std::invalid_argument(table + key +
                                   " must be a non-empty string path");
     }
-    if (refuse_absolute && std::filesystem::path(*path).is_absolute()) {
-      throw std::invalid_argument(
-          table + key + " must be relative to the file that sets it, not '" +
-          *path + "'");
+    CheckNoNulByte(*path, table + key);
+    if (check_relative) {
+      const std::filesystem::path fs_path{*path};
+      if (fs_path.is_absolute()) {
+        throw std::invalid_argument(
+            table + key + " must be relative to the file that sets it, not '" +
+            *path + "'");
+      }
+      if (HasParentTraversal(fs_path)) {
+        throw std::invalid_argument(table + key +
+                                    " must not contain '..' path traversal: '" +
+                                    *path + "'");
+      }
     }
   };
   if (const auto* model = mujoco.get("robot_model")) {
@@ -447,7 +548,7 @@ void RebaseSimulationMujoco(toml::table& document, const std::string& file,
   if (mujoco == nullptr) {
     throw std::invalid_argument(file + ": [simulation.mujoco] must be a table");
   }
-  CheckSimulationMujoco(*mujoco, file, /*refuse_absolute=*/true);
+  CheckSimulationMujoco(*mujoco, file, /*check_relative=*/true);
   const fs::path base = fs::path(file).parent_path();
   const auto rebase = [&](const std::string& path) {
     return (base.empty() ? fs::path(path) : base / path)
@@ -508,17 +609,38 @@ void RequireSimulationMujoco(const toml::table& tbl,
   }
 }
 
-// [trajectories] belongs at a subsystem file's top level. Under its
-// [subsystem] header it would be merged into the subsystem's table and then
-// replaced by a top-level [trajectories], so it is refused, not dropped.
-void RefuseHeaderTrajectories(const toml::table& document,
+// Framework section tables belong at a subsystem file's top level, not under
+// [subsystem], and no key may be set in both [subsystem] and the top level:
+// otherwise ExpandManifest's top-level pass would silently overwrite the
+// [subsystem] value.
+void CheckSubsystemFileHeader(const toml::table& document,
                               const std::string& file) {
-  if (const auto* header = document["subsystem"].as_table();
-      header != nullptr && header->contains("trajectories")) {
-    throw std::invalid_argument(
-        file +
-        ": [subsystem.trajectories] is not read; put the entries in a "
-        "top-level [trajectories] table");
+  if (!document.contains("subsystem")) return;
+  const auto* header = document["subsystem"].as_table();
+  if (header == nullptr) {
+    throw std::invalid_argument(file + ": [subsystem] must be a table");
+  }
+  static constexpr std::array<std::string_view, 10> kTopLevelOnlySections = {
+      "targets",     "teleop",         "motors",          "sensors",
+      "encoders",    "digital_inputs", "digital_outputs", "analog_inputs",
+      "pwm_outputs", "trajectories",
+  };
+  for (const std::string_view section : kTopLevelOnlySections) {
+    if (header->contains(section)) {
+      throw std::invalid_argument(
+          file + ": [subsystem." + std::string(section) +
+          "] is not read; put the entries in a top-level [" +
+          std::string(section) + "] table");
+    }
+  }
+  for (auto&& [k, v] : *header) {
+    const std::string_view key = k.str();
+    if (key == "name" || key == "defaults") continue;
+    if (document.contains(key)) {
+      throw std::invalid_argument(file + ": duplicate key '" +
+                                  std::string(key) +
+                                  "' set in both [subsystem] and top level");
+    }
   }
 }
 
@@ -676,6 +798,15 @@ RawDevice ParseMotor(const toml::table& t, const std::string& name) {
   m.soft_limits = Read(t, "soft_limits", m.soft_limits);
   m.reverse_limit_rot = Read(t, "reverse_limit_rot", m.reverse_limit_rot);
   m.forward_limit_rot = Read(t, "forward_limit_rot", m.forward_limit_rot);
+  if (!(m.reverse_limit_rot < m.forward_limit_rot)) {
+    throw std::invalid_argument(
+        "reverse_limit_rot must be less than forward_limit_rot for " + name);
+  }
+  if (m.soft_limits && m.continuous_wrap) {
+    throw std::invalid_argument(
+        "soft_limits = true and continuous_wrap = true for " + name +
+        " contradict each other: continuous wrap has no travel endpoints");
+  }
   m.forward_limit_switch = ReadLimitSwitch(t, "forward_limit_switch", name);
   m.reverse_limit_switch = ReadLimitSwitch(t, "reverse_limit_switch", name);
   m.max_velocity_rps = Read(t, "max_velocity_rps", m.max_velocity_rps);
@@ -932,6 +1063,9 @@ std::vector<std::pair<std::string, TeleopValue>> ParseTeleopAssignments(
   for (auto&& [key, value] : table) keys.emplace_back(key.str());
   std::sort(keys.begin(), keys.end());
   for (const auto& key : keys) {
+    if (key.empty()) {
+      throw std::invalid_argument(where + " contains an empty field name");
+    }
     const auto& value = table[key];
     if (const auto* flag = value.as_boolean()) {
       assignments.emplace_back(key, flag->get());
@@ -1256,13 +1390,18 @@ toml::table ExpandManifest(
     }
     std::optional<std::string> entry_defaults;
     if (entry->contains("defaults")) {
-      entry_defaults = resolve_entry_path(
-          ReadNonEmpty(*entry, "defaults", "", "[[subsystems]] entry"));
+      const std::string raw_defaults =
+          ReadNonEmpty(*entry, "defaults", "", "[[subsystems]] entry");
+      CheckNoNulByte(raw_defaults,
+                     path + ": [[subsystems]] entry '" + name + "' defaults");
+      entry_defaults = resolve_entry_path(raw_defaults);
     }
+    CheckNoNulByte(*rel_view,
+                   path + ": [[subsystems]] entry '" + name + "' path");
     const std::string file = resolve_entry_path(*rel_view);
     toml::table sub_file = read(file);
     CheckSubsystemFileKeys(sub_file, file);
-    RefuseHeaderTrajectories(sub_file, file);
+    CheckSubsystemFileHeader(sub_file, file);
     TrajectorySources sources;
     RebaseTrajectories(sub_file, file, file, sources);
 
@@ -1277,9 +1416,11 @@ toml::table ExpandManifest(
     }
     std::optional<std::string> defaults_file;
     if (header->contains("defaults")) {
+      const std::string raw_def =
+          ReadNonEmpty(*header, "defaults", "", "[subsystem]");
+      CheckNoNulByte(raw_def, file + ": [subsystem] defaults");
       const fs::path sub_base = fs::path(file).parent_path();
-      const fs::path def_rel{
-          ReadNonEmpty(*header, "defaults", "", "[subsystem]")};
+      const fs::path def_rel{raw_def};
       defaults_file =
           (def_rel.is_absolute() || sub_base.empty() ? def_rel
                                                      : sub_base / def_rel)
@@ -1291,7 +1432,12 @@ toml::table ExpandManifest(
     if (defaults_file) {
       toml::table merged = read(*defaults_file);
       CheckSubsystemFileKeys(merged, *defaults_file);
-      RefuseHeaderTrajectories(merged, *defaults_file);
+      CheckSubsystemFileHeader(merged, *defaults_file);
+      if (const auto* def_header = merged["subsystem"].as_table();
+          def_header != nullptr && def_header->contains("defaults")) {
+        throw std::invalid_argument(
+            *defaults_file + ": nested [subsystem] defaults is not supported");
+      }
       TrajectorySources defaults_sources;
       RebaseTrajectories(merged, *defaults_file, *defaults_file,
                          defaults_sources);
@@ -1302,6 +1448,7 @@ toml::table ExpandManifest(
       sources = std::move(defaults_sources);
       MergeTables(merged, sub_file);
       sub_file = std::move(merged);
+      CheckSubsystemFileHeader(sub_file, file);
       header = sub_file["subsystem"].as_table();
     }
     // Only the effective entries, after any defaults or overlay merge, are
@@ -1615,8 +1762,15 @@ uint16_t ResolveLocalPort(const RobotConfig& config, uint16_t cli_override) {
   return config.local_port;
 }
 
-RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
-  CheckTopLevelKeys(tbl);
+namespace {
+
+RobotConfig ParseRobotConfigTableImpl(toml::table tbl, bool validate_hardware,
+                                      bool paths_resolved) {
+  CheckDocumentStructure(tbl);
+  if (tbl.contains("include")) {
+    throw std::invalid_argument(
+        "top-level 'include' requires file resolution (ParseRobotConfig)");
+  }
   RobotConfig result;
   result.toml_data = std::move(tbl);
   const toml::table& root = result.toml_data;
@@ -1666,9 +1820,21 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
       }
     }
     hw.period_us = Read(*robot, "period_us", hw.period_us);
+    if (hw.period_us == 0) {
+      throw std::invalid_argument(
+          "[robot] field 'period_us' must be a positive integer");
+    }
     hw.command_timeout_us =
         Read(*robot, "command_timeout_us", hw.command_timeout_us);
+    if (hw.command_timeout_us == 0) {
+      throw std::invalid_argument(
+          "[robot] field 'command_timeout_us' must be a positive integer");
+    }
     hw.status_hz = Read(*robot, "status_hz", hw.status_hz);
+    if (!(hw.status_hz > 0.0)) {
+      throw std::invalid_argument(
+          "[robot] field 'status_hz' must be finite and positive");
+    }
     hw.commissioned = Read(*robot, "commissioned", hw.commissioned);
     // A commissioned robot drives hardware, so a mode its policy lists with
     // no producer would lose that mode on the field: it requires coverage,
@@ -1924,6 +2090,11 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
                                   dev.feedback_sensor);
     }
     require_same_subsystem(*sensor, dev.subsystem, dev.name);
+    if (!IsCANcoder(*sensor)) {
+      throw std::invalid_argument("feedback_sensor '" + dev.feedback_sensor +
+                                  "' for motor '" + dev.name +
+                                  "' must be a CANcoder");
+    }
     motor->feedback_sensor_id =
         std::visit([](const auto& c) { return c.id; }, sensor->config);
   }
@@ -2203,9 +2374,11 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
       if (mujoco == nullptr) {
         throw std::invalid_argument("[simulation.mujoco] must be a table");
       }
-      // ResolveRobotConfig has refused absolute paths and resolved the rest,
-      // which may then be absolute.
-      CheckSimulationMujoco(*mujoco, "config", /*refuse_absolute=*/false);
+      // ResolveRobotConfig has refused absolute and '..' traversal paths and
+      // resolved the rest (which may then be absolute); a parsed string keeps
+      // paths relative to the working directory and is checked here.
+      CheckSimulationMujoco(*mujoco, "config",
+                            /*check_relative=*/!paths_resolved);
       if (!mujoco->contains("robot_model")) {
         throw std::invalid_argument(
             "config: [simulation.mujoco] robot_model is required");
@@ -2295,9 +2468,18 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
   return result;
 }
 
+}  // namespace
+
+RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
+  return ParseRobotConfigTableImpl(std::move(tbl), validate_hardware,
+                                   /*paths_resolved=*/true);
+}
+
 RobotConfig ParseRobotConfigString(std::string_view toml_content) {
   try {
-    return ParseRobotConfigTable(toml::parse(toml_content));
+    return ParseRobotConfigTableImpl(toml::parse(toml_content),
+                                     /*validate_hardware=*/true,
+                                     /*paths_resolved=*/false);
   } catch (const toml::parse_error& err) {
     throw std::invalid_argument(std::string("TOML parse error: ") + err.what());
   }
@@ -2308,7 +2490,7 @@ toml::table ResolveRobotConfig(const std::string& path,
                                const DataFileCallback& data) {
   namespace fs = std::filesystem;
   toml::table tbl = read(path);
-  CheckTopLevelKeys(tbl);
+  CheckDocumentStructure(tbl, path);
   // [subsystems.<name>.trajectories] in this file and its include: rebased
   // now, required once the include is merged, so an entry this file
   // overrides is never required.
@@ -2335,7 +2517,7 @@ toml::table ResolveRobotConfig(const std::string& path,
                                                    : base_dir / inc_rel)
             .string();
     toml::table base = read(inc_file);
-    CheckTopLevelKeys(base);
+    CheckDocumentStructure(base, inc_file);
     const std::string base_dashboard = RebaseStudioDashboard(base, inc_file);
     if (dashboard_source.empty()) dashboard_source = base_dashboard;
     MujocoSources base_mujoco;

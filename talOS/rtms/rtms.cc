@@ -63,11 +63,18 @@ static_assert(sizeof(HeaderPrefix) ==
 // segment still being created: if it is absent, too small for the prefix, or
 // has not published magic yet, open() proceeds to SharedMemoryPtr.
 void ThrowIfVersionMismatch(const std::string& path) {
-  const int fd = ::shm_open(ShmObjectName(path).c_str(), O_RDONLY, 0666);
+  int fd = -1;
+  do {
+    fd = ::shm_open(ShmObjectName(path).c_str(), O_RDONLY, 0666);
+  } while (fd == -1 && errno == EINTR);
   if (fd == -1) return;
   struct stat info {};
   std::optional<std::uint64_t> version;
-  if (::fstat(fd, &info) == 0 && info.st_size >= 0 &&
+  int fstat_rc = -1;
+  do {
+    fstat_rc = ::fstat(fd, &info);
+  } while (fstat_rc < 0 && errno == EINTR);
+  if (fstat_rc == 0 && info.st_size >= 0 &&
       static_cast<std::uint64_t>(info.st_size) >= sizeof(HeaderPrefix)) {
     void* mapped =
         ::mmap(nullptr, sizeof(HeaderPrefix), PROT_READ, MAP_SHARED, fd, 0);
@@ -80,8 +87,9 @@ void ThrowIfVersionMismatch(const std::string& path) {
     }
   }
   ::close(fd);
-  if (version.has_value() && *version != kRtmsVersion) {
-    throw VersionMismatchError(path, *version);
+  const std::uint64_t found_version = version.value_or(kRtmsVersion);
+  if (found_version != kRtmsVersion) {
+    throw VersionMismatchError(path, found_version);
   }
 }
 
@@ -89,8 +97,27 @@ void ThrowIfVersionMismatch(const std::string& path) {
 // within microseconds, so 50 ms separates "still being created" from "never
 // will be" without masking either.
 constexpr int kInitAttempts = 200;
-constexpr useconds_t kInitRetryUs = 250;
-// How many times in all, kInitRetryUs apart (at least 1 s), one open() waits
+constexpr long kInitRetryNs = 250L * 1000L;
+
+// Sleeps one retry interval against an absolute monotonic deadline so signal
+// delivery (EINTR) neither collapses the wait nor livelocks relative restarts.
+void SleepInitRetry() noexcept {
+  constexpr std::int64_t kNsPerSecond = 1'000'000'000LL;
+  const auto now_ns = [] {
+    timespec now{};
+    ::clock_gettime(CLOCK_MONOTONIC, &now);
+    return static_cast<std::int64_t>(now.tv_sec) * kNsPerSecond + now.tv_nsec;
+  };
+  const std::int64_t deadline = now_ns() + kInitRetryNs;
+  for (;;) {
+    const std::int64_t remaining = deadline - now_ns();
+    if (remaining <= 0) return;
+    timespec req{static_cast<time_t>(remaining / kNsPerSecond),
+                 static_cast<long>(remaining % kNsPerSecond)};
+    if (::nanosleep(&req, nullptr) == 0 || errno != EINTR) return;
+  }
+}
+// How many times in all, kInitRetryNs apart (at least 1 s), one open() waits
 // for live claimants of closing segments to unlink them before giving up
 // (RTMSQueue::claimant_wait_attempts_, which tests lower).
 // Not a death test -- among processes of one build a live claimant is never
@@ -157,7 +184,7 @@ std::string SchemaOf(const RTMSHeader& header) {
 bool WaitInitialized(const RTMSHeader& header) {
   for (int attempt = 0; attempt < kInitAttempts; ++attempt) {
     if (header.magic.load(std::memory_order_acquire) == kRtmsMagic) return true;
-    ::usleep(kInitRetryUs);
+    SleepInitRetry();
   }
   return false;
 }
@@ -171,8 +198,11 @@ class HeaderView {
 
   explicit HeaderView(const std::string& path, Access access = Access::kRead) {
     const bool write = access == Access::kWrite;
-    const int fd = ::shm_open(ShmObjectName(path).c_str(),
-                              write ? O_RDWR : O_RDONLY, 0666);
+    int fd = -1;
+    do {
+      fd = ::shm_open(ShmObjectName(path).c_str(), write ? O_RDWR : O_RDONLY,
+                      0666);
+    } while (fd == -1 && errno == EINTR);
     if (fd == -1) {
       failed_ = errno != ENOENT;
       return;
@@ -181,7 +211,11 @@ class HeaderView {
     struct stat info {};
     bool sized = false;
     for (int attempt = 0; attempt < kInitAttempts; ++attempt) {
-      if (::fstat(fd, &info) < 0) {
+      int fstat_rc = -1;
+      do {
+        fstat_rc = ::fstat(fd, &info);
+      } while (fstat_rc < 0 && errno == EINTR);
+      if (fstat_rc < 0) {
         failed_ = true;
         break;
       }
@@ -190,7 +224,7 @@ class HeaderView {
         sized = true;
         break;
       }
-      ::usleep(kInitRetryUs);
+      SleepInitRetry();
     }
     if (sized) {
       void* mapped =
@@ -545,7 +579,7 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
         if (on_reclaim_wait_ != nullptr) {
           on_reclaim_wait_(segment_id, claimant_waits);
         }
-        ::usleep(kInitRetryUs);
+        SleepInitRetry();
         continue;
       }
       // A claimant killed before unlinking it never will, and one whose
@@ -639,7 +673,7 @@ void RTMSQueue::replace_for_session() {
       if (on_reclaim_wait_ != nullptr) {
         on_reclaim_wait_(segment_id, claimant_waits);
       }
-      ::usleep(kInitRetryUs);
+      SleepInitRetry();
       continue;
     }
     // Attached queues (a count), or a claimant that died or gave its claim
@@ -814,6 +848,9 @@ WriteStatus RTMSQueue::write(std::span<const std::byte> message) {
 
 WriteStatus RTMSQueue::write(std::span<const std::byte> message,
                              std::int64_t publish_time_ns) {
+  if (header_ == nullptr) {
+    return {WriteResult::FAILURE, 0};
+  }
   // Low-level queues may omit publisher at construction; their first write
   // must still claim exclusive ownership before touching the ring.
   if (!options_.publisher) {
@@ -988,7 +1025,8 @@ ReadResult RTMSQueue::read_next(std::uint64_t reader_id,
                                 MessageInfo& info) {
   info = MessageInfo{};
 
-  if (reader_id >= MAX_READERS || destination.size() < header_->message_bytes) {
+  if (header_ == nullptr || reader_id >= MAX_READERS ||
+      destination.size() < header_->message_bytes) {
     return ReadResult::INVALID;
   }
 
