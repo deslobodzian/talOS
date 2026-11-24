@@ -104,6 +104,15 @@ class Rebuilt2026Rules final : public GameRules {
   std::string_view failure() const override { return {}; }
   void Report(::sim::MatchState& match) const override;
   FmsReport Fms() const override;
+  // A FUEL held or in reserve is out of play; every other body is in play.
+  bool InPlay(int body) const override {
+    if (body < 0 || static_cast<std::size_t>(body) >= fuel_of_body_.size()) {
+      return true;
+    }
+    const int fuel = fuel_of_body_[static_cast<std::size_t>(body)];
+    return fuel < 0 ||
+           status_[static_cast<std::size_t>(fuel)] == Status::kInPlay;
+  }
 
  private:
   struct Fuel {
@@ -147,6 +156,7 @@ class Rebuilt2026Rules final : public GameRules {
   SplitMix64 random_;
   std::vector<Fuel> fuel_;
   std::vector<Status> status_;
+  std::vector<int> fuel_of_body_;       // by body id: its FUEL index, or -1
   std::vector<uint64_t> release_step_;  // by FUEL index, while held
   std::array<Hub, 2> hubs_{};
   double radius_m_{};
@@ -182,6 +192,7 @@ void Rebuilt2026Rules::Attach(const mjModel& model, mjData& data) {
   fuel_.assign(static_cast<std::size_t>(count), Fuel{});
   status_.assign(fuel_.size(), Status::kInPlay);
   release_step_.assign(fuel_.size(), 0);
+  fuel_of_body_.assign(static_cast<std::size_t>(model.nbody), -1);
   for (int k = 0; k < count; ++k) {
     std::array<char, 16> name{};
     std::snprintf(name.data(), name.size(), "fuel_%03d", k);
@@ -195,6 +206,7 @@ void Rebuilt2026Rules::Attach(const mjModel& model, mjData& data) {
              "' is not a free body with one free joint and a geom");
     }
     const int joint = model.body_jntadr[body];
+    fuel_of_body_[static_cast<std::size_t>(body)] = k;
     fuel_[static_cast<std::size_t>(k)] = {model.jnt_qposadr[joint],
                                           model.jnt_dofadr[joint]};
     if (k == 0) radius_m_ = model.geom_rbound[model.body_geomadr[body]];

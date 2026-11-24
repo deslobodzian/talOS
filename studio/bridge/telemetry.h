@@ -600,6 +600,21 @@ class ClientFeed {
   // hearing from the stream.
   bool holds_tick() const { return has_values_; }
 
+  // Whether the client owes no dictionary page and no keyframe: there is
+  // no dictionary, or it holds the whole dictionary and a tick of it (or
+  // there is no tick yet). What Pump has left for it are change-only
+  // updates and heartbeats, which a game pieces message may share the
+  // budget with (PumpPieces in pieces.h).
+  bool Settled(const TelemetryState& state) const {
+    if (!state.has_dictionary) return true;
+    if (!known_ || stream_id_ != state.stream_id ||
+        dictionary_id_ != state.dictionary_id ||
+        dictionary_pages_sent_ < state.dictionary_pages.size()) {
+      return false;
+    }
+    return !state.has_frame || has_values_;
+  }
+
   // True when the client holds exactly the state's latest tick (of the
   // channels `mask` marks, when given) and owes no coalesced alert pulse.
   bool current(const TelemetryState& state,
@@ -751,7 +766,9 @@ class ClientFeed {
 // values. `rate` is the client's share in B/s; `afford(framed_bytes)` and the
 // senders are as in ClientFeed.
 struct ClientFeeds {
-  enum class Feed { kGraph, kTelemetry, kThrottledTelemetry };
+  // kPieces: a game pieces message (pieces.h), sent only while
+  // PiecesMayGo(); it never takes the shared reservation.
+  enum class Feed { kGraph, kTelemetry, kThrottledTelemetry, kPieces };
 
   static constexpr std::int64_t kHoldNs = 250'000'000;
   static constexpr double kGraphShare = 0.5;
@@ -759,25 +776,40 @@ struct ClientFeeds {
   GraphFeed graph;
   ClientFeed telemetry;
 
-  // `afford` takes either `(framed_bytes)` or `(framed_bytes, Feed)`. When
+  // `afford` takes `(framed_bytes, Feed, own_room)`, `(framed_bytes, Feed)`
+  // or `(framed_bytes)`. When
   // `telemetry_first` is true (a telemetry send such as a dictionary page or
   // keyframe is waiting on the shared egress bucket), telemetry is offered
   // before the system graph so a small graph update cannot preempt or drain
-  // budget ahead of it.
+  // budget ahead of it. `pieces_room` is the framed size of a game pieces
+  // message owed to the client, held whether or not its allowance covers it
+  // yet (PiecesRoom in pieces.h): while the client is Settled, a telemetry
+  // update goes only when the client's own bucket holds it and that much
+  // more, so the pieces message is not starved by updates that would fill
+  // the client's share. An `afford(framed_bytes, feed, own_room)` applies
+  // the room to the client's own bucket alone (the shared bucket, and the
+  // shared reservation, see only the update's bytes), as the bridge does
+  // (AffordProgrammerSend in drive.h). A two- or one-argument `afford` is
+  // asked for both together: telemetry_test's ClientFeeds and
+  // SharedReservation tests use them, and owe no pieces (room 0).
   template <class Afford, class SendText, class SendBinary>
   void Pump(const SystemGraphDocument& document, const TelemetryState& state,
             std::int64_t now_ns, double rate, Afford&& afford,
             SendText&& send_text, SendBinary&& send_binary,
-            bool telemetry_first = false) {
-    const auto call_afford = [&afford](std::size_t bytes, Feed feed) {
-      if constexpr (requires { afford(bytes, feed); }) {
-        return afford(bytes, feed);
+            bool telemetry_first = false, std::size_t pieces_room = 0) {
+    const auto call_afford = [&afford](std::size_t bytes, Feed feed,
+                                       std::size_t own_room = 0) {
+      if constexpr (requires { afford(bytes, feed, own_room); }) {
+        return afford(bytes, feed, own_room);
+      } else if constexpr (requires { afford(bytes, feed); }) {
+        return afford(bytes + own_room, feed);
       } else {
-        return afford(bytes);
+        return afford(bytes + own_room);
       }
     };
-    const auto afford_telemetry = [&call_afford](std::size_t bytes) {
-      return call_afford(bytes, Feed::kTelemetry);
+    const std::size_t room = telemetry.Settled(state) ? pieces_room : 0;
+    const auto afford_telemetry = [&call_afford, room](std::size_t bytes) {
+      return call_afford(bytes, Feed::kTelemetry, room);
     };
     if (telemetry_first) {
       telemetry.Pump(state, now_ns, afford_telemetry, send_binary);
@@ -816,6 +848,14 @@ struct ClientFeeds {
           return ok;
         });
     if (sent) held_sent_ns_ = now_ns;
+  }
+
+  // Whether a game pieces message may go: no graph message deferred, and
+  // no telemetry dictionary page or keyframe owed (ClientFeed::Settled).
+  // Those go before pieces; telemetry updates share with them (Pump's
+  // `pieces_room`).
+  bool PiecesMayGo(const TelemetryState& state) const {
+    return held_since_ns_ < 0 && telemetry.Settled(state);
   }
 
   // The earliest instant Pump, called with nothing new published, may send:
@@ -990,10 +1030,16 @@ class SharedReservation {
   // Records that `client` was blocked specifically by the shared bucket on a
   // send of `framed_bytes` from `feed` (own bucket holds it, socket is not
   // backpressured). Messages over kBurstBytes can never fit and are ignored;
-  // throttled telemetry while a graph waits on `own` is ignored too.
+  // throttled telemetry while a graph waits on `own`, and a game pieces
+  // message, are ignored too.
   void BlockedOnShared(Client client, std::size_t framed_bytes,
                        ClientFeeds::Feed feed) {
-    if (feed == ClientFeeds::Feed::kThrottledTelemetry) return;
+    // Throttled telemetry, and the game pieces (rebuilt later against the
+    // latest message when it can be afforded), never reserve the bucket.
+    if (feed == ClientFeeds::Feed::kThrottledTelemetry ||
+        feed == ClientFeeds::Feed::kPieces) {
+      return;
+    }
     if (static_cast<double>(framed_bytes) > EgressBudget::kBurstBytes) return;
     if (!in_client_ || current_client_ != client || current_blocked_) return;
     current_blocked_ = true;

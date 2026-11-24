@@ -13,7 +13,9 @@ import type {SessionManifest} from '../src/data/manifest';
 import {TelemetryStore} from '../src/data/store';
 import type {PlaybackState, Snapshot, SystemState} from '../src/data/types';
 import {UPDATE_CAPACITY} from '../src/data/worker-stream';
+import type {PiecesSnapshot} from '../src/data/pieces';
 import {graphVersionMismatch, SYSTEM_GRAPH_VERSION} from '../src/system';
+import {piecesMessage} from './pieces_message';
 
 let now = 1000;
 type Listener = ((event: {data: unknown}) => void)|null;
@@ -33,6 +35,7 @@ class FakeSocket {
 let playback: PlaybackState|null = null;
 let system: SystemState|null = null;
 let frames: Snapshot[] = [];
+let pieces: PiecesSnapshot|null = null;
 // The main thread's render cache, fed as studio.ts feeds it.
 const store = new TelemetryStore(cb => cb());
 function apply(m: Record<string, unknown>) {
@@ -46,6 +49,8 @@ function apply(m: Record<string, unknown>) {
     store.ingest(m.frames as Snapshot[], m.reset as boolean);
   } else if (m.type === 'alerts') {
     store.setAlertLatch(m.latch as AlertLatch);
+  } else if (m.type === 'pieces') {
+    pieces = m.pieces as PiecesSnapshot|null;
   }
 }
 let exported: ArrayBuffer|null = null;
@@ -513,4 +518,27 @@ test('alert activations in frames dropped by WorkerUpdateStream stay latched', (
   advance(8);
   assert.equal(store.alertLatch().alerts.length, 0);
   assert.equal(store.alertLatch().matchKey, null);
+});
+
+// REQ-DEV-43
+test('the bridge\'s game pieces reach the page beside telemetry, and a new connection clears them', () => {
+  const socket = connect();
+  binary(socket, demoPacket(0n));
+  binary(socket, piecesMessage(true, 2, 0.075, 5n, [
+    {index: 0, in_play: true, x_mm: 1000, y_mm: 2000, z_mm: 75},
+    {index: 1, in_play: true, x_mm: 3000, y_mm: 4000, z_mm: 75}]));
+  binary(socket, piecesMessage(false, 2, 0.075, 6n, [
+    {index: 1, in_play: false, x_mm: 3001, y_mm: 4000, z_mm: 75}]));
+  binary(socket, demoPacket(1n));
+  advance(40);
+  assert.equal(playback!.stats.invalid, 0, 'a pieces message is not a bad telemetry page');
+  assert.equal(frames.at(-1)!.sequence_id, '1');
+  assert.equal(pieces!.sample_time_ns, '6');
+  assert.deepEqual([...pieces!.in_play], [1, 0]);
+  assert.ok(Math.abs(pieces!.positions[3] - 3.001) < 1e-6);
+
+  // Another bridge: no pieces until its keyframe.
+  connect();
+  advance(40);
+  assert.equal(pieces, null, 'a new connection starts with no pieces');
 });

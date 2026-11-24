@@ -116,8 +116,9 @@ cc_binary(
 
 # The program's GatewayExtension: assembles the world from the config's
 # [simulation.mujoco] with the robot's scripted shooters and the field's game
-# rules, finds the field models in its runfiles, feeds the rules the match
-# and publishes /sim/state/match, and reports the plant's clock. A library
+# rules, finds the field models in its runfiles, feeds the rules the match,
+# publishes /sim/state/match and /sim/telemetry/pieces, and reports the
+# plant's clock. A library
 # so the component tests drive it in process.
 cc_library(
     name = "gateway_extension",
@@ -138,9 +139,11 @@ cc_library(
         "//talOS/events:events_core",
         "//talOS/hardware",
         "//talOS/hardware:sim_messages",
+        "//talOS/hardware:sim_rings",
         "//talOS/ipc",
         "//talOS/simulation:gateway_main",
         "//talOS/simulation/mujoco/fields/rebuilt_2026:rules",
+        "@mujoco",
         "@rules_cc//cc/runfiles",
     ],
 )
@@ -179,6 +182,29 @@ cc_test(
         "//talOS/hardware:codecs",
         "//talOS/hardware:sim_messages",
         "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+# REQ-DEV-43: /sim/telemetry/pieces against the stepped model's bodies on
+# the 2026 field (positions, count, radius, a scored FUEL out of play), the
+# 10th-tick rule, identical bytes across runs, a free robot never a piece,
+# and the refusals of a field the message cannot carry.
+cc_test(
+    name = "pieces_test",
+    size = "small",
+    srcs = ["pieces_test.cc"],
+    data = ["//talOS/simulation/mujoco/fields/rebuilt_2026"],
+    env = {"FIELD_XML": "$(rlocationpath //talOS/simulation/mujoco/fields/rebuilt_2026)"},
+    deps = [
+        ":gateway_extension",
+        ":plant",
+        "//talOS/configuration",
+        "//talOS/driver_station",
+        "//talOS/hardware",
+        "//talOS/hardware:sim_messages",
+        "@googletest//:gtest_main",
+        "@mujoco",
         "@rules_cc//cc/runfiles",
     ],
 )
@@ -277,8 +303,8 @@ cc_test(
 
 # REQ-DEV-40: the program referees its mode schedule's match on the 2026
 # field: /sim/state/match's periods in order and counting down, the Driver
-# Station's match time and game message, and the live registry row against
-# --describe. Integration lane: fork/exec, loopback UDP, shared memory; one
+# Station's match time and game message, the live registry row against
+# --describe, and (REQ-DEV-43) /sim/telemetry/pieces every 50 ms. Integration lane: fork/exec, loopback UDP, shared memory; one
 # run of about 1.3 s of real time.
 cc_test(
     name = "match_state_test",
@@ -297,6 +323,7 @@ cc_test(
     deps = [
         "//talOS/driver_station",
         "//talOS/hardware:sim_messages",
+        "//talOS/hardware:sim_rings",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "//talOS/introspection:registry",

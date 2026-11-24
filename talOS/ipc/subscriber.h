@@ -39,10 +39,14 @@ class Subscriber {
           RTMSOptions{
               .overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
               .read_mode = ReadMode::SEQUENCE,
-          })
-      : topic_{topic}, queue_{topic_,           sizeof(Message),
-                              alignof(Message), talos::schema::Of<Message>(),
-                              MAX_SLOTS,        options} {
+          },
+      std::size_t slots = MAX_SLOTS)  // the topic's ring, as its writer's
+      : topic_{topic}, queue_{topic_,
+                              sizeof(Message),
+                              alignof(Message),
+                              talos::schema::Of<Message>(),
+                              slots,
+                              options} {
     reader_id_ = queue_.register_reader();
     if (!reader_id_) {
       throw std::runtime_error("RTMS topic " + topic_ +

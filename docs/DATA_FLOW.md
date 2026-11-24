@@ -28,6 +28,7 @@ flowchart LR
   SIM[sim_gateway or WPILib RoboRIO sim] <-->|same UDP contract in simulation| HW
   SIM -->|/sim/state, physics gateway only| T
   SIM -->|/sim/state/match, MuJoCo gateway only| T
+  SIM -->|/sim/telemetry/pieces, MuJoCo gateway only| SB
   HW -->|/hw/state and /hw/state/driver_station| N[actuator-owning nodes]
   N -->|/hw/request/node| HW
   HW -->|Driver Station snapshot| DRIVER[target producers: teleop, autonomous]
@@ -60,9 +61,10 @@ shared-memory topics only; its repository documents their rates.
 | target producers (`teleop`) → actuator nodes | Shared-memory target lanes | On the producer's `period_us`, `teleop`'s 5000 µs (200 Hz); mode/freshness policy selects one lane. |
 | `sim_gateway --physics` → simulated sensors (a robot's simulated cameras) / telemetry | Shared-memory `/sim/state` | Every physics/hardware tick (200 Hz); main-processor node-clock timestamp, true field pose and field-frame velocity. No writer under ideal or WPILib/RoboRIO simulation. |
 | The MuJoCo gateway → telemetry | Shared-memory `/sim/state/match` | Every tick (200 Hz at a 5 ms `[robot] period_us`, else as the period gives); `sample_time_ns` on the main-processor node clock at the tick's start, the match its field's game referees (period None without a game). No other writer. |
-| Any publisher → the loop of a reader asleep on its topic (wake) | AF_UNIX datagram, Linux abstract address / macOS `/tmp/talos-wake-<id>`; no port ([talOS/rtms](../talOS/rtms/README.md#wake-channel)) | 1 byte, at most one per reader sleep per topic: a write sends one to each reader slot armed since the last publication (a reader of a prompt subscription under `Delivery::ON_PUBLISH`, the bridge's reader of each `/hw/request/<node>`, or `studio_bridge`'s reader of `/talos/telemetry`, between its drain and its next block), none when no reader is armed; a writer taking over a topic sends one to every reader with a receiver. A lost datagram costs a node's loop up to its 1 s backstop, the bridge up to its longest wait, 10000 µs (`HardwareNode::kMaxWaitUs`), and `studio_bridge` up to its next duty, at most its 250 ms graph refresh ([Studio bridge](../studio/bridge/README.md#waking)). A send that fails other than to a gone receiver counts in the writer's registry row (`wake_failures`), and a request the bridge's latest-value read passes over in its subsystem's request row (`requests_skipped`; [wake loss](../talOS/introspection/README.md#wake-loss)). |
+| The MuJoCo gateway → studio_bridge | Shared-memory `/sim/telemetry/pieces` | The first tick and every round(50 ms / period)-th after it: every 10th, 20 Hz, at a 5 ms `[robot] period_us`, 16.7 to 25 Hz over the gateway's 1 to 20 ms periods; `sample_time_ns` as `/sim/state/match`, each game piece's position and whether it is in play (`pieces_count` 0 without a field). Only `studio_bridge` reads it (optional, an observer, latest only); telemetry observes state and status topics only, so the telemetry feed and its recording carry no piece positions (REQ-DEV-43). No other writer. |
+| Any publisher → the loop of a reader asleep on its topic (wake) | AF_UNIX datagram, Linux abstract address / macOS `/tmp/talos-wake-<id>`; no port ([talOS/rtms](../talOS/rtms/README.md#wake-channel)) | 1 byte, at most one per reader sleep per topic: a write sends one to each reader slot armed since the last publication (a reader of a prompt subscription under `Delivery::ON_PUBLISH`, the bridge's reader of each `/hw/request/<node>`, or `studio_bridge`'s readers of `/talos/telemetry` and `/sim/telemetry/pieces`, between its drain and its next block), none when no reader is armed; a writer taking over a topic sends one to every reader with a receiver. A lost datagram costs a node's loop up to its 1 s backstop, the bridge up to its longest wait, 10000 µs (`HardwareNode::kMaxWaitUs`), and `studio_bridge` up to its next duty, at most its 250 ms graph refresh ([Studio bridge](../studio/bridge/README.md#waking)). A send that fails other than to a gone receiver counts in the writer's registry row (`wake_failures`), and a request the bridge's latest-value read passes over in its subsystem's request row (`requests_skipped`; [wake loss](../talOS/introspection/README.md#wake-loss)). |
 | Nodes → telemetry → studio_bridge | Shared-memory states/statuses → `/talos/telemetry` byte topic | Telemetry period 10000 µs = 100 Hz, each tick as one or more value pages; dictionary pages before the first tick and every 100th (1 Hz at this rate). |
-| studio_bridge ↔ browser/agent | HTTP + WebSocket, configured port 5800 | Per client: graph, dictionary pages and a keyframe on connection, then change-only telemetry updates of at most one per producer tick and system-graph value updates of at most one per 500 ms (the whole graph again when its structure changes), deferred and coalesced when the egress budget is short. HTTP requests are not the value stream. |
+| studio_bridge ↔ browser/agent | HTTP + WebSocket, configured port 5800 | Per client: graph, dictionary pages and a keyframe on connection, then change-only telemetry updates of at most one per producer tick and system-graph value updates of at most one per 500 ms (the whole graph again when its structure changes), deferred and coalesced when the egress budget is short. Under the MuJoCo gateway, game pieces messages too: a keyframe of every piece, then the pieces whose millimetre position or in-play flag changed, at most one per `/sim/telemetry/pieces` message, only while the client's graph and telemetry have nothing waiting (below). HTTP requests are not the value stream. |
 | studio_bridge → driver dashboard (`/drive`) | WebSocket, the same port | Per drive client (at most the layout's `drive_clients`, outside `max_clients`): dictionary pages and a keyframe of the feed's channels (the layout's, `hw/status/alert_error_link_lost`, `hw/status/alert_error_protocol_mismatch`, and with an `alerts` widget every alert channel) on connection, then change-only updates of those channels at most `update_hz` (default 20) a second, an empty update after 100 ms without one, and the drive summary (at most <!-- size: telemetry.drive_summary_bytes -->4,096 B) on change at most every 500 ms; within the layout's `budget_bytes_per_s` (default 24,000 B/s), reserved out of the bridge's 160,000 B/s ([bridge README](../studio/bridge/README.md#driver-dashboard-feed)). |
 
 A failed send never kills the bridge (`RuntimeUdpPeer` raises no
@@ -340,6 +342,7 @@ separate.
 | `/<estimator>/state`: a `new_subsystem --type estimator` node → telemetry | <!-- size: pose_estimate.slot_bytes -->80 | <!-- size: pose_estimate.bytes -->72 B geometry.PoseEstimate (`talOS/msgs/layout_asserts.cc`); `valid` = fresh usable odometry, `localized` = established field-frame trust; `localized` sits in existing payload padding |
 | `/sim/state`: physics sim_gateway → telemetry and a robot's simulated sensors | <!-- size: odometry_sample.slot_bytes -->64 | <!-- size: odometry_sample.bytes -->56 B geometry.OdometrySample: sample_time_ns + Pose2d + Twist2d; 200 Hz, always valid while published; absent with ideal or WPILib/RoboRIO simulation |
 | `/sim/state/match`: the MuJoCo gateway, each tick, from its field's game rules (period None without a game) → telemetry | <!-- size: match_state.slot_bytes -->72 | <!-- size: match_state.bytes -->64 B sim.MatchState (`talOS/hardware/sim.fbs`): sample_time_ns, schedule_time_us, period_remaining_us, seven u32 counts (points, AUTO points and scored per alliance, shots), two u16 piece counts, the period and stage, four flags, 2 B tail padding; declared in `//talOS/hardware:sim_messages` |
+| `/sim/telemetry/pieces`: the MuJoCo gateway, every round(50 ms / period)-th tick → studio_bridge | <!-- size: game_pieces.slot_bytes -->8344 × <!-- size: game_pieces.slot_count -->8 slots | <!-- size: game_pieces.bytes -->8336 B sim.GamePieces (`talOS/hardware/sim.fbs`): sample_time_ns, u32 pieces_count, f32 radius_m, then x_m, y_m and z_m as 640 f32 each and 640 bool in_play; ring = <!-- size: game_pieces.ring_bytes -->66752 B of slot storage: its one reader takes only the newest message, and eight slots take 320 ms to lap at 25 Hz, the fastest rate, against a copy of microseconds (`kPiecesSlots`, `talOS/hardware/sim_rings.h`, read by the gateway, `studio_bridge` and both `--describe`s); declared in `//talOS/hardware:sim_messages` |
 | `/talos/telemetry`: telemetry → studio_bridge | <!-- size: telemetry.slot_stride_bytes -->16392 × <!-- size: telemetry.slot_count -->64 slots | <!-- size: telemetry.dictionary_page_bytes -->16384 B byte payload capacity; ring = <!-- size: telemetry.ring_bytes -->1049088 B of slot storage; the writer overwrites, so a reader more than 63 pages behind (about 0.3 s at 100 Hz with the bench's two value pages a tick) is lapped and counts the missed pages, and a stalled reader never stops publication; the bridge never applies a tick it lost a page of |
 
 Sources: `talOS/hardware/packet.h`, `talOS/hardware/status/bridge_status.fbs`,
@@ -351,7 +354,8 @@ of the bench's and examples' configs reports. Struct sizes include alignment
 padding: they must not be inferred by simply adding scalar field widths.
 The `/sim/state` payload is pinned by `static_assert(sizeof(geometry::OdometrySample)
 == 56)` in `talOS/simulation/gateway_main.cc` and `/sim/state/match`'s by
-`static_assert(sizeof(sim::MatchState) == 64)` in
+`static_assert(sizeof(sim::MatchState) == 64)` and `/sim/telemetry/pieces`'s
+by `static_assert(sizeof(sim::GamePieces) == 8336)` in
 `talOS/hardware/sim_layout_asserts.cc`; RTMS adds its 8 B publication timestamp.
 These truth topics are local to the main processor and never cross hardware UDP.
 
@@ -518,6 +522,50 @@ every change since, so a client's view is always one whole producer tick.
 **The live view therefore
 skips intermediate samples whenever the budget is short; each node's event log
 is the complete record.**
+
+Under the MuJoCo gateway each programmer client is also sent the game pieces
+(`PiecesFeed` in [`studio/bridge/pieces.h`](../studio/bridge/pieces.h);
+layout in the [bridge README](../studio/bridge/README.md#game-pieces)): a
+keyframe of every piece on connection, then a message naming only the pieces
+whose millimetre position or in-play flag changed since that client's last
+one, 24 B plus 16 B a piece; nothing while none changed. The largest, a
+keyframe of 640 pieces, is 10,264 B (10,274 B framed, `static_assert` in
+`pieces.h`), inside the 64,000 B burst: 0.37 s of a 28,000 B/s client share.
+The 2026 field's 504 FUEL at rest cost nothing after the keyframe; ten moving
+FUEL at 20 Hz cost 3,880 B/s framed (194 B a message), and every piece moving at 20 Hz would
+want 205 kB/s, more than any share, so the client is sent fewer, larger
+messages that each carry the latest positions. The pieces have an
+allowance per programmer client (`PiecesFeed` in `pieces.h`): it accrues a
+quarter of the client's rate R (`kPiecesShare`), up to one 10,274 B keyframe
+(`kPiecesAllowanceBytes`), so the first keyframe goes at once and deltas
+never bank more; a message goes when the allowance covers it and the
+client's and the shared bucket afford it, and is charged to all three. A
+graph message, a telemetry dictionary page and a telemetry keyframe go
+first: no pieces message goes while one is pending
+(`ClientFeeds::PiecesMayGo`). While a pieces message is owed, the client's
+telemetry updates leave room for it in the client's own bucket
+(`PiecesRoom`, `AffordProgrammerSend`; the shared bucket and the shared
+reservation see only an update's own bytes): they go when that bucket holds
+them and the owed message too, whether or not the allowance covers it yet, so telemetry that
+would fill the share cannot take the pieces' bytes first. For a client of
+rate R this gives: the pieces spend at most R/4 over any window plus one
+allowance, so saturating telemetry keeps at least 3/4 of R; one telemetry
+update waits at most one pieces message's bytes / R longer than without
+pieces (a 504-piece delta, 8,098 B framed: 0.29 s at 28,000 B/s, 0.20 s at
+40,000 B/s, and about 4.6 s at `max_clients` = 64 with the default layout,
+R = 1,750 B/s, long enough that Studio marks that client's readings stale
+meanwhile; ten moving FUEL, 194 B: 7 ms and 5 ms); and a message of N
+changed pieces goes at min(20, R/4 / its bytes) a second: 10 moving FUEL at
+20 Hz at either share, 100 at 4.3 Hz (28,000 B/s) or 6.1 Hz (40,000 B/s),
+all 504 at 0.86 or 1.2 Hz, each message carrying the latest positions. Once
+motion stops, the client holds the latest positions within one message's
+bytes / (R/4) plus 50 ms (1.21 s for all 504 at 28,000 B/s). A message the
+allowance or the budget holds back is rebuilt against the latest when it
+goes, and a delta is never larger than a keyframe of the field, which the
+allowance's cap always covers, so the client converges. A pieces message
+never takes the shared reservation. Without pieces (a robot, or
+`sim_gateway`) nothing here applies and the bridge sends what it did. Drive
+clients are sent none.
 
 Studio's bridge sends at most **160,000 B/s** in all, charging every
 WebSocket send with conservative framing overhead (`EgressBudget` in
