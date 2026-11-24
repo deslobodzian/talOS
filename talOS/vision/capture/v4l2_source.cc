@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -252,15 +253,11 @@ class Source final : public CameraSource {
         mode.fps <= 0 || mode.fps > 1000000) {
       return false;
     }
-    if (!JoinExitedWorkersOutsideLocks()) {
+    std::unique_lock lifecycle(lifecycle_mutex_);
+    if (!PrepareQuiescentForConfigLocked(lifecycle)) {
       return false;
     }
-    std::lock_guard lifecycle(lifecycle_mutex_);
     std::lock_guard lock(state_mutex_);
-    if (running_.load(std::memory_order_acquire) || worker_.joinable() ||
-        !retired_workers_.empty()) {
-      return false;
-    }
     mode_ = mode;
     return true;
   }
@@ -269,15 +266,11 @@ class Source final : public CameraSource {
     return controls_;
   }
   bool SetControls(const CameraControls& controls) override {
-    if (!JoinExitedWorkersOutsideLocks()) {
+    std::unique_lock lifecycle(lifecycle_mutex_);
+    if (!PrepareQuiescentForConfigLocked(lifecycle)) {
       return false;
     }
-    std::lock_guard lifecycle(lifecycle_mutex_);
     std::lock_guard lock(state_mutex_);
-    if (running_.load(std::memory_order_acquire) || worker_.joinable() ||
-        !retired_workers_.empty()) {
-      return false;
-    }
     controls_ = controls;
     return true;
   }
@@ -299,28 +292,65 @@ class Source final : public CameraSource {
   bool controls_applied() const override { return controls_applied_; }
   bool Start() override {
     std::unique_lock lifecycle(lifecycle_mutex_);
-    for (;;) {
+    if (IsSelfWorker()) {
       if (running_.load(std::memory_order_acquire)) {
         return true;
       }
-      std::vector<std::jthread> to_join;
-      bool on_self_capture = false;
-      DetachWorkersLocked(to_join, &on_self_capture);
-      if (!to_join.empty()) {
-        lifecycle.unlock();
-        JoinThreads(to_join);
-        lifecycle.lock();
-        continue;
-      }
-      if (on_self_capture) {
+      if (IsSelfBeforeDeviceRelease()) {
         lifecycle.unlock();
         ReportConnection(
             ConnectionState::kError,
             device_id() + ": cannot restart inside frame callback");
         return false;
       }
-      ReleaseDevice();
-      break;
+      if (active_teardowns_ > 0) {
+        return false;
+      }
+      std::vector<std::jthread> other_workers;
+      DetachWorkersLocked(other_workers);
+      if (!other_workers.empty()) {
+        ++active_teardowns_;
+        lifecycle.unlock();
+        JoinThreads(other_workers);
+        other_workers.clear();
+        lifecycle.lock();
+        --active_teardowns_;
+        lifecycle_cv_.notify_all();
+        if (running_.load(std::memory_order_acquire)) {
+          return true;
+        }
+        if (active_teardowns_ > 0) {
+          return false;
+        }
+      }
+    } else {
+      for (;;) {
+        if (running_.load(std::memory_order_acquire)) {
+          return true;
+        }
+        std::vector<std::jthread> to_join;
+        DetachWorkersLocked(to_join);
+        if (!to_join.empty()) {
+          ++active_teardowns_;
+          lifecycle.unlock();
+          JoinThreads(to_join);
+          to_join.clear();
+          lifecycle.lock();
+          --active_teardowns_;
+          lifecycle_cv_.notify_all();
+          continue;
+        }
+        if (active_teardowns_ > 0) {
+          lifecycle_cv_.wait(lifecycle, [&] {
+            return active_teardowns_ == 0 ||
+                   running_.load(std::memory_order_acquire) ||
+                   HasJoinableWorkersLocked();
+          });
+          continue;
+        }
+        ReleaseDevice();
+        break;
+      }
     }
     auto fail = [&](const char* step, int error) {
       running_.store(false, std::memory_order_release);
@@ -475,42 +505,101 @@ class Source final : public CameraSource {
     return true;
   }
   void Stop() override {
-    for (;;) {
-      std::vector<std::jthread> to_join;
-      bool on_self_capture = false;
-      {
-        std::lock_guard lifecycle(lifecycle_mutex_);
-        DetachWorkersLocked(to_join, &on_self_capture);
-        running_.store(false, std::memory_order_release);
-        if (to_join.empty()) {
-          if (!on_self_capture) {
-            ReleaseDevice();
-          }
-          return;
-        }
+    std::unique_lock lifecycle(lifecycle_mutex_);
+    running_.store(false, std::memory_order_release);
+    if (IsSelfWorker()) {
+      // Request stop on ourselves and defer joining/device release so we never
+      // self-join, never AB-BA deadlock an external Stop() waiting on us, and
+      // never close fd_/mappings_ while FrameCallback/VIDIOC_QBUF is active.
+      std::vector<std::jthread> other_workers;
+      DetachWorkersLocked(other_workers);
+      if (!other_workers.empty()) {
+        ++active_teardowns_;
+        lifecycle.unlock();
+        JoinThreads(other_workers);
+        other_workers.clear();
+        lifecycle.lock();
+        --active_teardowns_;
+        lifecycle_cv_.notify_all();
       }
-      JoinThreads(to_join);
-      std::lock_guard lifecycle(lifecycle_mutex_);
-      if (!running_.load(std::memory_order_acquire)) {
-        std::vector<std::jthread> remaining;
-        bool still_self = false;
-        DetachWorkersLocked(remaining, &still_self);
-        if (remaining.empty()) {
-          if (!still_self) {
-            ReleaseDevice();
-          }
-          return;
-        }
-        // Another worker appeared before we finished teardown; join it next.
+      if (!IsSelfBeforeDeviceRelease() && active_teardowns_ == 0 &&
+          !running_.load(std::memory_order_acquire) && !worker_.joinable()) {
+        ReleaseDevice();
+      }
+      return;
+    }
+    for (;;) {
+      running_.store(false, std::memory_order_release);
+      std::vector<std::jthread> to_join;
+      DetachWorkersLocked(to_join);
+      if (!to_join.empty()) {
+        ++active_teardowns_;
+        lifecycle.unlock();
+        JoinThreads(to_join);
+        to_join.clear();
+        lifecycle.lock();
+        --active_teardowns_;
+        lifecycle_cv_.notify_all();
         continue;
       }
+      if (active_teardowns_ > 0) {
+        lifecycle_cv_.wait(lifecycle, [&] {
+          return active_teardowns_ == 0 || HasJoinableWorkersLocked();
+        });
+        continue;
+      }
+      ReleaseDevice();
       return;
     }
   }
 
  private:
-  void DetachWorkersLocked(std::vector<std::jthread>& to_join,
-                           bool* on_self_capture) {
+  static inline thread_local const Source* t_current_worker_source = nullptr;
+  static inline thread_local bool t_worker_before_device_release = false;
+
+  bool IsSelfWorker() const { return t_current_worker_source == this; }
+  bool IsSelfBeforeDeviceRelease() const {
+    return t_current_worker_source == this && t_worker_before_device_release;
+  }
+  bool HasJoinableWorkersLocked() {
+    std::lock_guard lock(state_mutex_);
+    return worker_.joinable() || !retired_workers_.empty();
+  }
+  bool PrepareQuiescentForConfigLocked(
+      std::unique_lock<std::mutex>& lifecycle) {
+    if (IsSelfWorker()) {
+      return !running_.load(std::memory_order_acquire) &&
+             !IsSelfBeforeDeviceRelease() && active_teardowns_ == 0 &&
+             !worker_.joinable();
+    }
+    for (;;) {
+      if (running_.load(std::memory_order_acquire)) {
+        return false;
+      }
+      if (active_teardowns_ > 0) {
+        lifecycle_cv_.wait(lifecycle, [&] {
+          return active_teardowns_ == 0 ||
+                 running_.load(std::memory_order_acquire);
+        });
+        continue;
+      }
+      std::vector<std::jthread> to_join;
+      DetachWorkersLocked(to_join);
+      if (!to_join.empty()) {
+        ++active_teardowns_;
+        lifecycle.unlock();
+        JoinThreads(to_join);
+        to_join.clear();
+        lifecycle.lock();
+        --active_teardowns_;
+        lifecycle_cv_.notify_all();
+        continue;
+      }
+      return !running_.load(std::memory_order_acquire) &&
+             active_teardowns_ == 0 && !HasJoinableWorkersLocked();
+    }
+  }
+  void DetachWorkersLocked(std::vector<std::jthread>& to_join) {
     std::lock_guard lock(state_mutex_);
     const auto self = std::this_thread::get_id();
     if (worker_.joinable()) {
@@ -522,16 +611,6 @@ class Source final : public CameraSource {
       }
     }
     ReapRetiredLocked(to_join);
-    bool self_active = false;
-    for (const auto& t : retired_workers_) {
-      if (t.joinable() && t.get_id() == self) {
-        self_active = capture_active_.load(std::memory_order_acquire);
-        break;
-      }
-    }
-    if (on_self_capture != nullptr) {
-      *on_self_capture = self_active;
-    }
   }
   void ReapRetiredLocked(std::vector<std::jthread>& to_join) {
     const auto self = std::this_thread::get_id();
@@ -547,31 +626,6 @@ class Source final : public CameraSource {
       if (t.joinable()) {
         t.join();
       }
-    }
-  }
-  bool JoinExitedWorkersOutsideLocks() {
-    for (;;) {
-      std::vector<std::jthread> to_join;
-      {
-        std::lock_guard lifecycle(lifecycle_mutex_);
-        std::lock_guard lock(state_mutex_);
-        if (running_.load(std::memory_order_acquire)) {
-          return false;
-        }
-        const auto self = std::this_thread::get_id();
-        if (worker_.joinable()) {
-          if (worker_.get_id() == self) {
-            retired_workers_.push_back(std::move(worker_));
-          } else {
-            to_join.push_back(std::move(worker_));
-          }
-        }
-        ReapRetiredLocked(to_join);
-      }
-      if (to_join.empty()) {
-        return !running_.load(std::memory_order_acquire);
-      }
-      JoinThreads(to_join);
     }
   }
   void ReleaseDevice() {
@@ -603,6 +657,20 @@ class Source final : public CameraSource {
     }
   }
   void Capture(const std::stop_token& stop) {
+    struct WorkerScope {
+      const Source* prev_source;
+      bool prev_before_release;
+      explicit WorkerScope(const Source* self)
+          : prev_source(t_current_worker_source),
+            prev_before_release(t_worker_before_device_release) {
+        t_current_worker_source = self;
+        t_worker_before_device_release = true;
+      }
+      ~WorkerScope() {
+        t_worker_before_device_release = prev_before_release;
+        t_current_worker_source = prev_source;
+      }
+    } scope{this};
     talos::process::ConfigureBackgroundThread();
     std::string reason = "capture stopped";
     const CameraMode mode = CurrentMode();
@@ -687,6 +755,7 @@ class Source final : public CameraSource {
     }
     running_.store(false, std::memory_order_release);
     ReleaseDevice();
+    t_worker_before_device_release = false;
     capture_active_.store(false, std::memory_order_release);
     if (!stop.stop_requested()) {
       ReportConnection(ConnectionState::kDisconnected,
@@ -700,6 +769,8 @@ class Source final : public CameraSource {
   CameraSourceConfig config_;
   V4L2Syscalls sys_;
   mutable std::mutex lifecycle_mutex_;
+  std::condition_variable lifecycle_cv_;
+  size_t active_teardowns_{0};
   mutable std::mutex state_mutex_;
   CameraMode mode_;
   CameraControls controls_;
