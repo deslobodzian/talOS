@@ -13,12 +13,18 @@
 //   later runs keep advancing until stop.
 // - `always`: every run advances twice, records its pid, then freezes until
 //   SIGKILL.
+//
+// If TALOS_HOLD_RUN2_BEFORE_REGISTER is set to a non-empty path, run 2 creates
+// <path>.ready and spins before claiming its registry row until <path> is
+// removed or a stop signal arrives.
 
 #include <unistd.h>
 
 #include <chrono>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -64,6 +70,17 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, OnStop);
   std::signal(SIGTERM, OnStop);
 
+  const std::size_t run_number = CountLines(runs_file) + 1;
+  const char* hold = std::getenv("TALOS_HOLD_RUN2_BEFORE_REGISTER");
+  if (run_number == 2 && hold != nullptr && hold[0] != '\0') {
+    const std::filesystem::path hold_path{hold};
+    std::ofstream{std::string{hold} + ".ready"}.close();
+    while (stop == 0 && std::filesystem::exists(hold_path)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    if (stop != 0) return 0;
+  }
+
   talos::introspect::NodeRegistration row{{
       .name = "studio_bridge",
       .target = "//studio/bridge:studio_bridge",
@@ -86,7 +103,6 @@ int main(int argc, char** argv) {
     row.end_sample();
   };
 
-  const std::size_t run_number = CountLines(runs_file) + 1;
   std::uint64_t dispatch = 1;
   sample(dispatch++);
   if (mode == "always") {
