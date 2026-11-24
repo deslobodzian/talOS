@@ -5,6 +5,7 @@ separately compiled variants of one schema (testdata/variants).
 
 import os
 import re
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -15,6 +16,8 @@ from deps_consumer.ConsumerState import ConsumerState
 from deps_geometry.Pose2d import Pose2d
 from python.runfiles import runfiles
 from reflection import BaseType as ReflectionBaseType
+from reflection import Enum as ReflectionEnum
+from reflection import EnumVal as ReflectionEnumVal
 from reflection import Field as ReflectionField
 from reflection import Object as ReflectionObject
 from reflection import Schema as ReflectionSchema
@@ -228,6 +231,256 @@ class VariantTest(unittest.TestCase):
         self.assertIsNone(talos_schema.struct_hash(base, "schema_variant.Kind"))
         self.assertIsNone(talos_schema.struct_hash(b"\xa5" * 64,
                                                    "schema_variant.Reading"))
+
+
+def _single_field_bfbs(base, index=-1, offset=0, element=0, fixed_length=0,
+                       bytesize=8, minalign=8, is_struct=True,
+                       with_enum=False, omit_type=False, omit_fields=False):
+    b = flatbuffers.Builder(256)
+    enums_off = None
+    if with_enum:
+        en_name = b.CreateString("test.Kind")
+        ev_name = b.CreateString("A")
+        ReflectionEnumVal.EnumValStart(b)
+        ReflectionEnumVal.EnumValAddName(b, ev_name)
+        ReflectionEnumVal.EnumValAddValue(b, 0)
+        ev_off = ReflectionEnumVal.EnumValEnd(b)
+        ReflectionEnum.EnumStartValuesVector(b, 1)
+        b.PrependUOffsetTRelative(ev_off)
+        evs_off = b.EndVector()
+        ReflectionType.TypeStart(b)
+        ReflectionType.TypeAddBaseType(b, ReflectionBaseType.BaseType.UByte)
+        ut_off = ReflectionType.TypeEnd(b)
+        ReflectionEnum.EnumStart(b)
+        ReflectionEnum.EnumAddName(b, en_name)
+        ReflectionEnum.EnumAddValues(b, evs_off)
+        ReflectionEnum.EnumAddUnderlyingType(b, ut_off)
+        e_off = ReflectionEnum.EnumEnd(b)
+        ReflectionSchema.SchemaStartEnumsVector(b, 1)
+        b.PrependUOffsetTRelative(e_off)
+        enums_off = b.EndVector()
+    else:
+        ReflectionSchema.SchemaStartEnumsVector(b, 0)
+        enums_off = b.EndVector()
+
+    name_off = b.CreateString("bad.Struct")
+    fields_off = None
+    if not omit_fields:
+        field_name_off = b.CreateString("field")
+        type_off = None
+        if not omit_type:
+            ReflectionType.TypeStart(b)
+            ReflectionType.TypeAddBaseType(b, base)
+            ReflectionType.TypeAddIndex(b, index)
+            ReflectionType.TypeAddElement(b, element)
+            ReflectionType.TypeAddFixedLength(b, fixed_length)
+            type_off = ReflectionType.TypeEnd(b)
+        ReflectionField.FieldStart(b)
+        ReflectionField.FieldAddName(b, field_name_off)
+        if type_off is not None:
+            ReflectionField.FieldAddType(b, type_off)
+        ReflectionField.FieldAddOffset(b, offset)
+        field_off = ReflectionField.FieldEnd(b)
+        ReflectionObject.ObjectStartFieldsVector(b, 1)
+        b.PrependUOffsetTRelative(field_off)
+        fields_off = b.EndVector()
+
+    ReflectionObject.ObjectStart(b)
+    ReflectionObject.ObjectAddName(b, name_off)
+    if fields_off is not None:
+        ReflectionObject.ObjectAddFields(b, fields_off)
+    ReflectionObject.ObjectAddIsStruct(b, is_struct)
+    ReflectionObject.ObjectAddMinalign(b, minalign)
+    ReflectionObject.ObjectAddBytesize(b, bytesize)
+    obj_off = ReflectionObject.ObjectEnd(b)
+
+    ReflectionSchema.SchemaStartObjectsVector(b, 1)
+    b.PrependUOffsetTRelative(obj_off)
+    objs_off = b.EndVector()
+
+    ReflectionSchema.SchemaStart(b)
+    ReflectionSchema.SchemaAddObjects(b, objs_off)
+    ReflectionSchema.SchemaAddEnums(b, enums_off)
+    b.Finish(ReflectionSchema.SchemaEnd(b), file_identifier=b"BFBS")
+    return bytes(b.Output())
+
+
+class HostileSchemaTest(unittest.TestCase):
+    # REQ-CONTRACT-07
+    def test_truncated_and_corrupted_bfbs_return_none_and_raise_schema_error(self):
+        base = _variant("float_level")
+        # Every prefix of a valid .bfbs (including right after "BFBS") must fail
+        # cleanly without raising struct.error / IndexError / AssertionError.
+        hostile = [
+            b"",
+            b"BFBS",
+            b"\x00\x00\x00\x00BFBS",
+            b"\x0c\x00\x00\x00BFBS",
+            b"\xff\xff\xff\x7fBFBS" + b"\x00" * 16,
+            # Root at offset 12, negative soffset making vtable out of bounds.
+            struct.pack("<I4sIi", 12, b"BFBS", 0, 1000),
+            # Root at offset 12, vtable at offset 16 with huge vector length.
+            struct.pack("<I4sIiHHHI", 12, b"BFBS", 0, -4, 6, 8, 4, 0x7fffffff),
+        ]
+        # Sample prefixes across the entire buffer, plus every prefix <= 32 bytes.
+        for cut in list(range(min(33, len(base)))) + list(
+                range(33, len(base), max(1, len(base) // 40))):
+            hostile.append(base[:cut])
+
+        for idx, buf in enumerate(hostile):
+            with self.subTest(case=idx, length=len(buf)):
+                self.assertIsNone(
+                    talos_schema.canonical_struct(buf, "schema_variant.Reading"))
+                self.assertIsNone(
+                    talos_schema.struct_hash(buf, "schema_variant.Reading"))
+                with self.assertRaises(talos_schema.SchemaError):
+                    talos_schema.find_struct(buf, "schema_variant.Reading")
+
+    # REQ-CONTRACT-07
+    def test_cyclic_diamond_and_deep_structs_return_none(self):
+        # 1. Direct self-cycle (object 0 references object 0).
+        self_cycle = _single_field_bfbs(ReflectionBaseType.BaseType.Obj, index=0)
+        self.assertIsNone(talos_schema.canonical_struct(self_cycle, "bad.Struct"))
+        self.assertIsNone(talos_schema.struct_hash(self_cycle, "bad.Struct"))
+
+        # 2. 22-level diamond DAG (depth < 32, 2^22 - 1 paths > 4096 visits).
+        b = flatbuffers.Builder(1024)
+        levels = 22
+        obj_offs = []
+        for i in range(levels):
+            name_off = b.CreateString(f"dag.o{i}")
+            field_offs = []
+            if i + 1 == levels:
+                fn = b.CreateString("leaf_m")
+                ReflectionType.TypeStart(b)
+                ReflectionType.TypeAddBaseType(b, ReflectionBaseType.BaseType.Double)
+                ReflectionType.TypeAddIndex(b, -1)
+                ft = ReflectionType.TypeEnd(b)
+                ReflectionField.FieldStart(b)
+                ReflectionField.FieldAddName(b, fn)
+                ReflectionField.FieldAddType(b, ft)
+                ReflectionField.FieldAddOffset(b, 0)
+                field_offs.append(ReflectionField.FieldEnd(b))
+            else:
+                for k in range(2):
+                    fn = b.CreateString("a" if k == 0 else "b")
+                    ReflectionType.TypeStart(b)
+                    ReflectionType.TypeAddBaseType(b, ReflectionBaseType.BaseType.Obj)
+                    ReflectionType.TypeAddIndex(b, i + 1)
+                    ft = ReflectionType.TypeEnd(b)
+                    ReflectionField.FieldStart(b)
+                    ReflectionField.FieldAddName(b, fn)
+                    ReflectionField.FieldAddType(b, ft)
+                    ReflectionField.FieldAddId(b, k)
+                    ReflectionField.FieldAddOffset(b, 0)
+                    field_offs.append(ReflectionField.FieldEnd(b))
+            ReflectionObject.ObjectStartFieldsVector(b, len(field_offs))
+            for fo in reversed(field_offs):
+                b.PrependUOffsetTRelative(fo)
+            fvec = b.EndVector()
+            ReflectionObject.ObjectStart(b)
+            ReflectionObject.ObjectAddName(b, name_off)
+            ReflectionObject.ObjectAddFields(b, fvec)
+            ReflectionObject.ObjectAddIsStruct(b, True)
+            ReflectionObject.ObjectAddMinalign(b, 8)
+            ReflectionObject.ObjectAddBytesize(b, 8)
+            obj_offs.append(ReflectionObject.ObjectEnd(b))
+        ReflectionSchema.SchemaStartObjectsVector(b, len(obj_offs))
+        for oo in reversed(obj_offs):
+            b.PrependUOffsetTRelative(oo)
+        ovec = b.EndVector()
+        ReflectionSchema.SchemaStartEnumsVector(b, 0)
+        evec = b.EndVector()
+        ReflectionSchema.SchemaStart(b)
+        ReflectionSchema.SchemaAddObjects(b, ovec)
+        ReflectionSchema.SchemaAddEnums(b, evec)
+        b.Finish(ReflectionSchema.SchemaEnd(b), file_identifier=b"BFBS")
+        dag_bfbs = bytes(b.Output())
+        self.assertIsNone(talos_schema.canonical_struct(dag_bfbs, "dag.o0"))
+        self.assertIsNone(talos_schema.struct_hash(dag_bfbs, "dag.o0"))
+
+        # 3. Linear chain exceeding max depth (35 > 32).
+        b = flatbuffers.Builder(1024)
+        chain_len = 35
+        obj_offs = []
+        for i in range(chain_len):
+            name_off = b.CreateString(f"chain.o{i}")
+            fn = b.CreateString("x")
+            ReflectionType.TypeStart(b)
+            if i + 1 == chain_len:
+                ReflectionType.TypeAddBaseType(b, ReflectionBaseType.BaseType.Double)
+                ReflectionType.TypeAddIndex(b, -1)
+            else:
+                ReflectionType.TypeAddBaseType(b, ReflectionBaseType.BaseType.Obj)
+                ReflectionType.TypeAddIndex(b, i + 1)
+            ft = ReflectionType.TypeEnd(b)
+            ReflectionField.FieldStart(b)
+            ReflectionField.FieldAddName(b, fn)
+            ReflectionField.FieldAddType(b, ft)
+            ReflectionField.FieldAddOffset(b, 0)
+            fo = ReflectionField.FieldEnd(b)
+            ReflectionObject.ObjectStartFieldsVector(b, 1)
+            b.PrependUOffsetTRelative(fo)
+            fvec = b.EndVector()
+            ReflectionObject.ObjectStart(b)
+            ReflectionObject.ObjectAddName(b, name_off)
+            ReflectionObject.ObjectAddFields(b, fvec)
+            ReflectionObject.ObjectAddIsStruct(b, True)
+            ReflectionObject.ObjectAddMinalign(b, 8)
+            ReflectionObject.ObjectAddBytesize(b, 8)
+            obj_offs.append(ReflectionObject.ObjectEnd(b))
+        ReflectionSchema.SchemaStartObjectsVector(b, len(obj_offs))
+        for oo in reversed(obj_offs):
+            b.PrependUOffsetTRelative(oo)
+        ovec = b.EndVector()
+        ReflectionSchema.SchemaStartEnumsVector(b, 0)
+        evec = b.EndVector()
+        ReflectionSchema.SchemaStart(b)
+        ReflectionSchema.SchemaAddObjects(b, ovec)
+        ReflectionSchema.SchemaAddEnums(b, evec)
+        b.Finish(ReflectionSchema.SchemaEnd(b), file_identifier=b"BFBS")
+        chain_bfbs = bytes(b.Output())
+        self.assertIsNone(talos_schema.canonical_struct(chain_bfbs, "chain.o0"))
+        self.assertIsNone(talos_schema.struct_hash(chain_bfbs, "chain.o0"))
+
+    # REQ-CONTRACT-07
+    def test_invalid_indices_basetypes_null_fields_and_enum_on_non_int(self):
+        bt = ReflectionBaseType.BaseType
+        cases = {
+            "obj_neg_index": _single_field_bfbs(bt.Obj, index=-1),
+            "obj_oob_index": _single_field_bfbs(bt.Obj, index=99),
+            "enum_oob_index": _single_field_bfbs(bt.Int, index=0),
+            "raw_basetype_neg": _single_field_bfbs(-128),
+            "raw_basetype_high": _single_field_bfbs(127),
+            "raw_element_high": _single_field_bfbs(bt.Array, element=127,
+                                                   fixed_length=1),
+            "string_field": _single_field_bfbs(bt.String),
+            "zero_length_array": _single_field_bfbs(bt.Array, element=bt.Int,
+                                                    fixed_length=0),
+            "offset_past_end": _single_field_bfbs(bt.Long, offset=1, bytesize=8),
+            "array_past_end": _single_field_bfbs(bt.Array, element=bt.Long,
+                                                 fixed_length=2, bytesize=8),
+            "zero_bytesize": _single_field_bfbs(bt.Int, bytesize=0),
+            "missing_type": _single_field_bfbs(bt.Int, omit_type=True),
+            "missing_fields": _single_field_bfbs(bt.Int, omit_fields=True),
+            "bool_with_enum": _single_field_bfbs(bt.Bool, index=0,
+                                                 with_enum=True),
+            "float_with_enum": _single_field_bfbs(bt.Float, index=0,
+                                                  with_enum=True),
+            "double_with_enum": _single_field_bfbs(bt.Double, index=0,
+                                                   with_enum=True),
+            "float_array_with_enum": _single_field_bfbs(
+                bt.Array, element=bt.Float, index=0, fixed_length=2,
+                with_enum=True),
+        }
+        # Sanity: valid integer enum passes.
+        valid_enum = _single_field_bfbs(bt.UByte, index=0, with_enum=True)
+        self.assertIsNotNone(talos_schema.struct_hash(valid_enum, "bad.Struct"))
+
+        for label, bfbs in cases.items():
+            with self.subTest(label=label):
+                self.assertIsNone(talos_schema.canonical_struct(bfbs, "bad.Struct"))
+                self.assertIsNone(talos_schema.struct_hash(bfbs, "bad.Struct"))
 
 
 if __name__ == "__main__":
