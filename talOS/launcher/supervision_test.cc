@@ -406,7 +406,10 @@ std::string TrappedRun(const std::string& record, std::string_view then) {
   return "trap 'exit 0' INT TERM\n" + RecordLogArgThen(record, then);
 }
 
-// A stub's tail that runs until the session stops it.
+// A stub's tail that runs until the session stops it. Only safe after an
+// active INT/TERM trap (such as TrappedRun): without a trap, bash's
+// wait-and-cooperative-exit can ignore SIGINT when it lands in a child
+// sleep's fork window; untrapped stubs must use `exec sleep 86400`.
 constexpr std::string_view kLoopUntilStopped = "while :; do sleep 0.05; done\n";
 
 // A run whose live endpoints differ from its probe's is reported, recorded
@@ -1378,6 +1381,224 @@ TEST(Supervision, CriticalCleanExitRestarts) {
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
   ::remove(peers.c_str());
+}
+
+// A critical peer that exited 0 once and restarted is now actively running:
+// its prior clean exit must not cause RosterContinues to skip it and drop
+// another critical member's clean-exit restart.
+// REQ-SAFE-29
+TEST(Supervision, CriticalCleanExitRestartsWhileRestartedPeerRuns) {
+  auto options = BaseOptions("clean_exit_restarted_peer");
+  options.duration_s = kHangSeconds;
+  const auto hw_restarted = TempPath("clean_exit_restarted_peer_hw");
+  const auto alpha_restarted = TempPath("clean_exit_restarted_peer_alpha");
+  const auto beta_runs = TempPath("clean_exit_restarted_peer_beta");
+  ::remove(hw_restarted.c_str());
+  ::remove(alpha_restarted.c_str());
+  ::remove(beta_runs.c_str());
+  const auto restart_once_then_signal = [](const std::string& marker) {
+    return "trap 'exit 0' INT TERM\n"
+           "prev=\"\"\n"
+           "log=\"\"\n"
+           "for arg in \"$@\"; do\n"
+           "  if [ \"$prev\" = \"--log\" ]; then log=\"$arg\"; fi\n"
+           "  prev=\"$arg\"\n"
+           "done\n"
+           "case \"$log\" in\n"
+           "  *restart1.tlog)\n"
+           "    : > " +
+           marker + "\n" + std::string{kLoopUntilStopped} +
+           "    ;;\n"
+           "  *)\n"
+           "    exit 0\n"
+           "    ;;\n"
+           "esac\n";
+  };
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      WriteStub("clean_exit_restarted_peer_hardware",
+                restart_once_then_signal(hw_restarted), "hardware_node");
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("clean_exit_restarted_peer_alpha",
+                restart_once_then_signal(alpha_restarted), "alpha");
+  options.binary_overrides["//example/beta:node"] = WriteStub(
+      "clean_exit_restarted_peer_beta",
+      TrappedRun(beta_runs,
+                 "case \"$log\" in\n"
+                 "  *beta.tlog)\n"
+                 "    while [ ! -f " +
+                     hw_restarted + " ] || [ ! -f " + alpha_restarted +
+                     " ]; do sleep 0.01; done\n"
+                     "    exit 0\n"
+                     "    ;;\n"
+                     "esac\n" +
+                     std::string{kLoopUntilStopped}),
+      "beta");
+  std::string seen;
+  EXPECT_EQ(RunSessionUntil(
+                options,
+                [&](const std::string& live) {
+                  if (ReadLines(beta_runs).size() >= 2) return true;
+                  // Stop promptly if beta's clean-exit restart was wrongly
+                  // cancelled so a regression fails fast instead of hanging.
+                  const auto beta = ManifestEntry(live, "beta");
+                  return beta.find("\"exit_code\": 0") != std::string::npos &&
+                         beta.find("\"restart_count\": 0") !=
+                             std::string::npos &&
+                         beta.find("\"retry_at_monotonic_ns\": 0") !=
+                             std::string::npos;
+                },
+                seen),
+            0);
+  ASSERT_FALSE(seen.empty())
+      << "session ended before beta finished or restarted";
+  EXPECT_EQ(
+      ReadLines(beta_runs),
+      (std::vector<std::string>{options.output_dir + "/beta.tlog",
+                                options.output_dir + "/beta.restart1.tlog"}));
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const auto beta = ManifestEntry(manifest, "beta");
+  EXPECT_NE(beta.find("\"restart_count\": 1"), std::string::npos) << beta;
+  const std::string output =
+      ReadFile(options.output_dir + "/" + std::string{kLauncherOutputFile});
+  EXPECT_EQ(output.find("beta finished with the rest of the roster"),
+            std::string::npos)
+      << output;
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(hw_restarted.c_str());
+  ::remove(alpha_restarted.c_str());
+  ::remove(beta_runs.c_str());
+}
+
+// A critical member whose clean-exit restart fails to spawn must still retry
+// even if every peer exits 0 while that retry is pending:
+// RestartSchedule::Started() cleared last_exit_clean_ on the restart attempt,
+// so neither the member nor its peers see the stale clean-exit flag and drop
+// the retry as "finished with the rest of the roster". Because the retrying
+// member is not running during its retry window, RosterContinues' live-peer
+// check alone cannot save it.
+// REQ-SAFE-29
+TEST(Supervision, FailedSpawnAfterCleanExitRetriesWhenPeersExitCleanly) {
+  auto options = BaseOptions("clean_exit_failed_spawn");
+  options.duration_s = kHangSeconds;
+  testing::SteppedClock clock;
+  const SupervisionTime start = clock.Freeze();
+  options.supervision_clock = clock.clock();
+  const auto alpha_runs = TempPath("clean_exit_failed_spawn_alpha_runs");
+  const auto peers_exit = TempPath("clean_exit_failed_spawn_peers_exit");
+  ::remove(alpha_runs.c_str());
+  ::remove(peers_exit.c_str());
+  const std::string peer_body =
+      "trap 'exit 0' INT TERM\n"
+      "prev=\"\"\n"
+      "log=\"\"\n"
+      "for arg in \"$@\"; do\n"
+      "  if [ \"$prev\" = \"--log\" ]; then log=\"$arg\"; fi\n"
+      "  prev=\"$arg\"\n"
+      "done\n"
+      "case \"$log\" in\n"
+      "  *restart1.tlog) exit 0 ;;\n"
+      "esac\n"
+      "while [ ! -f " +
+      peers_exit +
+      " ]; do sleep 0.01; done\n"
+      "exit 0\n";
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      WriteStub("clean_exit_failed_spawn_hardware", peer_body, "hardware_node");
+  const std::string alpha_bin =
+      WriteStub("clean_exit_failed_spawn_alpha",
+                RecordLogArgThen(alpha_runs,
+                                 "case \"$log\" in\n"
+                                 "  *alpha.tlog)\n"
+                                 "    chmod a-x \"$0\"\n"
+                                 "    exit 0\n"
+                                 "    ;;\n"
+                                 "esac\n"
+                                 "exit 0\n"),
+                "alpha");
+  options.binary_overrides["//example/alpha:node"] = alpha_bin;
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("clean_exit_failed_spawn_beta", peer_body, "beta");
+  const std::string live = options.output_dir + "/" +
+                           std::to_string(options.session_id) +
+                           "/manifest.json";
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    const auto reaped_runs = [&](const char* name, std::size_t count) {
+      const auto runs = ManifestRuns(ReadFile(live), name);
+      return runs.size() >= count &&
+             runs.back().find("\"reason\": \"running\"") == std::string::npos;
+    };
+    // Wait for alpha run 0 to exit 0 and be reaped while peers are running.
+    if (!WaitFor(stop, [&] {
+          SupervisionWakeup::Wake();
+          return reaped_runs("alpha", 1);
+        })) {
+      return;
+    }
+    // Step to alpha's 50 ms clean-exit restart; exec fails with EACCES and
+    // schedules a retry at start + 150 ms.
+    clock.HoldAt(start + 50ms);
+    if (!WaitFor(stop, [&] {
+          SupervisionWakeup::Wake();
+          const auto runs = ManifestRuns(ReadFile(live), "alpha");
+          return runs.size() >= 2 &&
+                 runs[1].find("\"reason\": \"spawn_failed\"") !=
+                     std::string::npos;
+        })) {
+      return;
+    }
+    // Restore alpha's execute bit for the retry, then let both peers exit 0
+    // cleanly while alpha's retry is pending.
+    ::chmod(alpha_bin.c_str(), 0755);
+    { std::ofstream touch{peers_exit}; }
+    if (!WaitFor(stop, [&] {
+          SupervisionWakeup::Wake();
+          return reaped_runs("hardware_node", 1) && reaped_runs("beta", 1);
+        })) {
+      return;
+    }
+    // Step to start + 150 ms: both peers' 50 ms restarts (due at +100 ms) and
+    // alpha's retry (due at +150 ms) are due. Because Started() cleared
+    // alpha's last_exit_clean_, alpha retries and spawns restart1.tlog.
+    clock.HoldAt(start + 150ms);
+    if (!WaitFor(stop, [&] {
+          SupervisionWakeup::Wake();
+          return reaped_runs("alpha", 3) && reaped_runs("hardware_node", 2) &&
+                 reaped_runs("beta", 2);
+        })) {
+      return;
+    }
+    // All three restart1 runs have exited 0 cleanly; step past the longest
+    // clean-exit backoff (200 ms for alpha's third start) so RosterContinues
+    // ends the session cleanly.
+    clock.HoldAt(start + 450ms);
+    WaitFor(stop, [&] {
+      SupervisionWakeup::Wake();
+      return false;
+    });
+  }};
+  EXPECT_EQ(RunSession(options), 0);
+  driver.request_stop();
+  driver.join();
+  ::chmod(alpha_bin.c_str(), 0755);
+  EXPECT_EQ(
+      ReadLines(alpha_runs),
+      (std::vector<std::string>{options.output_dir + "/alpha.tlog",
+                                options.output_dir + "/alpha.restart1.tlog"}));
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const auto alpha = ManifestEntry(manifest, "alpha");
+  EXPECT_NE(alpha.find("\"restart_count\": 1"), std::string::npos) << alpha;
+  const auto history = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(history.size(), 3u) << manifest;
+  EXPECT_NE(history[0].find("\"reason\": \"exit\""), std::string::npos)
+      << history[0];
+  EXPECT_NE(history[1].find("\"reason\": \"spawn_failed\""), std::string::npos)
+      << history[1];
+  EXPECT_NE(history[2].find("\"reason\": \"exit\""), std::string::npos)
+      << history[2];
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(alpha_runs.c_str());
+  ::remove(peers_exit.c_str());
 }
 
 // A run that cannot be spawned -- fork or pipe failing, as under EAGAIN -- is
@@ -3513,11 +3734,32 @@ TEST(Supervision, UndescribedNodeAllowedExplicitlyStillMustRegister) {
       "alpha", false);
   options.binary_overrides["//example/beta:node"] =
       WriteStub("undescribed_beta", "exit 0\n");
+  const uint64_t session = options.session_id;
+  const std::string live =
+      options.output_dir + "/" + std::to_string(session) + "/manifest.json";
   testing::SupervisionPasses passes;
   bool stepped = false;
   std::jthread driver{[&](const std::stop_token& stop) {
     const testing::SteppedClock::ReleaseOnExit release{clock};
-    if (!WaitFor(stop, [&] { return !ReadLines(runs).empty(); })) return;
+    // Wait until alpha run 0 is up and its peers' run 0s have exited cleanly
+    // and been reaped, so advancing to start + kMinHeartbeatTimeout cannot
+    // SIGKILL a still-exiting peer under heartbeat_startup_grace_ms = 0.
+    if (!WaitFor(stop, [&] {
+          SupervisionWakeup::Wake();
+          if (ReadLines(runs).empty()) return false;
+          const std::string manifest = ReadFile(live);
+          for (const char* name : {"hardware_node", "beta"}) {
+            const auto member_runs = ManifestRuns(manifest, name);
+            if (member_runs.empty() ||
+                member_runs.back().find("\"reason\": \"running\"") !=
+                    std::string::npos) {
+              return false;
+            }
+          }
+          return true;
+        })) {
+      return;
+    }
     const uint64_t next = passes.Started() + 2;
     if (!WaitFor(stop, [&] {
           SupervisionWakeup::Wake();
@@ -3525,11 +3767,34 @@ TEST(Supervision, UndescribedNodeAllowedExplicitlyStillMustRegister) {
         })) {
       return;
     }
+    // Step run 0 past kMinHeartbeatTimeout so unregistered alpha is killed as
+    // heartbeat_missing and restarted cleanly; while the clock stays frozen at
+    // start + kMinHeartbeatTimeout, run 1 of alpha and its peers exit cleanly
+    // without hitting any heartbeat timeout or starting a second restart.
     clock.HoldAt(start + kMinHeartbeatTimeout);
-    if (!WaitFor(stop, [&] { return ReadLines(runs).size() >= 2; })) return;
+    if (!WaitFor(stop, [&] {
+          SupervisionWakeup::Wake();
+          const std::string manifest = ReadFile(live);
+          for (const char* name : {"hardware_node", "alpha", "beta"}) {
+            const auto member_runs = ManifestRuns(manifest, name);
+            if (member_runs.size() < 2 ||
+                member_runs.back().find("\"reason\": \"running\"") !=
+                    std::string::npos) {
+              return false;
+            }
+          }
+          return true;
+        })) {
+      return;
+    }
     stepped = true;
-    // Past the 50 ms clean-exit backoff so RosterContinues ends the session.
-    clock.HoldAt(start + kMinHeartbeatTimeout + 100ms);
+    // Past every clean-exit backoff (100 ms for restart 2) so RosterContinues
+    // cancels every pending restart and ends the session at once.
+    clock.HoldAt(start + kMinHeartbeatTimeout + 200ms);
+    WaitFor(stop, [&] {
+      SupervisionWakeup::Wake();
+      return false;
+    });
   }};
   EXPECT_EQ(RunSession(options), 0);
   driver.request_stop();
@@ -5585,7 +5850,7 @@ TEST(Supervision, BridgeProtocolMismatchWarnsOncePerRunAndRewarnsOnRestart) {
   options.max_restarts = 2;
   // Run 1 records its pid and waits for `crash_run1`, then exits 1 (triggers
   // immediate restart for critical hardware_node). Run 2 records its pid and
-  // sleeps until stopped.
+  // execs sleep until stopped (no bash WCE loop that could swallow SIGINT).
   options.binary_overrides["//talOS/bridge:hardware_node"] =
       WriteDescribedStub("proto_warn_hw", bridge_desc,
                          "echo $$ >> '" + hw_runs +
@@ -5598,11 +5863,11 @@ TEST(Supervision, BridgeProtocolMismatchWarnsOncePerRunAndRewarnsOnRestart) {
                              "' ]; do sleep 0.01; done\n"
                              "  exit 1\n"
                              "fi\n"
-                             "while :; do sleep 0.05; done\n");
+                             "exec sleep 86400\n");
   options.binary_overrides["//example/alpha:node"] =
-      WriteStub("proto_warn_alpha", "while :; do sleep 0.05; done\n", "alpha");
+      WriteStub("proto_warn_alpha", "exec sleep 86400\n", "alpha");
   options.binary_overrides["//example/beta:node"] =
-      WriteStub("proto_warn_beta", "while :; do sleep 0.05; done\n", "beta");
+      WriteStub("proto_warn_beta", "exec sleep 86400\n", "beta");
 
   const std::string session_dir =
       options.output_dir + "/" + std::to_string(options.session_id);

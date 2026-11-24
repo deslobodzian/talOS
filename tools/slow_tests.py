@@ -26,7 +26,8 @@ each target's tags. Finding no test result at all is an error.
 
 The budgets are docs/TESTING.md §9. Without `--check` it reports and exits
 0. With `--check` it exits 1 when a test action exceeds its lane's budget: a
-target with no lane tag is in the fast lane (5 s). The lane tags come from
+target with no lane tag is in the fast lane (5 s), and a target carrying
+multiple lane tags fails closed. The lane tags come from
 `--lanes FILE` (lines of `<label> <lane>`; unlisted labels are fast), else
 from the `--bep` file's target tags (an untagged target is fast), else from
 one `bazel query` per lane; a query that fails or finds no lane-tagged test
@@ -183,7 +184,8 @@ def from_bep(lines):
         if completed:
             # proto3 JSON omits an empty `tag`: an untagged target is fast.
             lanes[completed["label"]] = lane_of(
-                event.get("completed", {}).get("tag", []))
+                event.get("completed", {}).get("tag", []),
+                label=completed["label"])
         key = event.get("id", {}).get("testResult")
         seconds = duration_seconds(event.get("testResult", {}))
         if key is None or seconds is None:
@@ -201,14 +203,20 @@ BUDGETS = {"fast": 5.0, "heavy": 120.0, "integration": 30.0, "e2e": 180.0,
 LANE_TAGS = ("heavy", "integration", "e2e", "perf")
 
 
-def lane_of(tags):
-    """The lane a target's tags put it in."""
-    return next((lane for lane in LANE_TAGS if lane in tags), "fast")
+def lane_of(tags, label=None):
+    """The lane a target's tags put it in. Fails closed on multiple lane tags."""
+    matched = [lane for lane in LANE_TAGS if lane in tags]
+    if len(matched) > 1:
+        who = f"target {label}" if label else "target"
+        raise ValueError(
+            f"{who} carries multiple lane tags ({', '.join(matched)}); "
+            f"assign at most one of {', '.join(LANE_TAGS)}")
+    return matched[0] if matched else "fast"
 
 
 def read_lanes(lines):
     """{label: lane} from `<label> <lane>` lines; fails closed on malformed
-    lines or unknown lanes."""
+    lines, unknown lanes, or conflicting lane assignments."""
     lanes = {}
     for number, raw in enumerate(lines, 1):
         stripped = raw.split("#", 1)[0].strip()
@@ -223,6 +231,10 @@ def read_lanes(lines):
             raise ValueError(
                 f"lanes line {number}: unknown lane {lane!r} for {label}; "
                 f"lanes are {', '.join(BUDGETS)}")
+        if label in lanes and lanes[label] != lane:
+            raise ValueError(
+                f"lanes line {number}: target {label} assigned multiple lanes "
+                f"({lanes[label]}, {lane})")
         lanes[label] = lane
     return lanes
 
@@ -230,13 +242,13 @@ def read_lanes(lines):
 def query_lanes():
     """{label: lane} for every test carrying a lane tag, from bazel query.
 
-    Iterates `reversed(LANE_TAGS)` so precedence matches `lane_of`
-    (`heavy > integration > e2e > perf`). Exits when a query fails (any exit
-    but 0, or 3 with only external `@` repository errors under --keep_going)
-    or when no test carries a lane tag: either would put tests in the wrong
-    lane and pass an enforced lane's overrun."""
+    Fails closed when any target carries multiple lane tags, when a query
+    fails (any exit but 0, or 3 with only external `@` repository errors under
+    --keep_going), or when no test carries a lane tag: any of these would put
+    tests in the wrong lane and pass an enforced lane's overrun."""
     lanes = {}
-    for lane in reversed(LANE_TAGS):
+    conflicts = {}
+    for lane in LANE_TAGS:
         expression = f"attr(tags, '[\\[ ]{lane}[,\\]]', tests(//...))"
         query = subprocess.run(
             ["bazel", "query", "--keep_going", "--noshow_progress", expression],
@@ -250,7 +262,16 @@ def query_lanes():
                      f"with non-external package error; lanes unknown\n"
                      f"{query.stderr}")
         for label in query.stdout.split():
-            lanes[label] = lane
+            if label in lanes and lanes[label] != lane:
+                conflicts.setdefault(label, [lanes[label]]).append(lane)
+            else:
+                lanes[label] = lane
+    if conflicts:
+        details = "; ".join(
+            f"{label} ({', '.join(found)})"
+            for label, found in sorted(conflicts.items()))
+        sys.exit(f"slow_tests: target(s) carry multiple lane tags: {details}; "
+                 f"assign at most one of {', '.join(LANE_TAGS)}")
     if not lanes:
         sys.exit("slow_tests: bazel query found no test in any lane "
                  f"({', '.join(LANE_TAGS)}); lanes unknown")
@@ -299,8 +320,11 @@ def main(argv=None):
                      f"{', '.join(BUDGETS)}; got {args.enforce!r}")
     bep_lanes = {}
     if args.bep:
-        with open(args.bep, encoding="utf-8") as handle:
-            results, bep_lanes = from_bep(handle)
+        try:
+            with open(args.bep, encoding="utf-8") as handle:
+                results, bep_lanes = from_bep(handle)
+        except ValueError as exc:
+            sys.exit(f"slow_tests: {exc}")
         source = args.bep
     else:
         if not os.path.isdir(args.testlogs):

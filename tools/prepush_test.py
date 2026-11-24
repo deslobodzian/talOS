@@ -832,6 +832,37 @@ class PrepushTest(unittest.TestCase):
         self.assertEqual(status, 0, out)
         self.assert_cleaned_up()
 
+    # REQ-DEV-25: if $lock/pid disappears or reads empty between `[ -f ]` and
+    # `cat`, prepush must fail closed immediately instead of matching empty
+    # `holder` against a concurrent holder's freshly mkdir'd lock and
+    # `rm -rf`-ing it.
+    def test_empty_holder_fails_closed_without_removing_concurrent_lock(self):
+        lock = os.path.join(self.tmpdir, f"talos-prepush-{os.getuid()}.lock")
+        put(os.path.join(lock, "pid"), "999999\n")
+        marker = os.path.join(lock, "concurrent_holder")
+        real_cat = shutil.which("cat")
+        wrap_dir = os.path.join(self.tmp, "wrap_cat")
+        state = os.path.join(self.tmp, "cat_tripped")
+        put(os.path.join(wrap_dir, "cat"),
+            "#!/bin/sh\n"
+            f'if [ "$1" = {shlex.quote(os.path.join(lock, "pid"))} ] && '
+            f'[ ! -e {shlex.quote(state)} ]; then\n'
+            f'  : > {shlex.quote(state)}\n'
+            f'  rm -rf {shlex.quote(lock)}\n'
+            f'  mkdir -p {shlex.quote(lock)}\n'
+            f'  : > {shlex.quote(marker)}\n'
+            '  exit 1\n'
+            'fi\n'
+            f'exec {shlex.quote(real_cat)} "$@"\n',
+            0o755)
+        status, out, calls = self.prepush(
+            PATH=wrap_dir + os.pathsep + self.env["PATH"])
+        self.assertEqual(status, 2, out)
+        self.assertEqual(calls, [], out)
+        self.assertTrue(os.path.exists(marker),
+                        "concurrent holder's live lock was removed")
+        self.assertFalse(os.path.exists(lock + ".retake"), out)
+
     # REQ-DEV-25
     def test_leaves_other_worktrees_registered(self):
         # Another worktree whose directory is missing for now (an unmounted

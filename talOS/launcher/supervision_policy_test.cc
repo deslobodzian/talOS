@@ -186,6 +186,24 @@ TEST(SupervisionPolicy, RestartsOutsideRollingWindowDoNotExhaustBudget) {
   EXPECT_EQ(inside.due_at(), start + 60s + 100ms);
 }
 
+// A restart attempt starts a new run, so it clears last_exit_clean from the
+// prior clean exit; otherwise RosterContinues mistakes the running member for
+// one whose latest run exited 0, and a subsequent retry sees the stale flag.
+// REQ-SAFE-29
+TEST(SupervisionPolicy, StartedClearsLastExitClean) {
+  const RestartLimits limits = SessionRestartLimits(kDefaultMaxRestarts);
+  RestartSchedule schedule{/*critical=*/true};
+  schedule.RunEnded(/*clean=*/true);
+  ASSERT_TRUE(schedule.last_exit_clean());
+  EXPECT_EQ(schedule.Schedule(kT0, limits), 50ms);
+  const SupervisionTime first_start = schedule.due_at();
+  schedule.Started(first_start);
+  EXPECT_FALSE(schedule.last_exit_clean());
+  // A retry scheduled without another RunEnded (e.g. a failed spawn after
+  // Started) sees a crash, not the prior run's clean exit.
+  EXPECT_EQ(schedule.Schedule(first_start + limits.window, limits), 0ms);
+}
+
 // Over two simulated hours of runs of random length (half of them crashing
 // as they start), a non-critical member never has more than max_restarts
 // starts in any 60 s window, however late each pass takes its due start.

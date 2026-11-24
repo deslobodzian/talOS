@@ -3528,13 +3528,23 @@ def plan_standalone(target_dir, name, lang, talos_root, kind="velocity",
     paths), matching `new_robot`'s accepted relative-path policy."""
     if problem := check_name(name) or check_kind(name, lang, kind, raw):
         raise Refused(problem)
-    if os.path.exists(target_dir) and os.listdir(target_dir):
-        raise Refused(f"{target_dir} already exists and is not empty")
+    typed = os.path.abspath(target_dir)
+    if os.path.islink(typed):
+        raise Refused(f"{target_dir} is a symbolic link")
+    talos_real = os.path.realpath(talos_root)
+    target_real = os.path.realpath(typed)
+    if target_real == talos_real or target_real.startswith(talos_real + os.sep):
+        raise Refused(f"{target_dir} is inside the talOS checkout "
+                      f"{talos_real}; a standalone repository is a workspace "
+                      "of its own, outside it")
+    if os.path.lexists(typed):
+        if not os.path.isdir(typed):
+            raise Refused(f"{target_dir} already exists and is not a directory")
+        if os.listdir(typed):
+            raise Refused(f"{target_dir} already exists and is not empty")
     files = package_files(name, lang, standalone=True, kind=kind, raw=raw)
     # Real paths, so a symlinked directory (macOS /tmp) cannot skew it.
-    talos_path = os.path.relpath(os.path.realpath(talos_root),
-                                 os.path.realpath(target_dir)).replace(
-                                     os.sep, "/")
+    talos_path = os.path.relpath(talos_real, target_real).replace(os.sep, "/")
     files["MODULE.bazel"] += (
         "\n# The talOS checkout this repository was generated from. Replace it\n"
         "# with a registry version once talos is published to one.\n"
