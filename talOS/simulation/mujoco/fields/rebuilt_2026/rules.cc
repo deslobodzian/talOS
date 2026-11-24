@@ -92,6 +92,12 @@ class Rebuilt2026Rules final : public GameRules {
       : random_(options.seed) {}
 
   void Attach(const mjModel& model, mjData& data) override;
+  // The match clock and period (Advance), so Report and Fms follow the
+  // input on a tick with no step.
+  bool ObserveMatch(const MatchInput& input) override {
+    Advance(input);
+    return true;
+  }
   bool AfterStep(mjModel& model, mjData& data, uint64_t step,
                  const MatchInput& input) override;
   // Never fails.
@@ -448,6 +454,10 @@ void Rebuilt2026Rules::Release(Hub& hub, mjData& data, uint64_t step) {
 
 bool Rebuilt2026Rules::AfterStep(mjModel& /*model*/, mjData& data,
                                  uint64_t step, const MatchInput& input) {
+  // The plant gave ObserveMatch this input first; Advance is idempotent for
+  // one input (each phase change it makes moves past the case that made it,
+  // and StartTeleop's draw happens only on that change), so this is a no-op
+  // there and keeps AfterStep whole for a caller that steps without it.
   Advance(input);
   // Scoring: a FUEL not held whose centre is in a scoring site, moving down,
   // in FUEL index order; the qpos and qvel a rule before this one wrote.

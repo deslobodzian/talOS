@@ -229,18 +229,21 @@ counter and its exit randomness.
 
 ## Rules
 
-`:rules` (`rules.h`, `MakeRebuilt2026Rules`) is the 2026 game on this
-model: a `GameRules` ([`game.h`](../../game.h)), the
-[world rule](../../world_rules.h) a `MujocoPlant` runs after every MuJoCo
-step once a program adds it (`MujocoPlant::AddRules`), REQ-DEV-40. It reads
-only this model's contract: the FUEL range numerics above, `*_hub_score`,
-`*_hub_exit_0..3`, and a robot model's sites `preload_0` to `preload_7`;
-`Attach` refuses a model without one of them, naming it. Each step it sees
-the plant's `MatchInput` (Driver Station mode and enable, and the schedule
-clock's time once it has started) and the plant's step count, and nothing
-else: no clock, and no allocation after `Attach`. A FUEL is in play, held
-(scored and parked, waiting for its HUB to return it) or reserve (in the
-reserve row, never placed).
+`:rules` (`rules.h`, `MakeRebuilt2026Rules`) is the 2026 game on this model:
+a `GameRules` ([`game.h`](../../game.h)), the [world
+rule](../../world_rules.h) a `MujocoPlant` runs after every MuJoCo step
+(`MujocoPlant::AddRules`), REQ-DEV-40. `mujoco_gateway` adds it to a config
+whose `field` is `rebuilt_2026` ([the
+match](../../README.md#mujoco_gateway)). It reads only this model's
+contract: the FUEL range numerics above, `*_hub_score`, `*_hub_exit_0..3`,
+and a robot model's sites `preload_0` to `preload_7`; `Attach` refuses a
+model without one of them, naming it. It sees the plant's `MatchInput`
+(Driver Station mode and enable, and the schedule clock's time once it has
+started) when the plant is given it (`ObserveMatch`, whether or not a step
+follows) and again with each step, the plant's step count, and nothing else:
+no clock, and no allocation after `Attach`. A FUEL is in play, held (scored
+and parked, waiting for its HUB to return it) or reserve (in the reserve
+row, never placed).
 
 - **Scoring.** A FUEL that is not held, whose centre is inside a
   `*_hub_score` cylinder with any downward velocity at the end of a step,
@@ -266,18 +269,21 @@ reserve row, never placed).
   robot model's `preload_0` to `preload_7` that exist, in that order, at
   rest and in play; the rest of the reserve stays in its row. A robot with
   no such site has no preloads.
-- **Periods**, on the schedule clock. The match starts at the first step
-  that is enabled, on the schedule clock and in autonomous (AUTO) or teleop
-  (TELEOP without AUTO, AUTO's points 0-0); test mode starts nothing. AUTO
-  ends at the first step out of autonomous, or 20 s after it started; a
-  disable or e-stop does not end it. TELEOP starts at the first enabled
-  teleop step after that and lasts 140 s whatever the mode: TRANSITION
-  10 s, SHIFTS 1 to 4 of 25 s, END GAME 30 s. The match has then Ended,
-  for the rest of the run: nothing restarts it. Every period and stage
-  starts at its first step at or after its start time and ends before its
-  end time: a step exactly 10 s after TELEOP starts is in SHIFT 1, AUTO's
-  last step is the one before 20 s, and one exactly 140 s into TELEOP is
-  Ended.
+- **Periods**, on the schedule clock, judged at each match input the rules
+  see (a "step" in this paragraph: one given to the plant, as at every
+  gateway tick, and each step's), so a period begins on the tick whose input
+  starts it even when that tick runs no plant step. The match starts at the
+  first step that is enabled, on the schedule clock and in autonomous (AUTO)
+  or teleop (TELEOP without AUTO, AUTO's points 0-0); test mode starts
+  nothing. AUTO ends at the first step out of autonomous, or 20 s after it
+  started; a disable or e-stop does not end it. TELEOP starts at the first
+  enabled teleop step after that and lasts 140 s whatever the mode:
+  TRANSITION 10 s, SHIFTS 1 to 4 of 25 s, END GAME 30 s. The match has then
+  Ended, for the rest of the run: nothing restarts it. Every period and
+  stage starts at its first step at or after its start time and ends before
+  its end time: a step exactly 10 s after TELEOP starts is in SHIFT 1,
+  AUTO's last step is the one before 20 s, and one exactly 140 s into TELEOP
+  is Ended.
 - **When a HUB counts.** Both HUBs count in AUTO, TRANSITION and END GAME.
   In SHIFTS 1 to 4 the alliance with more AUTO points is inactive in 1 and
   3 and active in 2 and 4, the other alliance the reverse; on a tie one

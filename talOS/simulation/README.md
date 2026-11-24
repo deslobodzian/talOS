@@ -203,8 +203,10 @@ stalls timeshare work, and the nodes then correctly expire their targets.
 
 `//talOS/simulation/mujoco:mujoco_gateway` is this program with a MuJoCo
 world as the physics backend's plant: the robot's model from the config's
-`[simulation.mujoco]` on a field model. A config names it in `[robot]
-sim_gateway`; its flags, output and model rules are in
+`[simulation.mujoco]` on a field model, refereed by the field's game when
+it has one, whose match it publishes on `/sim/state/match` and stamps into
+the Driver Station packets. A config names it in `[robot] sim_gateway`;
+its flags, output and model rules are in
 [its README](mujoco/README.md#mujoco_gateway).
 
 ## Tests

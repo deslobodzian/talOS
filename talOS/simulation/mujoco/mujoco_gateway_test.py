@@ -38,6 +38,23 @@ controller_address = "127.0.0.1"
 [subsystems.frame]
 """
 
+# A flywheel carrying its inlet and numeric but no `flywheel_exit` site: a
+# scripted shooter's contract, partly.
+_INLET_ONLY = """<mujoco><compiler angle="radian"/><worldbody>
+  <body name="frame" pos="0 0 0.5">
+    <inertial pos="0 0 0" mass="10" diaginertia="1 1 1"/>
+    <site name="flywheel_inlet" type="box" size="0.1 0.1 0.1"/>
+    <body name="wheel">
+      <joint name="flywheel_joint" type="hinge" axis="0 0 1"/>
+      <inertial pos="0 0 0" mass="1" diaginertia="0.002 0.002 0.0025"/>
+    </body>
+  </body>
+</worldbody>
+<custom><numeric name="flywheel_shooter" data="0.5 0.0508"/></custom>
+<actuator><motor name="flywheel" joint="flywheel_joint"/></actuator>
+</mujoco>
+"""
+
 # A hinge sprung 1e12 N*m/rad towards 1 rad on 1e-3 kg*m^2: the explicit
 # spring diverges within a few 5 ms steps.
 _DIVERGING = """<mujoco><compiler angle="radian"/><worldbody>
@@ -55,10 +72,10 @@ _DIVERGING = """<mujoco><compiler angle="radian"/><worldbody>
 
 class MujocoGatewayTest(unittest.TestCase):
 
-    # REQ-DEV-37: the same roster member as sim_gateway --physics (name,
-    # /sim/state, schema), so the launcher and the graph lint see no
-    # difference but the program's label.
-    def test_describes_as_sim_gateway_physics(self):
+    # REQ-DEV-37, REQ-DEV-40: the same roster member as sim_gateway
+    # --physics (name, /sim/state, schema) plus /sim/state/match, so the
+    # launcher and the graph lint see the program's label and the match.
+    def test_describes_as_sim_gateway_physics_with_the_match(self):
         mujoco = _run("--describe")
         self.assertEqual(mujoco.returncode, 0, mujoco.stderr)
         plain = subprocess.run(
@@ -70,6 +87,12 @@ class MujocoGatewayTest(unittest.TestCase):
         self.assertEqual(mujoco_json.pop("target"),
                          "//talOS/simulation/mujoco:mujoco_gateway")
         plain_json.pop("target")
+        match = [source for source in mujoco_json["sources"]
+                 if source["name"] == "/sim/state/match"]
+        self.assertEqual(len(match), 1, mujoco_json["sources"])
+        self.assertEqual(match[0]["schema"], "sim.MatchState")
+        self.assertEqual(match[0]["kind"], "SENDER")
+        mujoco_json["sources"].remove(match[0])
         self.assertEqual(mujoco_json, plain_json)
 
     # REQ-DEV-37: refused before the socket opens, exit 1, naming the key or
@@ -94,13 +117,20 @@ class MujocoGatewayTest(unittest.TestCase):
              _ROBOT + arm + '[subsystems.arm.digital_inputs.arm_home]\n'
              'dio = 0\nsim_sensor = "missing_sensor"\n' + mujoco, None,
              ["arm_home", "missing_sensor"]),
+            ("a scripted shooter's inlet without its exit",
+             _ROBOT + '[subsystems.frame.motors.flywheel]\ncan_id = 1\n'
+             + mujoco, None, ["flywheel_exit"]),
         )
         for what, toml, flags, names in cases:
             with self.subTest(what), tempfile.TemporaryDirectory() as tmp:
                 if toml is None:
                     config = _path("ROVER_CONFIG")
                 else:
-                    shutil.copy(_path("ARM_XML"), Path(tmp) / "arm.xml")
+                    if "flywheel" in toml:
+                        (Path(tmp) / "arm.xml").write_text(
+                            _INLET_ONLY, encoding="utf-8")
+                    else:
+                        shutil.copy(_path("ARM_XML"), Path(tmp) / "arm.xml")
                     config = Path(tmp) / "robot.toml"
                     config.write_text(toml, encoding="utf-8")
                 port, remote = udp_ports()

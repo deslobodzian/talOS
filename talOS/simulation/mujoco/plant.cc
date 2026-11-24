@@ -919,6 +919,21 @@ void MujocoPlant::AddRules(WorldRules& rules) {
 
 void MujocoPlant::SetMatchInput(const MatchInput& input) {
   match_input_ = input;
+  if (failed_) return;
+  // Each rule observes the input now, so what it reports follows the input
+  // on a tick whose plant time rounds to no step.
+  try {
+    for (WorldRules* rules : rules_) {
+      if (!rules->ObserveMatch(input)) {
+        Fail(rules->failure());
+        return;
+      }
+    }
+  } catch (const std::exception& error) {
+    Fail(error.what());
+  } catch (...) {
+    Fail("a world rule threw something that is not a std::exception");
+  }
 }
 
 void MujocoPlant::Refresh() {

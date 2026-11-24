@@ -30,11 +30,12 @@ struct TickInput {
 
 // The FMS fields a Driver Station packet carries that only an extension sets.
 // The gateway keeps one FmsStamp for the whole run, all zero until the first
-// BeforeTick writes it; it copies it into every packet it sends until the
-// next BeforeTick. Without an extension the packets carry match_time_s 0
-// and an empty game_specific_message. The message ends at its first NUL and
-// at most at kMaxGameMessageLength - 1 characters (the codec's limit). A
-// non-finite match_time_s goes out as 0.
+// Stamp writes it; every tick, after Endpoint::Tick, it calls Stamp and
+// copies the stamp into the Driver Station data, so a packet carries the
+// stamp as of the tick it is sent on. Without an extension the packets carry
+// match_time_s 0 and an empty game_specific_message. The message ends at its
+// first NUL and at most at kMaxGameMessageLength - 1 characters (the codec's
+// limit). A non-finite match_time_s goes out as 0.
 struct FmsStamp {
   float match_time_s{0.0f};
   std::array<char, driver_station::kMaxGameMessageLength>
@@ -63,11 +64,16 @@ class GatewayExtension {
                          const hardware::sim::PhysicsOptions& options,
                          hardware::sim::PhysicsSimBackend& backend) = 0;
   // Every tick, after the Driver Station data is stamped with the tick's mode
-  // and before Endpoint::Tick, whether or not a Driver Station packet is due
-  // this tick; `fms` is the stamp (FmsStamp) the extension may rewrite.
+  // and before Endpoint::Tick (which reads the backend and so steps a
+  // physics plant), whether or not a Driver Station packet is due this tick.
   // `schedule_us` is set once the schedules' time zero (the loop's start, or
   // --schedule-start-file's time) is known and reached. Throw: exit 1.
-  virtual void BeforeTick(const TickInput& tick, FmsStamp& fms) {}
+  virtual void BeforeTick(const TickInput& tick) {}
+  // Every tick, after Endpoint::Tick and before the tick's Driver Station
+  // packet (if one is due) is encoded, whether or not one is: `fms` is the
+  // run's one stamp (FmsStamp), which the extension may rewrite; the packet
+  // carries it as of this tick. Throw: exit 1.
+  virtual void Stamp(FmsStamp& fms) {}
   virtual void AfterTick(uint64_t now_us) = 0;  // throw: exit 1
   // The topics the extension publishes itself (SENDER entries; the gateway
   // does not open them; ids are renumbered after the gateway's own). Called
