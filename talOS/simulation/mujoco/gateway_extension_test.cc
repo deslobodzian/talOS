@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
@@ -19,6 +20,7 @@
 
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/configuration/config_parser.h"
+#include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/sim_physics.h"
 #include "talOS/simulation/mujoco/plant.h"
 
@@ -119,6 +121,88 @@ TEST(MujocoGatewayExtension, ChassisOwnerRefusesEachAnalyticChassisSetting) {
                 std::string_view::npos)
           << e.what();
     }
+  }
+}
+
+// REQ-DEV-40: the match input a tick shows the rules is the Driver Station's
+// mode (its bits only while one is attached), the gateway's own enable
+// (enabled and not e-stopped), the FMS alliance and the schedule clock.
+TEST(MujocoGatewayExtension, MatchInputIsTheTicksDriverStation) {
+  namespace ds = driver_station;
+  using Mode = MatchInput::Mode;
+  struct Case {
+    const char* what;
+    uint32_t flags;
+    ds::Alliance alliance;
+    std::optional<uint64_t> schedule_us;
+    MatchInput expected;
+  };
+  constexpr uint32_t kOn = ds::kDsAttached | ds::kEnabled;
+  const Case cases[] = {
+      {"disabled teleop",
+       ds::kDsAttached | ds::kTeleop,
+       ds::Alliance::kBlue,
+       0,
+       {Mode::kTeleop, false, false, true, 0}},
+      {"autonomous",
+       kOn | ds::kAutonomous,
+       ds::Alliance::kBlue,
+       1500,
+       {Mode::kAutonomous, true, false, true, 1500}},
+      {"teleop",
+       kOn | ds::kTeleop,
+       ds::Alliance::kBlue,
+       20'000'000,
+       {Mode::kTeleop, true, false, true, 20'000'000}},
+      {"e-stopped",
+       kOn | ds::kTeleop | ds::kEStop,
+       ds::Alliance::kBlue,
+       7,
+       {Mode::kTeleop, false, false, true, 7}},
+      {"test",
+       kOn | ds::kTest,
+       ds::Alliance::kBlue,
+       7,
+       {Mode::kTest, true, false, true, 7}},
+      {"red",
+       kOn | ds::kTeleop,
+       ds::Alliance::kRed,
+       7,
+       {Mode::kTeleop, true, true, true, 7}},
+      {"no Driver Station: no mode",
+       ds::kEnabled | ds::kTeleop,
+       ds::Alliance::kBlue,
+       7,
+       {Mode::kNone, true, false, true, 7}},
+      {"test and autonomous: test",
+       kOn | ds::kTest | ds::kAutonomous,
+       ds::Alliance::kBlue,
+       7,
+       {Mode::kTest, true, false, true, 7}},
+      {"autonomous and teleop: autonomous",
+       kOn | ds::kAutonomous | ds::kTeleop,
+       ds::Alliance::kBlue,
+       7,
+       {Mode::kAutonomous, true, false, true, 7}},
+      {"before the schedule",
+       kOn | ds::kAutonomous,
+       ds::Alliance::kRed,
+       std::nullopt,
+       {Mode::kAutonomous, true, true, false, 0}},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.what);
+    ds::DriverStationData station;
+    station.fms.flags = c.flags;
+    station.fms.alliance = c.alliance;
+    const MatchInput input = MatchInputOf({.now_us = 1,
+                                           .schedule_us = c.schedule_us,
+                                           .driver_station = &station});
+    EXPECT_EQ(input.mode, c.expected.mode);
+    EXPECT_EQ(input.enabled, c.expected.enabled);
+    EXPECT_EQ(input.red_alliance, c.expected.red_alliance);
+    EXPECT_EQ(input.scheduled, c.expected.scheduled);
+    EXPECT_EQ(input.schedule_us, c.expected.schedule_us);
   }
 }
 

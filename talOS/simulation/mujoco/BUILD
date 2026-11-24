@@ -113,8 +113,10 @@ cc_binary(
 )
 
 # The program's GatewayExtension: assembles the world from the config's
-# [simulation.mujoco], finds the field models in its runfiles, and reports
-# the plant's clock. A library so the component tests drive it in process.
+# [simulation.mujoco] with the robot's scripted shooters and the field's game
+# rules, finds the field models in its runfiles, feeds the rules the match
+# and publishes /sim/state/match, and reports the plant's clock. A library
+# so the component tests drive it in process.
 cc_library(
     name = "gateway_extension",
     srcs = ["gateway_extension.cc"],
@@ -125,10 +127,18 @@ cc_library(
     ],
     visibility = ["//talOS/simulation/mujoco:__subpackages__"],
     deps = [
+        ":game",
         ":plant",
+        ":scripted_shooter",
+        ":world_rules",
         "//talOS/configuration",
+        "//talOS/driver_station",
+        "//talOS/events:events_core",
         "//talOS/hardware",
+        "//talOS/hardware:sim_messages",
+        "//talOS/ipc",
         "//talOS/simulation:gateway_main",
+        "//talOS/simulation/mujoco/fields/rebuilt_2026:rules",
         "@rules_cc//cc/runfiles",
     ],
 )
@@ -156,13 +166,18 @@ cc_test(
     name = "gateway_bit_identity_test",
     size = "small",
     srcs = ["gateway_bit_identity_test.cc"],
+    data = ["//talOS/simulation/mujoco/fields/rebuilt_2026"],
+    env = {"FIELD_XML": "$(rlocationpath //talOS/simulation/mujoco/fields/rebuilt_2026)"},
     deps = [
         ":gateway_extension",
         ":plant",
         "//talOS/configuration",
+        "//talOS/driver_station",
         "//talOS/hardware",
         "//talOS/hardware:codecs",
+        "//talOS/hardware:sim_messages",
         "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
     ],
 )
 
@@ -200,9 +215,11 @@ cc_test(
     size = "small",
     srcs = ["fields_test.cc"],
     deps = [
+        ":game",
         ":gateway_extension",
         ":plant",
         "//talOS/configuration",
+        "//talOS/hardware:sim_messages",
         "@googletest//:gtest_main",
         "@mujoco",
     ],
@@ -226,7 +243,40 @@ cc_test(
         ":gateway_extension",
         ":plant",
         "//talOS/configuration",
+        "//talOS/driver_station",
         "//talOS/hardware",
+        "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+# REQ-DEV-40: the program referees its mode schedule's match on the 2026
+# field: /sim/state/match's periods in order and counting down, the Driver
+# Station's match time and game message, and the live registry row against
+# --describe. Integration lane: fork/exec, loopback UDP, shared memory; one
+# run of about 1.3 s of real time.
+cc_test(
+    name = "match_state_test",
+    size = "small",
+    srcs = ["match_state_test.cc"],
+    data = [
+        "testdata/rover/robot.toml",
+        "testdata/rover/rover.xml",
+        ":mujoco_gateway",
+    ],
+    env = {
+        "MUJOCO_GATEWAY": "$(rlocationpath :mujoco_gateway)",
+        "ROVER_CONFIG": "$(rlocationpath testdata/rover/robot.toml)",
+    },
+    tags = ["integration"],
+    deps = [
+        "//talOS/driver_station",
+        "//talOS/hardware:sim_messages",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:names",
+        "//talOS/introspection:registry",
+        "//talOS/ipc",
+        "//talOS/protocol:frame",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],

@@ -282,8 +282,9 @@ inertia/friction and the MuJoCo model:
   robot's MJCF file), `robot_model_files` (optional array: every other file
   the model reads, such as meshes), `field` (optional field model name,
   today `"rebuilt_2026"`; absent or `""` is flat carpet) and `seed`
-  (optional, default 1: the seed a field's game rules draw from, an integer
-  from 0 to 2^63 - 1, the non-negative range of a TOML integer). The file
+  (optional, default 1: the seed `mujoco_gateway` gives the field's game
+  rules to draw from, an integer from 0 to 2^63 - 1, the non-negative range
+  of a TOML integer). The file
   that sets `robot_model` sets the whole model: `robot_model_files` comes
   only from that file (absent there, none), so a file that includes another
   and sets `robot_model` discards the included file's list, while `field`
