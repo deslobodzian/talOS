@@ -197,7 +197,7 @@ py_library(
 
 # ./sim.sh --config: which file a path names, and its refusals (missing,
 # outside the repository, ambiguous, stale manifest), with a stub bazel and
-# resolver so nothing builds or starts. Sharded across 2 actions to stay well
+# resolver so nothing builds or starts. Sharded across 4 actions to stay well
 # under the fast lane's 5 s budget on CI.
 py_test(
     name = "sim_sh_test",
@@ -205,7 +205,7 @@ py_test(
     srcs = ["sim_sh_test.py"],
     data = ["//:sim.sh"],
     legacy_create_init = False,
-    shard_count = 2,
+    shard_count = 4,
     deps = [
         ":sharded_test_loader",
         ":sync_manifest_lib",
