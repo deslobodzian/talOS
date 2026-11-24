@@ -287,25 +287,28 @@ TEST(SharedMemory, FailedMmapUnlinksOnlyOnCreate) {
 // REQ-CONTRACT-21: attaching with a larger size than the existing segment
 // rejects with std::runtime_error and leaves the existing segment intact.
 TEST(SharedMemory, AttachRejectsUndersizedSegmentWithoutUnlinking) {
+  const long raw_page = ::sysconf(_SC_PAGESIZE);
+  ASSERT_GT(raw_page, 0);
+  const std::size_t page = static_cast<std::size_t>(raw_page);
   const std::string path = "/undersized_" + std::to_string(::getpid());
   const auto name = ShmObjectName(path);
   shm_unlink(name.c_str());
 
-  SharedMemoryPtr creator{path, 4096};
+  SharedMemoryPtr creator{path, page};
   ASSERT_EQ(creator.mode(), SharedMemoryMode::CREATE);
   ASSERT_NE(creator.ptr(), nullptr);
   static_cast<unsigned char*>(creator.ptr())[0] = 0xA5u;
 
-  EXPECT_THROW((SharedMemoryPtr{path, 8192}), std::runtime_error);
+  EXPECT_THROW((SharedMemoryPtr{path, page * 2}), std::runtime_error);
 
   const int fd = shm_open(name.c_str(), O_RDWR, 0666);
   ASSERT_NE(fd, -1) << "rejected attach unlinked the existing segment";
   struct stat st {};
   EXPECT_EQ(::fstat(fd, &st), 0);
-  EXPECT_EQ(st.st_size, 4096);
+  EXPECT_EQ(st.st_size, static_cast<off_t>(page));
   ::close(fd);
 
-  SharedMemoryPtr intact{path, 4096};
+  SharedMemoryPtr intact{path, page};
   EXPECT_EQ(intact.mode(), SharedMemoryMode::ATTACH);
   ASSERT_NE(intact.ptr(), nullptr);
   EXPECT_EQ(static_cast<const unsigned char*>(intact.ptr())[0], 0xA5u);
