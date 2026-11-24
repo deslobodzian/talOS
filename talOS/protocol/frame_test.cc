@@ -104,6 +104,9 @@ TEST(FrameTest, EncodeFrameInPlaceRejectsInvalidArguments) {
                                nullptr, kMaxFrameSize),
             0u);
   EXPECT_EQ(EncodeFrameInPlace(FrameType::kHardwareState, kFlagNone, 1, 2, 0,
+                               frame.data(), 0),
+            0u);
+  EXPECT_EQ(EncodeFrameInPlace(FrameType::kHardwareState, kFlagNone, 1, 2, 0,
                                frame.data(), kFrameHeaderSize - 1),
             0u);
   EXPECT_EQ(EncodeFrameInPlace(FrameType::kHardwareState, kFlagNone, 1, 2, 16,

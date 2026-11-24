@@ -132,7 +132,7 @@ int main(int argc, char** argv) {
     auto& stick = ds.joysticks[0];
     stick.connected = true;
     stick.axis_count = 4;
-    stick.button_count = 12;
+    stick.button_count = talos::driver_station::kMaxButtons;
     stick.buttons = buttons;
     stick.axes[0] = axis0;
     stick.axes[1] = axis1;
