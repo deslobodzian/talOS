@@ -1,8 +1,8 @@
 # MuJoCo
 
 The [MuJoCo](https://mujoco.org) physics engine as a Bazel dependency
-(`@mujoco//:mujoco`, 3.17.0 from source with a root-only patch
-(`third_party/mujoco_mesh_transformed_init.patch`,
+(`@mujoco//:mujoco`, 3.17.0 from source with root-only patches for three
+undefined behaviours (`third_party/mujoco_*.patch`,
 [INSTALL](../../../docs/INSTALL.md)), C engine `-O2` in every build by
 `talos.bazelrc`; [why](../../../docs/METHODOLOGY.md#13-open-source-first)).
 Only this package and its subpackages may depend on it, which
