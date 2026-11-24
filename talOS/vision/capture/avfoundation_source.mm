@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -80,12 +81,12 @@ class Source final : public CameraSource {
     return mode_;
   }
   bool SetMode(const CameraMode& mode) override {
-    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
-    std::lock_guard<std::mutex> lock(device_mutex_);
-    if (running_.load(std::memory_order_acquire)) return false;
     if (!mode.width || !mode.height || !std::isfinite(mode.fps) ||
         mode.fps <= 0 || mode.fps > 2147483.0)
       return false;
+    std::unique_lock<std::mutex> lifecycle(lifecycle_mutex_);
+    if (!PrepareQuiescentForConfigLocked(lifecycle)) return false;
+    std::lock_guard<std::mutex> lock(device_mutex_);
     mode_ = mode;
     return true;
   }
@@ -94,9 +95,9 @@ class Source final : public CameraSource {
     return controls_;
   }
   bool SetControls(const CameraControls& c) override {
-    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
+    std::unique_lock<std::mutex> lifecycle(lifecycle_mutex_);
+    if (!PrepareQuiescentForConfigLocked(lifecycle)) return false;
     std::lock_guard<std::mutex> lock(device_mutex_);
-    if (running_.load(std::memory_order_acquire)) return false;
     controls_ = c;
     return true;
   }
@@ -127,13 +128,45 @@ class Source final : public CameraSource {
   }
   bool controls_applied() const override { return controls_applied_; }
   bool Start() override {
+    if (IsSelfReceive()) return false;
     std::unique_lock<std::mutex> lifecycle(lifecycle_mutex_);
-    if (running_.load(std::memory_order_acquire)) return true;
+    for (;;) {
+      if (running_.load(std::memory_order_acquire)) return true;
+      std::vector<DetachedSession> to_drain;
+      CollectRetiredLocked(to_drain);
+      if (!to_drain.empty()) {
+        ++active_teardowns_;
+        lifecycle.unlock();
+        for (auto& d : to_drain) TeardownDetached(d);
+        to_drain.clear();
+        lifecycle.lock();
+        --active_teardowns_;
+        lifecycle_cv_.notify_all();
+        continue;
+      }
+      if (active_teardowns_ > 0) {
+        lifecycle_cv_.wait(lifecycle, [&] {
+          return active_teardowns_ == 0 ||
+                 running_.load(std::memory_order_acquire) ||
+                 !retired_sessions_.empty();
+        });
+        continue;
+      }
+      break;
+    }
     auto fail = [&](ConnectionState state, const std::string& message) {
       DetachedSession detached = DetachSessionLocked();
+      const bool has_detached = HasSession(detached);
+      if (has_detached) ++active_teardowns_;
       const std::string full = device_id() + ": " + message;
       lifecycle.unlock();
-      TeardownDetached(detached);
+      if (has_detached) {
+        TeardownDetached(detached);
+        lifecycle.lock();
+        --active_teardowns_;
+        lifecycle_cv_.notify_all();
+        lifecycle.unlock();
+      }
       NotifyConnection(state, full);
       return false;
     };
@@ -275,7 +308,8 @@ class Source final : public CameraSource {
       dispatch_ = dispatch_queue_create(
           "talos.camera", dispatch_queue_attr_make_with_qos_class(
                               DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
-      dispatch_queue_set_specific(dispatch_, &kDispatchQueueKey, this, nullptr);
+      dispatch_queue_set_specific(dispatch_, &kDispatchQueueKey,
+                                  (__bridge void*)dispatch_, nullptr);
       [output_ setSampleBufferDelegate:delegate_ queue:dispatch_];
       if (![session_ canAddOutput:output_]) {
         [session_ commitConfiguration];
@@ -298,23 +332,104 @@ class Source final : public CameraSource {
     return true;
   }
   void Stop() override {
-    DetachedSession detached;
-    {
-      std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
-      detached = DetachSessionLocked();
+    std::unique_lock<std::mutex> lifecycle(lifecycle_mutex_);
+    running_.store(false, std::memory_order_release);
+    connected_.store(false, std::memory_order_release);
+    if (IsSelfReceive()) {
+      DetachedSession detached = DetachSessionLocked();
+      if (HasSession(detached)) {
+        retired_sessions_.push_back(detached);
+      }
+      lifecycle.unlock();
+      if (HasSession(detached)) {
+        @autoreleasepool {
+          [detached.session stopRunning];
+          [detached.output setSampleBufferDelegate:nil queue:nullptr];
+        }
+      }
+      return;
     }
-    TeardownDetached(detached);
+    for (;;) {
+      running_.store(false, std::memory_order_release);
+      connected_.store(false, std::memory_order_release);
+      std::vector<DetachedSession> to_drain;
+      DetachedSession active = DetachSessionLocked();
+      if (HasSession(active)) {
+        to_drain.push_back(active);
+      }
+      CollectRetiredLocked(to_drain);
+      if (!to_drain.empty()) {
+        ++active_teardowns_;
+        lifecycle.unlock();
+        for (auto& d : to_drain) TeardownDetached(d);
+        to_drain.clear();
+        lifecycle.lock();
+        --active_teardowns_;
+        lifecycle_cv_.notify_all();
+        continue;
+      }
+      if (active_teardowns_ > 0) {
+        lifecycle_cv_.wait(lifecycle, [&] {
+          return active_teardowns_ == 0 || session_ != nil ||
+                 !retired_sessions_.empty();
+        });
+        continue;
+      }
+      return;
+    }
   }
 
   uint64_t dropped_frames() const override { return dropped_frames_.load(); }
 
  private:
+  static inline thread_local const Source* t_current_receive_source = nullptr;
+
+  bool IsSelfReceive() const { return t_current_receive_source == this; }
+
   struct DetachedSession {
     AVCaptureSession* session = nil;
     AVCaptureVideoDataOutput* output = nil;
     TalosCaptureDelegate* delegate = nil;
     dispatch_queue_t dispatch = nullptr;
   };
+  static bool HasSession(const DetachedSession& d) {
+    return d.session != nil || d.output != nil || d.delegate != nil ||
+           d.dispatch != nullptr;
+  }
+  void CollectRetiredLocked(std::vector<DetachedSession>& out) {
+    for (auto& d : retired_sessions_) {
+      if (HasSession(d)) out.push_back(d);
+    }
+    retired_sessions_.clear();
+  }
+  bool PrepareQuiescentForConfigLocked(
+      std::unique_lock<std::mutex>& lifecycle) {
+    if (IsSelfReceive()) return false;
+    for (;;) {
+      if (running_.load(std::memory_order_acquire)) return false;
+      std::vector<DetachedSession> to_drain;
+      CollectRetiredLocked(to_drain);
+      if (!to_drain.empty()) {
+        ++active_teardowns_;
+        lifecycle.unlock();
+        for (auto& d : to_drain) TeardownDetached(d);
+        to_drain.clear();
+        lifecycle.lock();
+        --active_teardowns_;
+        lifecycle_cv_.notify_all();
+        continue;
+      }
+      if (active_teardowns_ > 0) {
+        lifecycle_cv_.wait(lifecycle, [&] {
+          return active_teardowns_ == 0 ||
+                 running_.load(std::memory_order_acquire) ||
+                 !retired_sessions_.empty();
+        });
+        continue;
+      }
+      return !running_.load(std::memory_order_acquire);
+    }
+  }
   DetachedSession DetachSessionLocked() {
     running_.store(false, std::memory_order_release);
     connected_.store(false, std::memory_order_release);
@@ -337,10 +452,11 @@ class Source final : public CameraSource {
     @autoreleasepool {
       [detached.session stopRunning];
       [detached.output setSampleBufferDelegate:nil queue:nullptr];
-      const bool on_dispatch_queue =
+      const bool on_this_queue =
           detached.dispatch &&
-          dispatch_get_specific(&kDispatchQueueKey) == this;
-      if (detached.dispatch && !on_dispatch_queue) {
+          dispatch_get_specific(&kDispatchQueueKey) ==
+              (__bridge void*)detached.dispatch;
+      if (detached.dispatch && !on_this_queue) {
         dispatch_sync(detached.dispatch, ^{
                       });
       }
@@ -365,6 +481,14 @@ class Source final : public CameraSource {
     return desc ? std::string(desc) : std::string("unknown error");
   }
   void Receive(CMSampleBufferRef sample, AVCaptureSession* session) {
+    struct ReceiveScope {
+      const Source* prev;
+      explicit ReceiveScope(const Source* self)
+          : prev(t_current_receive_source) {
+        t_current_receive_source = self;
+      }
+      ~ReceiveScope() { t_current_receive_source = prev; }
+    } scope{this};
     if (!running_.load(std::memory_order_acquire)) return;
     CVPixelBufferRef pixels = CMSampleBufferGetImageBuffer(sample);
     if (!pixels ||
@@ -433,6 +557,9 @@ class Source final : public CameraSource {
   bool controls_applied_{true};
   uint64_t session_id_ = 0, sequence_ = 0;
   mutable std::mutex lifecycle_mutex_;
+  std::condition_variable lifecycle_cv_;
+  size_t active_teardowns_{0};
+  std::vector<DetachedSession> retired_sessions_;
   mutable std::mutex device_mutex_;
   static constexpr char kDispatchQueueKey = 0;
   AVCaptureDevice* device_ = nil;
