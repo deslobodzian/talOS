@@ -1267,7 +1267,9 @@ untouched.
 (`sim_plant.h`), which integrates the motion of the motors it binds and, when
 its model's root body has a free joint, the chassis. The backend stays the
 only controller and electrical model. At each `Configure` the plant binds
-motors by name (`ExternalPlant::Bind`). From then on a bound motor's rotor
+motors by name (`ExternalPlant::Bind`); a program that builds its plant
+before attaching it reads the same motor list (names, gears, winding
+constants) from `PhysicsSimBackend::PlantMotors`. From then on a bound motor's rotor
 position and velocity, and the chassis pose and velocity when the plant owns
 it, are the plant's; a configuration never resets the plant's world, and the
 gyro zeroes on the plant's heading at each bind and controller restart.
