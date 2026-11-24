@@ -617,6 +617,32 @@ TEST(Target, HardwareStateNotReadyIsNullWithFreshTeleopAndTarget) {
   EXPECT_EQ(lift.source, "");
 }
 
+// REQ-SAFE-41, REQ-RT-04: Target::get() and Target::source() must run on the
+// node's loop thread so unsynchronized target/hardware state and the
+// live-target flush gate cannot be raced from a worker thread.
+TEST_F(TargetTest, TargetGetAndSourceRefuseOffLoopThread) {
+  Hold("teleop", 1.0, 20ms);
+  ASSERT_EQ(Seen(), 1.0);
+
+  bool get_refused = false;
+  bool source_refused = false;
+  std::thread worker{[&] {
+    try {
+      (void)lift.target.get();
+    } catch (const std::logic_error&) {
+      get_refused = true;
+    }
+    try {
+      (void)lift.target.source();
+    } catch (const std::logic_error&) {
+      source_refused = true;
+    }
+  }};
+  worker.join();
+  EXPECT_TRUE(get_refused);
+  EXPECT_TRUE(source_refused);
+}
+
 TEST_F(TargetTest, DriverStationLossIsNull) {
   Hold("teleop", 1.0, 20ms);
   ASSERT_EQ(Seen(), 1.0);

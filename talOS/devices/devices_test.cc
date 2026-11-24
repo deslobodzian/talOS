@@ -2526,6 +2526,7 @@ TEST(Devices, DriverStationDropsACorruptPacket) {
   EXPECT_EQ(pilot.packets, 0);
   EXPECT_FALSE(pilot.ds.connected());
 }
+// REQ-SAFE-11
 TEST(Devices, DriverStationRejectsReorderedSampleAndModeTimes) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& pilot = sim.add<Pilot>("watcher");
@@ -2545,12 +2546,26 @@ TEST(Devices, DriverStationRejectsReorderedSampleAndModeTimes) {
   data.sample_time_us = 201;
   data.mode_since_us = 99;
   publish();
+  // A zero mode_since_us cannot zero out an established generation in the
+  // same boot (which would admit an older generation later).
+  data.sample_time_us = 201;
+  data.mode_since_us = 0;
+  publish();
   EXPECT_EQ(pilot.packets, 1);
   EXPECT_EQ(pilot.ds.data().sample_time_us, 200u);
   EXPECT_EQ(pilot.ds.data().mode_since_us, 100u);
   data.mode_since_us = 100;
   publish();
+  ASSERT_EQ(pilot.packets, 2);
+  ASSERT_TRUE(pilot.ds.connected());
+  ASSERT_TRUE(pilot.ds.enabled());
+
+  // Replaying the same nonzero sample_time_us is rejected and must not
+  // refresh freshness past [robot] command_timeout_us (100 ms).
+  for (int i = 0; i < 12; ++i) publish();
   EXPECT_EQ(pilot.packets, 2);
+  EXPECT_FALSE(pilot.ds.connected());
+  EXPECT_FALSE(pilot.ds.enabled());
 }
 
 // REQ-SAFE-11
