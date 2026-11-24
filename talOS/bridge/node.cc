@@ -40,6 +40,44 @@ uint64_t SaturatingAdd(uint64_t a, uint64_t b) {
              : a + b;
 }
 
+std::string ParseNonEmptyFlag(std::string_view flag, std::string_view value) {
+  if (value.empty()) {
+    throw std::invalid_argument("empty value for " + std::string{flag});
+  }
+  return std::string{value};
+}
+
+// Forward-jump upper bound for Driver Station timestamps (`sample_time_us` and
+// `mode_since_us`) within the current gateway boot, mirroring
+// ClockOffsetEstimator's jitter and drift bound so a corrupt far-future packet
+// cannot latch `last_ds_sample_time_us_` or downstream `DriverStationLink` for
+// the rest of the boot.
+bool WithinDriverStationForwardBound(uint64_t timestamp_us,
+                                     uint64_t last_state_sample_us,
+                                     uint64_t last_state_receipt_us,
+                                     int64_t min_offset_us, uint64_t now_us) {
+  if (timestamp_us <= last_state_sample_us) return true;
+  const uint64_t sample_delta_us = timestamp_us - last_state_sample_us;
+  const uint64_t receipt_delta_us = ElapsedUs(now_us, last_state_receipt_us);
+  // If the latest accepted State arrived delayed relative to the promptest
+  // State in clock_'s window, its one-way delay exceeds clock_.offset_us() by
+  // that lag; adding it back avoids false drops on live Driver Station frames
+  // arriving right after a delayed post-outage State.
+  const int64_t last_delay_us =
+      static_cast<int64_t>(last_state_receipt_us - last_state_sample_us);
+  const uint64_t state_lag_us = last_delay_us > min_offset_us
+                                    ? static_cast<uint64_t>(last_delay_us) -
+                                          static_cast<uint64_t>(min_offset_us)
+                                    : 0;
+  const uint64_t elapsed_us = SaturatingAdd(receipt_delta_us, state_lag_us);
+  const uint64_t drift_us =
+      elapsed_us / ClockOffsetEstimator::kMaxClockDriftDivisor;
+  const uint64_t max_delta_us = SaturatingAdd(
+      elapsed_us,
+      SaturatingAdd(drift_us, ClockOffsetEstimator::kMaxSampleJumpMarginUs));
+  return sample_delta_us <= max_delta_us;
+}
+
 int ParseIntFlag(std::string_view flag, std::string_view value, int min_value) {
   int parsed = 0;
   const char* const end = value.data() + value.size();
@@ -991,13 +1029,21 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
   // Driver Station packets are forwarded only from the boot the accepted
   // State is in (a retired boot's delayed packet, or one from a boot whose
   // State has not arrived yet, is dropped), in strictly increasing sample
-  // order within it.
+  // order within it, and with both sample_time_us and mode_since_us inside
+  // the gateway clock's forward-jump bound so a corrupt far-future packet
+  // cannot lock out the rest of the boot.
   if (frame.header.type == protocol::FrameType::kDriverStation) {
     driver_station::DriverStationData data{};
     if (!driver_station::Decode({frame.payload, frame.payload_size}, data) ||
         last_boot_id_ == 0 || data.boot_id != last_boot_id_ ||
         (last_ds_sample_time_us_ &&
-         data.sample_time_us <= *last_ds_sample_time_us_)) {
+         data.sample_time_us <= *last_ds_sample_time_us_) ||
+        !WithinDriverStationForwardBound(
+            data.sample_time_us, last_sample_time_us_, last_state_receipt_us_,
+            clock_.offset_us(), now_us) ||
+        !WithinDriverStationForwardBound(
+            data.mode_since_us, last_sample_time_us_, last_state_receipt_us_,
+            clock_.offset_us(), now_us)) {
       return;
     }
     last_ds_sample_time_us_ = data.sample_time_us;
@@ -1710,11 +1756,11 @@ int RunHardwareNodeMain(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
       if (arg == "--config" && i + 1 < argc) {
-        config_path = argv[++i];
+        config_path = ParseNonEmptyFlag(arg, argv[++i]);
       } else if (arg == "--remote" && i + 1 < argc) {
-        remote_cli = argv[++i];
+        remote_cli = ParseNonEmptyFlag(arg, argv[++i]);
       } else if (arg == "--local-address" && i + 1 < argc) {
-        local_address_cli = argv[++i];
+        local_address_cli = ParseNonEmptyFlag(arg, argv[++i]);
       } else if (arg == "--remote-port" && i + 1 < argc) {
         remote_port_cli = talos::config::ParsePortFlag(arg, argv[++i]);
       } else if (arg == "--local-port" && i + 1 < argc) {
@@ -1726,7 +1772,7 @@ int RunHardwareNodeMain(int argc, char** argv) {
       } else if (arg == "--describe") {
         describe = true;
       } else if (arg == "--log" && i + 1 < argc) {
-        log_path = argv[++i];
+        log_path = ParseNonEmptyFlag(arg, argv[++i]);
       } else if (arg == "--log-max-bytes" && i + 1 < argc) {
         log_max_bytes = ParseUint64Flag(arg, argv[++i]);
       } else if (arg == "--log-window-us" && i + 1 < argc) {
