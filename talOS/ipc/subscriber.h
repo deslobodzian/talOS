@@ -42,7 +42,7 @@ class Subscriber {
           })
       : topic_{topic}, queue_{topic_,           sizeof(Message),
                               alignof(Message), talos::schema::Of<Message>(),
-                              MAX_SLOTS,        options} {
+                              MAX_SLOTS,        subscribing(options)} {
     reader_id_ = queue_.register_reader();
     if (!reader_id_) {
       throw std::runtime_error("RTMS topic " + topic_ +
@@ -157,6 +157,14 @@ class Subscriber {
   bool arm_wake() { return reader_id_ && queue_.arm_wake(*reader_id_); }
 
  private:
+  // A subscriber never claims writer ownership or unlinks the segment as a
+  // session owner, whatever the caller left set in RTMSOptions.
+  static RTMSOptions subscribing(RTMSOptions options) {
+    options.publisher = false;
+    options.session_owner = false;
+    return options;
+  }
+
   void release() {
     if (reader_id_) {
       queue_.release_reader(reader_id_.value());
