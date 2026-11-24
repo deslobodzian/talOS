@@ -200,7 +200,10 @@ class OutputTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             parameters = os.path.join(tmp, "robot_params.toml")
             model = os.path.join(tmp, "robot.xml")
-            shutil.copy(os.path.join(EXAMPLES, "shooter_rig.toml"), parameters)
+            # copyfile: the contents without the mode, since a checkout's
+            # tracked files are read-only under CI and prepush.
+            shutil.copyfile(
+                os.path.join(EXAMPLES, "shooter_rig.toml"), parameters)
             args = ["--parameters", parameters, "--out", model]
             quiet = io.StringIO()
             with redirect_stdout(quiet), redirect_stderr(quiet):
