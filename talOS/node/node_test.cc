@@ -17,6 +17,8 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <typeindex>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -2607,6 +2609,355 @@ can_id = 1
     EXPECT_EQ(observed[1].flags & kNonLatestMask,
               introspect::naming::kSourceFlagObserver);
   }
+}
+
+struct CollidingDsReader {
+  explicit CollidingDsReader(Node& n)
+      : ds{n.subscribe<Count>(current_topic)},
+        lane{n.publish<Count>("/lift/target/teleop")} {}
+  static inline std::string_view current_topic;
+  Subscription<Count> ds;
+  Publisher<Count> lane;
+};
+
+struct CollidingTypedLane {
+  explicit CollidingTypedLane(Node& n)
+      : ds{n.subscribe<Count>(introspect::naming::kDriverStationTopic)},
+        lane{n.publish<Count>(current_topic)} {}
+  static inline std::string_view current_topic;
+  Subscription<Count> ds;
+  Publisher<Count> lane;
+};
+
+struct CollidingByteLane {
+  explicit CollidingByteLane(Node& n)
+      : ds{n.subscribe<Count>(introspect::naming::kDriverStationTopic)},
+        lane{n.publish_bytes(current_topic, 16)} {}
+  static inline std::string_view current_topic;
+  Subscription<Count> ds;
+  BytePublisher lane;
+};
+
+struct HostedWithUpdate {
+  explicit HostedWithUpdate(Node&) { ++constructed; }
+  void update() { ++ticks; }
+  static inline int constructed = 0;
+  int ticks = 0;
+};
+
+struct HostedWithoutUpdate {
+  explicit HostedWithoutUpdate(Node&) { ++constructed; }
+  static inline int constructed = 0;
+};
+
+// REQ-SAFE-14: IsDriverStationTopic and TargetLaneCollisionParts recognise
+// every ShmObjectName-colliding topic spelling (`//`, `.`, mixed separators),
+// AddSubscription refuses `/~` pre-hashed SHM names (direct or remapped), and
+// OperatorArming enforcement blocks colliding DS subscriptions and colliding
+// teleop target-lane publishers (typed, bytes, direct, remapped, and lazy).
+TEST(Node, OperatorArmingBlocksShmCollidingTopicBypasses) {
+  const std::string canonical_ds_shm =
+      ShmObjectName(introspect::naming::kDriverStationTopic, "");
+  for (const std::string_view topic : {
+           "/hw/state/driver_station",
+           "//hw/state/driver_station",
+           "///hw/state/driver_station",
+           "/hw.state.driver_station",
+           "//hw.state.driver_station",
+           "/hw/state.driver_station",
+           "/hw.state/driver_station",
+       }) {
+    EXPECT_TRUE(introspect::naming::IsDriverStationTopic(topic)) << topic;
+    EXPECT_EQ(ShmObjectName(topic, ""), canonical_ds_shm) << topic;
+  }
+  for (const std::string_view topic : {
+           "",
+           "/",
+           "//",
+           "hw/state/driver_station",
+           "hw.state.driver_station",
+           "/hw/state",
+           "/hw/state/driver_station/",
+           "/hw/state/driver_station/extra",
+           "/hw/state/driver_station2",
+           "/hw//state/driver_station",
+           "/other/state/driver_station",
+       }) {
+    EXPECT_FALSE(introspect::naming::IsDriverStationTopic(topic)) << topic;
+  }
+
+  const std::string canonical_lane_shm =
+      ShmObjectName("/lift/target/teleop", "");
+  for (const std::string_view topic : {
+           "/lift/target/teleop",
+           "//lift/target/teleop",
+           "///lift/target/teleop",
+           "/lift.target.teleop",
+           "//lift.target.teleop",
+           "/lift/target.teleop",
+           "/lift.target/teleop",
+       }) {
+    const auto parts = introspect::naming::TargetLaneCollisionParts(topic);
+    ASSERT_TRUE(parts.has_value()) << topic;
+    EXPECT_EQ(parts->subsystem, "lift") << topic;
+    EXPECT_EQ(parts->source, "teleop") << topic;
+    EXPECT_EQ(ShmObjectName(topic, ""), canonical_lane_shm) << topic;
+  }
+  for (const std::string_view topic : {
+           "",
+           "/",
+           "//",
+           "lift/target/teleop",
+           "/lift/target",
+           "/lift/target/",
+           "/lift/target.",
+           "/.target/teleop",
+           "/target/teleop",
+           "/lift/state/teleop",
+           "/lift/target/teleop/extra",
+           "/lift/target/teleop.extra",
+           "/lift//target/teleop",
+           "/~deadbeef12345678",
+       }) {
+    EXPECT_FALSE(
+        introspect::naming::TargetLaneCollisionParts(topic).has_value())
+        << topic;
+  }
+
+  constexpr const char* kArmingToml = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[robot.targets]
+teleop = ["teleop"]
+autonomous = ["auto"]
+
+[subsystems.driver]
+[subsystems.ds_remap.remap]
+"state" = "/hw.state.driver_station"
+[subsystems.hash_remap.remap]
+"state" = "/~deadbeef12345678"
+[subsystems.lane_remap.remap]
+"out" = "/lift.target.teleop"
+[subsystems.auto_driver]
+
+[subsystems.lift.motors.m]
+can_id = 1
+)";
+
+  // Direct and remapped `/~` and `//~` subscriptions and publishers are
+  // refused.
+  {
+    struct HashedSub {
+      explicit HashedSub(Node& n)
+          : sub{n.subscribe<Count>("/~deadbeef12345678")} {}
+      Subscription<Count> sub;
+    };
+    struct DoubleSlashHashedSub {
+      explicit DoubleSlashHashedSub(Node& n)
+          : sub{n.subscribe<Count>("//~deadbeef12345678")} {}
+      Subscription<Count> sub;
+    };
+    struct RemappedHashedSub {
+      explicit RemappedHashedSub(Node& n) : sub{n.subscribe<Count>("state")} {}
+      Subscription<Count> sub;
+    };
+    struct DoubleSlashHashedPub {
+      explicit DoubleSlashHashedPub(Node& n)
+          : pub{n.publish<Count>("//~deadbeef12345678")} {}
+      Publisher<Count> pub;
+    };
+    auto sim = Sim::FromToml(kArmingToml);
+    EXPECT_THROW(sim.add<HashedSub>("driver"), std::invalid_argument);
+    EXPECT_THROW(sim.add<DoubleSlashHashedSub>("driver"),
+                 std::invalid_argument);
+    EXPECT_THROW(sim.add<RemappedHashedSub>("hash_remap"),
+                 std::invalid_argument);
+    EXPECT_THROW(sim.add<DoubleSlashHashedPub>("driver"),
+                 std::invalid_argument);
+  }
+
+  // Colliding DS subscription spellings + unarmed teleop lane are refused.
+  for (const std::string_view ds_topic : {
+           "/hw.state.driver_station",
+           "//hw/state/driver_station",
+           "/hw/state.driver_station",
+           "/hw.state/driver_station",
+       }) {
+    SCOPED_TRACE(ds_topic);
+    CollidingDsReader::current_topic = ds_topic;
+    auto sim = Sim::FromToml(kArmingToml);
+    ExpectInvalidArgumentNaming(
+        [&] { sim.add<CollidingDsReader>("driver"); },
+        {"OperatorArming", "REQ-SAFE-14", "/lift/target/teleop"});
+  }
+  {
+    struct RemappedDsReader {
+      explicit RemappedDsReader(Node& n)
+          : ds{n.subscribe<Count>("state")},
+            lane{n.publish<Count>("/lift/target/teleop")} {}
+      Subscription<Count> ds;
+      Publisher<Count> lane;
+    };
+    auto sim = Sim::FromToml(kArmingToml);
+    ExpectInvalidArgumentNaming(
+        [&] { sim.add<RemappedDsReader>("ds_remap"); },
+        {"OperatorArming", "REQ-SAFE-14", "/lift/target/teleop"});
+  }
+
+  // Explicit DS reader + colliding teleop lane spellings (typed and bytes,
+  // direct and remapped) are refused.
+  for (const std::string_view lane_topic : {
+           "/lift.target.teleop",
+           "//lift/target/teleop",
+           "/lift/target.teleop",
+           "/lift.target/teleop",
+       }) {
+    SCOPED_TRACE(lane_topic);
+    CollidingTypedLane::current_topic = lane_topic;
+    CollidingByteLane::current_topic = lane_topic;
+    auto sim = Sim::FromToml(kArmingToml);
+    ExpectInvalidArgumentNaming([&] { sim.add<CollidingTypedLane>("driver"); },
+                                {"OperatorArming", "REQ-SAFE-14", lane_topic});
+    ExpectInvalidArgumentNaming([&] { sim.add<CollidingByteLane>("driver"); },
+                                {"OperatorArming", "REQ-SAFE-14", lane_topic});
+  }
+  {
+    struct RemappedCollidingLane {
+      explicit RemappedCollidingLane(Node& n)
+          : ds{n.subscribe<Count>(introspect::naming::kDriverStationTopic)},
+            lane{n.publish<Count>("out")} {}
+      Subscription<Count> ds;
+      Publisher<Count> lane;
+    };
+    auto sim = Sim::FromToml(kArmingToml);
+    ExpectInvalidArgumentNaming(
+        [&] { sim.add<RemappedCollidingLane>("lane_remap"); },
+        {"OperatorArming", "REQ-SAFE-14", "/lift.target.teleop"});
+  }
+
+  // Non-teleop colliding lane is allowed and still promotes loop_tier to
+  // kControl; post-start lazy colliding DS/lane calls still report
+  // OperatorArming before CheckOpen.
+  {
+    struct AutoCollidingLane {
+      explicit AutoCollidingLane(Node& n)
+          : ds{n.subscribe<Count>(introspect::naming::kDriverStationTopic)},
+            lane{n.publish<Count>("/lift.target.auto")} {}
+      Subscription<Count> ds;
+      Publisher<Count> lane;
+    };
+    struct UnarmedTeleopOnly {
+      explicit UnarmedTeleopOnly(Node& n)
+          : lane{n.publish<Count>("/lift/target/teleop")} {}
+      Publisher<Count> lane;
+    };
+    auto sim = Sim::FromToml(kArmingToml);
+    sim.add<AutoCollidingLane>("auto_driver");
+    EXPECT_EQ(detail::NodeAccess::loop_tier(sim.node("auto_driver")),
+              process::LoopTier::kControl);
+    ExpectInvalidArgumentNaming(
+        [&] {
+          (void)sim.node("auto_driver").publish<Count>("/lift.target.teleop");
+        },
+        {"OperatorArming", "REQ-SAFE-14", "/lift.target.teleop"});
+
+    sim.add<UnarmedTeleopOnly>("driver");
+    ExpectInvalidArgumentNaming(
+        [&] {
+          (void)sim.node("driver").subscribe<Count>("/hw.state.driver_station");
+        },
+        {"OperatorArming", "REQ-SAFE-14", "/lift/target/teleop"});
+  }
+}
+
+// REQ-RT-19, REQ-CONTRACT-05: post-start plain subscribe, Wake::kAtDrain
+// subscribe, Wake::kOnPublish subscribe, and publish throw std::logic_error
+// before mutating watchers, Delivery/set_prompt, or loop_tier, while
+// RefuseHardwareRequest still rejects /hw/request with std::invalid_argument.
+TEST(Node, PostStartSubscribeAndPublishThrowBeforeMutatingNode) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Empty>("listener");
+  Node& node = sim.node("listener");
+  ASSERT_EQ(detail::NodeAccess::loop_tier(node), process::LoopTier::kObserver);
+
+  int drain_calls = 0;
+  int prompt_calls = 0;
+  EXPECT_THROW((void)node.subscribe<Count>("/listener/late_plain"),
+               std::logic_error);
+  EXPECT_THROW((void)node.subscribe<Count>(
+                   "/listener/late_drain", [&](const Count&) { ++drain_calls; },
+                   Wake::kAtDrain),
+               std::logic_error);
+  EXPECT_THROW((void)node.subscribe<Count>(
+                   "/listener/late_prompt",
+                   [&](const Count&) { ++prompt_calls; }, Wake::kOnPublish),
+               std::logic_error);
+  EXPECT_THROW((void)node.publish<Count>("/listener/state"), std::logic_error);
+  EXPECT_THROW((void)node.publish<Count>("/arm/target/auto"), std::logic_error);
+  EXPECT_EQ(detail::NodeAccess::loop_tier(node), process::LoopTier::kObserver);
+  EXPECT_THROW((void)node.publish<Count>("/hw/request/listener"),
+               std::invalid_argument);
+
+  sim.publish("/listener/late_plain", Count{1, 0});
+  sim.publish("/listener/late_drain", Count{2, 0});
+  sim.publish("/listener/late_prompt", Count{3, 0});
+  sim.step(20ms);
+  EXPECT_EQ(drain_calls, 0);
+  EXPECT_EQ(prompt_calls, 0);
+}
+
+// REQ-DEV-09: HostCppNode<T> checks that the node is still open before
+// constructing or attaching T, and attaches extension + update() atomically so
+// a post-start or duplicate call never orphans T in extensions.
+TEST(Node, HostCppNodeAfterStartFailsAtomicallyWithoutOrphaningExtension) {
+  HostedWithUpdate::constructed = 0;
+  HostedWithoutUpdate::constructed = 0;
+
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Empty>("listener");
+  Node& node = sim.node("listener");
+
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    EXPECT_EQ(detail::HostCppNode<HostedWithUpdate>(&node), -1);
+    const std::string err = detail::NodeDetail::host_error();
+    EXPECT_NE(err.find("constructor"), std::string::npos) << err;
+    EXPECT_EQ(
+        detail::NodeDetail::find_extension(node, typeid(HostedWithUpdate)),
+        nullptr);
+  }
+  EXPECT_EQ(detail::HostCppNode<HostedWithoutUpdate>(&node), -1);
+  const std::string no_upd_err = detail::NodeDetail::host_error();
+  EXPECT_NE(no_upd_err.find("constructor"), std::string::npos) << no_upd_err;
+  EXPECT_EQ(
+      detail::NodeDetail::find_extension(node, typeid(HostedWithoutUpdate)),
+      nullptr);
+  EXPECT_EQ(HostedWithUpdate::constructed, 0);
+  EXPECT_EQ(HostedWithoutUpdate::constructed, 0);
+
+  // Pre-start hosting still attaches T and runs update() normally.
+  const std::string& config_path = detail::SimAccess::config_path(sim);
+  event::SimulationEnvironment env;
+  event::SimulatedEventLoop<> loop{env};
+  detail::LoopPortFor<event::SimulatedEventLoop<>> port{loop};
+  auto fresh = detail::NodeAccess::create(detail::NodeSetup{
+      .name = "listener",
+      .config_path = config_path,
+      .config = std::make_shared<const config::RobotConfig>(
+          config::ParseRobotConfig(config_path)),
+      .simulation = true,
+      .loop = &port,
+  });
+  ASSERT_EQ(detail::HostCppNode<HostedWithUpdate>(fresh.get()), 0)
+      << detail::NodeDetail::host_error();
+  auto* hosted = static_cast<HostedWithUpdate*>(
+      detail::NodeDetail::find_extension(*fresh, typeid(HostedWithUpdate)));
+  ASSERT_NE(hosted, nullptr);
+  EXPECT_EQ(HostedWithUpdate::constructed, 1);
+  detail::NodeAccess::start(*fresh);
+  loop.run_until(event::MonotonicTime{} + 15ms);
+  EXPECT_EQ(hosted->ticks, 3);
 }
 
 }  // namespace

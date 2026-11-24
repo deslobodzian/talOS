@@ -6,9 +6,13 @@ namespace talos::teleop {
 
 // Zero inside the deadband, then rescaled to ramp from 0 at the threshold
 // to full scale at 1 instead of stepping. Continuous at the threshold edge.
+// Out-of-range or NaN deadband_frac (outside [0, 1)) fails safe to 0.0.
 inline double Deadband(double value, double deadband_frac) {
   const double magnitude = std::abs(value);
-  if (magnitude <= deadband_frac || deadband_frac >= 1.0) return 0.0;
+  if (magnitude <= deadband_frac || !(deadband_frac >= 0.0) ||
+      deadband_frac >= 1.0) {
+    return 0.0;
+  }
   return std::copysign((magnitude - deadband_frac) / (1.0 - deadband_frac),
                        value);
 }

@@ -486,21 +486,25 @@ void NodeRegistration::sweep_stale(RegistryHeader* header) {
   const std::int64_t now = monotonic_now_ns();
   for (std::size_t i = 0; i < kMaxNodes; ++i) {
     NodeRecord& record = header->nodes[i];
-    // A live claimant/sweeper holds RegistryLock until its state commit.
+    const std::uint64_t state = record.state.load(std::memory_order_acquire);
+    // A live claimant holds RegistryLock until its state commit.
     // Under that lock any remaining CLAIMING row is abandoned, even if
     // death preceded its first pid or heartbeat store. Reclaim immediately.
-    if (record.state.load(std::memory_order_acquire) ==
-        static_cast<std::uint64_t>(SlotState::CLAIMING)) {
+    if (state == static_cast<std::uint64_t>(SlotState::CLAIMING)) {
       record.state.store(static_cast<std::uint64_t>(SlotState::FREE),
                          std::memory_order_release);
       continue;
     }
-    if (record.state.load(std::memory_order_acquire) !=
-        static_cast<std::uint64_t>(SlotState::ACTIVE)) {
+    if (state != static_cast<std::uint64_t>(SlotState::ACTIVE)) {
       continue;
     }
     // The claimant's identity is written under this lock before ACTIVE
     // and never after, so it is stable while the row is ACTIVE.
+    // RegistryLock already serializes every claim, release, and sweep, so
+    // evaluate liveness while state remains ACTIVE (never flipping through
+    // CLAIMING, which would drop a live row from lock-free readers or risk
+    // stranding it if this sweeper were killed) and store FREE directly only
+    // when confirmed gone.
     const std::uint64_t claimant =
         (record.pid_start << kProcessPidBits) | record.pid;
     const auto& beat = record.heartbeat_monotonic_ns;
@@ -508,20 +512,7 @@ void NodeRegistration::sweep_stale(RegistryHeader* header) {
         talos::ProcessWordAlive(claimant)) {
       continue;
     }
-    // Take the slot before deciding, so two nodes starting at once cannot
-    // free the same row twice; hand it back when the owner heartbeated
-    // while we were deciding and still runs.
-    std::uint64_t expected = static_cast<std::uint64_t>(SlotState::ACTIVE);
-    if (!record.state.compare_exchange_strong(
-            expected, static_cast<std::uint64_t>(SlotState::CLAIMING),
-            std::memory_order_acq_rel)) {
-      continue;
-    }
-    const bool gone =
-        now - beat.load(std::memory_order_relaxed) >= kLivenessTimeoutNs ||
-        !talos::ProcessWordAlive(claimant);
-    record.state.store(gone ? static_cast<std::uint64_t>(SlotState::FREE)
-                            : static_cast<std::uint64_t>(SlotState::ACTIVE),
+    record.state.store(static_cast<std::uint64_t>(SlotState::FREE),
                        std::memory_order_release);
   }
 }
@@ -797,9 +788,12 @@ NodeSnapshot RegistryReader::copy(const NodeRecord& record, std::size_t slot) {
   node.pid = record.pid;
   node.session_id = record.session_id;
   node.start_wall_ns = record.start_wall_ns;
+  // Acquire pairs with activate() (clearing kFlagConstructing after publish()
+  // and publish_selections()) and mark_quiesced(), so readers observing those
+  // transitions also observe the published heartbeat, sources, and selections.
+  node.flags = record.flags.load(std::memory_order_acquire);
   node.heartbeat_monotonic_ns =
       record.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
-  node.flags = record.flags.load(std::memory_order_relaxed);
   node.dispatch_count = record.dispatch_count.load(std::memory_order_relaxed);
   node.declared_source_count =
       record.declared_source_count.load(std::memory_order_relaxed);

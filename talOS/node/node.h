@@ -131,6 +131,13 @@ class Subscription;
 template <Message M>
 class Publisher;
 
+namespace detail {
+void CheckHostNodeOpen(const Node& node);
+void AttachHostedNode(Node& node, std::type_index type,
+                      std::shared_ptr<void> object,
+                      std::function<void()> update);
+}  // namespace detail
+
 class Node {
  public:
   ~Node();
@@ -248,6 +255,10 @@ class Node {
  private:
   friend struct detail::NodeAccess;  // the framework's side: access.h
   friend struct detail::NodeDetail;  // safe public-API thunks: node_detail.h
+  friend void detail::CheckHostNodeOpen(const Node& node);
+  friend void detail::AttachHostedNode(Node& node, std::type_index type,
+                                       std::shared_ptr<void> object,
+                                       std::function<void()> update);
   explicit Node(detail::NodeSetup setup);
   struct Impl;
   std::unique_ptr<Impl> impl_;
@@ -406,16 +417,18 @@ std::int32_t HostCppNode(void* raw_node) noexcept {
       return -1;
     }
     auto& node = *static_cast<Node*>(raw_node);
+    CheckHostNodeOpen(node);
     if (NodeDetail::find_extension(node, typeid(T)) != nullptr) {
       throw std::logic_error(std::string{node.name()} +
                              ": extension added twice");
     }
     auto object = std::make_shared<T>(node);
-    T* raw = object.get();
-    NodeDetail::add_extension(node, typeid(T), std::move(object));
+    std::function<void()> update;
     if constexpr (requires(T& t) { t.update(); }) {
-      NodeDetail::set_update(node, [raw] { raw->update(); });
+      T* raw = object.get();
+      update = [raw] { raw->update(); };
     }
+    AttachHostedNode(node, typeid(T), std::move(object), std::move(update));
     return 0;
   } catch (const std::exception& e) {
     NodeDetail::set_host_error(e.what());

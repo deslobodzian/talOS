@@ -562,7 +562,12 @@ class AbiErrorsTest(unittest.TestCase):
     def test_abi_errors_are_not_values_states_or_true_flags(self):
         sim = Sim.from_toml(ROBOT_TOML)
         follower = sim.add(Follower, "follower")
-        stepper = sim.add(Stepper, "planner")
+        class LinkedStepper(Stepper):
+            def __init__(self, node):
+                super().__init__(node)
+                self.link = talos.HardwareLink(node)
+
+        stepper = sim.add(LinkedStepper, "planner")
         # A failed state read returns 0, a valid state: only the error
         # string set by the failed call tells them apart.
         stepper.sm._index = 99  # no such state machine: every C call fails
@@ -600,7 +605,7 @@ class AbiErrorsTest(unittest.TestCase):
         node._native = None
         with self.assertRaises(talos.TalosError):
             subscription.fresh(-0.01)
-        link = talos.HardwareLink(sim.node("planner"))
+        link = stepper.link
         sim.node("planner")._native = None
         with self.assertRaises(talos.TalosError):
             link.fresh(-0.01)

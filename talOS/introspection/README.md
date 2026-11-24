@@ -292,8 +292,7 @@ was released after it ([the limit](../launcher/README.md#session-manifest)).
 A claimant killed at any instruction before this
 commit cannot keep the lock held. Any CLAIMING slot observed by the next sweep
 under the lock is therefore abandoned, and is freed immediately, even if the
-claimant died before recording a pid or heartbeat. This also recovers a sweeper
-killed during its own temporary CLAIMING transition. Recovery takes one sweep
+claimant died before recording a pid or heartbeat. Recovery takes one sweep
 (a fixed scan of 32 slots), not 32 restarts or a heartbeat timeout.
 
 Every new claim also sweeps ACTIVE slots whose claimant is gone: its process
@@ -303,9 +302,10 @@ records a claim, the pid, the process start time and the pid namespace
 (`pid_start`; `//talOS/rtms:process_liveness`), so a killed node's row is freed
 by the next claim, and a pid reused since does not keep it. A claimant in
 another pid namespace sharing `/dev/shm` cannot be looked up from this one, so
-its row is freed only once its heartbeat is `kLivenessTimeout` old. Both are
-rechecked after the ACTIVE-to-CLAIMING transition so a refresh observed during
-the sweep can keep the row. `RegistryReader::nodes()` makes the same process
+its row is freed only once its heartbeat is `kLivenessTimeout` old. Under
+`RegistryLock`, the row stays ACTIVE while liveness is evaluated and transitions
+directly to FREE only when confirmed gone, so concurrent lock-free readers never
+lose sight of a live node. `RegistryReader::nodes()` makes the same process
 check, so until that claim a killed node's row reads `alive = false` at once,
 its heartbeat still fresh.
 

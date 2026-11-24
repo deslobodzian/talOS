@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -2845,10 +2846,102 @@ TEST(HardwareNodeTrustTest, ConfigAckBeforeFirstStateSuppressesRedundantPush) {
   }
 }
 
+// A corrupt Driver Station packet with a far-future sample_time_us or
+// mode_since_us must be dropped without latching last_ds_sample_time_us_ (or
+// wedging downstream DriverStationLink::OnPacket), while normal packets,
+// post-outage packets, and live packets right after a delayed post-outage State
+// are still forwarded.
+// REQ-SAFE-11, REQ-RT-27
+TEST(HardwareNodeTrustTest,
+     FarFutureDriverStationTimestampIsDroppedWithoutLockingOutBoot) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  Bridge bridge{cfg};
+  HardwareNode& node = bridge.node;
+  InProcessGateway& gateway = bridge.gateway;
+  ipc::Subscriber<talos::hardware::Packet> ds_sub{kDriverStationTopic};
+
+  const auto send_ds = [&](uint64_t boot_id, uint64_t sample_time_us,
+                           uint64_t mode_since_us, uint64_t now_us) -> bool {
+    driver_station::DriverStationData data{};
+    data.boot_id = boot_id;
+    data.sample_time_us = sample_time_us;
+    data.mode_since_us = mode_since_us;
+    data.fms.flags = driver_station::kDsAttached | driver_station::kEnabled |
+                     driver_station::kTeleop;
+    std::array<uint8_t, driver_station::kMaxEncodedSize> payload{};
+    const auto size = driver_station::Encode(data, payload);
+    EXPECT_GT(size, 0u);
+    gateway.Receive(protocol::FrameType::kDriverStation, now_us,
+                    std::span<const uint8_t>{payload.data(), size});
+    node.Tick(now_us);
+    return ds_sub.read().has_value();
+  };
+
+  constexpr uint64_t kBoot = 11;
+  constexpr uint64_t kInitialSampleUs = 10'000;
+  constexpr uint64_t kInitialReceiptUs = 1'000'000;
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, kBoot, 1, kInitialSampleUs),
+                              kInitialReceiptUs));
+  ASSERT_TRUE(send_ds(kBoot, kInitialSampleUs, kInitialSampleUs,
+                      kInitialReceiptUs + 1'000));
+  ASSERT_EQ(node.driver_station_packets_received(), 1u);
+
+  // At receipt + 2 ms, any timestamp past elapsed + drift + 1 s margin is
+  // dropped without updating last_ds_sample_time_us_.
+  constexpr uint64_t kCheckReceiptUs = kInitialReceiptUs + 2'000;
+  constexpr uint64_t kMaxValidUs =
+      kInitialSampleUs + 2'000 +
+      2'000 / ClockOffsetEstimator::kMaxClockDriftDivisor +
+      ClockOffsetEstimator::kMaxSampleJumpMarginUs;
+  constexpr uint64_t kMaxU64 = std::numeric_limits<uint64_t>::max();
+  EXPECT_FALSE(send_ds(kBoot, kMaxU64, kInitialSampleUs, kCheckReceiptUs));
+  EXPECT_FALSE(send_ds(kBoot, kInitialSampleUs + 60'000'000, kInitialSampleUs,
+                       kCheckReceiptUs));
+  EXPECT_FALSE(
+      send_ds(kBoot, kMaxValidUs + 1, kInitialSampleUs, kCheckReceiptUs));
+  EXPECT_FALSE(send_ds(kBoot, 30'000, kMaxU64, kCheckReceiptUs));
+  EXPECT_FALSE(send_ds(kBoot, 30'000, kMaxValidUs + 1, kCheckReceiptUs));
+  EXPECT_EQ(node.driver_station_packets_received(), 1u);
+
+  // A normal packet at the exact same sample_time_us as the rejected
+  // mode_since_us packets still forwards, proving last_ds_sample_time_us_ was
+  // not latched.
+  EXPECT_TRUE(
+      send_ds(kBoot, 30'000, kInitialSampleUs, kInitialReceiptUs + 3'000));
+  EXPECT_EQ(node.driver_station_packets_received(), 2u);
+
+  // After a 10 s outage, a live Driver Station packet arriving before any new
+  // State is within elapsed bridge time + drift + margin and forwards.
+  constexpr uint64_t kOutageUs = 10'000'000;
+  EXPECT_TRUE(send_ds(kBoot, kInitialSampleUs + kOutageUs,
+                      kInitialSampleUs + kOutageUs,
+                      kInitialReceiptUs + kOutageUs));
+  EXPECT_EQ(node.driver_station_packets_received(), 3u);
+
+  // A delayed buffered State from before the outage arrives, followed 1 ms
+  // later by a live Driver Station packet: accounting for the delayed State's
+  // lag against clock_.offset_us() keeps the live packet flowing while still
+  // rejecting a corrupt far-future packet.
+  ASSERT_TRUE(
+      gateway.Deliver(TrustState(config_id, kBoot, 1, kInitialSampleUs + 5'000),
+                      kInitialReceiptUs + kOutageUs + 1'000));
+  EXPECT_TRUE(send_ds(kBoot, kInitialSampleUs + kOutageUs + 20'000,
+                      kInitialSampleUs + kOutageUs,
+                      kInitialReceiptUs + kOutageUs + 2'000));
+  EXPECT_EQ(node.driver_station_packets_received(), 4u);
+  EXPECT_FALSE(send_ds(kBoot, kInitialSampleUs + kOutageUs + 60'020'000,
+                       kInitialSampleUs + kOutageUs,
+                       kInitialReceiptUs + kOutageUs + 3'000));
+  EXPECT_EQ(node.driver_station_packets_received(), 4u);
+}
+
 // hardware_node CLI numeric flags (--duration-s, --log-max-bytes, --session-id)
 // must parse the entire string strictly as a non-negative integer, rejecting
 // negative values, trailing garbage, whitespace, leading '+', empty strings,
-// and overflow with a clean nonzero exit.
+// and overflow with a clean nonzero exit; string value flags (--config,
+// --remote, --local-address, --log) must also reject empty values rather than
+// silently falling back or disabling recording.
 // REQ-CONTRACT-17
 TEST(HardwareNodeTrustTest, CliRejectsMalformedAndNegativeNumericFlags) {
   const std::filesystem::path config_path =
@@ -2874,7 +2967,8 @@ TEST(HardwareNodeTrustTest, CliRejectsMalformedAndNegativeNumericFlags) {
     return std::tuple<int, std::string, std::string>{rc, out, err};
   };
 
-  // Positive controls: valid non-negative integers succeed under --describe.
+  // Positive controls: valid non-negative integers and non-empty string flags
+  // succeed under --describe.
   {
     const auto [rc, out, err] = run_cli(
         {"hardware_node", "--config", config_path.string(), "--describe",
@@ -2883,10 +2977,11 @@ TEST(HardwareNodeTrustTest, CliRejectsMalformedAndNegativeNumericFlags) {
     EXPECT_NE(out.find("\"describe_version\""), std::string::npos) << out;
   }
   {
-    const auto [rc, out, err] =
-        run_cli({"hardware_node", "--config", config_path.string(),
-                 "--describe", "--duration-s", "30", "--log-max-bytes",
-                 "1048576", "--session-id", "18446744073709551615"});
+    const auto [rc, out, err] = run_cli(
+        {"hardware_node", "--config", config_path.string(), "--describe",
+         "--remote", "127.0.0.1", "--local-address", "127.0.0.1", "--log",
+         "unused.tlog", "--duration-s", "30", "--log-max-bytes", "1048576",
+         "--session-id", "18446744073709551615"});
     EXPECT_EQ(rc, 0) << err;
     EXPECT_NE(out.find("\"describe_version\""), std::string::npos) << out;
   }
@@ -2896,6 +2991,10 @@ TEST(HardwareNodeTrustTest, CliRejectsMalformedAndNegativeNumericFlags) {
     const char* value;
   };
   const BadCase bad_cases[] = {
+      {"--config", ""},
+      {"--remote", ""},
+      {"--local-address", ""},
+      {"--log", ""},
       {"--duration-s", "-5"},
       {"--duration-s", "-1"},
       {"--duration-s", "5abc"},
@@ -2927,6 +3026,13 @@ TEST(HardwareNodeTrustTest, CliRejectsMalformedAndNegativeNumericFlags) {
     EXPECT_EQ(rc, 1);
     EXPECT_TRUE(out.empty()) << out;
     EXPECT_NE(err.find(tc.flag), std::string::npos) << err;
+  }
+  {
+    const auto [rc, out, err] =
+        run_cli({"hardware_node", "--config", "", "--describe"});
+    EXPECT_EQ(rc, 1);
+    EXPECT_TRUE(out.empty()) << out;
+    EXPECT_NE(err.find("--config"), std::string::npos) << err;
   }
 
   std::error_code ec;
