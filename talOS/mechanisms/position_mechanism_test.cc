@@ -506,6 +506,56 @@ TEST(PositionMechanism, RequestDoesNotCarryIntoTheNextTick) {
   EXPECT_EQ(arm.Applied().mode, Mode::kNeutral);
 }
 
+// A request lasts one tick even where nothing else gates it: with
+// AllowUntargetedOutputs the devices flush does not neutralize a tick with no
+// target, so the mechanism alone must stop driving when the owner stops
+// asking (both set_goal() and hold()).
+// REQ-SAFE-36
+TEST(PositionMechanism, OneRequestDrivesOneTick) {
+  struct OnceNode {
+    explicit OnceNode(Node& node) : mech{node, "arm"} {
+      AllowUntargetedOutputs(node);
+    }
+    void update() {
+      if (ask) {
+        if (hold_mode) {
+          mech.hold();
+        } else {
+          mech.set_goal(0.2);
+        }
+      }
+      mech.update();
+      ++ticks;
+    }
+    PositionMechanism mech;
+    bool ask = false;
+    bool hold_mode = false;
+    int ticks = 0;
+  };
+  for (const bool hold_mode : {false, true}) {
+    SCOPED_TRACE(hold_mode ? "hold" : "set_goal");
+    Rig<OnceNode> arm{"arm"};
+    arm.SetMotor(0.1);
+    arm.Start();
+    const int before_ask = arm.node.ticks;
+    arm.node.hold_mode = hold_mode;
+    arm.node.ask = true;
+    arm.sim.step(5ms);
+    ASSERT_GT(arm.node.ticks, before_ask);
+    ASSERT_TRUE(arm.mech().driving());
+    ASSERT_EQ(arm.Applied().mode, Mode::kMotionMagic);
+    ASSERT_DOUBLE_EQ(arm.Applied().demand, hold_mode ? 0.1 : 0.2);
+
+    const int before_idle = arm.node.ticks;
+    arm.node.ask = false;
+    arm.sim.step(5ms);
+    ASSERT_GT(arm.node.ticks, before_idle);
+    EXPECT_FALSE(arm.mech().driving());
+    EXPECT_EQ(arm.mech().phase(), PositionPhase::kReady);
+    EXPECT_EQ(arm.Applied().mode, Mode::kNeutral);
+  }
+}
+
 // Each bad [m] table throws at construction, naming the key.
 // REQ-SAFE-36
 TEST(PositionMechanism, BadParameterFailsConstruction) {
