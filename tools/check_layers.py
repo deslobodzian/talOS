@@ -91,8 +91,10 @@ refuses from the start (RULES.md 2):
   `-trigraphs`/`-ftrigraphs`/`-fms-extensions`/`-fms-compatibility`/`-I`/
   `-iquote`/`-isystem`/`-cxx-isystem`/`-idirafter`/`--include-directory`/
   `-iwithprefix`/`-iwithsysroot` compiler flags (joined, separate, or via
-  `-Wp,`/`-Xclang`), as well as non-empty (or dynamic) `includes = ...`
-  keyword arguments that add `-isystem` include search paths.
+  `-Wp,`/`-Xclang`), as well as non-empty (or dynamic/mutated) `includes = ...`
+  keyword arguments and dynamic/mutated `**kwargs` splats (outside unmodified
+  `.bzl` macro `**kwargs` pass-through) that can add `-isystem` include search
+  paths.
 
 Structural enforcement (ARCH-2 / RULES.md 2): Bazel visibility (checked above
 for every restricted target) prevents robot node code from depending on
@@ -1119,14 +1121,331 @@ def _is_non_cpp_file(path):
     return os.path.splitext(base)[1].lower() in NON_CPP_SUFFIXES
 
 
-def _collect_starlark_bindings(tree):
-    bindings = {}
+# Starlark methods that cannot mutate their receiver container. Any other
+# attribute/method access (including `append`, `extend`, `insert`, `pop`,
+# `popitem`, `remove`, `clear`, `update`, `setdefault`, or an unknown method)
+# marks the receiver variable as mutated (fail closed).
+_STARLARK_READONLY_METHODS = frozenset({
+    "get",
+    "keys",
+    "values",
+    "items",
+    "copy",
+    "index",
+    "count",
+    "elems",
+    # Immutable string methods.
+    "capitalize",
+    "codepoints",
+    "endswith",
+    "find",
+    "format",
+    "isalnum",
+    "isalpha",
+    "isdigit",
+    "islower",
+    "isspace",
+    "istitle",
+    "isupper",
+    "join",
+    "lower",
+    "lstrip",
+    "partition",
+    "removeprefix",
+    "removesuffix",
+    "replace",
+    "rfind",
+    "rpartition",
+    "rsplit",
+    "rstrip",
+    "split",
+    "splitlines",
+    "startswith",
+    "strip",
+    "title",
+    "upper",
+})
+# Methods safe on a `.bzl` macro's `**kwargs` pass-through parameter: read-only
+# methods plus `pop` (which only removes a key and can never add `includes`).
+_STARLARK_KWARG_PASSTHROUGH_METHODS = _STARLARK_READONLY_METHODS | frozenset({
+    "pop",
+})
+# Built-in functions that do not mutate list/dict arguments passed to them.
+_STARLARK_READONLY_BUILTINS = frozenset({
+    "all",
+    "any",
+    "bool",
+    "dict",
+    "dir",
+    "enumerate",
+    "getattr",
+    "hasattr",
+    "hash",
+    "len",
+    "list",
+    "max",
+    "min",
+    "repr",
+    "reversed",
+    "set",
+    "sorted",
+    "str",
+    "tuple",
+    "type",
+    "zip",
+})
+
+
+def _container_root_names(node, skip_popped=False):
+    """Yields variable names whose container may be referenced by `node`.
+
+    When `skip_popped=True`, omits the receiver of `.pop(...)` because the
+    returned value has been detached from that container (shallow copies such
+    as `list(...)`, `dict(...)`, and `.copy()` still alias nested elements and
+    are never skipped).
+    """
+    if isinstance(node, ast.Name):
+        yield node.id
+    elif isinstance(node, (ast.Subscript, ast.Attribute)):
+        yield from _container_root_names(node.value, skip_popped=skip_popped)
+    elif isinstance(node, ast.IfExp):
+        yield from _container_root_names(node.body, skip_popped=skip_popped)
+        yield from _container_root_names(node.orelse, skip_popped=skip_popped)
+    elif isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Attribute):
+            if not (skip_popped and node.func.attr == "pop"):
+                yield from _container_root_names(
+                    node.func.value, skip_popped=skip_popped)
+        for a in node.args:
+            yield from _container_root_names(a, skip_popped=skip_popped)
+        for kw in node.keywords:
+            yield from _container_root_names(kw.value, skip_popped=skip_popped)
+    elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        for elt in node.elts:
+            yield from _container_root_names(elt, skip_popped=skip_popped)
+    elif isinstance(node, ast.Dict):
+        for v in node.values:
+            yield from _container_root_names(v, skip_popped=skip_popped)
+    elif isinstance(node, ast.Starred):
+        yield from _container_root_names(node.value, skip_popped=skip_popped)
+
+
+def _iter_assigned_names(target):
+    if isinstance(target, ast.Name):
+        yield target.id
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            yield from _iter_assigned_names(elt)
+    elif isinstance(target, ast.Starred):
+        yield from _iter_assigned_names(target.value)
+
+
+def _record_target_mutations(target, assign_counts, mutated,
+                             count_simple_name=False):
+    if isinstance(target, ast.Name):
+        if count_simple_name:
+            assign_counts[target.id] = assign_counts.get(target.id, 0) + 1
+        else:
+            mutated.add(target.id)
+    elif isinstance(target, (ast.Subscript, ast.Attribute)):
+        mutated.update(_container_root_names(target.value))
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            _record_target_mutations(elt, assign_counts, mutated,
+                                     count_simple_name=False)
+    elif isinstance(target, ast.Starred):
+        _record_target_mutations(target.value, assign_counts, mutated,
+                                 count_simple_name=False)
+
+
+def _propagate_aliases(mutated, alias_refs):
+    changed = True
+    while changed:
+        changed = False
+        for name in list(mutated):
+            for ref in alias_refs.get(name, ()):
+                if ref not in mutated:
+                    mutated.add(ref)
+                    changed = True
+
+
+def _collect_starlark_bindings(tree, *, container_safe=False):
+    """Returns single-assigned, unmutated top-level Starlark bindings.
+
+    Any variable reassigned more than once, targeted by `AugAssign`,
+    subscript/attribute assignment, loop/parameter binding, or a non-read-only
+    method/attribute access (including through aliases) is excluded (fail
+    closed). With `container_safe=True`, variables passed as arguments to
+    non-read-only calls (other than `includes = ...` or `**var` splats) are
+    also excluded so a helper call cannot mutate a list/dict in place.
+    """
+    top_level = {}
     for stmt in tree.body:
-        if isinstance(stmt, ast.Assign):
-            for target in stmt.targets:
+        if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and
+                isinstance(stmt.targets[0], ast.Name)):
+            top_level[stmt.targets[0].id] = stmt.value
+
+    assign_counts = {}
+    mutated = set()
+    alias_refs = {}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            simple = len(node.targets) == 1
+            for target in node.targets:
+                _record_target_mutations(target, assign_counts, mutated,
+                                         count_simple_name=simple)
+                for name in _iter_assigned_names(target):
+                    alias_refs.setdefault(name, set()).update(
+                        _container_root_names(node.value, skip_popped=True))
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+            _record_target_mutations(node.target, assign_counts, mutated,
+                                     count_simple_name=False)
+        elif isinstance(node, ast.Delete):
+            for target in node.targets:
+                _record_target_mutations(target, assign_counts, mutated,
+                                         count_simple_name=False)
+        elif isinstance(node, (ast.For, ast.comprehension)):
+            _record_target_mutations(node.target, assign_counts, mutated,
+                                     count_simple_name=False)
+            for name in _iter_assigned_names(node.target):
+                alias_refs.setdefault(name, set()).update(
+                    _container_root_names(node.iter, skip_popped=True))
+        elif isinstance(node, ast.FunctionDef):
+            mutated.add(node.name)
+            for arg in (list(node.args.posonlyargs) + list(node.args.args) +
+                        list(node.args.kwonlyargs)):
+                mutated.add(arg.arg)
+            if node.args.vararg:
+                mutated.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                mutated.add(node.args.kwarg.arg)
+        elif isinstance(node, ast.Lambda):
+            for arg in (list(node.args.posonlyargs) + list(node.args.args) +
+                        list(node.args.kwonlyargs)):
+                mutated.add(arg.arg)
+            if node.args.vararg:
+                mutated.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                mutated.add(node.args.kwarg.arg)
+        elif isinstance(node, ast.Attribute):
+            if node.attr not in _STARLARK_READONLY_METHODS:
+                mutated.update(_container_root_names(node.value))
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id == "load":
+                for a in node.args[1:]:
+                    if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                        mutated.add(a.value)
+                for kw in node.keywords:
+                    if kw.arg:
+                        mutated.add(kw.arg)
+                continue
+            if container_safe:
+                is_ro_builtin = (
+                    isinstance(node.func, ast.Name) and
+                    node.func.id in _STARLARK_READONLY_BUILTINS)
+                is_ro_method = (
+                    isinstance(node.func, ast.Attribute) and
+                    node.func.attr in _STARLARK_READONLY_METHODS)
+                if not is_ro_builtin and not is_ro_method:
+                    for a in node.args:
+                        mutated.update(
+                            _container_root_names(a, skip_popped=True))
+                    for kw in node.keywords:
+                        if kw.arg not in ("includes", None):
+                            mutated.update(
+                                _container_root_names(
+                                    kw.value, skip_popped=True))
+
+    for name, count in assign_counts.items():
+        if count > 1:
+            mutated.add(name)
+
+    _propagate_aliases(mutated, alias_refs)
+    return {k: v for k, v in top_level.items() if k not in mutated}
+
+
+def _function_mutates_kwarg(func_node, kw_name):
+    """True when `func_node`'s `**kw_name` parameter may be mutated or rebound
+    inside `func_node` (fail closed)."""
+    mutated = set()
+    alias_refs = {}
+
+    for node in ast.walk(func_node):
+        if node is func_node:
+            continue
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
                 if isinstance(target, ast.Name):
-                    bindings[target.id] = stmt.value
-    return bindings
+                    if target.id == kw_name:
+                        mutated.add(kw_name)
+                else:
+                    _record_target_mutations(target, {}, mutated,
+                                             count_simple_name=False)
+                for name in _iter_assigned_names(target):
+                    alias_refs.setdefault(name, set()).update(
+                        _container_root_names(node.value, skip_popped=True))
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+            _record_target_mutations(node.target, {}, mutated,
+                                     count_simple_name=False)
+        elif isinstance(node, ast.Delete):
+            for target in node.targets:
+                _record_target_mutations(target, {}, mutated,
+                                         count_simple_name=False)
+        elif isinstance(node, (ast.For, ast.comprehension)):
+            _record_target_mutations(node.target, {}, mutated,
+                                     count_simple_name=False)
+            for name in _iter_assigned_names(node.target):
+                alias_refs.setdefault(name, set()).update(
+                    _container_root_names(node.iter, skip_popped=True))
+        elif isinstance(node, ast.Attribute):
+            if node.attr not in _STARLARK_KWARG_PASSTHROUGH_METHODS:
+                mutated.update(_container_root_names(node.value,
+                                                     skip_popped=True))
+        elif isinstance(node, ast.Call):
+            is_ro_builtin = (isinstance(node.func, ast.Name) and
+                             node.func.id in _STARLARK_READONLY_BUILTINS)
+            is_safe_method = (
+                isinstance(node.func, ast.Attribute) and
+                node.func.attr in _STARLARK_KWARG_PASSTHROUGH_METHODS)
+            if not is_ro_builtin and not is_safe_method:
+                for a in node.args:
+                    mutated.update(_container_root_names(a, skip_popped=True))
+                for kw in node.keywords:
+                    if kw.arg is not None:
+                        mutated.update(
+                            _container_root_names(kw.value, skip_popped=True))
+
+    _propagate_aliases(mutated, alias_refs)
+    return kw_name in mutated
+
+
+def _is_safe_starlark_kwargs_dict(node, safe_bindings, str_bindings,
+                                  seen=frozenset()):
+    """True only when `node` resolves to a literal Starlark dict whose keys
+    are all statically known strings (or recursively safe unpacked dicts)
+    and none sets a non-empty `includes`."""
+    if isinstance(node, ast.Name):
+        if node.id in safe_bindings and node.id not in seen:
+            return _is_safe_starlark_kwargs_dict(
+                safe_bindings[node.id], safe_bindings, str_bindings,
+                seen | {node.id})
+        return False
+    if not isinstance(node, ast.Dict):
+        return False
+    for k, v in zip(node.keys, node.values):
+        if k is None:
+            if not _is_safe_starlark_kwargs_dict(
+                    v, safe_bindings, str_bindings, seen):
+                return False
+            continue
+        key_str = _eval_starlark_str(k, str_bindings)
+        if key_str is None:
+            return False
+        if (key_str == "includes" and
+                not _is_empty_starlark_includes(v, safe_bindings)):
+            return False
+    return True
 
 
 def _eval_starlark_str(node, bindings, seen=frozenset()):
@@ -1248,8 +1567,10 @@ def scan_starlark_ast(path, tree):
     """Refuses BUILD / `.bzl` string constants carrying bypass symbols,
     token pasting, C++ trigraphs, forbidden header paths, or forbidden
     `-include`/`-imacros`/`-trigraphs`/`-ftrigraphs`/include-path compiler
-    flags, as well as non-empty or dynamic `includes` keyword arguments."""
+    flags, as well as non-empty (or dynamic/mutated) `includes` keyword
+    arguments and dynamic/mutated `**kwargs` splats."""
     bindings = _collect_starlark_bindings(tree)
+    safe_bindings = _collect_starlark_bindings(tree, container_safe=True)
     violations = []
     seen_keys = set()
     reported_flag_nodes = set()
@@ -1261,37 +1582,82 @@ def scan_starlark_ast(path, tree):
             violations.append(SourceViolation(path, lineno, kind, detail,
                                               header=header))
 
-    # Refuse non-empty (or dynamic) `includes = ...` attributes on rule/macro
-    # calls: Bazel translates `includes` into `-isystem` search paths that can
-    # shorten `#include` paths past static header checks.
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        for kw in node.keywords:
-            if kw.arg == "includes":
-                if not _is_empty_starlark_includes(kw.value, bindings):
-                    lineno = getattr(kw, "lineno", getattr(node, "lineno", 1))
-                    add(lineno, "starlark-forbidden-includes",
-                        "Starlark call sets `includes` (adds -isystem search "
-                        "paths that can shorten #include paths)")
-            elif kw.arg is None:
-                val = kw.value
-                seen_names = set()
-                while (isinstance(val, ast.Name) and val.id in bindings and
-                       val.id not in seen_names):
-                    seen_names.add(val.id)
-                    val = bindings[val.id]
-                if isinstance(val, ast.Dict):
-                    for k, v in zip(val.keys, val.values):
-                        if (k is not None and
-                                _eval_starlark_str(k, bindings) == "includes"
-                                and not _is_empty_starlark_includes(v, bindings)):
-                            lineno = getattr(
-                                kw, "lineno", getattr(node, "lineno", 1))
-                            add(lineno, "starlark-forbidden-includes",
-                                "Starlark call sets `includes` via kwargs "
-                                "(adds -isystem search paths that can shorten "
-                                "#include paths)")
+    # Refuse non-empty (or dynamic/mutated) `includes = ...` attributes and
+    # non-literal/mutated `**kwargs` splats on rule/macro calls: Bazel
+    # translates `includes` into `-isystem` search paths that can shorten
+    # `#include` paths past static header checks. Unmodified `.bzl` macro
+    # `**kwargs` pass-through stays allowed because call sites are checked.
+    def check_calls(node, passthrough_kwargs):
+        if isinstance(node, ast.FunctionDef):
+            shadowed = {
+                arg.arg
+                for arg in (list(node.args.posonlyargs) +
+                            list(node.args.args) +
+                            list(node.args.kwonlyargs))
+            }
+            if node.args.vararg:
+                shadowed.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                shadowed.add(node.args.kwarg.arg)
+            inner_kwargs = set(passthrough_kwargs) - shadowed
+            if (node.args.kwarg and
+                    not _function_mutates_kwarg(node, node.args.kwarg.arg)):
+                inner_kwargs.add(node.args.kwarg.arg)
+            for default in node.args.defaults:
+                check_calls(default, passthrough_kwargs)
+            for default in node.args.kw_defaults:
+                if default is not None:
+                    check_calls(default, passthrough_kwargs)
+            for dec in node.decorator_list:
+                check_calls(dec, passthrough_kwargs)
+            inner_frozen = frozenset(inner_kwargs)
+            for stmt in node.body:
+                check_calls(stmt, inner_frozen)
+            return
+        if isinstance(node, ast.Lambda):
+            shadowed = {
+                arg.arg
+                for arg in (list(node.args.posonlyargs) +
+                            list(node.args.args) +
+                            list(node.args.kwonlyargs))
+            }
+            if node.args.vararg:
+                shadowed.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                shadowed.add(node.args.kwarg.arg)
+            for default in node.args.defaults:
+                check_calls(default, passthrough_kwargs)
+            for default in node.args.kw_defaults:
+                if default is not None:
+                    check_calls(default, passthrough_kwargs)
+            check_calls(node.body, passthrough_kwargs - shadowed)
+            return
+        if isinstance(node, ast.Call):
+            for kw in node.keywords:
+                if kw.arg == "includes":
+                    if not _is_empty_starlark_includes(kw.value, safe_bindings):
+                        lineno = getattr(
+                            kw, "lineno", getattr(node, "lineno", 1))
+                        add(lineno, "starlark-forbidden-includes",
+                            "Starlark call sets `includes` (adds -isystem "
+                            "search paths that can shorten #include paths)")
+                elif kw.arg is None:
+                    if (isinstance(kw.value, ast.Name) and
+                            kw.value.id in passthrough_kwargs):
+                        continue
+                    if not _is_safe_starlark_kwargs_dict(
+                            kw.value, safe_bindings, bindings):
+                        lineno = getattr(
+                            kw, "lineno", getattr(node, "lineno", 1))
+                        add(lineno, "starlark-forbidden-includes",
+                            "Starlark call sets `includes` or uses "
+                            "dynamic/mutated **kwargs (adds -isystem search "
+                            "paths or cannot verify statically that `includes` "
+                            "is unset)")
+        for child in ast.iter_child_nodes(node):
+            check_calls(child, passthrough_kwargs)
+
+    check_calls(tree, frozenset())
 
     # First detect adjacent flag+arg list/tuple pairs like `["-include", "foo"]`.
     for node in ast.walk(tree):
