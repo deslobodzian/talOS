@@ -110,10 +110,12 @@ tie, so the blue HUB counts through SHIFT 1 as well as TRANSITION.
 
 ## Tests
 
-`shot_test` (e2e) runs the launcher on `robot_sim.toml` with the schedules
-above and judges the session's record (`/sim/state/match` in telemetry's
-event log, `/hw/state` in the bridge's): all 8 preloads launched and at
-least 7 scored in TELEOP (every measured session scored 8; one of margin), each beam break closed and open, every member exiting 0,
+`shot_test` (e2e) runs the launcher on `robot_sim.toml` with the joystick
+schedule above (`disabled:1,teleop:60`) and judges the session's record
+(`/sim/state/match` in telemetry's event log, `/hw/state` in the bridge's): all
+8 preloads launched and at least 7 blue points scored in TELEOP (every measured
+session scored 8; one of margin), each beam break closed and open, every member
+exiting 0,
 the graph accepted without `--allow-graph-errors`. It ends the session on
 the record, not on a wall-clock time: once all eight have scored, or the
 schedule clock is 3 s past the eighth launch or 30 s past its start.
@@ -122,5 +124,5 @@ processes, at least 7 of 8 and the same `/sim/state/match` every run, on
 talOS's copy of the model (talOS does not depend on an example) and its
 own config, with sleeping on as `robot_sim.toml` has it;
 `model_twin_test` holds the two models to the same bytes. `sim_test`
-(`talos_sim_test`) starts, runs and stops the rig cleanly. The nodes keep the
-node test matrix `new_subsystem` gave them.
+(`talos_sim_test`) starts, runs and stops the rig cleanly. The nodes carry the
+full node test matrix (`feeder/node_test.cc`, `flywheel/node_test.cc`).

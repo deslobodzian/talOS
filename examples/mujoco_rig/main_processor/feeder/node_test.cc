@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -137,6 +138,8 @@ TEST_F(FeederTest, ReleasedLaneGoesNeutral) {
   ReleaseTarget<Target>(sim, "feeder", "teleop");
   sim.step(40ms);
   EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_EQ(Applied(), Mode::kNeutral);
+  EXPECT_FALSE(Latest().enabled());
 }
 
 // REQ-CONTRACT-25: matrix case 5, the node's `state` published, `enabled`
@@ -147,6 +150,7 @@ TEST_F(FeederTest, NeverSentGoesNeutral) {
   Teleop();
   sim.step(60ms);
   EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_EQ(Applied(), Mode::kNeutral);
   EXPECT_FALSE(Latest().enabled());
 }
 
@@ -161,6 +165,8 @@ TEST_F(FeederTest, DriverStationLossGoesNeutral) {
   hw.stop_driver_station();  // the bridge stops forwarding DS packets
   Hold(30.0, 160ms);         // past command_timeout_us: the DS is stale
   EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_EQ(Applied(), Mode::kNeutral);
+  EXPECT_FALSE(Latest().enabled());
 }
 
 // REQ-CONTRACT-25
@@ -175,6 +181,7 @@ TEST_F(FeederTest, DisconnectedFeedbackGoesNeutral) {
   // the node's own feedback gate is what stops it.
   ASSERT_TRUE(talos::robot_enabled(sim.node("feeder")));
   EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_EQ(Applied(), Mode::kNeutral);
   const State state = Latest();
   EXPECT_FALSE(state.connected());
   EXPECT_FALSE(state.enabled());
@@ -182,10 +189,22 @@ TEST_F(FeederTest, DisconnectedFeedbackGoesNeutral) {
 
 // REQ-SAFE-04
 TEST_F(FeederTest, NonFiniteDemandGoesNeutral) {
+  hw.ideal_motors();
   Teleop();
-  Hold(std::numeric_limits<double>::quiet_NaN(), 40ms);
-  EXPECT_EQ(Request(), Mode::kNeutral);
-  EXPECT_FALSE(Latest().enabled());
+  for (const double demand : {std::numeric_limits<double>::quiet_NaN(),
+                              std::numeric_limits<double>::infinity(),
+                              -std::numeric_limits<double>::infinity()}) {
+    SCOPED_TRACE(demand);
+    Hold(30.0, 40ms);
+    ASSERT_EQ(Applied(), Mode::kVelocity);
+
+    Hold(demand, 40ms);
+    EXPECT_EQ(Request(), Mode::kNeutral);
+    EXPECT_EQ(Applied(), Mode::kNeutral);
+    const State state = Latest();
+    EXPECT_FALSE(state.enabled());
+    EXPECT_TRUE(std::isfinite(state.velocity_rps()));
+  }
 }
 
 // matrix: n/a 9 (the feeder reads no parameters)
@@ -197,14 +216,16 @@ TEST_F(FeederTest, OtherModesLaneIsIgnored) {
   Teleop();
   Hold(30.0, 40ms, "auto");  // autonomous's lane, live, in teleop
   EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_EQ(Applied(), Mode::kNeutral);
   ReleaseTarget<Target>(sim, "feeder", "auto");
 
   hw.set_driver_station(DsPacket(ds::kEnabled | ds::kAutonomous));
   sim.step(10ms);
   Hold(30.0, 40ms);  // teleop's lane, live, in autonomous
   EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_EQ(Applied(), Mode::kNeutral);
   Hold(20.0, 40ms, "auto");
-  const auto request = hw.motor_request("feeder", "feeder_motor");
+  const auto request = hw.applied_motor("feeder", "feeder_motor");
   EXPECT_EQ(request.mode, Mode::kVelocity);
   EXPECT_DOUBLE_EQ(request.demand, 20.0);
 }
@@ -229,10 +250,12 @@ TEST_F(FeederTest, EarlierGenerationTargetIsIgnored) {
   PublishTarget(sim, "feeder", "teleop", Target{30.0}, before);
   sim.step(20ms);
   EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_EQ(Applied(), Mode::kNeutral);
   // The same target stamped with the current generation drives at once.
   PublishTarget(sim, "feeder", "teleop", Target{30.0});
   sim.step(20ms);
   EXPECT_EQ(Request(), Mode::kVelocity);
+  EXPECT_EQ(Applied(), Mode::kVelocity);
 }
 
 // REQ-RT-06: the steady-state tick (target read, request, flush, state
