@@ -2507,5 +2507,370 @@ m_s_follow = { can_id = 13, follow = "m_s0" }
       "feedback_sensor");
 }
 
+// REQ-SAFE-26, REQ-CONTRACT-17: RemoteCANcoder + rezero + soft_limits
+// combinations fail closed, continuous_wrap contradicts soft_limits, soft limit
+// bounds must be finite and ordered (even with validate_hardware = false), and
+// RemoteCANcoder feedback_sensor must name a CANcoder.
+TEST(ConfigTest,
+     RejectsContradictorySoftLimitsContinuousWrapAndInvalidLimitBounds) {
+  const std::string remote_prefix = R"(
+[subsystems.test.sensors.enc]
+can_id = 2
+[subsystems.test.motors.arm]
+can_id = 3
+feedback = "RemoteCANcoder"
+feedback_sensor = "enc"
+)";
+  // RemoteCANcoder defaults to position_frame = "rezero", which refuses
+  // soft_limits = true whether position_frame is omitted or explicit.
+  ExpectRejectedNaming(remote_prefix + "soft_limits = true\n", "soft_limits");
+  ExpectRejectedNaming(
+      remote_prefix + "position_frame = \"rezero\"\nsoft_limits = true\n",
+      "soft_limits");
+
+  // continuous_wrap and soft_limits contradict each other.
+  try {
+    static_cast<void>(Parse(remote_prefix + "position_frame = \"absolute\"\n"
+                                            "soft_limits = true\n"
+                                            "continuous_wrap = true\n"));
+    ADD_FAILURE() << "accepted soft_limits = true with continuous_wrap = true";
+  } catch (const std::invalid_argument& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find("soft_limits"), std::string::npos) << what;
+    EXPECT_NE(what.find("continuous_wrap"), std::string::npos) << what;
+    EXPECT_NE(what.find("arm"), std::string::npos) << what;
+  }
+
+  // Inverted, equal, and non-finite soft limit bounds are refused for both
+  // runtime (validate_hardware = true) and build-time (validate_hardware =
+  // false) parsing, naming the limit key and motor.
+  for (const auto& [limits_toml, expected_key] : {
+           std::pair{"reverse_limit_rot = 2.0\nforward_limit_rot = 1.0\n",
+                     "reverse_limit_rot"},
+           std::pair{"reverse_limit_rot = 1.0\nforward_limit_rot = 1.0\n",
+                     "reverse_limit_rot"},
+           std::pair{"reverse_limit_rot = nan\nforward_limit_rot = 1.0\n",
+                     "reverse_limit_rot"},
+           std::pair{"reverse_limit_rot = -1.0\nforward_limit_rot = inf\n",
+                     "forward_limit_rot"},
+           std::pair{"reverse_limit_rot = -inf\nforward_limit_rot = 1.0\n",
+                     "reverse_limit_rot"},
+       }) {
+    SCOPED_TRACE(limits_toml);
+    const std::string full = std::string(kMotor) + remote_prefix +
+                             "position_frame = \"absolute\"\n"
+                             "soft_limits = true\n" +
+                             limits_toml;
+    for (const bool validate_hw : {true, false}) {
+      try {
+        static_cast<void>(
+            ParseRobotConfigTable(toml::parse(full), validate_hw));
+        ADD_FAILURE() << "accepted invalid limits with validate_hardware="
+                      << validate_hw;
+      } catch (const std::invalid_argument& error) {
+        const std::string what = error.what();
+        EXPECT_NE(what.find(expected_key), std::string::npos) << what;
+        EXPECT_NE(what.find("arm"), std::string::npos) << what;
+      }
+    }
+  }
+
+  // Non-CANcoder feedback_sensor is rejected even when validate_hardware =
+  // false.
+  for (const std::string_view bad_sensor : {
+           "[subsystems.test.sensors.imu]\ntype = \"Pigeon2\"\ncan_id = 2\n"
+           "[subsystems.test.motors.arm]\ncan_id = 3\n"
+           "feedback = \"RemoteCANcoder\"\nfeedback_sensor = \"imu\"\n",
+           "[subsystems.test.motors.arm]\ncan_id = 3\n"
+           "feedback = \"RemoteCANcoder\"\nfeedback_sensor = \"m1\"\n",
+       }) {
+    SCOPED_TRACE(bad_sensor);
+    try {
+      static_cast<void>(ParseRobotConfigTable(
+          toml::parse(std::string(kMotor) + std::string(bad_sensor)),
+          /*validate_hardware=*/false));
+      ADD_FAILURE() << "accepted non-CANcoder feedback_sensor";
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      EXPECT_NE(what.find("feedback_sensor"), std::string::npos) << what;
+      EXPECT_NE(what.find("arm"), std::string::npos) << what;
+    }
+  }
+
+  // Valid absolute RemoteCANcoder motor with ordered soft limits parses.
+  const auto valid = Parse(remote_prefix +
+                           "position_frame = \"absolute\"\n"
+                           "soft_limits = true\n"
+                           "reverse_limit_rot = -0.25\n"
+                           "forward_limit_rot = 0.5\n");
+  const auto arm =
+      std::find_if(valid.hardware.motors.begin(), valid.hardware.motors.end(),
+                   [](const auto& motor) { return motor.name == "arm"; });
+  ASSERT_NE(arm, valid.hardware.motors.end());
+  EXPECT_TRUE(arm->soft_limits);
+  EXPECT_DOUBLE_EQ(arm->reverse_limit_rot, -0.25);
+  EXPECT_DOUBLE_EQ(arm->forward_limit_rot, 0.5);
+}
+
+// REQ-DEV-37, REQ-CONTRACT-17: [simulation.mujoco] robot_model and
+// robot_model_files refuse '..' path traversal, embedded NUL bytes, and
+// absolute paths (both in files and in string-parsed configs).
+TEST_F(ManifestTest,
+       SimulationMujocoRejectsPathTraversalAbsoluteStringAndNulPaths) {
+  std::filesystem::create_directories(dir_ / "sub" / "nested");
+  Write("outside.xml", "<mujoco/>\n");
+  Write("outside.stl", "solid\n");
+  Write("sub/robot.xml", "<mujoco/>\n");
+
+  const struct {
+    const char* name;
+    const char* config_rel;
+    std::string content;
+    std::vector<const char*> parts;
+  } cases[] = {
+      {"robot_model parent traversal",
+       "sub/robot.toml",
+       "[simulation.mujoco]\nrobot_model = \"../outside.xml\"\n",
+       {"robot_model", "sub/robot.toml"}},
+      {"robot_model interior parent traversal",
+       "sub/robot.toml",
+       "[simulation.mujoco]\nrobot_model = \"nested/../robot.xml\"\n",
+       {"robot_model", "sub/robot.toml"}},
+      {"robot_model_files parent traversal",
+       "sub/robot.toml",
+       "[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+       "robot_model_files = [\"../outside.stl\"]\n",
+       {"robot_model_files[0]", "sub/robot.toml"}},
+      {"robot_model_files interior traversal",
+       "sub/robot.toml",
+       "[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+       "robot_model_files = [\"nested/../../outside.stl\"]\n",
+       {"robot_model_files[0]", "sub/robot.toml"}},
+      {"robot_model NUL byte",
+       "sub/robot.toml",
+       "[simulation.mujoco]\nrobot_model = \"robot\\u0000.xml\"\n",
+       {"robot_model", "NUL"}},
+      {"robot_model_files NUL byte",
+       "sub/robot.toml",
+       "[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+       "robot_model_files = [\"mesh\\u0000.stl\"]\n",
+       {"robot_model_files[0]", "NUL"}},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.name);
+    Write(c.config_rel, c.content + std::string(kMotor));
+    try {
+      static_cast<void>(ParseRobotConfig((dir_ / c.config_rel).string()));
+      ADD_FAILURE() << "accepted " << c.name;
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      for (const char* part : c.parts) {
+        EXPECT_NE(what.find(part), std::string::npos) << what;
+      }
+    }
+  }
+
+  // String-parsed configs also refuse absolute paths and '..' traversal in
+  // [simulation.mujoco].
+  const std::string abs_model = (dir_ / "outside.xml").generic_string();
+  for (const auto& [toml_body, key] : {
+           std::pair{
+               "[simulation.mujoco]\nrobot_model = \"" + abs_model + "\"\n",
+               "robot_model"},
+           std::pair{std::string("[simulation.mujoco]\n"
+                                 "robot_model = \"../outside.xml\"\n"),
+                     "robot_model"},
+           std::pair{std::string("[simulation.mujoco]\n"
+                                 "robot_model = \"robot.xml\"\n"
+                                 "robot_model_files = [\"../outside.stl\"]\n"),
+                     "robot_model_files[0]"},
+       }) {
+    SCOPED_TRACE(toml_body);
+    try {
+      static_cast<void>(Parse(toml_body));
+      ADD_FAILURE() << "accepted string config: " << toml_body;
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      EXPECT_NE(what.find("config: [simulation.mujoco]"), std::string::npos)
+          << what;
+      EXPECT_NE(what.find(key), std::string::npos) << what;
+    }
+  }
+}
+
+// REQ-CONTRACT-31, REQ-OPS-39, REQ-CONTRACT-17: config files must declare
+// relative [trajectories] and [studio] dashboard paths (no absolute paths or
+// embedded NUL bytes).
+TEST_F(ManifestTest, RejectsAbsoluteAndNulTrajectoryAndDashboardPathsInFiles) {
+  Write("existing.traj", "{}\n");
+  Write("existing_dashboard.toml", "[dashboard]\n");
+  const std::string abs_traj = (dir_ / "existing.traj").generic_string();
+  const std::string abs_dash =
+      (dir_ / "existing_dashboard.toml").generic_string();
+
+  Write("robot.toml",
+        "[[subsystems]]\nname = \"auto\"\npath = \"subsystems/auto.toml\"\n");
+  Write("subsystems/auto.toml",
+        "[subsystem]\nname = \"auto\"\n[trajectories]\ntaxi = \"" + abs_traj +
+            "\"\n[motors.m]\ncan_id = 1\n");
+  try {
+    static_cast<void>(ParseRobotConfig(Robot()));
+    ADD_FAILURE() << "accepted absolute trajectory path in subsystem file";
+  } catch (const std::invalid_argument& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find("subsystems/auto.toml"), std::string::npos) << what;
+    EXPECT_NE(what.find("trajectories.taxi"), std::string::npos) << what;
+  }
+
+  Write("robot.toml",
+        "[studio]\ndashboard = \"" + abs_dash + "\"\n" + std::string(kMotor));
+  try {
+    static_cast<void>(ParseRobotConfig(Robot()));
+    ADD_FAILURE() << "accepted absolute [studio] dashboard path in file";
+  } catch (const std::invalid_argument& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find("robot.toml"), std::string::npos) << what;
+    EXPECT_NE(what.find("[studio] dashboard"), std::string::npos) << what;
+  }
+
+  // NUL bytes fail before the ResolveRobotConfig data callback is invoked.
+  Write("robot.toml",
+        "[studio]\ndashboard = \"a\\u0000b.toml\"\n" + std::string(kMotor));
+  bool data_called = false;
+  EXPECT_THROW(
+      static_cast<void>(ResolveRobotConfig(
+          Robot(), detail::ParseTomlFile,
+          [&](const std::string&, const std::string&) { data_called = true; })),
+      std::invalid_argument);
+  EXPECT_FALSE(data_called);
+}
+
+// REQ-CONTRACT-10, REQ-CONTRACT-17: malformed singular sections in an included
+// base file cannot be silently overwritten by an overlay; subsystem files
+// refuse framework sections under [subsystem], duplicate keys across
+// [subsystem] and top level, and nested defaults; unexpanded include and
+// non-positive [robot] rates are rejected.
+TEST_F(ManifestTest,
+       RejectsMalformedBaseSectionsHeaderCollisionsAndNestedDefaults) {
+  const std::string valid_overlay = R"(
+include = "base.toml"
+[robot]
+period_us = 5000
+[robot.targets]
+teleop = ["teleop"]
+[studio]
+http_port = 5800
+[simulation.battery]
+nominal_voltage_v = 12.6
+[simulation.chassis]
+mass_kg = 50.0
+[subsystems.arm.motors.m]
+can_id = 1
+)";
+  Write("robot.toml", valid_overlay);
+  for (const char* broken_base : {
+           "robot = 1\n",
+           "studio = 1\n",
+           "simulation = 1\n",
+           "subsystems = 1\n",
+           "[robot]\ntargets = 1\n",
+           "[simulation]\nbattery = 1\n",
+           "[simulation]\nchassis = 1\n",
+           "[simulation]\nswerve_modules = {}\n",
+           "[subsystems]\narm = 1\n",
+           "[subsystems.arm]\nmotors = 1\n",
+       }) {
+    SCOPED_TRACE(broken_base);
+    Write("base.toml", broken_base);
+    try {
+      static_cast<void>(ParseRobotConfig(Robot()));
+      ADD_FAILURE() << "silently overwrote broken base: " << broken_base;
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string_view{error.what()}.find("base.toml"),
+                std::string_view::npos)
+          << error.what();
+    }
+  }
+
+  // Subsystem files refuse framework section tables placed under [subsystem]
+  // and keys duplicated between [subsystem] and top level.
+  Write("robot.toml",
+        "[[subsystems]]\nname = \"arm\"\npath = \"subsystems/arm.toml\"\n");
+  for (const auto& [sub_toml, expected] : {
+           std::pair{"[subsystem]\nname = \"arm\"\n"
+                     "[subsystem.targets]\nteleop = [\"teleop\"]\n",
+                     "[subsystem.targets]"},
+           std::pair{"[subsystem]\nname = \"arm\"\n"
+                     "[subsystem.motors.m]\ncan_id = 1\n",
+                     "[subsystem.motors]"},
+           std::pair{"period_us = 5000\n[subsystem]\nname = \"arm\"\n"
+                     "period_us = 10000\n",
+                     "duplicate key 'period_us'"},
+       }) {
+    SCOPED_TRACE(sub_toml);
+    Write("subsystems/arm.toml", sub_toml);
+    try {
+      static_cast<void>(ParseRobotConfig(Robot()));
+      ADD_FAILURE() << "accepted invalid subsystem file:\n" << sub_toml;
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      EXPECT_NE(what.find("subsystems/arm.toml"), std::string::npos) << what;
+      EXPECT_NE(what.find(expected), std::string::npos) << what;
+    }
+  }
+
+  // Nested defaults and non-table [subsystem] in a defaults file are refused.
+  Write("subsystems/arm.toml",
+        "[subsystem]\nname = \"arm\"\ndefaults = \"defaults.toml\"\n"
+        "[motors.m]\ncan_id = 1\n");
+  for (const auto& [def_toml, expected] : {
+           std::pair{"[subsystem]\ndefaults = \"grandparent.toml\"\n",
+                     "nested [subsystem] defaults"},
+           std::pair{"subsystem = 1\n", "[subsystem]"},
+       }) {
+    SCOPED_TRACE(def_toml);
+    Write("subsystems/defaults.toml", def_toml);
+    try {
+      static_cast<void>(ParseRobotConfig(Robot()));
+      ADD_FAILURE() << "accepted invalid defaults file:\n" << def_toml;
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      EXPECT_NE(what.find("defaults.toml"), std::string::npos) << what;
+      EXPECT_NE(what.find(expected), std::string::npos) << what;
+    }
+  }
+
+  // Unexpanded top-level include in ParseRobotConfigString is refused.
+  try {
+    static_cast<void>(ParseRobotConfigString("include = \"base.toml\"\n" +
+                                             std::string(kMotor)));
+    ADD_FAILURE() << "accepted unexpanded top-level include in string config";
+  } catch (const std::invalid_argument& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find("include"), std::string::npos) << what;
+    EXPECT_NE(what.find("ParseRobotConfig"), std::string::npos) << what;
+  }
+
+  // Empty field name in teleop assignments is refused.
+  ExpectRejected("[subsystems.test.teleop.defaults]\n\"\" = 1.0\n");
+
+  // Non-positive or non-finite [robot] timing/status fields fail even when
+  // validate_hardware = false (build-time resolve.cc).
+  for (const std::string_view bad_robot : {
+           "[robot]\nperiod_us = 0\n",
+           "[robot]\ncommand_timeout_us = 0\n",
+           "[robot]\nstatus_hz = 0.0\n",
+           "[robot]\nstatus_hz = -10.0\n",
+           "[robot]\nstatus_hz = nan\n",
+           "[robot]\nstatus_hz = inf\n",
+       }) {
+    SCOPED_TRACE(bad_robot);
+    EXPECT_THROW(ParseRobotConfigTable(
+                     toml::parse(std::string(bad_robot) + std::string(kMotor)),
+                     /*validate_hardware=*/false),
+                 std::invalid_argument);
+  }
+}
+
 }  // namespace
 }  // namespace talos::config
