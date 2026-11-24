@@ -298,6 +298,7 @@ std::size_t TargetAccess::open_lane(Node& node, std::string_view subsystem,
                                     std::size_t alignment,
                                     const schema::Identity& message,
                                     std::optional<std::size_t> arming) {
+  NodeAccess::require_loop_thread(node, "TargetLane");
   const std::size_t envelope = TargetEnvelopeBytes(bytes, alignment);
   if (arming) ArmingAt(node, *arming);  // throws unless this node has it
   if (auto problem = introspect::naming::CheckTargetLane(subsystem, source)) {
@@ -305,16 +306,20 @@ std::size_t TargetAccess::open_lane(Node& node, std::string_view subsystem,
   }
   const std::string topic =
       introspect::naming::TargetLaneTopic(subsystem, source);
+  // Register the publisher and Driver Station before attaching Targets so a
+  // post-start or arming refusal leaves node extensions untouched.
+  const std::size_t publisher = NodeAccess::add_target_lane_publisher(
+      node, topic, envelope, kMessageAlignment, schema::Envelope(message),
+      /*operator_arming=*/arming.has_value());
+  DriverStation ds = DriverStationAccess::internal(node);
   auto& lanes = node.extension<Targets>().lanes;
   lanes.push_back(LaneState{
-      .publisher = NodeAccess::add_target_lane_publisher(
-          node, topic, envelope, kMessageAlignment, schema::Envelope(message),
-          /*operator_arming=*/arming.has_value()),
+      .publisher = publisher,
       .bytes = bytes,
       .alignment = alignment,
       // Subscribed here, so the producer drains the Driver Station right
       // before its timer and send() stamps the packet it saw last.
-      .ds = DriverStationAccess::internal(node),
+      .ds = ds,
       .envelope = std::vector<std::byte>(envelope),
       .arming = arming,
   });
@@ -355,8 +360,22 @@ bool TargetAccess::lane_release(Node& node, std::size_t lane) {
 }
 
 std::size_t TargetAccess::open_arming(Node& node) {
+  NodeAccess::require_loop_thread(node, "OperatorArming");
+  // Refuse post-start registration without mutating node state:
+  // Node::after_update checks `started` (throwing std::logic_error) before
+  // rejecting an empty callback (throwing std::invalid_argument).
+  try {
+    node.after_update({});
+  } catch (const std::invalid_argument&) {
+    // Still in construction.
+  } catch (const std::logic_error&) {
+    throw std::logic_error(
+        std::string{node.name()} +
+        ": OperatorArming must be opened in the constructor");
+  }
+  DriverStation ds = DriverStationAccess::internal(node);
   auto& armings = node.extension<Targets>().armings;
-  armings.push_back(ArmingState{.ds = DriverStationAccess::internal(node)});
+  armings.push_back(ArmingState{.ds = ds});
   return armings.size() - 1;
 }
 

@@ -2766,6 +2766,47 @@ TEST(Target, InvalidTargetLookupsDoNotAttachExtensionAndRefuseOffLoopThread) {
   worker.join();
   EXPECT_TRUE(sources_refused);
   EXPECT_TRUE(bytes_refused);
+
+  // Post-start and off-loop-thread OperatorArming and TargetLane construction
+  // must fail closed without mutating node state or attaching Targets (even
+  // when DriverStationLink is already attached).
+  struct DsHolder {
+    explicit DsHolder(Node& n) : ds{n} {}
+    DriverStation ds;
+  };
+  auto sim_ds = Sim::FromToml(std::string{kRobotToml} +
+                              "[subsystems.op]\nperiod_us = 20000\n");
+  sim_ds.add<DsHolder>("op");
+  Node& ds_node = sim_ds.node("op");
+  EXPECT_THROW((void)OperatorArming(ds_node), std::logic_error);
+  EXPECT_THROW((void)TargetLane<Goal>(ds_node, "lift", "auto"),
+               std::logic_error);
+  EXPECT_THROW((void)detail::TargetAccess::arming_armed(ds_node, 0),
+               std::out_of_range);
+  EXPECT_THROW((void)detail::TargetAccess::lane_release(ds_node, 0),
+               std::out_of_range);
+
+  bool off_arming_refused = false;
+  bool off_lane_refused = false;
+  std::thread off_worker{[&] {
+    try {
+      (void)OperatorArming(ds_node);
+    } catch (const std::logic_error&) {
+      off_arming_refused = true;
+    }
+    try {
+      (void)TargetLane<Goal>(ds_node, "lift", "auto");
+    } catch (const std::logic_error&) {
+      off_lane_refused = true;
+    }
+  }};
+  off_worker.join();
+  EXPECT_TRUE(off_arming_refused);
+  EXPECT_TRUE(off_lane_refused);
+  EXPECT_THROW((void)detail::TargetAccess::arming_armed(ds_node, 0),
+               std::out_of_range);
+  EXPECT_THROW((void)detail::TargetAccess::lane_release(ds_node, 0),
+               std::out_of_range);
 }
 
 }  // namespace
