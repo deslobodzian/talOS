@@ -96,7 +96,7 @@ class RestartSchedule {
   SupervisionTime due_at() const { return at_; }
   bool Due(SupervisionTime now) const { return pending_ && now >= at_; }
   // The pending start is attempted at `now`: it counts against the window
-  // whether or not it spawns; clears pending and quarantined.
+  // whether or not it spawns; clears last_exit_clean, pending and quarantined.
   void Started(SupervisionTime now);
   // A stopping session, or a roster that has completed, drops it.
   void Cancel();
