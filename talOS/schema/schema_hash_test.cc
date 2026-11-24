@@ -14,8 +14,10 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include "flatbuffers/hash.h"
 #include "flatbuffers/reflection_generated.h"
 #include "flatbuffers/verifier.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
@@ -535,6 +537,89 @@ TEST(SchemaHash, RejectsEnumIndexOnNonIntegerScalars) {
     EXPECT_FALSE(Hash(array, "test.Crafted"))
         << "Array of " << reflection::EnumNameBaseType(bad_base);
   }
+}
+
+// REQ-CONTRACT-07: embedded NUL bytes inside verified .bfbs reflection strings
+// must be hashed by length rather than truncating at the first '\0', matching
+// Python talos_schema.struct_hash and distinguishing distinct field names.
+TEST(SchemaHash, EmbeddedNulInFieldNameDoesNotTruncateHash) {
+  auto build_with_field_name = [](std::string_view field_name) {
+    flatbuffers::FlatBufferBuilder builder;
+    const auto obj_name = builder.CreateString("test.Nul");
+    const auto fname =
+        builder.CreateString(field_name.data(), field_name.size());
+    reflection::TypeBuilder tb(builder);
+    tb.add_base_type(reflection::BaseType::Int);
+    const auto type = tb.Finish();
+    reflection::FieldBuilder fb(builder);
+    fb.add_name(fname);
+    fb.add_type(type);
+    fb.add_offset(0);
+    const auto field = fb.Finish();
+    const auto fields = builder.CreateVector(&field, 1);
+    reflection::ObjectBuilder ob(builder);
+    ob.add_name(obj_name);
+    ob.add_fields(fields);
+    ob.add_is_struct(true);
+    ob.add_minalign(4);
+    ob.add_bytesize(4);
+    const auto obj = ob.Finish();
+    const auto objects = builder.CreateVector(&obj, 1);
+    const auto enums = builder.CreateVector(
+        std::vector<flatbuffers::Offset<reflection::Enum>>{});
+    reflection::SchemaBuilder sb(builder);
+    sb.add_objects(objects);
+    sb.add_enums(enums);
+    reflection::FinishSchemaBuffer(builder, sb.Finish());
+    return std::vector<std::uint8_t>(
+        builder.GetBufferPointer(),
+        builder.GetBufferPointer() + builder.GetSize());
+  };
+
+  auto fnv1a_bytes = [](std::string_view text) {
+    std::uint64_t h = flatbuffers::FnvTraits<std::uint64_t>::kOffsetBasis;
+    for (unsigned char c : text) {
+      h ^= c;
+      h *= flatbuffers::FnvTraits<std::uint64_t>::kFnvPrime;
+    }
+    return h;
+  };
+
+  const std::string_view name_a("x\0a", 3);
+  const std::string_view name_b("x\0b", 3);
+  const auto bytes_a = build_with_field_name(name_a);
+  const auto bytes_b = build_with_field_name(name_b);
+  flatbuffers::Verifier va(bytes_a.data(), bytes_a.size());
+  flatbuffers::Verifier vb(bytes_b.data(), bytes_b.size());
+  ASSERT_TRUE(reflection::VerifySchemaBuffer(va));
+  ASSERT_TRUE(reflection::VerifySchemaBuffer(vb));
+
+  const std::string expected_canon_a =
+      std::string{"struct test.Nul 4 4 {"} + std::string{name_a} + "@0:Int;}";
+  const std::string expected_canon_b =
+      std::string{"struct test.Nul 4 4 {"} + std::string{name_b} + "@0:Int;}";
+  const auto* schema_a = reflection::GetSchema(bytes_a.data());
+  const auto* schema_b = reflection::GetSchema(bytes_b.data());
+  EXPECT_EQ(
+      talos::schema::canonical_struct(*schema_a, *schema_a->objects()->Get(0)),
+      expected_canon_a);
+  EXPECT_EQ(
+      talos::schema::canonical_struct(*schema_b, *schema_b->objects()->Get(0)),
+      expected_canon_b);
+
+  const auto hash_a = Hash(bytes_a, "test.Nul");
+  const auto hash_b = Hash(bytes_b, "test.Nul");
+  ASSERT_TRUE(hash_a.has_value());
+  ASSERT_TRUE(hash_b.has_value());
+  EXPECT_NE(*hash_a, *hash_b);
+  EXPECT_EQ(*hash_a, fnv1a_bytes(expected_canon_a));
+  EXPECT_EQ(*hash_b, fnv1a_bytes(expected_canon_b));
+  EXPECT_NE(*hash_a,
+            flatbuffers::HashFnv1a<std::uint64_t>(expected_canon_a.c_str()));
+  EXPECT_EQ(talos::schema::struct_hash(*schema_a, *schema_a->objects()->Get(0)),
+            *hash_a);
+  EXPECT_EQ(talos::schema::struct_hash(*schema_b, *schema_b->objects()->Get(0)),
+            *hash_b);
 }
 
 }  // namespace

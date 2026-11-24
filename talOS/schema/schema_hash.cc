@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "flatbuffers/hash.h"
@@ -13,6 +14,16 @@ namespace {
 
 constexpr int kMaxDepth = 32;
 constexpr std::size_t kMaxStructVisits = 4096;
+
+// FNV-1a 64 over all bytes of `text`, including any embedded NULs.
+std::uint64_t hash_fnv1a(std::string_view text) {
+  std::uint64_t hash = flatbuffers::FnvTraits<std::uint64_t>::kOffsetBasis;
+  for (unsigned char c : text) {
+    hash ^= c;
+    hash *= flatbuffers::FnvTraits<std::uint64_t>::kFnvPrime;
+  }
+  return hash;
+}
 
 bool append_struct(const reflection::Schema& schema,
                    const reflection::Object& object, std::string& out,
@@ -138,7 +149,7 @@ std::uint64_t struct_hash(const reflection::Schema& schema,
                           const reflection::Object& object) {
   const std::string canonical = canonical_struct(schema, object);
   if (canonical.empty()) return 0;
-  return flatbuffers::HashFnv1a<std::uint64_t>(canonical.c_str());
+  return hash_fnv1a(canonical);
 }
 
 std::optional<std::uint64_t> struct_hash(const std::uint8_t* bfbs,
@@ -155,7 +166,7 @@ std::optional<std::uint64_t> struct_hash(const std::uint8_t* bfbs,
   if (object == nullptr || !object->is_struct()) return std::nullopt;
   const std::string canonical = canonical_struct(schema, *object);
   if (canonical.empty()) return std::nullopt;
-  return flatbuffers::HashFnv1a<std::uint64_t>(canonical.c_str());
+  return hash_fnv1a(canonical);
 }
 
 }  // namespace talos::schema
