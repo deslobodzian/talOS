@@ -27,6 +27,7 @@
 #include <string_view>
 #include <vector>
 
+#include "RioLog.h"
 #include "hardware/config.h"
 #include "hardware/messages.h"
 
@@ -575,6 +576,135 @@ TEST(CanBusSampler, StartsNoReaderWhileTwoAbandonedOnesAreStillBlocked) {
     const std::lock_guard lock{gate->mutex};
     EXPECT_EQ(Gate::Count(gate->reads, "C"), 0);
   }
+}
+
+// LogCanBusStatus posts under LogKind::kCanBusStatus keyed per (bus,
+// failing/recovered), so simultaneous STALE faults on multiple buses ("rio"
+// and a CANivore) and a subsequent bus recovery within 1 s all emit without
+// cross-bus suppression, coalescing, or loss.
+// REQ-OPS-20
+TEST(CanBusHealth, LogCanBusStatusKeepsMultiBusStaleAndRecoveryDistinct) {
+  CanBusHealth health;
+  health.Configure(Devices({"Shooter"}, {}), /*simulation=*/false);
+  ASSERT_EQ(health.bus_count(), 2u);
+  ASSERT_EQ(health.StaleUs(), 600'000u);
+
+  std::vector<std::string> lines;
+  talos::rio::RioLog log{
+      [&](std::string_view line) { lines.emplace_back(line); }};
+  const auto poll_and_log = [&](uint64_t now_us) {
+    health.Poll(now_us, [&](const Change& change) {
+      talos::rio::LogCanBusStatus(log, health.bus(change.bus), health.StaleUs(),
+                                  change);
+    });
+  };
+
+  // Both buses start PENDING, then go STALE simultaneously on one Poll() tick.
+  poll_and_log(kStartUs);
+  const uint64_t stale_us = kStartUs + health.StaleUs();
+  poll_and_log(stale_us);
+  log.Drain(stale_us);
+  ASSERT_EQ(lines.size(), 2u)
+      << "second bus STALE was suppressed behind the first bus's key";
+  EXPECT_NE(lines[0].find("CAN bus rio"), std::string::npos) << lines[0];
+  EXPECT_NE(lines[0].find("STALE"), std::string::npos) << lines[0];
+  EXPECT_EQ(lines[0].find("coalesced"), std::string::npos) << lines[0];
+  EXPECT_NE(lines[1].find("CAN bus Shooter"), std::string::npos) << lines[1];
+  EXPECT_NE(lines[1].find("STALE"), std::string::npos) << lines[1];
+  EXPECT_EQ(lines[1].find("coalesced"), std::string::npos) << lines[1];
+
+  // Bus 0 ("rio") recovers 200 ms later (well within the 1 s RioLog window):
+  // its recovery must emit immediately without being suppressed or coalesced.
+  const uint64_t recover_us = stale_us + 200'000;
+  Buses buses;
+  buses.samples["rio"] = Ok(0.15);
+  health.SampleNext(recover_us, buses);
+  poll_and_log(recover_us);
+  lines.clear();
+  log.Drain(recover_us);
+  ASSERT_EQ(lines.size(), 1u)
+      << "bus 0 recovery was suppressed behind its STALE window";
+  EXPECT_NE(lines[0].find("CAN bus rio"), std::string::npos) << lines[0];
+  EXPECT_NE(lines[0].find("status read again (0 failed reads in the spell)"),
+            std::string::npos)
+      << lines[0];
+  EXPECT_EQ(lines[0].find("coalesced"), std::string::npos) << lines[0];
+
+  // After the 1 s window expires, no hidden suppressed/coalesced event
+  // surfaces.
+  lines.clear();
+  log.Drain(recover_us + talos::rio::RioLog::kWindowUs);
+  EXPECT_TRUE(lines.empty());
+}
+
+// On a single bus, a rapid kFailing -> kRecovered -> kFailing sequence within
+// 1 s must emit the kRecovered line (with its spell_failures count) on its own
+// key rather than letting the second kFailing overwrite or suppress it.
+// REQ-OPS-20
+TEST(CanBusHealth, LogCanBusStatusDoesNotDropRecoveryInRapidFailingSpell) {
+  CanBusHealth health;
+  health.Configure(Devices({"rio"}, {}), /*simulation=*/false);
+  ASSERT_EQ(health.bus_count(), 1u);
+
+  std::vector<std::string> lines;
+  talos::rio::RioLog log{
+      [&](std::string_view line) { lines.emplace_back(line); }};
+  const auto poll_and_log = [&](uint64_t now_us) {
+    health.Poll(now_us, [&](const Change& change) {
+      talos::rio::LogCanBusStatus(log, health.bus(change.bus), health.StaleUs(),
+                                  change);
+    });
+  };
+  const CanBusHealth::Sample failed{
+      false, 0.0, 0, 0, 0, 0, "HAL_CAN_GetCANStatus failed"};
+
+  // Establish an OK baseline.
+  health.SampleNext(kStartUs, [](std::string_view) { return Ok(0.2); });
+  poll_and_log(kStartUs + kLoopPeriodUs);
+  log.Drain(kStartUs + kLoopPeriodUs);
+  ASSERT_TRUE(lines.empty());
+
+  // Two failed reads -> kFailing, then OK -> kRecovered, then failed ->
+  // kFailing, all within 400 ms (and before RioLog drains once), so a shared
+  // key would overwrite window.last and permanently drop kRecovered.
+  const uint64_t t_fail1 = kStartUs + kPeriodUs;
+  health.SampleNext(t_fail1, [&](std::string_view) { return failed; });
+  health.SampleNext(t_fail1 + kPeriodUs,
+                    [&](std::string_view) { return failed; });
+  poll_and_log(t_fail1 + kPeriodUs + kLoopPeriodUs);
+
+  const uint64_t t_rec = t_fail1 + 2 * kPeriodUs;
+  health.SampleNext(t_rec, [](std::string_view) { return Ok(0.25); });
+  poll_and_log(t_rec + kLoopPeriodUs);
+
+  const uint64_t t_fail2 = t_fail1 + 3 * kPeriodUs;
+  health.SampleNext(t_fail2, [&](std::string_view) { return failed; });
+  poll_and_log(t_fail2 + kLoopPeriodUs);
+
+  const uint64_t drain_us = t_fail2 + kLoopPeriodUs;
+  log.Drain(drain_us);
+  ASSERT_EQ(lines.size(), 2u)
+      << "kFailing and kRecovered must both emit immediately on distinct keys";
+  EXPECT_NE(lines[0].find("CAN bus rio"), std::string::npos) << lines[0];
+  EXPECT_NE(lines[0].find("status read failing"), std::string::npos)
+      << lines[0];
+  EXPECT_EQ(lines[0].find("coalesced"), std::string::npos) << lines[0];
+  EXPECT_NE(lines[1].find("CAN bus rio"), std::string::npos) << lines[1];
+  EXPECT_NE(lines[1].find("status read again (2 failed reads in the spell)"),
+            std::string::npos)
+      << lines[1];
+  EXPECT_EQ(lines[1].find("coalesced"), std::string::npos) << lines[1];
+
+  // The second kFailing was buffered on the failing key and flushes cleanly
+  // when that key's 1 s window closes, without touching the recovered key.
+  lines.clear();
+  log.Drain(drain_us + talos::rio::RioLog::kWindowUs);
+  ASSERT_EQ(lines.size(), 1u);
+  EXPECT_NE(lines[0].find("CAN bus rio"), std::string::npos) << lines[0];
+  EXPECT_NE(lines[0].find("status read failing"), std::string::npos)
+      << lines[0];
+  EXPECT_NE(lines[0].find("[1 changes coalesced"), std::string::npos)
+      << lines[0];
 }
 
 }  // namespace
