@@ -536,5 +536,54 @@ TEST(LauncherRetention, RelativeNonExistentOutputDirSharesLockFilesystem) {
   }
 }
 
+// REQ-OPS-11: A concurrent SessionDirectoryLock::Held() shared-lock probe
+// landing between OpenLockFile and flock(LOCK_EX | LOCK_NB) during Refresh()
+// returns a transient EWOULDBLOCK. TakeCurrent() retries briefly so a removed
+// session.lock is retaken instead of falsely reported lost, while a persistent
+// holder still reports kLost.
+TEST(LauncherRetention, RefreshRetriesTransientEwouldblockFromConcurrentProbe) {
+  const std::filesystem::path dir =
+      std::filesystem::path{::testing::TempDir()} /
+      ("talos_dir_lock_retry_" + std::to_string(::getpid()));
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+  std::error_code create_err;
+  auto lock = SessionDirectoryLock::Create(
+      dir,
+      [](const std::filesystem::path& p, std::error_code& err) {
+        std::filesystem::create_directories(p, err);
+      },
+      create_err);
+  ASSERT_TRUE(lock.has_value()) << create_err.message();
+
+  const std::filesystem::path lock_path = dir / kSessionDirectoryLockFile;
+  ASSERT_EQ(::unlink(lock_path.c_str()), 0);
+
+  int transient_calls = 0;
+  const auto refreshed = lock->Refresh([&](int fd, int op) -> int {
+    if (transient_calls++ < 2) {
+      errno = EWOULDBLOCK;
+      return -1;
+    }
+    return ::flock(fd, op);
+  });
+  EXPECT_EQ(refreshed, SessionDirectoryLock::Refreshed::kRetaken);
+  EXPECT_EQ(transient_calls, 3);
+  EXPECT_TRUE(SessionDirectoryLock::Held(dir, false));
+
+  ASSERT_EQ(::unlink(lock_path.c_str()), 0);
+  int persistent_calls = 0;
+  const auto lost = lock->Refresh([&](int /*fd*/, int /*op*/) -> int {
+    ++persistent_calls;
+    errno = EWOULDBLOCK;
+    return -1;
+  });
+  EXPECT_EQ(lost, SessionDirectoryLock::Refreshed::kLost);
+  EXPECT_EQ(persistent_calls, 10);
+
+  lock.reset();
+  std::filesystem::remove_all(dir, ec);
+}
+
 }  // namespace
 }  // namespace talos::launcher

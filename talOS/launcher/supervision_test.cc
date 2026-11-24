@@ -4045,12 +4045,12 @@ TEST(Supervision, SessionDirectoryLockIsRefreshedAndRetakenWhileHeld) {
       clock.Advance(half);
       aged_before_due = pass() && aged();
       clock.Advance(half);
-      touched_when_due = wait([&] { return !aged(); });
+      touched_when_due = pass() && !aged();
       // Removed twice, each time refreshed into a lock retention sees.
       for (bool* outcome : {&retaken, &retaken_again}) {
         ::unlink(lock.c_str());
         clock.Advance(kLockFileRefresh);
-        *outcome = wait([&] { return SessionDirectoryLock::Held(dir, false); });
+        *outcome = pass() && SessionDirectoryLock::Held(dir, false);
       }
       wait([&] { return reports() > 0; });
       pass();
