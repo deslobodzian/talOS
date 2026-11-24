@@ -191,6 +191,8 @@ _PRIVILEGED_FRAMEWORK_LIBRARIES = (
     "talOS/simulation:gateway_main",
     "talOS/simulation/mujoco:gateway_extension",
     "talOS/simulation/mujoco:plant",
+    "talOS/simulation/mujoco:scripted_shooter",
+    "talOS/simulation/mujoco:world_rules",
 )
 FORBIDDEN_NODE_DEPS = (
     "talOS/rtms/...",
