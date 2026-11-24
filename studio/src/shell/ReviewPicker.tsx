@@ -43,12 +43,17 @@ export function ReviewPicker({onClose, fetchFn, server: fixed}: {
 }) {
   const studio = useStudio();
   const [server, setServer] = useState(() => fixed ?? loadServer());
+  const [listedServer, setListedServer] = useState(() => fixed ?? loadServer());
   const [sessions, setSessions] = useState<ReviewSession[]|null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const fetcher = fetchFn ?? ((url, init) => fetch(url, init));
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
+  const fixedRef = useRef(fixed);
+  fixedRef.current = fixed;
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   const listReqRef = useRef(0);
   const mountedRef = useRef(false);
 
@@ -68,7 +73,8 @@ export function ReviewPicker({onClose, fetchFn, server: fixed}: {
       const next = await listSessions(address, fetcherRef.current);
       if (!mountedRef.current || req !== listReqRef.current) return;
       setSessions(next);
-      if (!fixed) saveServer(address);
+      setListedServer(address);
+      if (!fixedRef.current) saveServer(address);
     } catch (e) {
       if (!mountedRef.current || req !== listReqRef.current) return;
       setSessions(null);
@@ -76,13 +82,14 @@ export function ReviewPicker({onClose, fetchFn, server: fixed}: {
     } finally {
       if (mountedRef.current && req === listReqRef.current) setBusy(false);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    void list(server);
+    const target = fixed ?? server;
+    if (fixed !== undefined) setServer(fixed);
+    void list(target);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [fixed, list]);
 
   useEscape(onClose);
 
@@ -91,13 +98,14 @@ export function ReviewPicker({onClose, fetchFn, server: fixed}: {
     setBusy(true);
     setError('');
     try {
-      const source = await RecordedSource.open(server, id, {fetch: fetcherRef.current});
+      const source = await RecordedSource.open(
+          listedServer, id, {fetch: fetcherRef.current});
       if (!mountedRef.current || req !== listReqRef.current) {
         source.close();
         return;
       }
       studio.openRecorded(source);
-      onClose();
+      onCloseRef.current();
     } catch (e) {
       if (!mountedRef.current || req !== listReqRef.current) return;
       setError(errorMessage(e));

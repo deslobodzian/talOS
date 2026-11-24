@@ -45,7 +45,12 @@ function mapSeries(values: ArrayLike<number>, fn: (v: number) => number):
   const out = new Float64Array(values.length);
   for (let i = 0; i < values.length; i++) {
     const v = values[i];
-    out[i] = Number.isFinite(v) ? fn(v) : NaN;
+    if (!Number.isFinite(v)) {
+      out[i] = NaN;
+      continue;
+    }
+    const mapped = fn(v);
+    out[i] = Number.isFinite(mapped) ? mapped : NaN;
   }
   return out;
 }
@@ -71,13 +76,13 @@ type CameraRow = {
 // reading" (table cells wrap it in a muted dash via Cell, so a bare '—' here
 // only reaches the std-dev and estimator blocks).
 function fmt(value: number|null, places: number, suffix = ''): string {
-  if (value === null) return '—';
+  if (value === null || !Number.isFinite(value)) return '—';
   return `${value.toFixed(places)}${suffix}`;
 }
 
 // A value cell: absent readings are an explicit muted dash, never a guess.
 function Cell({value, children}: {value: unknown; children: ReactNode}) {
-  return value == null ?
+  return value == null || (typeof value === 'number' && !Number.isFinite(value)) ?
       <span className="text-muted">—</span> :
       <>{children}</>;
 }
@@ -123,7 +128,9 @@ function VisionPanel() {
 
   // The chart reference is the estimator pose, or sim ground truth when it is
   // present (the disagreement column always compares against the estimator).
-  const simPresent = Number.isFinite(snapshot?.channels['sim/state/pose/x_m']);
+  const simPresent =
+      Number.isFinite(snapshot?.channels['sim/state/pose/x_m']) &&
+      Number.isFinite(snapshot?.channels['sim/state/pose/y_m']);
   const refOwner = simPresent ? 'sim' : estimator?.name ?? null;
   const refX = refOwner ? channel(refOwner, 'state/pose/x_m') : null;
   const refY = refOwner ? channel(refOwner, 'state/pose/y_m') : null;
@@ -174,7 +181,10 @@ function VisionPanel() {
             col(state('pose/x_m'))(detail30),
             col(state('pose/y_m'))(detail30),
             col(state('valid'))(detail30));
-        if (cam) disagreement = Math.hypot(cam.x - estX, cam.y - estY);
+        if (cam) {
+          const d = Math.hypot(cam.x - estX, cam.y - estY);
+          if (Number.isFinite(d)) disagreement = d;
+        }
       }
 
       return {

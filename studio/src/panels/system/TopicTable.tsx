@@ -67,7 +67,7 @@ export function TopicTable(
       for (const source of node.sources) {
         if (source.name !== topic.name || source.kind !== 'SENDER') continue;
         const rate = rates[rateKey(node.name, source.id)];
-        if (rate !== undefined) {
+        if (rate !== undefined && Number.isFinite(rate)) {
           total += rate;
           measured = true;
         }

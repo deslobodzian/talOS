@@ -15,16 +15,15 @@ const KIND_LABEL = {
   TIMER: 'timer'
 } as const;
 
+const OWNER_PUBLISHED_ROLES = new Set(['state', 'status', 'event', 'telemetry']);
+const observerReads = (topic: string): boolean =>
+    OWNER_PUBLISHED_ROLES.has(topic.split('/')[2] ?? '');
+
 export function Wiring(
     {graph, node, stale, rates}: {
       graph: SystemGraph; node: SystemNode; stale: boolean;
       rates: Record<string, number>;
     }) {
-  const peersOf = (topic: string, want: 'publishers'|'subscribers') =>
-      graph.topics.find(t => t.name === topic)?.[want].filter(
-          n => n !== node.name) ??
-      [];
-
   const incoming = node.sources.filter(s => isSubscriber(s.kind));
   const outgoing = node.sources.filter(s => s.kind === 'SENDER');
   const live = nodeLiveness(node, {stale}) === 'live';
@@ -35,21 +34,31 @@ export function Wiring(
   // is allowed not to exist yet, and drawing either as a broken wire would
   // contradict what the topic table says about the same topic.
   const edge = (source: SystemSource, direction: 'in'|'out') => {
-    const peers = peersOf(source.name, direction === 'in' ? 'publishers' :
-                                                            'subscribers');
+    const topicRow = graph.topics.find(t => t.name === source.name);
+    const directPeers =
+        (topicRow?.[direction === 'in' ? 'publishers' : 'subscribers'] ?? [])
+            .filter(n => n !== node.name);
+    const observers = direction === 'out' ?
+        (topicRow?.observers ?? []).filter(n => n !== node.name) : [];
+    const peerLabels = [
+      ...directPeers,
+      ...observers.map(n => `${n} (observer)`)
+    ];
+    const connected = directPeers.length > 0 ||
+        (direction === 'out' && observers.length > 0 && observerReads(source.name));
     const rate = rates[rateKey(node.name, source.id)];
     const declared = source.external || source.optional || source.observer;
     const kindLabel = source.observer ? 'OBSERVER' : KIND_LABEL[source.kind];
     return <li key={source.kind + source.id}
-               className={peers.length || declared ? '' : 'dangling'}>
+               className={connected || declared ? '' : 'dangling'}>
       <div className="edge-topic">
         <code>{source.name}</code>
         <span className="edge-rate">{hertz(rate)}</span>
       </div>
       <div className="edge-meta">
         <em>{kindLabel}</em>
-        <span>{source.observer ? (peers.length ? peers.join(', ') : 'no publisher') :
-               peers.length      ? peers.join(', ') :
+        <span>{source.observer ? (peerLabels.length ? peerLabels.join(', ') : 'no publisher') :
+               peerLabels.length ? peerLabels.join(', ') :
                source.external ? 'outside talOS — no shared-memory peer' :
                source.optional ? 'optional — no peer yet' :
                direction === 'in' ? 'no publisher' :

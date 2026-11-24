@@ -369,3 +369,46 @@ test('subsystem cards render operator arming blocker when disarmed and clear whe
   });
   assert.ok(!armedHtml.includes('Disarmed'), armedHtml);
 });
+
+test('subsystems panel treats non-finite enabled/values/rates as unknown and marks all chip on empty filter', () => {
+  const snap = frame('1', '1000000000', {
+    'shooter/state/enabled': NaN,
+    'shooter/state/target_velocity_rps': 60,
+    'shooter/state/flywheel_velocity_rps': Infinity
+  });
+  const graph: SystemGraph = {
+    version: 2,
+    wall_ns: '1000000000',
+    registry: {
+      available: true, node_capacity: 256, source_capacity: 512,
+      liveness_timeout_ns: '1000000000'
+    },
+    bridge: {
+      topic: 'system', clients: 0, frames_forwarded: '0', invalid: '0',
+      ws_drops: '0'
+    },
+    nodes: [
+      node('shooter',
+           [source(0, 'TIMER', 'loop', '10000000', '1000000'),
+            source(1, 'TIMER', 'fast', '10000000', '1000000')],
+           [])
+    ],
+    topics: []
+  };
+  const studio = createStaticStudio({
+    frames: [snap],
+    playback: {mode: 'PAUSED', cursor_ns: snap.timestamp_ns},
+    system: {graph, rates: {'shooter 0': NaN, 'shooter 1': 100}}
+  });
+  const html = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <subsystemsPanel.component config={{selected: []}}
+                                   setConfig={() => {}} instanceId="test"/>
+      </StudioProvider>);
+  assert.doesNotMatch(html, /NaN|Infinity/, html);
+  assert.match(html, /class="subsystem-enabled">—<\/span>/, html);
+  assert.doesNotMatch(html, /class="subsystem-enabled[^"]*">disabled</, html);
+  assert.match(html, /Δ —<\/span>/, html);
+  assert.ok(html.includes('100 Hz'), html);
+  assert.match(html, /class="chip selected">all<\/button>/, html);
+});

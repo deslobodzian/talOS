@@ -59,7 +59,7 @@ function loopRate(node: SystemNode, rates: Record<string, number>): number | und
   const candidates = timers.length ? timers : node.sources;
   const measured = candidates
                         .map(s => rates[rateKey(node.name, s.id)])
-                        .filter((r): r is number => r !== undefined);
+                        .filter((r): r is number => r !== undefined && Number.isFinite(r));
   return measured.length ? Math.max(...measured) : undefined;
 }
 
@@ -78,6 +78,7 @@ function ChannelRow(
     }) {
   const stale = useChannelStale(channel);
   const kind = kindOf(info, value);
+  const finiteValue = value !== undefined && Number.isFinite(value);
   return <li className="channel-row">
     <code className="channel-name">{channelDisplayName(channel)}{stale && <em className="text-warn"> · STALE</em>}</code>
     <span className={'channel-value ' + kind}>
@@ -90,8 +91,8 @@ function ChannelRow(
                     value < info.labels.length ?
                 info.labels[value] :
                 value === undefined ? '—' : number(value)) :
-           <>{value === undefined ? '—' : number(value, 4)}
-             {info.unit && <em className="unit">{info.unit}</em>}
+           <>{finiteValue ? number(value, 4) : '—'}
+             {finiteValue && info.unit && <em className="unit">{info.unit}</em>}
            </>}
     </span>
     {kind === 'numeric' && seriesValues && seriesValues.length > 0 ?
@@ -110,9 +111,11 @@ function PairRow(
     }) {
   const measuredStale = useChannelStale(pair.measured);
   const targetStale = useChannelStale(pair.target);
-  const error = measuredValue !== undefined && targetValue !== undefined ?
+  const rawError = measuredValue !== undefined && targetValue !== undefined &&
+      Number.isFinite(measuredValue) && Number.isFinite(targetValue) ?
       measuredValue - targetValue :
       undefined;
+  const error = rawError !== undefined && Number.isFinite(rawError) ? rawError : undefined;
   return <li className="pair-row">
     <div className="pair-label">
       <b>{pair.stem}</b>
@@ -134,7 +137,7 @@ function PairRow(
              width={150} height={40} fillWidth={false} bare legend={false}/> :
          <span className="pair-empty">no history</span>}
     <span className="pair-error">
-      Δ {error === undefined ? '—' : number(error, 3)}{pair.unit ? ' ' + pair.unit : ''}
+      Δ {error === undefined ? '—' : number(error, 3) + (pair.unit ? ' ' + pair.unit : '')}
     </span>
   </li>;
 }
@@ -204,7 +207,9 @@ function SubsystemCard(
       rates: Record<string, number>;
       series: {values: Record<string, Float64Array>};
     }) {
-  const channels = [...sub.stateChannels, ...sub.statusChannels];
+  const channels = useMemo(
+      () => [...sub.stateChannels, ...sub.statusChannels],
+      [sub.stateChannels, sub.statusChannels]);
   const rows = channels
                    .map(channel => ({channel, info: infoBy.get(channel)}))
                    .filter((r): r is {channel: string; info: ChannelInfo} =>
@@ -240,7 +245,7 @@ function SubsystemCard(
       <span className={
                 'subsystem-enabled' +
                 (enabledValue === 1 ? ' on' : enabledValue === 0 ? ' off' : '')}>
-        {enabledValue === undefined ? '—' : enabledValue === 1 ? 'enabled' : 'disabled'}
+        {enabledValue === 1 ? 'enabled' : enabledValue === 0 ? 'disabled' : '—'}
       </span>
     </header>
 
@@ -326,9 +331,11 @@ function SubsystemsPanel({config, setConfig}: PanelProps<SubsystemsConfig>) {
 
   const series = useSeries(seriesChannels, {seconds: 30}, SPARKLINE_WIDTH);
 
+  const allSelected = !config.selected || config.selected.length === 0;
+
   const toggle = (name: string) => {
     const selected = config.selected;
-    if (selected === null) {
+    if (!selected || selected.length === 0) {
       setConfig({...config, selected: [name]});
     } else if (selected.includes(name)) {
       const next = selected.filter(n => n !== name);
@@ -341,15 +348,14 @@ function SubsystemsPanel({config, setConfig}: PanelProps<SubsystemsConfig>) {
   return <div className="subsystems">
     <div className="subsystems-toolbar">
       <div className="chips">
-        <button className={'chip' + (config.selected === null ? ' selected' : '')}
+        <button className={'chip' + (allSelected ? ' selected' : '')}
                 onClick={() => setConfig({...config, selected: null})}>
           all
         </button>
         {subsystems.map(sub =>
           <button key={sub.name}
                   className={'chip' +
-                             (config.selected !== null &&
-                                      config.selected.includes(sub.name) ?
+                             (!allSelected && config.selected!.includes(sub.name) ?
                                   ' selected' :
                                   '')}
                   onClick={() => toggle(sub.name)}>

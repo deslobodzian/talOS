@@ -7,6 +7,15 @@ import {useEffect, useMemo, useRef, useState} from 'react';
 
 import {filterCommands, type Command} from './commands';
 
+// Next highlighted row after Up/Down: clamps stale out-of-range indices
+// before stepping so ArrowUp moves immediately after the list shrinks.
+export function nextPaletteIndex(current: number, length: number,
+                                 delta: -1|1): number {
+  if (length <= 0) return 0;
+  const clamped = Math.max(0, Math.min(current, length - 1));
+  return Math.max(0, Math.min(clamped + delta, length - 1));
+}
+
 export function CommandPalette({commands, onClose}: {
   commands: readonly Command[];
   onClose: () => void;
@@ -17,7 +26,14 @@ export function CommandPalette({commands, onClose}: {
   const containerRef = useRef<HTMLDivElement>(null);
 
   const filtered = useMemo(() => filterCommands(commands, query), [commands, query]);
-  const activeIndex = filtered.length ? Math.min(active, filtered.length - 1) : -1;
+  const activeIndex = filtered.length ? Math.max(0, Math.min(active, filtered.length - 1)) : -1;
+
+  const filteredRef = useRef(filtered);
+  filteredRef.current = filtered;
+  const activeRef = useRef(activeIndex);
+  activeRef.current = activeIndex;
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   // Autofocus and remember where focus was so close restores it.
   useEffect(() => {
@@ -30,32 +46,45 @@ export function CommandPalette({commands, onClose}: {
 
   const run = (command: Command) => {
     command.run();
-    onClose();
+    onCloseRef.current();
   };
 
   // One document-level listener covers navigation wherever focus is, so the
   // palette stays keyboard-first even after clicking a result.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      const list = filteredRef.current;
       if (event.key === 'ArrowDown') {
         event.preventDefault();
-        setActive(a => (filtered.length ? Math.min(a + 1, filtered.length - 1) : 0));
+        setActive(a => nextPaletteIndex(a, list.length, 1));
       } else if (event.key === 'ArrowUp') {
         event.preventDefault();
-        setActive(a => Math.max(a - 1, 0));
+        setActive(a => nextPaletteIndex(a, list.length, -1));
       } else if (event.key === 'Enter') {
         event.preventDefault();
-        const command = filtered[Math.min(active, Math.max(0, filtered.length - 1))];
-        if (command) run(command);
+        const idx = activeRef.current;
+        const command = idx >= 0 ? list[idx] : undefined;
+        if (command) {
+          command.run();
+          onCloseRef.current();
+        }
       } else if (event.key === 'Escape') {
         event.preventDefault();
-        onClose();
+        onCloseRef.current();
       } else if (event.key === 'Tab') {
         const focusables = containerRef.current?.querySelectorAll<HTMLElement>(
             'input, button');
-        if (!focusables || focusables.length < 2) return;
+        if (!focusables || focusables.length === 0) return;
+        if (focusables.length === 1) {
+          event.preventDefault();
+          focusables[0].focus();
+          return;
+        }
         const first = focusables[0], last = focusables[focusables.length - 1];
-        if (event.shiftKey && document.activeElement === first) {
+        if (!containerRef.current?.contains(document.activeElement)) {
+          event.preventDefault();
+          (event.shiftKey ? last : first).focus();
+        } else if (event.shiftKey && document.activeElement === first) {
           event.preventDefault();
           last.focus();
         } else if (!event.shiftKey && document.activeElement === last) {
@@ -66,8 +95,7 @@ export function CommandPalette({commands, onClose}: {
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filtered, active, onClose]);
+  }, []);
 
   return <div className="palette-backdrop"
               onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}>
