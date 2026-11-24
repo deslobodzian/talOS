@@ -8,12 +8,16 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -253,6 +257,77 @@ TEST(MujocoGatewayExtension, MatchInputIsTheTicksDriverStation) {
     EXPECT_EQ(input.scheduled, c.expected.scheduled);
     EXPECT_EQ(input.schedule_us, c.expected.schedule_us);
   }
+}
+
+// REQ-DEV-37: a refused Configure leaves the extension unconfigured so a
+// subsequent Configure succeeds cleanly, and a second Configure after success
+// is refused.
+TEST(MujocoGatewayExtension, ConfigureFailureLeavesCleanStateAndAllowsRetry) {
+  InstallMujocoProcessHandlers();
+  const config::RobotConfig bad =
+      RowConfig({"bad",
+                 "ROVER_XML",
+                 "roller",
+                 "[simulation]\nwheel_radius_m = 0.06\n",
+                 {},
+                 nullptr},
+                200);
+  const config::RobotConfig good =
+      RowConfig({"good", "ARM_XML", "arm", "", {}, nullptr}, 201);
+  MujocoGatewayExtension extension({.tests_only_skip_writes = true});
+  hardware::sim::PhysicsOptions options;
+  hardware::sim::PhysicsSimBackend backend(options);
+  EXPECT_THROW(extension.Configure(bad, options, backend),
+               std::invalid_argument);
+  EXPECT_EQ(extension.plant(), nullptr);
+
+  // Missing field resolver throws invalid_argument (not bad_function_call) and
+  // leaves the extension unconfigured.
+  config::RobotConfig with_field = good;
+  ASSERT_TRUE(with_field.simulation.mujoco.has_value());
+  if (with_field.simulation.mujoco.has_value()) {
+    with_field.simulation.mujoco->field = "rebuilt_2026";
+  }
+  EXPECT_THROW(extension.Configure(with_field, options, backend),
+               std::invalid_argument);
+  EXPECT_EQ(extension.plant(), nullptr);
+
+  ASSERT_NO_THROW(extension.Configure(good, options, backend));
+  EXPECT_NE(extension.plant(), nullptr);
+  EXPECT_THROW(extension.Configure(good, options, backend), std::logic_error);
+}
+
+// REQ-DEV-37: null optional streams/callbacks and short Counts spans do not
+// crash any hook.
+TEST(MujocoGatewayExtension, NullOptionalCallbacksAndShortCountsSpanAreSafe) {
+  InstallMujocoProcessHandlers();
+  const config::RobotConfig config =
+      RowConfig({"null_opts", "ARM_XML", "arm", "", {}, nullptr}, 210);
+  MujocoGatewayExtension extension({.tests_only_skip_writes = true});
+  hardware::sim::PhysicsOptions options;
+  hardware::sim::PhysicsSimBackend backend(options);
+  ASSERT_NO_THROW(extension.Configure(config, options, backend));
+  EXPECT_NO_THROW(extension.BeforeTick({.now_us = 1000}));
+  FmsStamp stamp{};
+  EXPECT_NO_THROW(extension.Stamp(stamp));
+  EXPECT_NO_THROW(extension.AfterTick(1000));
+  EXPECT_NO_THROW(extension.Counts({}));
+  std::array<TopicCount, 1> single{};
+  EXPECT_NO_THROW(extension.Counts(single));
+  EXPECT_NO_THROW(extension.Finish());
+}
+
+// REQ-DEV-43: PiecesEveryTicks handles zero, small, nominal, and UINT32_MAX
+// periods without overflow.
+TEST(MujocoGatewayExtension, PiecesEveryTicksHandlesBoundariesWithoutOverflow) {
+  EXPECT_EQ(PiecesEveryTicks(0), 1u);
+  EXPECT_EQ(PiecesEveryTicks(1), 50'000u);
+  EXPECT_EQ(PiecesEveryTicks(5'000), 10u);
+  EXPECT_EQ(PiecesEveryTicks(20'000), 3u);
+  EXPECT_EQ(PiecesEveryTicks(50'000), 1u);
+  EXPECT_EQ(PiecesEveryTicks(100'000), 1u);
+  EXPECT_EQ(PiecesEveryTicks(100'001), 1u);
+  EXPECT_EQ(PiecesEveryTicks(std::numeric_limits<uint32_t>::max()), 1u);
 }
 
 }  // namespace
