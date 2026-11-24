@@ -542,6 +542,208 @@ talos_sim_test(
             problems,
         )
 
+    # REQ-DEV-25
+    def test_non_expr_mutating_calls_and_aliased_containers_fail_closed(self):
+        # `_ = TAGS.append("perf")` mutates TAGS inside an Assign statement.
+        problems, stats = run_check({
+            "talOS/build/sim_check.py": VALID_SIM_CHECK,
+            "pkg/BUILD": """
+TAGS = []
+_ = TAGS.append("perf")
+cc_test(
+    name = "assign_append_perf_test",
+    srcs = ["bad.cc"],
+    tags = TAGS,
+    deps = [],
+)
+""",
+            "pkg/bad.cc": "int main() { return 0; }\n",
+        })
+        self.assertEqual(stats["perf"], 1)
+        self.assertTrue(any("host_qualification" in p for p in problems), problems)
+        self.assertTrue(any("StallMeter" in p for p in problems), problems)
+        self.assertTrue(any("[HOST_UNQUALIFIED]" in p for p in problems), problems)
+
+        # Mutating an alias (via method call, subscript assign, or `+=`) or
+        # mutating the original while reading through an alias must invalidate
+        # the aliased binding and fail closed.
+        alias_cases = (
+            (
+                "alias_append_e2e",
+                """
+TAGS = []
+A = TAGS
+A.append("e2e")
+py_test(
+    name = "alias_append_e2e_test",
+    srcs = ["bad.py"],
+    tags = TAGS,
+)
+""",
+                "pkg/bad.py",
+                "pass\n",
+            ),
+            (
+                "alias_subscript_perf",
+                """
+TAGS = ["fast"]
+A = TAGS
+A[0] = "perf"
+cc_test(
+    name = "alias_sub_perf_test",
+    srcs = ["bad.cc"],
+    tags = TAGS,
+    deps = [],
+)
+""",
+                "pkg/bad.cc",
+                "int main() { return 0; }\n",
+            ),
+            (
+                "original_append_read_via_alias",
+                """
+TAGS = []
+A = TAGS
+TAGS.append("perf")
+cc_test(
+    name = "orig_append_alias_read_test",
+    srcs = ["bad.cc"],
+    tags = A,
+    deps = [],
+)
+""",
+                "pkg/bad.cc",
+                "int main() { return 0; }\n",
+            ),
+            (
+                "alias_aug_assign_perf",
+                """
+TAGS = ["fast"]
+A = TAGS
+A += ["perf"]
+cc_test(
+    name = "alias_aug_perf_test",
+    srcs = ["bad.cc"],
+    tags = TAGS,
+    deps = [],
+)
+""",
+                "pkg/bad.cc",
+                "int main() { return 0; }\n",
+            ),
+            (
+                "contained_item_append_perf",
+                """
+TAGS = ["fast"]
+BOX = [TAGS]
+ITEM = BOX[0]
+ITEM.append("perf")
+cc_test(
+    name = "contained_item_append_perf_test",
+    srcs = ["bad.cc"],
+    tags = TAGS,
+    deps = [],
+)
+""",
+                "pkg/bad.cc",
+                "int main() { return 0; }\n",
+            ),
+            (
+                "binop_container_subscript_append_perf",
+                """
+TAGS = ["fast"]
+BOX = [TAGS] + []
+BOX[0].append("perf")
+cc_test(
+    name = "binop_container_perf_test",
+    srcs = ["bad.cc"],
+    tags = TAGS,
+    deps = [],
+)
+""",
+                "pkg/bad.cc",
+                "int main() { return 0; }\n",
+            ),
+            (
+                "post_insert_dict_subscript_append_perf",
+                """
+TAGS = ["fast"]
+BOX = {}
+BOX["k"] = TAGS
+BOX["k"].append("perf")
+cc_test(
+    name = "post_insert_dict_perf_test",
+    srcs = ["bad.cc"],
+    tags = TAGS,
+    deps = [],
+)
+""",
+                "pkg/bad.cc",
+                "int main() { return 0; }\n",
+            ),
+            (
+                "post_insert_list_append_then_mutate_perf",
+                """
+TAGS = ["fast"]
+BOX = []
+BOX.append(TAGS)
+BOX[0].append("perf")
+cc_test(
+    name = "post_insert_list_perf_test",
+    srcs = ["bad.cc"],
+    tags = TAGS,
+    deps = [],
+)
+""",
+                "pkg/bad.cc",
+                "int main() { return 0; }\n",
+            ),
+            (
+                "ifexp_bare_name_alias_append_perf",
+                """
+TAGS = ["fast"]
+ALIAS = TAGS if True else ["fast"]
+ALIAS.append("perf")
+cc_test(
+    name = "ifexp_alias_perf_test",
+    srcs = ["bad.cc"],
+    tags = TAGS,
+    deps = [],
+)
+""",
+                "pkg/bad.cc",
+                "int main() { return 0; }\n",
+            ),
+            (
+                "listcomp_and_dict_call_append_perf",
+                """
+TAGS = ["fast"]
+BOX = dict(k = TAGS)
+BOX["k"].append("perf")
+cc_test(
+    name = "dict_call_perf_test",
+    srcs = ["bad.cc"],
+    tags = TAGS,
+    deps = [],
+)
+""",
+                "pkg/bad.cc",
+                "int main() { return 0; }\n",
+            ),
+        )
+        for case, build, src_path, src_text in alias_cases:
+            with self.subTest(case=case):
+                problems, _ = run_check({
+                    "talOS/build/sim_check.py": VALID_SIM_CHECK,
+                    "pkg/BUILD": build,
+                    src_path: src_text,
+                })
+                self.assertGreaterEqual(len(problems), 1, problems)
+                self.assertTrue(
+                    any("statically resolvable" in p for p in problems),
+                    problems,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

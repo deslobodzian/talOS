@@ -142,6 +142,22 @@ class RunningInSessionTest(unittest.TestCase):
         self.assertTrue(sim_check.running_in_session(stat, 18))
         self.assertFalse(sim_check.running_in_session(stat, 9))
 
+    # REQ-DEV-30: empty or truncated /proc/<pid>/stat bytes from a concurrently
+    # exiting process return False instead of raising and aborting SIGKILL
+    # cleanup in Launch.finish().
+    def test_truncated_or_malformed_stat_returns_false(self):
+        for raw in (
+                b"",
+                b"19 (py",
+                b"19 (py)",
+                b"19 (py) ",
+                b"19 (py) S 1 18",
+                b"19 (py) S 1 18 not_a_sid",
+                b"19 (py)S 1 18 18",
+        ):
+            with self.subTest(raw=raw):
+                self.assertFalse(sim_check.running_in_session(raw, 18))
+
 
 FAILING_SIM_STUB = """import json, os, sys
 out = sys.argv[sys.argv.index("--output-dir") + 1]

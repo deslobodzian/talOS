@@ -166,10 +166,20 @@ def running_in_session(stat, sid):
     """Whether `stat`, the bytes of one /proc/<pid>/stat, is a process of
     session `sid` that has not exited. A zombie (`Z`) has exited, and so
     has a process its reaper has taken but the kernel has not yet removed
-    (`X`, EXIT_DEAD), which a reader can see in the instant between."""
+    (`X`, EXIT_DEAD), which a reader can see in the instant between.
+    Returns False on empty or truncated bytes from a concurrently exiting
+    process."""
     # pid (comm) state ppid pgrp session ...; comm may hold spaces and ")".
-    fields = stat[stat.rindex(b")") + 2:].split()
-    return fields[0] not in (b"Z", b"X") and int(fields[3]) == sid
+    close = stat.rfind(b")")
+    if close == -1 or stat[close + 1:close + 2] != b" ":
+        return False
+    fields = stat[close + 2:].split()
+    if len(fields) <= 3:
+        return False
+    try:
+        return fields[0] not in (b"Z", b"X") and int(fields[3]) == sid
+    except ValueError:
+        return False
 
 
 def session_processes(sid):
@@ -193,13 +203,16 @@ def session_processes(sid):
     listing = subprocess.run(["ps", "-A", "-o", "pid=,stat="],
                              capture_output=True, text=True, check=True)
     for line in listing.stdout.splitlines():
-        pid, state = line.split(None, 1)
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        pid, state = parts
         if state.startswith("Z"):
             continue
         try:
             if os.getsid(int(pid)) == sid:
                 found.add(int(pid))
-        except OSError:
+        except (OSError, ValueError):
             pass
     return found
 

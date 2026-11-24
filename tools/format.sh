@@ -16,8 +16,9 @@
 #
 # Exit: 0 clean, 1 files need formatting, 2 usage or tool error.
 set -euo pipefail
+script_dir="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 cd "$(git rev-parse --show-toplevel)"
-. "$(dirname "${BASH_SOURCE[0]}")/clang18.sh"
+. "$script_dir/clang18.sh"
 
 mode=check
 base_arg=origin/main
@@ -27,7 +28,7 @@ while [ $# -gt 0 ]; do
     --fix) mode=fix ;;
     --all) base_arg=--all ;;
     --base) [ $# -ge 2 ] || clang18_die "--base needs a ref"; base_arg="$2"; shift ;;
-    -h|--help) sed -n '2,/^set /p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,/^set /p' "$script_dir/format.sh" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
     *) clang18_die "unknown argument: $1" ;;
   esac
   shift

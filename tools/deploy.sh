@@ -41,11 +41,11 @@ validate_prefix() {
   if (
     LC_ALL=C
     case "$p" in
-      *[[:space:][:cntrl:]]*|*[\<\>\&\"\'\\]*|*'%'*|*'$'*) exit 0 ;;
+      *[[:space:][:cntrl:]]*|*[\<\>\&\"\'\\]*|*'%'*|*'$'*|*';'*) exit 0 ;;
       *) exit 1 ;;
     esac
   ); then
-    die "invalid --prefix: must not contain whitespace, control, quote, backslash, XML-special, or systemd-expansion (% or \$) characters"
+    die "invalid --prefix: must not contain whitespace, control, quote, backslash, semicolon, XML-special, or systemd-expansion (% or \$) characters"
   fi
 }
 
@@ -909,11 +909,21 @@ cmd_enable_boot() {
   run sudo -u "$user" env -i PATH="$(service_path)" python3 -c '
 import os, sys
 root = sys.argv[1]
-def require(path, mode):
+def require(path, mode, verb="read/traverse"):
     if not os.access(path, mode):
-        sys.exit("deploy: error: service account cannot read/traverse " + path)
+        sys.exit(f"deploy: error: service account cannot {verb} " + path)
 require(root, os.R_OK | os.X_OK)
-require(os.path.join(root, "run.sh"), os.R_OK | os.X_OK)
+require(os.path.join(root, "run.sh"), os.R_OK | os.X_OK, "read/execute")
+for rel in ("launcher", os.path.join("studio", "studio_bridge")):
+    candidate = os.path.join(root, rel)
+    if os.path.isfile(candidate):
+        require(candidate, os.R_OK | os.X_OK, "read/execute")
+bin_dir = os.path.join(root, "bin")
+if os.path.isdir(bin_dir):
+    for name in sorted(os.listdir(bin_dir)):
+        candidate = os.path.join(bin_dir, name)
+        if os.path.isfile(candidate) and not name.endswith(".repo_mapping"):
+            require(candidate, os.R_OK | os.X_OK, "read/execute")
 for parent, dirs, files in os.walk(root, onerror=lambda e: sys.exit(str(e))):
     for name in dirs:
         require(os.path.join(parent, name), os.R_OK | os.X_OK)
@@ -1032,6 +1042,15 @@ $stderr_log $user:$group 644 4 1024 * NB"
     sudo chown root:wheel "$plist_dest"
     sudo chmod 644 "$plist_dest"
     sudo launchctl bootout system/org.talos.robot 2>/dev/null || true
+    # bootout returns asynchronously while a running daemon shuts down; wait
+    # until launchd reports it unloaded so bootstrap does not race teardown.
+    local waited=0
+    while launchctl print system/org.talos.robot >/dev/null 2>&1; do
+      [ "$waited" -lt 150 ] ||
+        die "system/org.talos.robot did not finish unloading after launchctl bootout"
+      sleep 0.1
+      waited=$((waited + 1))
+    done
     sudo launchctl bootstrap system "$plist_dest"
     say "boot start enabled ($plist_dest, as $user; launcher stderr in $stderr_log)"
     cmd_boot_check || die "boot settings above do not hold"
@@ -1042,6 +1061,8 @@ $stderr_log $user:$group 644 4 1024 * NB"
     return 0
   fi
   printf '%s' "$unit" | sudo tee /etc/systemd/system/talos.service >/dev/null
+  sudo chown root:root /etc/systemd/system/talos.service
+  sudo chmod 0644 /etc/systemd/system/talos.service
   sudo systemctl daemon-reload
   sudo systemctl enable talos.service
   say "boot start enabled (talos.service)"

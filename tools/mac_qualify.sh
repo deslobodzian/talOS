@@ -16,7 +16,7 @@
 # (the 2026 robot) qualifies its own nodes, such as its pose_estimator
 # benchmark, there. Every step runs even after a failure; a summary lists
 # each step's result, and the exit status is 1 if any failed. All output is
-# also written to the log (default /tmp/talos-qualify-<host>-<time>.log).
+# also written to the log (default ${TMPDIR:-/tmp}/talos-qualify-<host>-<time>.log).
 #
 # The config's nodes come from bazel-bin, so the build step must pass for the
 # later steps to mean anything. On macOS the restart-latency step asks for
@@ -30,10 +30,11 @@
 
 set -o pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
 
-LOG="/tmp/talos-qualify-$(hostname -s 2>/dev/null || echo host)-$(date +%Y%m%d-%H%M%S).log"
+TMP_ROOT="${TMPDIR:-/tmp}"
+LOG="${TMP_ROOT%/}/talos-qualify-$(hostname -s 2>/dev/null || echo host)-$(date +%Y%m%d-%H%M%S).log"
 while [ $# -gt 0 ]; do
   case "$1" in
     --log)
@@ -50,11 +51,29 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-exec > >(tee -a "$LOG") 2>&1
+( : >> "$LOG" ) || exit 2
+command -v tee >/dev/null 2>&1 || { echo "mac_qualify.sh: need tee" >&2; exit 2; }
+LOG_FIFO_DIR="$(mktemp -d "${TMP_ROOT%/}/talos-qualify.XXXXXX")" || exit 2
+LOG_FIFO="$LOG_FIFO_DIR/out.fifo"
+mkfifo "$LOG_FIFO" || { rm -rf "$LOG_FIFO_DIR"; exit 2; }
+tee -a "$LOG" < "$LOG_FIFO" &
+TEE_PID=$!
+cleanup_log() {
+  # Close the FIFO write end so tee flushes all remaining output (including
+  # summary) to stdout and $LOG, then wait for tee before exiting.
+  exec >/dev/null 2>&1
+  [ -n "${TEE_PID:-}" ] && wait "$TEE_PID" 2>/dev/null || true
+  rm -rf "$LOG_FIFO_DIR"
+}
+trap cleanup_log EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+exec > "$LOG_FIFO" 2>&1
 
 if [ "$(uname -s)" = "Darwin" ]; then
   # Ends with this script (-w); -i alone does not hold off maintenance sleep.
-  caffeinate -s -i -w $$ &
+  caffeinate -s -i -w $$ </dev/null >/dev/null 2>&1 &
 fi
 
 CONFIGS="bench/main_processor/configuration/robot.toml

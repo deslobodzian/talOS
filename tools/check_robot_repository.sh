@@ -19,9 +19,10 @@
 #   bazel test  --override_module=talos=<this checkout> --test_output=errors //...
 #
 # with the copy's own .bazelrc, whose `import %workspace%/talos/talos.bazelrc`
-# and status command under talos/ (the submodule, empty in the copy) are
-# pointed at this checkout first, and every BAZEL_FLAG (tools/prepush.sh
-# passes its --disk_cache and --nocache_test_results). Each config's
+# or `import %workspace%/../talos/talos.bazelrc` and matching status command
+# (the submodule or sibling checkout) are pointed at this checkout first, and
+# every BAZEL_FLAG (tools/prepush.sh passes its --disk_cache and
+# --nocache_test_results). Each config's
 # --describe-only runs as that repository's talos_graph_test targets, part
 # of its `bazel test //...`.
 #
@@ -45,9 +46,9 @@ source_repo="$1"
 shift
 bazel_flags=("$@")
 
-talos="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+talos="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 [ -d "$source_repo" ] || die "not a directory: $source_repo"
-source_repo="$(cd "$source_repo" && pwd -P)"
+source_repo="$(CDPATH='' cd -- "$source_repo" && pwd -P)"
 top="$(git --no-optional-locks -C "$source_repo" rev-parse --show-toplevel 2>/dev/null)" ||
   die "not a git repository: $source_repo"
 [ "$top" = "$source_repo" ] || die "not the top of a git repository: $source_repo (its top is $top)"
@@ -79,7 +80,7 @@ sys.exit(1)
   die "$source_repo is not a talOS-dependent repository: the MODULE.bazel of its commit $robot_commit has no bazel_dep(name = \"talos\")"
 talos_commit="$(git -C "$talos" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 [ -n "$(git -C "$talos" status --porcelain 2>/dev/null)" ] && talos_commit="$talos_commit+changes"
-tmp="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P)" ||
+tmp="$(CDPATH='' cd -- "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P)" ||
   die "TMPDIR is not a directory: ${TMPDIR:-/tmp}"
 copy="$tmp/talos-robot-check-$(id -u)"
 lock="$copy.lock"
@@ -95,7 +96,7 @@ bazel_started=0
 passed=0
 cleanup() {
   if [ "$bazel_started" = 1 ] && [ -d "$copy" ]; then
-    (cd "$copy" && bazel shutdown >/dev/null 2>&1)
+    (CDPATH='' cd -- "$copy" && bazel shutdown >/dev/null 2>&1)
   fi
   if [ "$passed" = 1 ]; then
     remove_copy
@@ -106,6 +107,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 if [ -n "$(git --no-optional-locks -C "$source_repo" status --porcelain)" ]; then
   echo "robot-check: $source_repo has uncommitted changes; checking its commit $robot_commit only"
@@ -117,8 +119,10 @@ mkdir -p "$copy" || die "cannot make $copy"
 git --no-optional-locks -C "$source_repo" archive --format=tar HEAD | tar -xf - -C "$copy" ||
   die "cannot copy $source_repo's HEAD to $copy"
 # Its talos.bazelrc import and status script, this checkout's.
-point_rc_at_talos "$copy/.bazelrc" talos "$talos"
-[ "$?" = 2 ] && die "cannot rewrite $copy/.bazelrc"
+for from in talos ../talos; do
+  point_rc_at_talos "$copy/.bazelrc" "$from" "$talos"
+  [ "$?" = 2 ] && die "cannot rewrite $copy/.bazelrc"
+done
 echo "robot-check: $source_repo at $robot_commit, against talOS $talos at $talos_commit, in $copy"
 
 verdict_failed() {  # verdict_failed PHASE LOG
@@ -144,7 +148,7 @@ phase() {
   local log="$copy.$name.log" t0=$SECONDS
   bazel_started=1
   echo "robot-check: $name"
-  if (cd "$copy" && bazel "$@") 2>&1 | tee "$log"; [ "${PIPESTATUS[0]}" = 0 ]; then
+  if (CDPATH='' cd -- "$copy" && bazel "$@") 2>&1 | tee "$log"; [ "${PIPESTATUS[0]}" = 0 ]; then
     echo "robot-check: $name ok ($((SECONDS - t0)) s)"
     return 0
   fi

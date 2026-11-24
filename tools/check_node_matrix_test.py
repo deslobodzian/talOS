@@ -451,6 +451,65 @@ class CheckNodeMatrixTest(unittest.TestCase):
                 check_node_matrix.targets(root, ["bot"]),
                 [(pkg, "actuator")])
 
+    # REQ-SAFE-36, REQ-SAFE-37, REQ-SAFE-38, REQ-CONTRACT-14
+    def test_python_mechanisms_infer_actuator_role(self):
+        # Comment-free Python mechanism nodes (direct, from-import, aliased,
+        # submodule import, or with BOM) must be classified as actuator (12
+        # cases), not observer (4 cases).
+        for src in (
+            "from talos.mechanisms import PositionMechanism\n",
+            "from talos.mechanisms import (\n    VelocityMechanism,\n)\n",
+            "import talos\nm = talos.mechanisms.VelocityMechanism(node, 'v')\n",
+            "import talos.mechanisms as m\nr = m.RollerWithSensor(node, 'r')\n",
+            "import talos as t\np = t.mechanisms.PositionMechanism(node, 'p')\n",
+            "from talos import mechanisms as m\nr = m.RollerWithSensor(node, 'r')\n",
+            "\ufefffrom talos.mechanisms import PositionMechanism\n",
+        ):
+            with self.subTest(src=src):
+                self.assertEqual(check_node_matrix.infer_role([src]), "actuator")
+
+    # REQ-CONTRACT-14
+    def test_raise_skip_test_counts_as_skipped_in_tests_and_parity(self):
+        # Raising unittest.SkipTest(...) or bare `raise unittest.SkipTest`
+        # skips at runtime and must neither satisfy a matrix case nor count
+        # parity scenario steps.
+        py_raised = (
+            "import unittest\n"
+            "from unittest import SkipTest\n"
+            "class ObsTest(unittest.TestCase):\n"
+            "    def test_publishes_from_a_live_input(self):\n"
+            '        raise unittest.SkipTest("later")\n'
+            "    def test_stale_input_clears_validity(self):\n"
+            "        raise unittest.SkipTest\n"
+            "    def test_bad_parameter_fails_construction(self):\n"
+            "        raise SkipTest\n"
+        )
+        _, result = check_node_matrix.check(py_raised, "py", "observer")
+        self.assertEqual(sorted(missing(result)), [1, 3, 9])
+
+        cpp = "TEST_F(ArmTest, StaleLaneGoesNeutral) {}\n"
+        claim = '# matrix: parity 3 node_test.cc "stale lane"\n'
+        base_run = (
+            'SCENARIO = [("stale lane", wait(0.2))]\n'
+            "def test_parity():\n"
+            "    {skip_stmt}\n"
+            '    parity.assert_same_behaviour(Cpp, Py, CONFIG, "arm", SCENARIO)\n'
+        )
+        for skip_stmt in (
+            'raise unittest.SkipTest("later")',
+            "raise unittest.SkipTest",
+            'raise SkipTest("later")',
+            "raise SkipTest",
+        ):
+            with self.subTest(skip_stmt=skip_stmt), self.assertRaisesRegex(
+                    check_node_matrix.MatrixError, r"parity 3:"):
+                check_node_matrix.check(
+                    claim + base_run.format(skip_stmt=skip_stmt),
+                    "py",
+                    "actuator",
+                    lambda name: cpp if name == "node_test.cc" else None,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

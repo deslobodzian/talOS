@@ -56,9 +56,37 @@ bool load(const char* bfbs_path, std::string_view file, Input& in) {
                  bfbs_path);
     return false;
   }
+  if (in.schema->objects() == nullptr) {
+    std::fprintf(stderr, "descriptor_gen: %s has no objects table\n",
+                 bfbs_path);
+    return false;
+  }
   for (const reflection::Object* object : *in.schema->objects()) {
+    if (object == nullptr) {
+      std::fprintf(stderr, "descriptor_gen: %s has a null object entry\n",
+                   bfbs_path);
+      return false;
+    }
     if (object->is_struct() && object->declaration_file() != nullptr &&
         object->declaration_file()->string_view() == file) {
+      if (object->name() == nullptr) {
+        std::fprintf(stderr, "descriptor_gen: %s has an unnamed struct\n",
+                     bfbs_path);
+        return false;
+      }
+      if (object->fields() == nullptr) {
+        std::fprintf(stderr, "descriptor_gen: %s: %s has no fields table\n",
+                     bfbs_path, object->name()->c_str());
+        return false;
+      }
+      for (const reflection::Field* field : *object->fields()) {
+        if (field == nullptr || field->name() == nullptr ||
+            field->type() == nullptr) {
+          std::fprintf(stderr, "descriptor_gen: %s: %s has a malformed field\n",
+                       bfbs_path, object->name()->c_str());
+          return false;
+        }
+      }
       in.structs.push_back(object);
     }
   }
@@ -118,7 +146,22 @@ int lint(const Input& in, std::string_view file) {
   int violations = 0;
   int missing_unit_suffix = 0;
   for (const reflection::Object* object : in.structs) {
+    if (object == nullptr || object->name() == nullptr ||
+        object->fields() == nullptr) {
+      std::fprintf(stderr,
+                   "descriptor_gen: %.*s: malformed struct reflection entry\n",
+                   static_cast<int>(file.size()), file.data());
+      return 1;
+    }
     for (const reflection::Field* field : *object->fields()) {
+      if (field == nullptr || field->name() == nullptr ||
+          field->type() == nullptr) {
+        std::fprintf(stderr,
+                     "descriptor_gen: %.*s: %s has a malformed field entry\n",
+                     static_cast<int>(file.size()), file.data(),
+                     object->name()->c_str());
+        return 1;
+      }
       const std::string_view name = field->name()->string_view();
       if (!is_lower_snake_case(name)) {
         ++violations;
@@ -235,6 +278,12 @@ int write_cc(const Input& in, std::string_view file, const char* out_path,
   // it declares the structs (--cpp-include), and a specialization needs only
   // the name.
   for (const reflection::Object* object : in.structs) {
+    if (object == nullptr || object->name() == nullptr) {
+      std::fprintf(stderr,
+                   "descriptor_gen: %.*s: malformed struct reflection entry\n",
+                   static_cast<int>(file.size()), file.data());
+      return 1;
+    }
     const std::string_view name = object->name()->string_view();
     const std::size_t dot = name.rfind('.');
     const std::string_view ns = dot == std::string_view::npos
@@ -258,6 +307,12 @@ int write_cc(const Input& in, std::string_view file, const char* out_path,
   }
   h << "\n};\n}  // namespace talos::schema_detail\n\nnamespace talos {\n";
   for (const reflection::Object* object : in.structs) {
+    if (object == nullptr || object->name() == nullptr) {
+      std::fprintf(stderr,
+                   "descriptor_gen: %.*s: malformed struct reflection entry\n",
+                   static_cast<int>(file.size()), file.data());
+      return 1;
+    }
     const std::string_view name = object->name()->string_view();
     h << "\ntemplate <>\nstruct Descriptor<::" << replace_all(name, ".", "::")
       << "> {\n  static constexpr std::string_view kName = \"" << name
@@ -281,6 +336,11 @@ int write_py(const Input& in, std::string_view tree) {
   }
   bytes << "\"\n";
   for (const reflection::Object* object : in.structs) {
+    if (object == nullptr || object->name() == nullptr) {
+      std::fprintf(stderr,
+                   "descriptor_gen: malformed struct reflection entry\n");
+      return 1;
+    }
     const std::string name = object->name()->str();
     const std::size_t dot = name.rfind('.');
     const std::string cls = name.substr(dot == name.npos ? 0 : dot + 1);

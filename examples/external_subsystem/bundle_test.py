@@ -9,8 +9,17 @@ import unittest
 
 from python.runfiles import runfiles
 
+CLEAN_ENV = {
+    k: v for k, v in os.environ.items()
+    if k not in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV",
+                 "RUNFILES_DIR", "RUNFILES_MANIFEST_FILE",
+                 "PYTHON_RUNFILES", "TEST_SRCDIR")
+}
+
 
 class BundleTest(unittest.TestCase):
+    # REQ-OPS-47, REQ-OPS-48: an installed consumer bundle warms up without
+    # warnings and describes cleanly with Bazel/Python env stripped.
     def test_external_node_in_relocated_bundle(self):
         source = runfiles.Create().Rlocation(
             "_main/examples/external_subsystem/robot_bundle")
@@ -20,14 +29,16 @@ class BundleTest(unittest.TestCase):
         deploy = runfiles.Create().Rlocation("_main/tools/deploy.sh")
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             prefix = os.path.join(tmp, "prefix")
-            subprocess.run(
+            install = subprocess.run(
                 ["bash", deploy, "install", source, "--prefix", prefix],
-                check=True, capture_output=True, text=True, timeout=120)
+                env=CLEAN_ENV, check=True, capture_output=True, text=True,
+                timeout=120)
+            self.assertNotIn("warning: warm-up", install.stderr)
             moved = os.path.join(prefix, "current")
             logs = os.path.join(tmp, "logs")
             proc = subprocess.run(
                 ["./run.sh", "--describe-only"], cwd=moved,
-                env=dict(os.environ, TALOS_LOG_DIR=logs),
+                env=dict(CLEAN_ENV, TALOS_LOG_DIR=logs),
                 capture_output=True, text=True, timeout=120)
             output = proc.stdout + "\n" + proc.stderr
             self.assertEqual(proc.returncode, 0, output)

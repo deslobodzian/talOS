@@ -55,18 +55,23 @@ def log_baseline_ns(logs):
     record headers only (events/log/format.h); payload decoding remains
     log_dump's job. A GAP record (version 8) counts like any record, as in
     log_dump's origin: its event time is the earliest a dropped record
-    named. On macOS Node time is MONOTONIC_RAW, not steady_clock.
+    named. Files with an incomplete header and truncated tail records (as a
+    SIGKILLed node leaves) are skipped, matching log_dump. On macOS Node
+    time is MONOTONIC_RAW, not steady_clock.
     """
     if isinstance(logs, Path) and logs.is_dir():
         logs = logs.glob("*.tlog")
     baseline = None
     for path in logs:
         with path.open("rb") as stream:
-            header_bytes, _, count, _, schema_bytes = read_tlog_header(
-                stream, path)
+            try:
+                header_bytes, _, count, _, schema_bytes = read_tlog_header(
+                    stream, path)
+            except ValueError:
+                continue
             stream.seek(header_bytes + _TLOG_ENTRY.size * count + schema_bytes)
             for _, _, timestamp, _ in iter_tlog_records(
-                    stream, path, allow_truncated=False):
+                    stream, path, allow_truncated=True):
                 baseline = (timestamp if baseline is None
                             else min(baseline, timestamp))
     return baseline

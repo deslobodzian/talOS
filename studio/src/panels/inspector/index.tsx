@@ -136,7 +136,7 @@ function InspectorPanel() {
   };
 
   const copyName = (name: string) => {
-    void navigator.clipboard?.writeText(name);
+    void navigator.clipboard?.writeText(name)?.catch(() => {});
   };
 
   const visibleCount = groups.reduce((n, g) => n + g.channels.length, 0);

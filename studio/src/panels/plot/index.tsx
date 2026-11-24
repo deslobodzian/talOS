@@ -20,7 +20,7 @@ import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 
 import {useActions, useDictionary, useEvents, usePlayback, useSeries} from '../../data/hooks';
-import type {ChannelInfo, RobotEvent, Series} from '../../data/types';
+import type {ChannelInfo, Mode, RobotEvent, Series} from '../../data/types';
 import {channelDisplayName} from '../../ui/channel';
 import {number} from '../../ui/formatters';
 import {EmptyState} from '../../ui/primitives';
@@ -227,6 +227,28 @@ export function cursorTimestampNs(
   return origin + BigInt(ns);
 }
 
+// Decide whether uPlot must recompute axis scales on `setData(data, resetScales)`.
+// Preserves a paused user zoom whose viewport lies within `[times[0], times[last]]`,
+// while resetting when scales are uninitialized, playback is advancing, the window
+// or channel set changed, the series is empty, or the data range shifted out from
+// under the current x-scale.
+export function shouldResetPlotScales(params: {
+  windowChanged: boolean;
+  mode: Mode;
+  times: ArrayLike<number>;
+  xScale: {min?: number | null; max?: number | null} | undefined;
+}): boolean {
+  const {windowChanged, mode, times, xScale} = params;
+  if (windowChanged || mode !== 'PAUSED' || times.length === 0) return true;
+  const min = xScale?.min;
+  const max = xScale?.max;
+  if (min == null || max == null || !Number.isFinite(min) || !Number.isFinite(max))
+    return true;
+  const first = times[0];
+  const last = times[times.length - 1];
+  return !(first <= min && last >= max);
+}
+
 function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
   const dictionary = useDictionary();
   const playback = usePlayback();
@@ -274,6 +296,7 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
       [keySig, info]);
   const prevWindowRef = useRef<number|null>(config.windowSeconds);
   const prevChannelSigRef = useRef<string>(channelSig);
+  const prevSeriesRef = useRef<Series|null>(null);
 
   const axes = useMemo(() => {
     const plotChannels: PlotChannel[] = keys.map(k => ({
@@ -428,8 +451,10 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
     if (!plot) return;
     const windowChanged = prevWindowRef.current !== config.windowSeconds ||
         prevChannelSigRef.current !== channelSig;
+    const seriesChanged = prevSeriesRef.current !== series;
     prevWindowRef.current = config.windowSeconds;
     prevChannelSigRef.current = channelSig;
+    prevSeriesRef.current = series;
     if (ordered.length === 0) {
       plot.setData([[], ...ordered.map(() => [])]);
       originRef.current = null;
@@ -439,9 +464,14 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
     originRef.current = BigInt(series.t0_ns);
     const data = plotData(series, ordered);
     const times = data[0];
-    const resetScales = windowChanged || playback.mode === 'LIVE_STREAMING' ||
-        times.length === 0;
+    const resetScales = shouldResetPlotScales({
+      windowChanged,
+      mode: playback.mode,
+      times,
+      xScale: plot.scales.x
+    });
     plot.setData(data, resetScales);
+    if (!resetScales && seriesChanged) plot.redraw();
     if (windowChanged && config.windowSeconds !== null && times.length > 0 &&
         times[0] < times[times.length - 1])
       plot.setScale('x', {min: times[0], max: times[times.length - 1]});

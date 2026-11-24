@@ -1875,6 +1875,39 @@ TEST(HardwareConfig, EachCanBusIsWarnedAboveSeventyPercentOnItsOwnLoad) {
       << diagnostics[0].message;
   EXPECT_NE(diagnostics[0].message.find("10 motors"), std::string::npos)
       << diagnostics[0].message;
+
+  // Halving status_hz scales per-device load linearly: the same ten motors on
+  // "rio" at 100 Hz drop from 0.87 (warning) to 0.46 (clean).
+  rio.status_hz = 100;
+  const auto rio_100_loads = EstimateCanBusLoads(rio);
+  ASSERT_EQ(rio_100_loads.size(), 1u);
+  EXPECT_NEAR(rio_100_loads[0].estimate_frac, 0.46, 1e-9);
+  EXPECT_TRUE(CheckHardwareConfig(rio).empty())
+      << Describe(CheckHardwareConfig(rio));
+
+  // Boundary straddling kCanBusWarnFrac (0.70): 18 CANivore motors at 200 Hz
+  // estimate 0.698 (clean), while 19 estimate 0.734 (warning).
+  hardware::Config boundary;
+  boundary.status_hz = 200;
+  AddDevices(boundary, "canivore", 18, 0, 0);
+  const auto below_loads = EstimateCanBusLoads(boundary);
+  ASSERT_EQ(below_loads.size(), 1u);
+  EXPECT_NEAR(below_loads[0].estimate_frac, 0.698, 1e-9);
+  EXPECT_TRUE(CheckHardwareConfig(boundary).empty())
+      << Describe(CheckHardwareConfig(boundary));
+
+  AddDevices(boundary, "canivore", 1, 0, 0);
+  const auto above_loads = EstimateCanBusLoads(boundary);
+  ASSERT_EQ(above_loads.size(), 1u);
+  EXPECT_NEAR(above_loads[0].estimate_frac, 0.734, 1e-9);
+  const auto above_diagnostics = CheckHardwareConfig(boundary);
+  ASSERT_EQ(above_diagnostics.size(), 1u) << Describe(above_diagnostics);
+  EXPECT_EQ(above_diagnostics[0].severity, Severity::WARNING);
+  EXPECT_EQ(above_diagnostics[0].subject, "canivore");
+  EXPECT_NE(above_diagnostics[0].message.find("0.73"), std::string::npos)
+      << above_diagnostics[0].message;
+  EXPECT_NE(above_diagnostics[0].message.find("0.70"), std::string::npos)
+      << above_diagnostics[0].message;
 }
 
 TEST(AlertPrefixedFields, RejectsOutOfRangeBaseTypeWithoutUb) {

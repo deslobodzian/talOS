@@ -10,10 +10,12 @@ it and refuses the bridge's push of another, so the run is refused.
 """
 
 import os
+import signal
 import socket
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tools import test_rio_in_the_loop as rio
 
@@ -153,6 +155,58 @@ class PortsTest(unittest.TestCase):
             with self.assertRaises(RuntimeError) as raised:
                 rio.check_ports((port,))
             self.assertIn(str(port), str(raised.exception))
+
+
+class ScenarioProcessControlTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        (self.dir / "controller_processor" / "rio").mkdir(parents=True)
+        (self.dir / "gateway.txt").write_text(
+            "hardware gateway config=0 commissioned=0 (waiting for config push)\n"
+        )
+
+    # REQ-DEV-06, REQ-SAFE-16: an inherited TALOS_SIM_DS_DISABLE_AFTER_MS must
+    # not leak into a WPILib scenario that passes disable_after_ms=None.
+    def test_start_wpilib_gateway_pops_inherited_disable_after_ms(self):
+        scenario = rio.Scenario(self.dir, self.dir, self.dir / "robot.toml",
+                                wpilib=True)
+        captured_envs = []
+
+        def fake_start(name, argv, cwd=None, env=None):
+            captured_envs.append(env)
+            return mock.MagicMock()
+
+        with mock.patch.dict(os.environ,
+                             {"TALOS_SIM_DS_DISABLE_AFTER_MS": "500"}), \
+                mock.patch.object(scenario, "start", side_effect=fake_start), \
+                mock.patch.object(scenario, "wait_for"):
+            scenario.start_wpilib_gateway(6, disable_after_ms=None)
+            scenario.start_wpilib_gateway(6, disable_after_ms=250)
+
+        self.assertNotIn("TALOS_SIM_DS_DISABLE_AFTER_MS", captured_envs[0])
+        self.assertEqual(captured_envs[1]["TALOS_SIM_DS_DISABLE_AFTER_MS"],
+                         "250")
+
+    # REQ-DEV-06, REQ-SAFE-16: Scenario.stop() must not signal an already-exited
+    # process (whose PID/PGID may have been reused).
+    def test_stop_skips_terminate_group_for_already_exited_process(self):
+        scenario = rio.Scenario(self.dir, self.dir, self.dir / "robot.toml")
+        exited = mock.MagicMock(pid=101)
+        exited.poll.return_value = 0
+        exited.wait.return_value = 0
+        running = mock.MagicMock(pid=102)
+        running.poll.return_value = None
+        running.wait.return_value = 0
+        scenario.names = {101: "exited", 102: "running"}
+
+        with mock.patch.object(rio, "_terminate_group") as term:
+            failed = scenario.stop([exited, running])
+
+        self.assertEqual(failed, [])
+        term.assert_called_once_with(running, signal.SIGTERM)
+        self.assertEqual(scenario.stopped, {101, 102})
 
 
 if __name__ == "__main__":

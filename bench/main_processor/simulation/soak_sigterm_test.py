@@ -12,6 +12,8 @@ import unittest
 from unittest import mock
 
 import soak_test
+import support
+from talOS.launcher import tlog_read
 
 # Runs inside a child Python process so a missing SIGTERM handler actually
 # terminates the process with -SIGTERM before finally: runs.
@@ -297,6 +299,78 @@ class SoakSigtermCleanupTest(unittest.TestCase):
                 )
         finally:
             signal.signal(signal.SIGTERM, original)
+
+
+def _tlog_header(process=b"node"):
+    return tlog_read.FILE.pack(
+        b"TALOSLOG",
+        tlog_read.VERSIONS[-1],
+        tlog_read.FILE.size,
+        0,
+        1000,
+        0,
+        0,
+        0,
+        process.ljust(64, b"\0"),
+        0,
+    )
+
+
+def _tlog_record(event_ns, payload=b"", stored=None):
+    if stored is None:
+        stored = len(payload)
+    return (
+        tlog_read.RECORD.pack(
+            tlog_read.RECORD_MAGIC,
+            tlog_read.TIMER,
+            1,
+            0,
+            event_ns,
+            event_ns,
+            0,
+            0,
+            0,
+            0,
+            0,
+            stored,
+        )
+        + payload
+    )
+
+
+class LogBaselineNsTest(unittest.TestCase):
+    # REQ-OPS-12, REQ-OPS-15, REQ-SAFE-31: SIGKILL mid-write can leave a
+    # truncated header or truncated trailing record; log_baseline_ns skips
+    # incomplete files/tails like log_dump and returns the earliest intact
+    # record timestamp.
+    def test_skips_truncated_header_and_truncated_tail_records(self):
+        with tempfile.TemporaryDirectory(prefix="tlog-baseline-") as work:
+            root = Path(work)
+            # Incomplete file header (SIGKILL mid-header write).
+            (root / "truncated_header.tlog").write_bytes(_tlog_header()[:12])
+            # Valid header + two intact records + truncated payload tail whose
+            # timestamp (1000) must not be counted.
+            (root / "truncated_payload.tlog").write_bytes(
+                _tlog_header(b"motor")
+                + _tlog_record(5000, b"abcd")
+                + _tlog_record(2000, b"xy")
+                + _tlog_record(1000, b"123", stored=64)
+            )
+            # Valid header + intact record + incomplete record header tail.
+            (root / "truncated_rec_hdr.tlog").write_bytes(
+                _tlog_header(b"gyro")
+                + _tlog_record(3000)
+                + _tlog_record(500)[:7]
+            )
+            self.assertEqual(support.log_baseline_ns(root), 2000)
+
+    # REQ-OPS-12, REQ-OPS-15, REQ-SAFE-31: a session containing only an
+    # incomplete-header .tlog returns None instead of raising ValueError.
+    def test_only_truncated_header_returns_none(self):
+        with tempfile.TemporaryDirectory(prefix="tlog-baseline-empty-") as work:
+            root = Path(work)
+            (root / "incomplete.tlog").write_bytes(b"TALOS")
+            self.assertIsNone(support.log_baseline_ns(root))
 
 
 if __name__ == "__main__":

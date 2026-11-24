@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {demoPacket, demoSystemGraph} from '../src/demo';
+import {demoDeclaredGraph, demoPacket, demoSystemGraph} from '../src/demo';
 import {AlertLevel, ChannelKind, concatPages, dictionaryId, encodeDictionaryPages, encodeValuePages, rawFromDouble} from '../src/encode';
 import type {AlertLatch} from '../src/data/alerts';
 import {GRAPH_STALE_AFTER_MS, readingClock, sampleStale} from '../src/data/freshness';
@@ -34,6 +34,7 @@ class FakeSocket {
 
 let playback: PlaybackState|null = null;
 let system: SystemState|null = null;
+let lastManifest: SessionManifest|null = null;
 let frames: Snapshot[] = [];
 let pieces: PiecesSnapshot|null = null;
 let postedFrameChunks: {reset: boolean; count: number}[] = [];
@@ -43,6 +44,7 @@ function apply(m: Record<string, unknown>) {
   if (m.type === 'playback') playback = m.state as PlaybackState;
   else if (m.type === 'system') system = m as unknown as SystemState;
   else if (m.type === 'manifest') {
+    lastManifest = (m.manifest as SessionManifest|null) ?? null;
     if (m.manifest) store.pushManifest(m.manifest as SessionManifest);
   } else if (m.type === 'frames') {
     const chunk = m.frames as Snapshot[];
@@ -581,4 +583,78 @@ test('postFrames chunks > 2000 reset frames with reset:true on chunk 1 and reset
   assert.equal(frames[0].sequence_id, '1');
   assert.equal(frames[total - 1].sequence_id, String(total));
   assert.equal(store.series(['x'], 'all', String(total * 1_000_000)).times.length, total);
+});
+
+// REQ-OPS-23: a pending /manifest.json or /declared.json fetch from a prior
+// WebSocket open that settles after an automatic reconnect must not clear
+// manifestInFlight for the new fetch or overwrite newer manifest/declared state.
+test('stale manifest and declared fetches from a prior reconnect never clear manifestInFlight or overwrite state', async () => {
+  type PendingFetch = {
+    url: string;
+    signal?: AbortSignal;
+    resolve: (res: Response) => void;
+    reject: (err: unknown) => void;
+  };
+  const manifestCalls: PendingFetch[] = [];
+  const declaredCalls: PendingFetch[] = [];
+  globalThis.fetch = ((url: string|URL|Request, init?: RequestInit) =>
+      new Promise<Response>((resolve, reject) => {
+        const entry: PendingFetch = {url: String(url), signal: init?.signal ?? undefined, resolve, reject};
+        if (entry.url.endsWith('/manifest.json')) manifestCalls.push(entry);
+        else if (entry.url.endsWith('/declared.json')) declaredCalls.push(entry);
+        else resolve(new Response('', {status: 404}));
+      })) as typeof fetch;
+
+  const declaredWithBus = (bus: string) =>
+      JSON.stringify({...JSON.parse(demoDeclaredGraph()), can_buses: ['rio', bus]});
+
+  try {
+    const socket1 = connect();
+    assert.equal(manifestCalls.length, 1);
+    assert.equal(declaredCalls.length, 1);
+
+    // Automatic reconnect (same `generation`, bumped `openGeneration`).
+    const retry = captureTimeout(() => socket1.onclose!());
+    retry();
+    const socket2 = sockets.at(-1)!;
+    assert.notEqual(socket2, socket1);
+    socket2.onopen!();
+
+    assert.equal(manifestCalls[0].signal?.aborted, true);
+    assert.equal(declaredCalls[0].signal?.aborted, true);
+    assert.equal(manifestCalls.length, 2);
+    assert.equal(declaredCalls.length, 2);
+
+    // Fetch 1 settles AFTER fetch 2 starts (simulating both an aborted fetch
+    // hitting finally and a late-resolving response that ignored AbortSignal).
+    manifestCalls[0].resolve(new Response(sessionManifest('111', 0)));
+    declaredCalls[0].resolve(new Response(declaredWithBus('StaleBus')));
+    await settle();
+    advance(8);
+
+    // Fetch 1's response must be ignored (never overwrites state).
+    assert.notEqual(lastManifest?.session_id, '111');
+    assert.notEqual(system?.declared?.can_buses?.[1], 'StaleBus');
+
+    // Advancing past the 1 Hz manifest poll interval while fetch 2 is still in
+    // flight must NOT duplicate fetch 2 (fetch 1's finally did not clear
+    // manifestInFlight).
+    advance(1500);
+    assert.equal(manifestCalls.length, 2,
+                 'stale fetch 1 cleared manifestInFlight and duplicated fetch 2');
+
+    // Now fetch 2 resolves cleanly and applies its state.
+    manifestCalls[1].resolve(new Response(sessionManifest('222', 0)));
+    declaredCalls[1].resolve(new Response(declaredWithBus('FreshBus')));
+    await settle();
+    advance(8);
+    assert.equal(lastManifest?.session_id, '222');
+    assert.deepEqual(system?.declared?.can_buses, ['rio', 'FreshBus']);
+
+    // Once fetch 2 finishes, the next 1 Hz poll starts fetch 3 normally.
+    advance(1100);
+    assert.equal(manifestCalls.length, 3);
+  } finally {
+    globalThis.fetch = async () => new Response('', {status: 404});
+  }
 });

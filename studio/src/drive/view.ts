@@ -228,12 +228,22 @@ function fieldWidget(model: DriveModel, w: Widget&{kind: 'field'}): string {
         '<rect class="robot" x="-0.45" y="-0.45" width="0.9" height="0.9"/>' +
         '<path class="heading" d="M0 0 L0.6 0"/></g>';
     const xs = model.history(w.channels.x), ys = model.history(w.channels.y);
-    const newest = xs.length ? xs[xs.length - 1].t_s : 0;
+    const newest = xs.length && ys.length ?
+        Math.min(xs[xs.length - 1].t_s, ys[ys.length - 1].t_s) : 0;
     const points: string[] = [];
-    for (let i = 0; i < xs.length && i < ys.length; i++) {
-      if (newest - xs[i].t_s > w.trail_s) continue;
-      if (!Number.isFinite(xs[i].v) || !Number.isFinite(ys[i].v)) continue;
-      points.push(`${xs[i].v.toFixed(2)},${(FIELD_HEIGHT_M - ys[i].v).toFixed(2)}`);
+    for (let ix = 0, iy = 0; ix < xs.length && iy < ys.length;) {
+      if (xs[ix].t_s < ys[iy].t_s) {
+        ix++;
+        continue;
+      }
+      if (ys[iy].t_s < xs[ix].t_s) {
+        iy++;
+        continue;
+      }
+      const xp = xs[ix++], yp = ys[iy++];
+      if (newest - xp.t_s > w.trail_s) continue;
+      if (!Number.isFinite(xp.v) || !Number.isFinite(yp.v)) continue;
+      points.push(`${xp.v.toFixed(2)},${(FIELD_HEIGHT_M - yp.v).toFixed(2)}`);
     }
     if (points.length > 1) trail = `<polyline class="trail" points="${points.join(' ')}"/>`;
   } else {
@@ -283,18 +293,31 @@ function graphWidget(model: DriveModel, w: Widget&{kind: 'graph'}): string {
         }
   }
   if (!Number.isFinite(lo) || !Number.isFinite(hi)) lo = 0, hi = 1;
-  if (hi <= lo) hi = lo + 1;
+  if (hi <= lo) {
+    const pad = Math.max(1, Math.abs(lo) * 1e-6);
+    const nextHi = lo + pad;
+    if (Number.isFinite(nextHi) && nextHi > lo) hi = nextHi;
+  }
+  const span = hi - lo;
+  const halfSpan = hi * 0.5 - lo * 0.5;
+  const normY = (v: number): number => {
+    const clamped = Math.min(hi, Math.max(lo, v));
+    if (!(span > 0)) return 0.5;
+    if (Number.isFinite(span)) return (clamped - lo) / span;
+    if (!(halfSpan > 0) || !Number.isFinite(halfSpan)) return 0.5;
+    return (clamped * 0.5 - lo * 0.5) / halfSpan;
+  };
   const H = 40, W = 100;
   const lines = traces.map((t, i) => {
     const segments: string[][] = [[]];
     for (const p of t) {
-      if (newest - p.t_s > w.window_s) continue;
+      if (!Number.isFinite(p.t_s) || newest - p.t_s > w.window_s) continue;
       if (!Number.isFinite(p.v)) {
         segments.push([]);
         continue;
       }
       const px = W - (newest - p.t_s) / w.window_s * W;
-      const py = H - (Math.min(hi, Math.max(lo, p.v)) - lo) / (hi - lo) * H;
+      const py = H - normY(p.v) * H;
       segments[segments.length - 1].push(`${px.toFixed(2)},${py.toFixed(2)}`);
     }
     return segments.filter(seg => seg.length > 1).map(seg =>
@@ -305,8 +328,13 @@ function graphWidget(model: DriveModel, w: Widget&{kind: 'graph'}): string {
     return `<li class="series-${i}"><svg class="key" viewBox="0 0 20 4"><line x1="0" y1="2" x2="20" y2="2" stroke-dasharray="${DASHES[i % DASHES.length]}"/></svg>` +
         `${esc(leaf(name))} <b>${fixed(r, 1)}</b></li>`;
   });
+  const axisNum = (v: number) => {
+    const str = v.toPrecision(4);
+    const num = +str;
+    return Number.isFinite(num) ? String(num) : str;
+  };
   return `<svg class="graph" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="${esc(heading(w))} over ${w.window_s} s">${lines.join('')}</svg>` +
-      `<div class="axis small"><span>${esc(String(+hi.toPrecision(4)))}</span><span>${esc(String(+lo.toPrecision(4)))}</span><span>last ${w.window_s} s</span></div>` +
+      `<div class="axis small"><span>${esc(axisNum(hi))}</span><span>${esc(axisNum(lo))}</span><span>last ${w.window_s} s</span></div>` +
       `<ul class="legend">${legend.join('')}</ul>`;
 }
 

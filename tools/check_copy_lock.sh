@@ -27,8 +27,15 @@
 # lock, $lock.retake, held until the new pid is written: two runs that both
 # read the dead pid cannot both remove and retake it, since the second finds
 # the retake lock (or, after it, a live pid).
+_copy_lock_cleanup() {
+  [ -n "${_copy_retake_dir:-}" ] && rmdir "$_copy_retake_dir" 2>/dev/null || true
+  [ -n "${_copy_lock_dir:-}" ] && rm -rf "$_copy_lock_dir"
+}
+
 take_copy_lock() {
   local lock="$1" what="$2" holder
+  _copy_lock_dir=""
+  _copy_retake_dir=""
   if ! mkdir "$lock" 2>/dev/null; then
     [ -f "$lock/pid" ] ||
       die "$lock has no pid yet: another check is starting (if none is, rmdir $lock)"
@@ -43,20 +50,34 @@ take_copy_lock() {
     fi
     mkdir "$lock.retake" 2>/dev/null ||
       die "another check is retaking $lock from a dead run (if none is, rmdir $lock.retake)"
+    _copy_retake_dir="$lock.retake"
+    trap _copy_lock_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
     # Under the retake lock: the lock must still be the dead holder's.
     if [ "$(cat "$lock/pid" 2>/dev/null || true)" != "$holder" ]; then
       rmdir "$lock.retake"
+      _copy_retake_dir=""
+      trap - EXIT INT TERM HUP
       die "another check took $lock first"
     fi
     rm -rf "$lock"
-    if ! { mkdir "$lock" 2>/dev/null &&
-           echo $$ > "$lock/pid.$$" &&
-           mv -f "$lock/pid.$$" "$lock/pid"; }; then
-      rmdir "$lock.retake"
+    if ! mkdir "$lock" 2>/dev/null; then
+      die "cannot take $lock"
+    fi
+    _copy_lock_dir="$lock"
+    if ! { echo $$ > "$lock/pid.$$" && mv -f "$lock/pid.$$" "$lock/pid"; }; then
       die "cannot take $lock"
     fi
     rmdir "$lock.retake"
+    _copy_retake_dir=""
   else
+    _copy_lock_dir="$lock"
+    trap _copy_lock_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
     { echo $$ > "$lock/pid.$$" && mv -f "$lock/pid.$$" "$lock/pid"; } ||
       die "cannot write $lock/pid"
   fi

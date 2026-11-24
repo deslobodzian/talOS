@@ -166,7 +166,15 @@ export function useManifest(): {manifest: SessionManifest|null; error: string} {
 export function useRobotStatus(): RobotStatus {
   const snapshot = useSnapshot();
   const system = useSystem();
-  return useMemo(() => robotStatus(snapshot, system), [snapshot, system]);
+  const recorded = useRecorded();
+  return useMemo(
+      () => robotStatus(
+          snapshot,
+          recorded ?
+              {graph: null, stale: false, rates: {}, error: '',
+               declared: recorded.declared, declaredError: ''} :
+              system),
+      [snapshot, system, recorded]);
 }
 
 // `points` is the consumer's width in pixels, the resolution a recorded

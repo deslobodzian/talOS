@@ -537,6 +537,112 @@ TEST_F(SuperstructureAlone, AtGoalForAnEarlierHeightDoesNotCount) {
   EXPECT_EQ(State(), SuperstructureState::RAISING);
 }
 
+// REQ-SAFE-07, REQ-CONTRACT-25: direct transitions between non-STOW commands
+// cancel the active step instead of keeping the old actuator demand.
+TEST_F(SuperstructureAlone, DirectNonStowCommandSwitchCancelsActiveStep) {
+  const IntakeStatus empty{IntakeState::IDLE, false, true};
+
+  // INTAKING -> SCORE_HIGH (without piece): stops intaking and stows.
+  Tick(SuperstructureCommand::INTAKE, empty, kDown);
+  ASSERT_EQ(State(), SuperstructureState::INTAKING);
+  Tick(SuperstructureCommand::SCORE_HIGH, empty, kDown);
+  EXPECT_EQ(State(), SuperstructureState::STOWED);
+  EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+  {
+    const auto intake =
+        LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+    ASSERT_TRUE(intake.has_value());
+    EXPECT_EQ(intake->active, 1);
+    EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
+  }
+
+  // RAISING -> INTAKE (even as the lift arrives at high_rot_): cancels to
+  // HOLDING and lowers the lift without ejecting.
+  Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+  ASSERT_EQ(State(), SuperstructureState::RAISING);
+  Tick(SuperstructureCommand::INTAKE, kHolding, kUp);
+  EXPECT_EQ(State(), SuperstructureState::HOLDING);
+  EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+  {
+    const auto intake =
+        LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+    ASSERT_TRUE(intake.has_value());
+    EXPECT_EQ(intake->active, 1);
+    EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
+  }
+
+  // SCORING -> INTAKE: stops EJECT and returns to HOLDING with lift at 0.
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kUp);
+  ASSERT_EQ(State(), SuperstructureState::SCORING);
+  Tick(SuperstructureCommand::INTAKE, kHolding, kUp);
+  EXPECT_EQ(State(), SuperstructureState::HOLDING);
+  EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+  {
+    const auto intake =
+        LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+    ASSERT_TRUE(intake.has_value());
+    EXPECT_EQ(intake->active, 1);
+    EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
+  }
+}
+
+// REQ-SAFE-36, REQ-CONTRACT-25: leaving the high goal while SCORING (re-homing,
+// moving out of tolerance, or homing failure) stops EJECT immediately.
+TEST_F(SuperstructureAlone, ScoringStopsEjectWhenElevatorLeavesGoal) {
+  const ElevatorStatus homing{ElevatorState::HOMING, 0.0, 0.0, false};
+  const ElevatorStatus moving{ElevatorState::MOVING, kHighRot - 1.0, kHighRot,
+                              false};
+  const ElevatorStatus homing_failed{ElevatorState::HOMING_FAILED, 0.0, 0.0,
+                                     false};
+
+  Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kUp);
+  ASSERT_EQ(State(), SuperstructureState::SCORING);
+
+  // Elevator resets and starts homing: drop back to RAISING, stopping EJECT.
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, homing);
+  EXPECT_EQ(State(), SuperstructureState::RAISING);
+  EXPECT_DOUBLE_EQ(ElevatorGoalRot(), kHighRot);
+  {
+    const auto intake =
+        LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+    ASSERT_TRUE(intake.has_value());
+    EXPECT_EQ(intake->active, 1);
+    EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
+  }
+
+  // Elevator returns to high_rot_ -> resumes SCORING, then leaves tolerance.
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kUp);
+  ASSERT_EQ(State(), SuperstructureState::SCORING);
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, moving);
+  EXPECT_EQ(State(), SuperstructureState::RAISING);
+  EXPECT_DOUBLE_EQ(ElevatorGoalRot(), kHighRot);
+  {
+    const auto intake =
+        LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+    ASSERT_TRUE(intake.has_value());
+    EXPECT_EQ(intake->active, 1);
+    EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
+  }
+
+  // Elevator returns to high_rot_, then fails homing: fall back to HOLDING.
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kUp);
+  ASSERT_EQ(State(), SuperstructureState::SCORING);
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, homing_failed);
+  EXPECT_EQ(State(), SuperstructureState::HOLDING);
+  EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+  {
+    const auto intake =
+        LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+    ASSERT_TRUE(intake.has_value());
+    EXPECT_EQ(intake->active, 1);
+    EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
+  }
+}
+
 // REQ-SAFE-04: an out-of-range SuperstructureCommand enum byte cancels an
 // active sequence to STOW instead of continuing to raise or eject.
 TEST_F(SuperstructureAlone, UnknownCommandCancelsToStow) {

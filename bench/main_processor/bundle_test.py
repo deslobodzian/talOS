@@ -82,7 +82,7 @@ NATIVE_IMPORTS = {
 CLEAN_ENV = {k: v for k, v in os.environ.items()
              if k not in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV",
                           "RUNFILES_DIR", "RUNFILES_MANIFEST_FILE",
-                          "PYTHON_RUNFILES")}
+                          "PYTHON_RUNFILES", "TEST_SRCDIR")}
 
 # Run by a node's venv interpreter: adds the site-packages directory it is
 # given, imports each module named after it and prints, as JSON, the real
@@ -219,11 +219,11 @@ def describe(bundle, prefix, command, *args):
     `args`. Returns the process, the session's graph, the installed
     bundle's directory and the install's stderr."""
     install = subprocess.run(["bash", deploy_script(), "install", bundle,
-                              "--prefix", prefix], check=True,
+                              "--prefix", prefix], env=CLEAN_ENV, check=True,
                              capture_output=True, text=True, timeout=120)
     where = os.path.join(prefix, "current")
     log_dir = os.path.join(prefix, "logs")
-    env = dict(os.environ, TALOS_LOG_DIR=log_dir)
+    env = dict(CLEAN_ENV, TALOS_LOG_DIR=log_dir)
     proc = subprocess.run([*command, "--describe-only", *args], cwd=where,
                           env=env, capture_output=True, text=True, timeout=120)
     sessions = sorted(
@@ -489,7 +489,8 @@ class BundleTest(unittest.TestCase):
             subprocess.run(
                 ["bash", deploy_script(), "install", copy, "--prefix", prefix,
                  "--no-warm-up"],
-                check=True, capture_output=True, text=True, timeout=120)
+                env=CLEAN_ENV, check=True, capture_output=True, text=True,
+                timeout=120)
             installed = os.path.realpath(os.path.join(prefix, "current"))
             webroot = os.path.join(installed, manifest["studio"]["webroot"])
             with open(os.path.join(webroot, "index.html"), "rb") as f:
@@ -509,7 +510,7 @@ class BundleTest(unittest.TestCase):
 
             log_dir = os.path.join(prefix, "logs")
             env = dict(
-                os.environ,
+                CLEAN_ENV,
                 TALOS_LOG_DIR=log_dir,
                 # Not the process id: Bazel's sandbox gives each test its
                 # own process-id namespace, so two tests at once can both
@@ -528,7 +529,7 @@ class BundleTest(unittest.TestCase):
                 marker = f"on http://localhost:{http_port}\n".encode()
                 buf = b""
                 fd = proc.stdout.fileno()
-                while marker not in buf:
+                while marker not in buf and len(buf) < (1 << 20):
                     ready, _, _ = select.select([fd], [], [], 30)
                     if not ready:
                         break

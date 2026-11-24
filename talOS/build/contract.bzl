@@ -635,6 +635,13 @@ def talos_cc_node(
         node_target = str(native.package_relative_label(name))
         if node_target.startswith("@@//"):
             node_target = node_target[2:]
+    caller_local_defines = kwargs.pop("local_defines", None)
+    local_defines = [
+        'TALOS_NODE_NAME=\\"%s\\"' % node_name,
+        'TALOS_NODE_TARGET=\\"%s\\"' % node_target,
+    ]
+    if caller_local_defines != None:
+        local_defines = caller_local_defines + local_defines
     node_dep = Label("//talOS/node")
     bin_name = name + "_bin"
     cc_binary(
@@ -642,10 +649,7 @@ def talos_cc_node(
         srcs = srcs,
         deps = deps + [node_dep],
         linkopts = linkopts,
-        local_defines = [
-            'TALOS_NODE_NAME=\\"%s\\"' % node_name,
-            'TALOS_NODE_TARGET=\\"%s\\"' % node_target,
-        ],
+        local_defines = local_defines,
         testonly = testonly,
         visibility = ["//visibility:private"],
         **kwargs
@@ -871,7 +875,7 @@ def _talos_bundle_impl(ctx):
                 if node.label.package:
                     n_name = node.label.package.split("/")[-1]
                 elif node.label.repo_name:
-                    n_name = node.label.repo_name.split("+")[0].split("~")[0]
+                    n_name = node.label.repo_name.split("+")[0].split("~")[0] or node.label.name
                 else:
                     n_name = node.label.name
             else:
@@ -881,6 +885,13 @@ def _talos_bundle_impl(ctx):
         direct_inputs.append(n_exec)
         rf_list = []
         lib_list = []
+        n_repo_mapping = None
+        if n_lang == "python":
+            ftr = node[DefaultInfo].files_to_run
+            rm = ftr.repo_mapping_manifest if ftr else None
+            if rm:
+                direct_inputs.append(rm)
+                n_repo_mapping = rm.path
         if n_rf and n_rf.files:
             transitive_inputs.append(n_rf.files)
             if n_lang == "python":
@@ -900,7 +911,7 @@ def _talos_bundle_impl(ctx):
                 for f in n_rf.files.to_list():
                     if f.extension in ("dylib", "so") or ".so." in f.basename:
                         lib_list.append({"src_path": f.path, "name": f.basename})
-        nodes_spec.append({
+        node_spec = {
             "name": n_name,
             "target": n_target,
             "label": _bundle_label(node.label),
@@ -908,7 +919,10 @@ def _talos_bundle_impl(ctx):
             "src_path": n_exec.path,
             "runfiles": rf_list,
             "shared_libs": lib_list,
-        })
+        }
+        if n_repo_mapping:
+            node_spec["repo_mapping"] = n_repo_mapping
+        nodes_spec.append(node_spec)
 
     # Each config file keeps its path relative to the config, so `include`,
     # `path` and `defaults` resolve in the bundle as they do in the source tree.
