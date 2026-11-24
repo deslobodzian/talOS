@@ -13,6 +13,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -584,6 +585,11 @@ void HardwareAccess::note_live_target(HardwareLink& link) {
   impl.live_target_update = detail::NodeAccess::next_update(impl.node);
 }
 
+std::uint64_t HardwareAccess::boot_id(const HardwareLink& link) {
+  const HardwareLink::Impl& impl = *link.impl_;
+  return impl.have_state ? impl.state.boot_id : 0;
+}
+
 void RequireInUpdate(const Node& node, std::string_view what) {
   detail::NodeAccess::require_loop_thread(node, what);
   if (!detail::NodeAccess::in_update(node)) {
@@ -627,13 +633,33 @@ Duration ReadinessAgeBound(const hardware::Config& config) {
                             /*ceil_round=*/true);
 }
 
+namespace {
+
+// Refuses post-start registration without mutating node state:
+// Node::after_update checks `started` (throwing std::logic_error) before
+// rejecting an empty callback (throwing std::invalid_argument).
+void RequireConstruction(Node& node, std::string_view what) {
+  try {
+    node.after_update({});
+  } catch (const std::invalid_argument&) {
+    return;
+  } catch (const std::logic_error&) {
+    throw std::logic_error(std::string{node.name()} + ": " + std::string{what} +
+                           " must be called in the constructor");
+  }
+}
+
+}  // namespace
+
 std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
                                        std::string_view name) {
   HardwareLink::Impl& impl = *link.impl_;
+  detail::NodeAccess::require_loop_thread(impl.node, "device handle");
   const std::uint16_t id = device_id(impl.config, impl.node.name(), kind, name);
   for (std::size_t i = 0; i < impl.devices.size(); ++i) {
     if (impl.devices[i].id == id && impl.devices[i].kind == kind) return i;
   }
+  RequireConstruction(impl.node, "device handle");
   if (kind == Kind::kMotor && impl.motor_ids.size() >= hardware::kMaxMotors) {
     throw std::invalid_argument(std::string{impl.node.name()} + ": more than " +
                                 std::to_string(hardware::kMaxMotors) +
@@ -1008,7 +1034,14 @@ void HardwareAccess::pwm_stop(HardwareLink& link, std::size_t index) {
 
 namespace {
 
-HardwareLink* LinkOf(Node& node) { return &node.extension<HardwareLink>(); }
+HardwareLink* LinkOf(Node& node) {
+  detail::NodeAccess::require_loop_thread(node, "device handle");
+  if (detail::NodeAccess::find_extension(node, typeid(HardwareLink)) ==
+      nullptr) {
+    RequireConstruction(node, "device handle");
+  }
+  return &node.extension<HardwareLink>();
+}
 
 HardwareLink& RequireLink(HardwareLink* link, const char* what) {
   if (link == nullptr) {

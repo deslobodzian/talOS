@@ -7,6 +7,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <typeinfo>
 #include <vector>
 
 #include "talOS/configuration/config_parser.h"
@@ -65,33 +66,38 @@ struct Targets {
   std::deque<ArmingState> armings;
 };
 
+Targets* FindTargets(Node& node) {
+  return static_cast<Targets*>(
+      NodeAccess::find_extension(node, typeid(Targets)));
+}
+
 TargetState& TargetAt(Node& node, std::size_t index) {
-  auto& targets = node.extension<Targets>().targets;
-  if (index >= targets.size()) {
+  Targets* all = FindTargets(node);
+  if (all == nullptr || index >= all->targets.size()) {
     throw std::out_of_range(std::string{node.name()} + ": no target at index " +
                             std::to_string(index));
   }
-  return targets[index];
+  return all->targets[index];
 }
 
 LaneState& LaneAt(Node& node, std::size_t index) {
-  auto& lanes = node.extension<Targets>().lanes;
-  if (index >= lanes.size()) {
+  Targets* all = FindTargets(node);
+  if (all == nullptr || index >= all->lanes.size()) {
     throw std::out_of_range(std::string{node.name()} +
                             ": no target lane at index " +
                             std::to_string(index));
   }
-  return lanes[index];
+  return all->lanes[index];
 }
 
 ArmingState& ArmingAt(Node& node, std::size_t index) {
-  auto& armings = node.extension<Targets>().armings;
-  if (index >= armings.size()) {
+  Targets* all = FindTargets(node);
+  if (all == nullptr || index >= all->armings.size()) {
     throw std::out_of_range(std::string{node.name()} +
                             ": no operator arming at index " +
                             std::to_string(index));
   }
-  return armings[index];
+  return all->armings[index];
 }
 
 // Armed, and nothing has happened since that the arming evaluation did not
@@ -216,6 +222,13 @@ const void* TargetAccess::target_get(Node& node, std::size_t target,
   TargetState& state = TargetAt(node, target);
   const ReportSelection report{node, state.selection, source};
   if (!robot_enabled(node)) return nullptr;
+  // Reject cross-boot actuation during a gateway reboot window where the new
+  // boot's State arrives before its first Driver Station packet (REQ-SAFE-07,
+  // REQ-SAFE-11, REQ-SAFE-13). ds_boot == 0 (send_joystick) stays allowed.
+  const std::uint64_t hw_boot =
+      HardwareAccess::boot_id(node.extension<HardwareLink>());
+  const std::uint64_t ds_boot = state.ds.data().boot_id;
+  if (hw_boot != 0 && ds_boot != 0 && hw_boot != ds_boot) return nullptr;
   const std::vector<std::int32_t>* lanes = nullptr;
   switch (DriverStationAccess::mode(state.ds)) {
     case DsMode::kTeleop:
@@ -271,10 +284,12 @@ const void* TargetAccess::target_get(Node& node, std::size_t target,
 
 std::span<const std::string> TargetAccess::target_sources(Node& node,
                                                           std::size_t target) {
+  NodeAccess::require_loop_thread(node, "Target::source");
   return TargetAt(node, target).sources;
 }
 
 std::size_t TargetAccess::target_bytes(Node& node, std::size_t target) {
+  NodeAccess::require_loop_thread(node, "Target::bytes");
   return TargetAt(node, target).bytes;
 }
 
