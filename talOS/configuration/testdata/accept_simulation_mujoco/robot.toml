@@ -1,0 +1,5 @@
+include = "base/robot.toml"
+
+[simulation.mujoco]
+field = "rebuilt_2026"
+seed = 0

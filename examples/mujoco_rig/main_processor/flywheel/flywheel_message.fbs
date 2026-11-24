@@ -1,0 +1,15 @@
+namespace flywheel;
+
+// What a producer asks for on its lane, /flywheel/target/<source>. The node
+// drives the motor only while the robot is enabled and a lane of its target
+// policy is live.
+struct FlywheelTarget {
+  velocity_rps:double;
+}
+
+// What the flywheel is doing, published every tick.
+struct FlywheelState {
+  enabled:bool;
+  velocity_rps:double;
+  connected:bool;
+}

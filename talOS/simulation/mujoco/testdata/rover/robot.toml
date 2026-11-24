@@ -1,0 +1,20 @@
+# A config for the MuJoCo gateway on the 2026 field: a free-root robot with one
+# bound roller motor and a digital input read from the model's rangefinder.
+[robot]
+name = "mujoco_rover"
+period_us = 5000
+command_timeout_us = 100000
+controller_address = "127.0.0.1"
+sim_gateway = "//talOS/simulation/mujoco:sim_gateway"
+
+[subsystems.rover.motors.roller]
+can_id = 1
+sensor_to_mechanism_ratio = 4.0
+
+[subsystems.rover.digital_inputs.floor_seen]
+dio = 0
+sim_sensor = "floor"
+
+[simulation.mujoco]
+robot_model = "rover.xml"
+field = "rebuilt_2026"

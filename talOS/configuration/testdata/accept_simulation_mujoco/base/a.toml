@@ -1,0 +1,11 @@
+[subsystem]
+name = "a"
+node = "//a:node"
+
+[motors.m]
+can_id = 1
+
+[digital_inputs.intake_beam]
+dio = 0
+sim_sensor = "intake_beam"
+sim_closed_reads = true

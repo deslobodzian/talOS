@@ -2028,5 +2028,72 @@ class CheckNodeSourcesTest(unittest.TestCase):
                 self.assertEqual(failures, 0, f"{name}: {out}")
 
 
+def run_mujoco(file_map):
+    out = io.StringIO()
+    failures = check_layers.run_mujoco_checks(
+        sorted(file_map.keys()), lambda p: file_map[p], out=out)
+    return failures, out.getvalue()
+
+
+class CheckMujocoLabelsTest(unittest.TestCase):
+    # REQ-CONTRACT-16: only talOS/simulation/mujoco/ may depend on @mujoco.
+    def test_mujoco_label_outside_its_package_fails(self):
+        refused = [
+            ("plain_dep", "bench/arm/BUILD",
+             'cc_library(name = "arm", deps = ["@mujoco"])\n'),
+            ("target_label", "talOS/devices/BUILD",
+             'cc_library(name = "devices", deps = ["@mujoco//:mujoco"])\n'),
+            ("canonical_label", "tools/BUILD",
+             'cc_binary(name = "x", deps = ["@@mujoco+//:mujoco"])\n'),
+            ("in_data", "examples/x/BUILD",
+             'sh_test(name = "x", data = ["@mujoco//model:files"])\n'),
+            ("in_select", "talOS/node/BUILD",
+             'cc_library(name = "n", deps = select({\n'
+             '    "//conditions:default": ["@mujoco"],\n'
+             '}))\n'),
+            ("via_variable", "talOS/node/BUILD",
+             'PHYSICS = "@mu" + "joco"\n'
+             'cc_library(name = "n", deps = [PHYSICS])\n'),
+            ("via_join", "talOS/node/BUILD",
+             'cc_library(name = "n", deps = ["".join(["@", "mujoco"])])\n'),
+            ("in_bzl_macro", "talOS/build/defs.bzl",
+             'def physics(name):\n'
+             '    native.cc_library(name = name, deps = ["@mujoco"])\n'),
+            ("load_from_package", "bench/arm/BUILD",
+             'load("//talOS/simulation/mujoco:defs.bzl", "PHYSICS")\n'
+             'cc_library(name = "arm", deps = [PHYSICS])\n'),
+            ("repo_name_alias", "MODULE.bazel",
+             'bazel_dep(name = "mujoco", version = "3.17.0", '
+             'repo_name = "physics")\n'),
+        ]
+        for name, path, text in refused:
+            with self.subTest(name=name):
+                failures, out = run_mujoco({path: text})
+                self.assertEqual(failures, 1, out)
+                self.assertIn(f"VIOLATION {path}:", out)
+
+    # REQ-CONTRACT-16
+    def test_mujoco_package_lookalikes_and_comments_pass(self):
+        files = {
+            "talOS/simulation/mujoco/BUILD":
+                'cc_test(name = "t", deps = ["@mujoco"])\n',
+            "talOS/simulation/mujoco/fields/x/BUILD":
+                'cc_library(name = "x", deps = ["@mujoco//:mujoco"])\n',
+            "bench/arm/BUILD": (
+                '# links @mujoco? no: comments are not labels\n'
+                'cc_library(name = "arm", deps = ["@mujoco_assets//x", '
+                '"//talOS/simulation:ports"])\n'),
+            "MODULE.bazel": 'bazel_dep(name = "mujoco", version = "3.17.0")\n',
+        }
+        failures, out = run_mujoco(files)
+        self.assertEqual(failures, 0, out)
+
+    # REQ-CONTRACT-16
+    def test_unparsable_starlark_fails_closed(self):
+        failures, out = run_mujoco({"talOS/node/BUILD": "cc_library(\n"})
+        self.assertEqual(failures, 1, out)
+        self.assertIn("fail closed", out)
+
+
 if __name__ == "__main__":
     unittest.main()

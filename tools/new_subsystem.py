@@ -2729,7 +2729,7 @@ def package_files(name, lang, standalone=False, kind="velocity", raw=False,
         files["BUILD"] = (loads + '\n\nexports_files(["defaults.toml"])\n\n'
                           + rest)
         extra_deps = (
-            'bazel_dep(name = "rules_cc", version = "0.2.18")\n'
+            'bazel_dep(name = "rules_cc", version = "0.2.22")\n'
             'bazel_dep(name = "googletest", version = "1.17.0.bcr.2")\n'
             if lang == "cpp" else
             'bazel_dep(name = "rules_python", version = "2.0.1")\n'

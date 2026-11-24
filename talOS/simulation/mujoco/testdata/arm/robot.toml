@@ -1,0 +1,15 @@
+# A config for the MuJoCo gateway: one arm motor, bound by the model's actuator
+# of the same name, on the flat carpet.
+[robot]
+name = "mujoco_arm"
+period_us = 5000
+command_timeout_us = 100000
+controller_address = "127.0.0.1"
+sim_gateway = "//talOS/simulation/mujoco:sim_gateway"
+
+[subsystems.arm.motors.arm]
+can_id = 1
+sensor_to_mechanism_ratio = 50.0
+
+[simulation.mujoco]
+robot_model = "arm.xml"

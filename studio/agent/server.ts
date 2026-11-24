@@ -3,6 +3,7 @@ import {pathToFileURL} from 'node:url';
 import {WebSocket, WebSocketServer} from 'ws';
 
 import {type Snapshot, TelemetryDecoder} from '../src/core';
+import {isPiecesMessage} from '../src/data/pieces';
 import {TelemetryHistory} from '../src/history';
 import {
   type DeclaredGraph,
@@ -281,8 +282,8 @@ export function startAgent(
     // bound.
     socket = new WebSocket(upstream, {maxPayload: MAX_SYSTEM_BYTES});
     socket.on('message', (raw, binary) => {
-      // Binary is telemetry; text is the system graph. The frame type carries
-      // the distinction, so neither side has to sniff the bytes.
+      // Binary is telemetry (or the game pieces, by their magic); text is the
+      // system graph. The frame type carries the distinction.
       if (!binary) {
         ingestSystemGraph(raw.toString());
         return;
@@ -291,6 +292,9 @@ export function startAgent(
         const bytes = Array.isArray(raw) ? Buffer.concat(raw) :
             raw instanceof ArrayBuffer   ? new Uint8Array(raw) :
                                            raw;
+        // The game pieces (REQ-DEV-43) are for the 3D viewport; the agent
+        // answers from telemetry and the graph.
+        if (isPiecesMessage(bytes)) return;
         for (const frame of decoder.decodeAll(bytes)) {
           if (!history.push(frame, decoder.currentDictionary(),
                             performance.now()))

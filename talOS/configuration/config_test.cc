@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "config_parser.h"
+#include "talOS/hardware/config_wire.h"
 
 namespace talos::config {
 namespace {
@@ -845,8 +846,7 @@ TEST(ConfigTest, SimHomeSwitchKeysStayOffTheWireAndRefuseWhatCannotBind) {
       }
     }
   };
-  for (const char* key :
-       {"sim_closed_at_rot", "sim_closed_above", "sim_closed_reads"}) {
+  for (const char* key : {"sim_closed_at_rot", "sim_closed_above"}) {
     const std::string value =
         std::string_view{key} == "sim_closed_at_rot" ? "0.0" : "true";
     expect_refused(std::string{key} + " = " + value + "\n",
@@ -865,6 +865,382 @@ TEST(ConfigTest, SimHomeSwitchKeysStayOffTheWireAndRefuseWhatCannotBind) {
       {"sim_motor", "m2", "home"});
   expect_refused("sim_motor = \"home\"\nsim_closed_at_rot = 0.0\n",
                  {"sim_motor", "'home'"});
+}
+
+// A digital input bound to a MuJoCo model sensor: only the MuJoCo gateway
+// reads it, so the config the RoboRIO receives is the same bytes with and
+// without it, and a binding that could not mean one thing is refused naming
+// the key and the input.
+// REQ-DEV-37
+TEST(ConfigTest, SimSensorStaysOffTheWireAndExcludesSimMotor) {
+  const std::string input = "[subsystems.test.digital_inputs.home]\ndio = 3\n";
+  const auto plain = Parse(input);
+  const auto with =
+      Parse(input + "sim_sensor = \"beam\"\nsim_closed_reads = true\n");
+  const auto& sim = with.hardware.digital_inputs.at(0).sim_sensor;
+  EXPECT_EQ(sim.sensor, "beam");
+  EXPECT_TRUE(sim.closed_reads);
+  EXPECT_TRUE(with.hardware.digital_inputs.at(0).sim_home_switch.motor.empty());
+  EXPECT_EQ(hardware::SerializeConfig(with.hardware),
+            hardware::SerializeConfig(plain.hardware));
+  EXPECT_EQ(hardware::ConfigurationId(with.hardware),
+            hardware::ConfigurationId(plain.hardware));
+
+  struct Case {
+    const char* body;
+    std::vector<const char*> parts;
+  };
+  const std::vector<Case> cases = {
+      {"sim_sensor = \"\"\n", {"sim_sensor", "home"}},
+      {"sim_sensor = 1\n", {"sim_sensor", "home"}},
+      {"sim_sensor = \"beam\"\nsim_motor = \"m1\"\nsim_closed_at_rot = 0.0\n",
+       {"sim_sensor", "sim_motor", "home"}},
+      {"sim_sensor = \"beam\"\nsim_closed_at_rot = 0.0\n",
+       {"sim_closed_at_rot", "sim_motor", "home"}},
+      {"sim_sensor = \"beam\"\nsim_closed_above = true\n",
+       {"sim_closed_above", "sim_motor", "home"}},
+      {"sim_closed_reads = true\n",
+       {"sim_closed_reads", "sim_motor", "sim_sensor", "home"}},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.body);
+    try {
+      Parse(input + c.body);
+      ADD_FAILURE() << "accepted";
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      for (const char* part : c.parts) {
+        EXPECT_NE(what.find(part), std::string::npos) << what;
+      }
+    }
+  }
+}
+
+// [simulation.mujoco] parses to resolved paths, against the include that sets
+// the model, with robot.toml's field and seed (0, a valid seed) over the
+// include's. (Which files the build lists is the shared cases' `files`,
+// SharedResolutionCases.)
+// REQ-DEV-37, REQ-DEV-40
+TEST(ConfigTest, SimulationMujocoResolvesPathsAgainstTheFileThatSetsThem) {
+  const std::string root =
+      "talOS/configuration/testdata/accept_simulation_mujoco";
+  const auto config = ParseRobotConfig(root + "/robot.toml");
+  ASSERT_TRUE(config.simulation.mujoco.has_value());
+  EXPECT_EQ(*config.simulation.mujoco,
+            (SimulationMujocoConfig{
+                .robot_model = root + "/base/mujoco/robot.xml",
+                .robot_model_files = {root + "/base/mujoco/meshes/a.stl",
+                                      root + "/base/mujoco/meshes/b.stl"},
+                .field = "rebuilt_2026",
+                .seed = 0}));
+  const auto& input = config.hardware.digital_inputs.at(0);
+  EXPECT_EQ(input.sim_sensor.sensor, "intake_beam");
+  EXPECT_TRUE(input.sim_sensor.closed_reads);
+}
+
+// [simulation.mujoco] seed, the draws of a field's game rules: 1 when no file
+// sets it, and the whole range of a TOML integer that is not negative.
+// REQ-DEV-40
+TEST_F(ManifestTest, SimulationMujocoSeedDefaultsToOneAndTakesTheFullRange) {
+  Write("robot.xml", "<mujoco/>\n");
+  const struct {
+    const char* seed_line;
+    std::uint64_t seed;
+  } cases[] = {
+      {"", 1},
+      {"seed = 9223372036854775807\n", 9223372036854775807u},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.seed_line);
+    Write("robot.toml", "[simulation.mujoco]\nrobot_model = \"robot.xml\"\n" +
+                            std::string(c.seed_line) + std::string(kMotor));
+    const auto config = ParseRobotConfig(Robot());
+    ASSERT_TRUE(config.simulation.mujoco.has_value());
+    EXPECT_EQ(config.simulation.mujoco->seed, c.seed);
+  }
+}
+
+// [simulation.mujoco] sleeping: off when no file sets it, on when one does,
+// an include's value kept unless robot.toml sets its own.
+// REQ-DEV-37
+TEST_F(ManifestTest, SimulationMujocoSleepingIsOffUnlessAFileSetsIt) {
+  Write("robot.xml", "<mujoco/>\n");
+  const struct {
+    const char* robot_line;  // robot.toml's, after robot_model
+    const char* base;        // base.toml, included when set
+    bool sleeping;
+  } cases[] = {
+      {"", nullptr, false},
+      {"sleeping = true\n", nullptr, true},
+      {"sleeping = false\n", nullptr, false},
+      {"", "[simulation.mujoco]\nsleeping = true\n", true},
+      {"sleeping = false\n", "[simulation.mujoco]\nsleeping = true\n", false},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(std::string(c.robot_line) + (c.base ? c.base : ""));
+    if (c.base != nullptr) Write("base.toml", c.base);
+    Write("robot.toml",
+          std::string(c.base != nullptr ? "include = \"base.toml\"\n" : "") +
+              "[simulation.mujoco]\nrobot_model = \"robot.xml\"\n" +
+              c.robot_line + std::string(kMotor));
+    const auto config = ParseRobotConfig(Robot());
+    ASSERT_TRUE(config.simulation.mujoco.has_value());
+    EXPECT_EQ(config.simulation.mujoco->sleeping, c.sleeping);
+  }
+}
+
+// Each refusal of [simulation.mujoco] names the key and the file that set it
+// (an include's own name when the include set it).
+// REQ-DEV-37, REQ-DEV-40
+TEST_F(ManifestTest, SimulationMujocoRefusalsNameTheKeyAndFile) {
+  Write("robot.xml", "<mujoco/>\n");
+  struct Case {
+    std::string robot;  // robot.toml before its subsystem
+    const char* base;   // base.toml, which robot.toml includes when set
+    std::vector<const char*> parts;
+  };
+  const std::vector<Case> cases = {
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\nmodel = 1\n",
+       nullptr,
+       {"'model'", "robot.toml"}},
+      {"[simulation.mujoco]\nfield = \"rebuilt_2026\"\n",
+       nullptr,
+       {"robot_model", "robot.toml"}},
+      {"[simulation.mujoco]\nrobot_model = \"\"\n",
+       nullptr,
+       {"robot_model", "robot.toml"}},
+      {"[simulation.mujoco]\nrobot_model = 1\n",
+       nullptr,
+       {"robot_model", "robot.toml"}},
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+       "robot_model_files = \"robot.xml\"\n",
+       nullptr,
+       {"robot_model_files", "robot.toml"}},
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+       "robot_model_files = [\"robot.xml\", 2]\n",
+       nullptr,
+       {"robot_model_files[1]", "robot.toml"}},
+      // An absolute path to a file that exists.
+      {"[simulation.mujoco]\nrobot_model = \"" +
+           (dir_ / "robot.xml").generic_string() + "\"\n",
+       nullptr,
+       {"robot_model", "robot.toml"}},
+      {"[simulation.mujoco]\nrobot_model = \"absent.xml\"\n",
+       nullptr,
+       {"robot_model", "absent.xml", "robot.toml"}},
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+       "robot_model_files = [\"robot.xml\", \"absent.stl\"]\n",
+       nullptr,
+       {"robot_model_files[1]", "absent.stl", "robot.toml"}},
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\nfield = 3\n",
+       nullptr,
+       {"field", "robot.toml"}},
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+       "field = \"rebuilt_2025\"\n",
+       nullptr,
+       {"field", "rebuilt_2025", "robot.toml"}},
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\nseed = -1\n",
+       nullptr,
+       {"seed", "robot.toml"}},
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\nseed = 1.0\n",
+       nullptr,
+       {"seed", "robot.toml"}},
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\nseed = \"1\"\n",
+       nullptr,
+       {"seed", "robot.toml"}},
+      // Past a TOML integer: the TOML parser refuses it, naming the file.
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+       "seed = 9223372036854775808\n",
+       nullptr,
+       {"robot.toml"}},
+      // An include's negative seed names the include.
+      {"include = \"base.toml\"\n",
+       "[simulation.mujoco]\nrobot_model = \"robot.xml\"\nseed = -1\n",
+       {"seed", "base.toml"}},
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\nsleeping = 1\n",
+       nullptr,
+       {"sleeping", "robot.toml"}},
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+       "sleeping = \"true\"\n",
+       nullptr,
+       {"sleeping", "robot.toml"}},
+      {"include = \"base.toml\"\n",
+       "[simulation.mujoco]\nrobot_model = \"robot.xml\"\nsleeping = 1\n",
+       {"sleeping", "base.toml"}},
+      {"[simulation]\nmujoco = 1\n",
+       nullptr,
+       {"[simulation.mujoco]", "robot.toml"}},
+      // robot.toml sets field only; the include's model is missing.
+      {"include = \"base.toml\"\n[simulation.mujoco]\nfield = \"\"\n",
+       "[simulation.mujoco]\nrobot_model = \"absent.xml\"\n",
+       {"robot_model", "absent.xml", "base.toml"}},
+      // The file that sets robot_model sets its files: a list without a
+      // model would travel with the include's model.
+      {"include = \"base.toml\"\n[simulation.mujoco]\n"
+       "robot_model_files = [\"robot.xml\"]\n",
+       "[simulation.mujoco]\nrobot_model = \"robot.xml\"\n",
+       {"robot_model_files", "robot.toml"}},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.robot);
+    Write("robot.toml", c.robot + std::string(kMotor));
+    if (c.base != nullptr) Write("base.toml", c.base);
+    try {
+      ParseRobotConfig(Robot());
+      ADD_FAILURE() << "accepted";
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      for (const char* part : c.parts) {
+        EXPECT_NE(what.find(part), std::string::npos) << what;
+      }
+    }
+  }
+}
+
+// [simulation.start_pose]: unset when no file sets it (the gateway then
+// starts at SimulationStartPose's 2, 2, 0); a file's whole pose, integers
+// read as metres, over its include's; an include's when the file sets none;
+// on a field, the floor's edges included.
+// REQ-DEV-37
+TEST_F(ManifestTest, SimulationStartPoseParsesTheFileThatSetsIt) {
+  Write("robot.xml", "<mujoco/>\n");
+  EXPECT_EQ(SimulationStartPose{}, (SimulationStartPose{2.0, 2.0, 0.0}));
+  const std::string field =
+      "[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+      "field = \"rebuilt_2026\"\n";
+  struct Case {
+    const char* what;
+    std::string robot;  // robot.toml before its subsystem
+    const char* base;   // base.toml, which robot.toml includes when set
+    std::optional<SimulationStartPose> pose;
+  };
+  const std::vector<Case> cases = {
+      {"unset", "", nullptr, std::nullopt},
+      {"set",
+       "[simulation.start_pose]\nx_m = 1.907\ny_m = 5.302\n"
+       "yaw_rad = -2.705\n",
+       nullptr, SimulationStartPose{1.907, 5.302, -2.705}},
+      {"integers", "[simulation.start_pose]\nx_m = 3\ny_m = 4\nyaw_rad = 0\n",
+       nullptr, SimulationStartPose{3.0, 4.0, 0.0}},
+      {"over the include's",
+       "include = \"base.toml\"\n[simulation.start_pose]\nx_m = 1.0\n"
+       "y_m = 1.5\nyaw_rad = 0.5\n",
+       "[simulation.start_pose]\nx_m = 9.0\ny_m = 9.0\nyaw_rad = 9.0\n",
+       SimulationStartPose{1.0, 1.5, 0.5}},
+      {"the include's", "include = \"base.toml\"\n",
+       "[simulation.start_pose]\nx_m = 9.0\ny_m = 3.0\nyaw_rad = 1.0\n",
+       SimulationStartPose{9.0, 3.0, 1.0}},
+      {"the field's far corner",
+       field + "[simulation.start_pose]\nx_m = 16.541188\ny_m = 8.069326\n"
+               "yaw_rad = 3.0\n",
+       nullptr, SimulationStartPose{16.541188, 8.069326, 3.0}},
+      {"the field's origin",
+       field + "[simulation.start_pose]\nx_m = 0.0\ny_m = 0.0\nyaw_rad = 0.0\n",
+       nullptr, SimulationStartPose{0.0, 0.0, 0.0}},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.what);
+    Write("robot.toml", c.robot + std::string(kMotor));
+    if (c.base != nullptr) Write("base.toml", c.base);
+    EXPECT_EQ(ParseRobotConfig(Robot()).simulation.start_pose, c.pose);
+  }
+}
+
+// Each refusal of [simulation.start_pose] names the key and the file that set
+// it (an include's own name when the include set it; "config" for a parsed
+// string): not a table, an unknown or missing key, a value that is not a
+// finite number, and with a field a position off its floor.
+// REQ-DEV-37
+TEST_F(ManifestTest, SimulationStartPoseRefusalsNameTheKeyAndFile) {
+  Write("robot.xml", "<mujoco/>\n");
+  const std::string field =
+      "[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+      "field = \"rebuilt_2026\"\n";
+  const std::string pose = "[simulation.start_pose]\n";
+  struct Case {
+    std::string robot;  // robot.toml before its subsystem
+    const char* base;   // base.toml, which robot.toml includes when set
+    std::vector<const char*> parts;
+  };
+  const std::vector<Case> cases = {
+      {"[simulation]\nstart_pose = [1.0, 2.0, 0.0]\n",
+       nullptr,
+       {"[simulation.start_pose]", "robot.toml"}},
+      {pose + "x_m = 1.0\ny_m = 1.0\nyaw_rad = 0.0\nz_m = 0.0\n",
+       nullptr,
+       {"'z_m'", "robot.toml"}},
+      {pose + "x_m = 1.0\ny_m = 1.0\n", nullptr, {"yaw_rad", "robot.toml"}},
+      {pose + "x_m = \"1.0\"\ny_m = 1.0\nyaw_rad = 0.0\n",
+       nullptr,
+       {"x_m", "robot.toml"}},
+      {pose + "x_m = 1.0\ny_m = true\nyaw_rad = 0.0\n",
+       nullptr,
+       {"y_m", "robot.toml"}},
+      {pose + "x_m = nan\ny_m = 1.0\nyaw_rad = 0.0\n",
+       nullptr,
+       {"x_m", "finite", "robot.toml"}},
+      {pose + "x_m = 1.0\ny_m = 1.0\nyaw_rad = -inf\n",
+       nullptr,
+       {"yaw_rad", "finite", "robot.toml"}},
+      {"include = \"base.toml\"\n",
+       "[simulation.start_pose]\nx_m = 1.0\ny_m = inf\nyaw_rad = 0.0\n",
+       {"y_m", "base.toml"}},
+      // Off the floor, on either side of either axis.
+      {field + pose + "x_m = -0.01\ny_m = 1.0\nyaw_rad = 0.0\n",
+       nullptr,
+       {"x_m", "rebuilt_2026", "robot.toml"}},
+      {field + pose + "x_m = 16.6\ny_m = 1.0\nyaw_rad = 0.0\n",
+       nullptr,
+       {"x_m", "rebuilt_2026", "robot.toml"}},
+      {field + pose + "x_m = 1.0\ny_m = -0.01\nyaw_rad = 0.0\n",
+       nullptr,
+       {"y_m", "rebuilt_2026", "robot.toml"}},
+      {field + pose + "x_m = 1.0\ny_m = 8.1\nyaw_rad = 0.0\n",
+       nullptr,
+       {"y_m", "rebuilt_2026", "robot.toml"}},
+      // The include's field and robot.toml's pose: the pose's file.
+      {"include = \"base.toml\"\n" + pose +
+           "x_m = 20.0\ny_m = 1.0\n"
+           "yaw_rad = 0.0\n",
+       "[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+       "field = \"rebuilt_2026\"\n",
+       {"x_m", "rebuilt_2026", "robot.toml"}},
+      // The include's pose and robot.toml's field: the include.
+      {"include = \"base.toml\"\n" + field,
+       "[simulation.start_pose]\nx_m = 1.0\ny_m = 9.0\nyaw_rad = 0.0\n",
+       {"y_m", "rebuilt_2026", "base.toml"}},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.robot);
+    Write("robot.toml", c.robot + std::string(kMotor));
+    if (c.base != nullptr) Write("base.toml", c.base);
+    try {
+      ParseRobotConfig(Robot());
+      ADD_FAILURE() << "accepted";
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      for (const char* part : c.parts) {
+        EXPECT_NE(what.find(part), std::string::npos) << what;
+      }
+    }
+  }
+  // A parsed string names "config", and its field check runs too.
+  for (const char* body :
+       {"[simulation.start_pose]\nx_m = 1.0\ny_m = 1.0\n",
+        "[simulation.start_pose]\nx_m = 17.0\ny_m = 1.0\nyaw_rad = 0.0\n"
+        "[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+        "field = \"rebuilt_2026\"\n"}) {
+    SCOPED_TRACE(body);
+    try {
+      Parse(body);
+      ADD_FAILURE() << "accepted";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string_view(error.what())
+                    .find("config: [simulation.start_pose]"),
+                std::string_view::npos)
+          << error.what();
+    }
+  }
 }
 
 TEST_F(ManifestTest, MergesSubsystemFilesAndKeepsTopLevelTables) {

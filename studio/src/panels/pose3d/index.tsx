@@ -1,5 +1,6 @@
 // The 3D spatial viewport: the chassis pose in three dimensions, with an
-// optional user-loaded field model. The old Spatial view, reading its pose
+// optional user-loaded field model and, under the MuJoCo gateway, the game
+// pieces in play as one instanced sphere mesh (data/pieces.ts). The old Spatial view, reading its pose
 // from useChassis(); a pose whose frame is no longer current is drawn
 // translucent and marked STALE. The WebGL canvas only renders in a browser;
 // under react-dom/server it renders a placeholder, so the registry test can
@@ -9,11 +10,12 @@ import {useEffect, useRef, useState} from 'react';
 import {Canvas, useThree} from '@react-three/fiber';
 import * as THREE from 'three';
 import {OrbitControls} from 'three/examples/jsm/controls/OrbitControls.js';
-import {GLTFLoader} from 'three/examples/jsm/loaders/GLTFLoader.js';
 
-import {useChassis} from '../../data/hooks';
+import {useChassis, usePieces} from '../../data/hooks';
+import {MAX_PIECES, pieceMatrices} from '../../data/pieces';
 import {FIELD_HEIGHT_M, FIELD_WIDTH_M} from '../field/geometry';
 import type {PanelDefinition} from '../types';
+import {loadFieldModel} from './field_model';
 import './pose3d.css';
 
 export type Pose3dConfig = Record<string, never>;
@@ -44,6 +46,33 @@ function OrbitNavigation() {
     };
   }, [camera, gl, invalidate]);
   return null;
+}
+
+// The game pieces in play, one instanced unit sphere scaled by their
+// radius. The mesh and its transforms are allocated once, for MAX_PIECES;
+// a pieces message rewrites them in place and asks for one frame.
+function GamePieces() {
+  const pieces = usePieces();
+  const {invalidate} = useThree();
+  const [mesh] = useState(() => {
+    const instanced = new THREE.InstancedMesh(
+        new THREE.SphereGeometry(1, 16, 12),
+        new THREE.MeshStandardMaterial({color: '#f2c94c'}), MAX_PIECES);
+    instanced.count = 0;
+    instanced.frustumCulled = false;
+    return instanced;
+  });
+  useEffect(() => () => {
+    mesh.geometry.dispose();
+    (mesh.material as THREE.Material).dispose();
+    mesh.dispose();
+  }, [mesh]);
+  useEffect(() => {
+    mesh.count = pieces ? pieceMatrices(pieces, mesh.instanceMatrix.array as Float32Array) : 0;
+    mesh.instanceMatrix.needsUpdate = true;
+    invalidate();
+  }, [pieces, mesh, invalidate]);
+  return <primitive object={mesh}/>;
 }
 
 function disposeModel(model: THREE.Group) {
@@ -96,6 +125,7 @@ function Pose3dPanel() {
                          rotation={[Math.PI / 2, 0, 0]}
                          position={[FIELD_WIDTH_M / 2, FIELD_HEIGHT_M / 2, 0]}/>
              {model && <primitive object={model}/>}
+             <GamePieces/>
              {reading && <group
                  position={[reading.pose.x, reading.pose.y, reading.pose.z + .2]}
                  rotation={[reading.pose.roll, reading.pose.pitch, reading.pose.yaw,
@@ -124,14 +154,12 @@ function Pose3dPanel() {
               if (!f) return;
               const request = ++requestRef.current;
               try {
-                const gltf =
-                    await new GLTFLoader().parseAsync(await f.arrayBuffer(), '');
+                const scene = await loadFieldModel(await f.arrayBuffer());
                 if (!mountedRef.current || request !== requestRef.current) {
-                  disposeModel(gltf.scene);
+                  disposeModel(scene);
                   return;
                 }
-                gltf.scene.rotation.x = Math.PI / 2;
-                setModel(gltf.scene);
+                setModel(scene);
                 setError('');
               } catch {
                 if (mountedRef.current && request === requestRef.current)
@@ -148,7 +176,7 @@ export const pose3dPanel: PanelDefinition<Pose3dConfig> = {
   id: 'pose3d',
   title: '3D Viewport',
   category: 'Spatial',
-  description: 'The chassis pose in three dimensions, with an optional field model.',
+  description: 'The chassis pose in three dimensions, with an optional field model and the simulated game pieces.',
   defaultConfig,
   parseConfig,
   component: Pose3dPanel,

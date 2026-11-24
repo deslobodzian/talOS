@@ -1,0 +1,12 @@
+# robot_model_files omits meshes/part.obj, which robot.xml reads.
+[robot]
+name = "mujoco_unlisted_mesh"
+period_us = 5000
+command_timeout_us = 100000
+controller_address = "127.0.0.1"
+sim_gateway = "//talOS/simulation/mujoco:sim_gateway"
+
+[simulation.mujoco]
+robot_model = "robot.xml"
+
+[subsystems.frame]
