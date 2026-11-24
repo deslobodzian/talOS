@@ -122,6 +122,10 @@ A world that fails (see **Failure** below) puts every output in total loss
 first; at the end of that tick the program prints the plant's clock and the
 failure, naming the MuJoCo warning, and exits 1 without a summary.
 
+[examples/mujoco_rig](../../../examples/mujoco_rig/README.md) is a robot
+whose own nodes, under the launcher, shoot its preloads into the blue HUB on
+this gateway.
+
 To check a model, run it for ten ticks and read the binding table:
 
 ```sh

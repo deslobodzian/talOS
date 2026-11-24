@@ -1,0 +1,47 @@
+# Simulation only: the rig on the 2026 field under the MuJoCo gateway
+# (examples/mujoco_rig/README.md). robot.toml never reads this file, so
+# nothing here reaches the robot.
+include = "robot.toml"
+
+[robot]
+# The launcher and hardware_node refuse this config without --sim.
+simulation_only = true
+# The program that stands in for the RoboRIO: the MuJoCo gateway, on the
+# world [simulation.mujoco] below names.
+sim_gateway = "//talOS/simulation/mujoco:sim_gateway"
+
+# The MuJoCo world: the rig's model on the 2026 field, whose game referees
+# the match and puts the eight preloads in the hopper. The rig's place on the
+# field is the gateway's --start-pose (README.md); no config key sets it.
+[simulation.mujoco]
+robot_model = "mujoco/robot.xml"
+field = "rebuilt_2026"
+# Seed 1 draws red inactive first at TELEOP's 0-0 tie, so the blue HUB
+# counts through SHIFT 1 as well as TRANSITION.
+seed = 1
+
+# flywheel: simulation values only; before a real robot drives the flywheel,
+# tune slot0 on the mechanism. Holding joystick button 3 spins it to the
+# shot's speed on /flywheel/target/teleop.
+[[subsystems.flywheel.teleop.bindings]]
+button = 3
+while_held = { velocity_rps = 41.0 }
+
+# The simulated motor's gains (volts per rps), not the mechanism's.
+[subsystems.flywheel.motors.flywheel_motor]
+slot0 = { p = 1.0, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
+
+[subsystems.flywheel.digital_inputs.shooter_beam]
+sim_sensor = "shooter_beam"
+
+# feeder: holding joystick button 4 runs it, rolling the next FUEL under its
+# roller into the pocket the flywheel shoots from.
+[[subsystems.feeder.teleop.bindings]]
+button = 4
+while_held = { velocity_rps = 30.0 }
+
+[subsystems.feeder.motors.feeder_motor]
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
+
+[subsystems.feeder.digital_inputs.feeder_beam]
+sim_sensor = "feeder_beam"
