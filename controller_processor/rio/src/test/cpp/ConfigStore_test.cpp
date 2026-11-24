@@ -35,6 +35,14 @@
 
 namespace hw = talos::hardware;
 
+namespace talos::rio {
+struct ConfigPersisterTestPeer {
+  static std::mutex& Mutex(ConfigPersister& persister) noexcept {
+    return persister.mutex_;
+  }
+};
+}  // namespace talos::rio
+
 // What the config saver's own thread allocates and frees, and which thread
 // frees a watched block, for
 // ConfigPersister.TheSaverThreadNeitherAllocatesNorFrees. Global new and delete
@@ -246,9 +254,17 @@ TEST(ConfigStore, StartupRestoreDoesNotWaitForDevicesAndDrivesOnlyAfter) {
   EXPECT_EQ(backend.begun, 1);
 
   // A mid-match reboot: the Driver Station is enabled while devices are still
-  // being configured; the gateway stays unconfigured and drives nothing.
+  // being configured; the gateway stays unconfigured, refuses commands for
+  // both config_id = 0 and the restoring config's id, and drives nothing.
   gateway.Tick(1000, true);
   EXPECT_FALSE(gateway.configured());
+  hw::Command cmd = DutyCycle(gateway);
+  EXPECT_EQ(cmd.config_id, 0u);
+  EXPECT_FALSE(gateway.Accept(cmd, 1, 1000));
+  cmd.config_id = hw::ConfigurationId(config);
+  cmd.count = 1;
+  cmd.motors[0] = {motor.id, hw::Mode::kDutyCycle, 0, 0.2, 0};
+  EXPECT_FALSE(gateway.Accept(cmd, 1, 1000));
   EXPECT_EQ(backend.applied, 0);
 
   backend.done = true;
@@ -374,6 +390,68 @@ TEST(ConfigPersister, TicksDoNotWaitForASlowSaveAndTheNewestIsSavedLast) {
   persister.Stop();
   EXPECT_EQ(store.finished(), (std::vector<uint64_t>{hw::ConfigurationId(a),
                                                      hw::ConfigurationId(c)}));
+}
+
+// Tick() must only try-lock mutex_: when another thread holds mutex_ (as the
+// saver thread does briefly while moving a slot or recording a result),
+// Tick(true) returns immediately without blocking, leaves the acknowledged
+// configuration pending, and hands it over once mutex_ is released.
+// REQ-CONTRACT-06
+TEST(ConfigPersister, TickReturnsImmediatelyWithoutBlockingWhenMutexIsHeld) {
+  const hw::Config a = ConfigWithMotor(1);
+  GatedStore store;
+  talos::rio::ConfigPersister persister{
+      [&](std::span<const uint8_t> persisted) { return store.Save(persisted); },
+      0};
+  persister.Start();
+  persister.Acknowledged(a);
+
+  constexpr std::chrono::seconds kHang{10};
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  bool locked = false;
+  bool release = false;
+  std::atomic<bool> timed_out{false};
+  std::thread holder{[&] {
+    std::unique_lock held{
+        talos::rio::ConfigPersisterTestPeer::Mutex(persister)};
+    {
+      std::lock_guard gate_lock{gate_mutex};
+      locked = true;
+    }
+    gate_cv.notify_one();
+    std::unique_lock gate_lock{gate_mutex};
+    if (!gate_cv.wait_for(gate_lock, kHang, [&] { return release; })) {
+      timed_out.store(true, std::memory_order_release);
+    }
+  }};
+
+  {
+    std::unique_lock gate_lock{gate_mutex};
+    gate_cv.wait(gate_lock, [&] { return locked; });
+  }
+
+  // mutex_ is held by `holder`; Tick(true) must try-lock and return without
+  // waiting for `holder` to release it (blocking would hold until kHang and
+  // set `timed_out`).
+  EXPECT_EQ(persister.Tick(true), 0u);
+  EXPECT_FALSE(timed_out.load(std::memory_order_acquire))
+      << "Tick(true) blocked waiting for mutex_";
+  EXPECT_TRUE(store.started().empty());
+
+  {
+    std::lock_guard gate_lock{gate_mutex};
+    release = true;
+  }
+  gate_cv.notify_one();
+  holder.join();
+
+  // Once mutex_ is released, subsequent ticks hand over and persist `a`.
+  ASSERT_TRUE(store.TickUntilStarted(persister, 1))
+      << "deferred configuration was never handed over after mutex_ release";
+  store.Release();
+  persister.Stop();
+  EXPECT_EQ(store.finished(), (std::vector<uint64_t>{hw::ConfigurationId(a)}));
 }
 
 // A save that fails leaves the previous file; it is reported once, and the

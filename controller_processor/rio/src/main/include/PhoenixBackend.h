@@ -13,6 +13,7 @@
 #include <ctre/phoenix6/CANcoder.hpp>
 #include <ctre/phoenix6/Pigeon2.hpp>
 #include <ctre/phoenix6/TalonFX.hpp>
+#include <ctre/phoenix6/hardware/ParentDevice.hpp>
 #include <ctre/phoenix6/sim/CANcoderSimState.hpp>
 #include <ctre/phoenix6/sim/Pigeon2SimState.hpp>
 #include <ctre/phoenix6/sim/TalonFXSimState.hpp>
@@ -210,10 +211,10 @@ class PhoenixBackend final : public talos::hardware::Backend {
   // Empty: its IsProLicensed signal off simulation, and true under
   // simulation, which needs no licence. phoenixTest sets it.
   std::function<std::optional<bool>(std::size_t motor_index)> pro_licensed_;
-  // The battery voltage a torque-current request's duty cap divides
-  // max_voltage by (Apply): Read's last reading that was finite and above
-  // 1 V, kept across a reading that is not. 0 until the first such reading,
-  // and the cap is then 0: no torque-current request drives on a guess.
+  // The battery voltage a duty-cycle or torque-current request's duty cap
+  // divides max_voltage by (Apply): Read's last reading that was finite and
+  // above 1 V, kept across a reading that is not. 0 until the first such
+  // reading, and the cap is then 0: neither mode drives on a guess.
   double last_battery_v_{0};
 
   bool is_simulation_{false};
@@ -250,6 +251,11 @@ class PhoenixBackend final : public talos::hardware::Backend {
   // phoenixTest sets it to inject thread-exhaustion (EAGAIN) failures.
   std::function<std::future<std::optional<std::vector<uint16_t>>>(RestoreTask)>
       launch_restore_;
+  // Polls (and clears) one Phoenix device's reset latch. Empty calls
+  // device.HasResetOccurred(). phoenixTest sets it because Phoenix 6 desktop
+  // simulation provides no reset-latch trigger.
+  std::function<bool(ctre::phoenix6::hardware::ParentDevice&)>
+      poll_device_reset_;
   bool restore_launch_failed_{false};
   // Held by Configure while it rebuilds the device lists, and by
   // WatchdogNeutral, which only tries it: it never waits on a configure.

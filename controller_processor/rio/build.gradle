@@ -542,8 +542,9 @@ tasks.register("rioBuildStampTest") {
         def runGradleCheck = { String label, List<String> extraArgs,
                                Map<String, String> extraEnv = [:] ->
             def cacheDir = new File(workRoot, "cache-${label}")
-            def cmd = [gradlewBin, '--no-daemon', '--offline',
-                       '--project-cache-dir', cacheDir.absolutePath] + extraArgs
+            def cmd = [gradlewBin, '--no-daemon'] +
+                      (gradle.startParameter.offline ? ['--offline'] : []) +
+                      ['--project-cache-dir', cacheDir.absolutePath] + extraArgs
             def pb = new ProcessBuilder(cmd)
             pb.directory(projectDir)
             pb.redirectErrorStream(true)
