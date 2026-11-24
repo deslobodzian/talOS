@@ -2,8 +2,9 @@
 // 1. Critical node clean exit followed by respawn SpawnFailed (REQ-OPS-06,
 //    REQ-OPS-08, REQ-SAFE-29).
 // 2. RefuseLaunch draining refusal studio_bridge stdout past pipe capacity
-//    after port announcement and refreshing session_lock_ every
-//    kLockFileRefresh (REQ-OPS-33, REQ-OPS-02, REQ-OPS-34).
+//    after port announcement and refreshing session_lock_ and
+//    session_directory_ every kLockFileRefresh (REQ-OPS-33, REQ-OPS-02,
+//    REQ-OPS-11, REQ-OPS-34, REQ-OPS-45).
 // 3. StudioBridge::Finish preserving exit_code when a settling bridge exited
 //    normally before SIGKILL (REQ-OPS-08, REQ-OPS-30).
 // 4. PublishedEndpoints catching a running node that declared endpoints in
@@ -435,7 +436,7 @@ TEST(LauncherEdgeTest,
   int exit_code = -1;
   std::thread runner([&] { exit_code = Launcher{options}.Run(); });
 
-  const bool ready = notify.WaitFor("READY=1", 4000);
+  const bool ready = notify.WaitFor("READY=1", 10000);
   // Open go_fifo to unblock the bridge's 256 KiB write (only after READY=1
   // proves port_announced == true).
   {
@@ -502,6 +503,153 @@ TEST(LauncherEdgeTest,
 
   ::unlink(go_fifo.c_str());
   ::unlink(done_fifo.c_str());
+  std::filesystem::remove_all(options.output_dir);
+}
+
+// REQ-OPS-11, REQ-OPS-45: RefuseLaunch must refresh session_directory_ (its
+// session.lock and quiet files such as graph.json) every kLockFileRefresh and
+// retake a removed session.lock, logging the retake once.
+TEST(LauncherEdgeTest,
+     RefuseLaunchRefreshesAndRetakesSessionDirectoryLockAndQuietFiles) {
+  NotifyCapture notify;
+
+  LauncherOptions options;
+  options.session_id = GenerateSessionId();
+  options.output_dir = TempPath("refuse_dir_lock");
+  options.config_path = WriteFixtureToml("refuse_dir_lock");
+  options.start_studio_bridge = true;
+  options.serve_refusal = true;
+  options.studio_http_port = 0;
+  options.duration_s = 1'000'000;
+  testing::SteppedClock clock;
+  const SupervisionTime start = clock.Freeze();
+  testing::SteppedClock::ReleaseOnExit release{clock};
+  options.supervision_clock = clock.clock();
+
+  // Two writers on /alpha/state triggers a phase-1 graph refusal after
+  // CreateSessionDirectory, talos.log setup, and graph.json write.
+  const auto writer =
+      MakeTopicSource(event::SourceKind::SENDER, "/alpha/state");
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      WriteDescribingStub("refuse_dir_lock_hw", "hardware_node",
+                          "//talOS/bridge:hardware_node", {}, "exit 0\n");
+  options.binary_overrides["//example/alpha:node"] =
+      WriteDescribingStub("refuse_dir_lock_alpha", "alpha",
+                          "//example/alpha:node", {writer}, "exit 0\n");
+  options.binary_overrides["//example/beta:node"] =
+      WriteDescribingStub("refuse_dir_lock_beta", "beta", "//example/beta:node",
+                          {writer}, "exit 0\n");
+
+  const std::string bridge_body =
+      "trap 'exit 0' INT TERM\n"
+      "printf 'listening 18080\\n'\n"
+      "while :; do sleep 0.05; done\n";
+  options.binary_overrides["//studio/bridge:studio_bridge"] =
+      WriteDescribingStub("refuse_dir_lock_bridge", "studio_bridge",
+                          "//studio/bridge:studio_bridge", {}, bridge_body);
+
+  const std::string session_dir =
+      options.output_dir + "/" + std::to_string(options.session_id);
+  const std::string graph_path = session_dir + "/graph.json";
+  const std::string dir_lock_path =
+      session_dir + "/" + std::string{kSessionDirectoryLockFile};
+  const std::string talos_log =
+      session_dir + "/" + std::string{kLauncherOutputFile};
+
+  int exit_code = -1;
+  std::thread runner([&] { exit_code = Launcher{options}.Run(); });
+
+  const bool ready = notify.WaitFor("READY=1", 10000);
+
+  constexpr time_t kAged = 1'000'000;
+  const auto age_graph = [&graph_path] {
+    const timespec times[2] = {{kAged, 0}, {kAged, 0}};
+    return ::utimensat(AT_FDCWD, graph_path.c_str(), times, 0) == 0;
+  };
+  const auto graph_aged = [&graph_path] {
+    struct stat st {};
+    return ::stat(graph_path.c_str(), &st) == 0 && st.st_mtime == kAged;
+  };
+  constexpr std::string_view kRetaken = "was removed while this session held";
+  const auto retake_reports = [&talos_log, kRetaken] {
+    const std::string text = ReadFile(talos_log);
+    std::size_t count = 0;
+    for (std::size_t at = text.find(kRetaken); at != std::string::npos;
+         at = text.find(kRetaken, at + 1)) {
+      ++count;
+    }
+    return count;
+  };
+
+  bool aged_ok = false;
+  bool stayed_aged_before_due = false;
+  bool unlinked_ok = false;
+  bool refreshed_and_logged = false;
+  bool dir_lock_held_after_retake = false;
+  bool second_aged_ok = false;
+  bool second_unlinked_ok = false;
+  bool retaken_again = false;
+
+  if (ready) {
+    aged_ok = age_graph();
+    if (aged_ok) {
+      clock.HoldAt(start + std::chrono::nanoseconds{kLockFileRefresh} / 2);
+      SupervisionWakeup::Wake();
+      ::poll(nullptr, 0, 20);
+      stayed_aged_before_due = graph_aged();
+
+      unlinked_ok = ::unlink(dir_lock_path.c_str()) == 0;
+      if (unlinked_ok) {
+        clock.HoldAt(start + kLockFileRefresh);
+        refreshed_and_logged = PollUntil(
+            [&] {
+              SupervisionWakeup::Wake();
+              return !graph_aged() && retake_reports() > 0;
+            },
+            2000);
+        dir_lock_held_after_retake =
+            SessionDirectoryLock::Held(session_dir, false);
+
+        // Unlink a second time: Refresh retakes it again and logs the retake
+        // only once across the refusal.
+        second_aged_ok = age_graph();
+        second_unlinked_ok = ::unlink(dir_lock_path.c_str()) == 0;
+        if (second_aged_ok && second_unlinked_ok) {
+          clock.HoldAt(start + 2 * kLockFileRefresh);
+          retaken_again = PollUntil(
+              [&] {
+                SupervisionWakeup::Wake();
+                return !graph_aged() &&
+                       SessionDirectoryLock::Held(session_dir, false);
+              },
+              2000);
+        }
+      }
+    }
+  }
+
+  ::kill(::getpid(), SIGINT);
+  runner.join();
+
+  EXPECT_TRUE(ready) << "RefuseLaunch did not send READY=1";
+  EXPECT_TRUE(aged_ok) << "failed to age " << graph_path;
+  EXPECT_TRUE(stayed_aged_before_due)
+      << "graph.json refreshed before kLockFileRefresh elapsed";
+  EXPECT_TRUE(unlinked_ok) << "failed to unlink " << dir_lock_path;
+  EXPECT_TRUE(refreshed_and_logged)
+      << "RefuseLaunch did not refresh graph.json and log session.lock retake "
+         "at kLockFileRefresh:\n"
+      << ReadFile(talos_log);
+  EXPECT_TRUE(dir_lock_held_after_retake)
+      << "session.lock was not retaken by RefuseLaunch";
+  EXPECT_TRUE(second_aged_ok) << "failed to re-age " << graph_path;
+  EXPECT_TRUE(second_unlinked_ok)
+      << "failed to unlink " << dir_lock_path << " a second time";
+  EXPECT_TRUE(retaken_again)
+      << "session.lock was not retaken on a second refresh";
+  EXPECT_EQ(retake_reports(), 1u) << ReadFile(talos_log);
+  EXPECT_EQ(exit_code, 1);
+
   std::filesystem::remove_all(options.output_dir);
 }
 

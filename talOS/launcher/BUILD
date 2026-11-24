@@ -638,13 +638,17 @@ py_test(
     legacy_create_init = False,
     main = "session_report_live_test.py",
     # Launches five processes and asserts wall-clock 5 ms cadence p99 < 10 ms
-    # (session_report --strict): sanitizer instrumentation on a 3-vCPU hosted
-    # runner cannot hold the 5 ms wall-clock bound (cf. studio/bridge
-    # client_timeout_test and TODO.md CI-13). Both Linux and macOS CI run it.
+    # (session_report --strict): needs exclusive CPU (a 3-vCPU hosted macOS
+    # runner running parallel targets stalls 5 ms ticks) and perf host
+    # qualification (docs/TESTING.md §6.7), and sanitizer instrumentation cannot
+    # hold the 5 ms wall-clock bound (cf. TODO.md CI-13). Both Linux and macOS
+    # CI run it.
     tags = [
+        "exclusive",
         "no_asan",
         "no_macos_sanitizer",
         "no_tsan",
+        "perf",
     ],
     deps = [
         "//talOS/memory:shm_name",

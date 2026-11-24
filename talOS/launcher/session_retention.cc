@@ -1,16 +1,22 @@
 #include "talOS/launcher/session_retention.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <exception>
-#include <fstream>
 #include <limits>
 #include <map>
 #include <span>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -34,12 +40,70 @@ namespace tlog = event::log;
 constexpr std::size_t kMaxClassFileBytes = 256;
 
 std::string ReadSmallFile(const fs::path& path) {
-  std::ifstream in{path, std::ios::binary};
-  if (!in.is_open()) return {};
-  std::string line(kMaxClassFileBytes, '\0');
-  in.read(line.data(), static_cast<std::streamsize>(line.size()));
-  line.resize(static_cast<std::size_t>(in.gcount()));
-  return line;
+  int fd = -1;
+  do {
+    fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+  } while (fd < 0 && errno == EINTR);
+  if (fd < 0) return {};
+  struct stat st {};
+  if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    ::close(fd);
+    return {};
+  }
+  std::string content(kMaxClassFileBytes, '\0');
+  std::size_t total = 0;
+  while (total < kMaxClassFileBytes) {
+    const ssize_t n =
+        ::read(fd, content.data() + total, kMaxClassFileBytes - total);
+    if (n > 0) {
+      total += static_cast<std::size_t>(n);
+      continue;
+    }
+    if (n == 0) break;
+    if (errno == EINTR) continue;
+    ::close(fd);
+    return {};
+  }
+  ::close(fd);
+  content.resize(total);
+  return content;
+}
+
+// Atomically replaces `cache` with `content` without following symlinks or
+// blocking on FIFOs. Uses a per-process/per-call temporary path so concurrent
+// writers never unlink or rename one another's in-flight file. Best-effort:
+// any failure leaves `cache` as it was and costs a rescan at the next launch.
+void WriteCacheAtomically(const fs::path& cache, std::string_view content) {
+  static std::atomic<std::uint64_t> sequence{0};
+  const std::uint64_t seq = sequence.fetch_add(1, std::memory_order_relaxed);
+  const std::string temporary = cache.string() + ".tmp." +
+                                std::to_string(::getpid()) + "." +
+                                std::to_string(seq);
+  if (::unlink(temporary.c_str()) != 0 && errno != ENOENT) return;
+  int fd = -1;
+  do {
+    fd = ::open(temporary.c_str(),
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+  } while (fd < 0 && errno == EINTR);
+  if (fd < 0) return;
+
+  std::size_t written = 0;
+  bool ok = true;
+  while (written < content.size()) {
+    const ssize_t n =
+        ::write(fd, content.data() + written, content.size() - written);
+    if (n > 0) {
+      written += static_cast<std::size_t>(n);
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    ok = false;
+    break;
+  }
+  if (::close(fd) != 0) ok = false;
+  if (!ok || std::rename(temporary.c_str(), cache.c_str()) != 0) {
+    ::unlink(temporary.c_str());
+  }
 }
 
 // Reads `<dir>/manifest.json`: nullopt when absent or unreadable, empty Fields
@@ -239,18 +303,19 @@ MatchVerdict RecordedMatch(const fs::path& dir, ClassCache cache_mode) {
                                    : MatchVerdict::kOther;
   if (cache_mode == ClassCache::kReadOnly) return verdict;
   // A cache that cannot be written costs a rescan at the next launch.
-  std::ofstream out{cache};
+  std::string content;
   switch (verdict) {
     case MatchVerdict::kMatch:
-      out << "match " << log_bytes << "\n";
+      content = "match " + std::to_string(log_bytes) + "\n";
       break;
     case MatchVerdict::kOther:
-      out << "other " << log_bytes << " " << reader << "\n";
+      content = "other " + std::to_string(log_bytes) + " " + reader + "\n";
       break;
     case MatchVerdict::kUnknown:
-      out << "unknown " << log_bytes << " " << reader << "\n";
+      content = "unknown " + std::to_string(log_bytes) + " " + reader + "\n";
       break;
   }
+  WriteCacheAtomically(cache, content);
   return verdict;
 }
 

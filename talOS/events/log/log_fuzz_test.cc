@@ -3,12 +3,14 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <random>
 #include <span>
 #include <stdexcept>
@@ -19,6 +21,7 @@
 #include "gtest/gtest.h"
 #include "talOS/events/context.h"
 #include "talOS/events/log/format.h"
+#include "talOS/events/log/log_file_sink.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/manifest.h"
 #include "talOS/events/session_manifest.h"
@@ -526,6 +529,300 @@ TEST(LogFuzzTest, SessionManifestReadTextEnforcesSizeBoundAndRegularFiles) {
   EXPECT_FALSE(session_manifest::ReadText(base).has_value());
 
   fs::remove_all(base, ec);
+}
+
+// REQ-CONTRACT-20, REQ-OPS-42: resynchronising past 128 KiB of repeated
+// RECORD_MAGIC bytes (and a repeated RECORD_MAGIC EOF tail) must stay cached
+// across FileSource windows and match LogReader record-for-record.
+TEST(LogFuzzTest, RepeatedRecordMagicDamageResyncParity) {
+  constexpr std::size_t kDamageBytes = std::size_t{128} << 10;
+  constexpr std::size_t kTailBytes = 64;
+
+  std::vector<ManifestEntry> entries(3);
+  entries[0].id = 0;
+  entries[0].kind = static_cast<std::uint16_t>(SourceKind::TIMER);
+  entries[0].period_ns = 1'000'000;
+  write_name(entries[0].name, "tick");
+
+  entries[1].id = 1;
+  entries[1].kind = static_cast<std::uint16_t>(SourceKind::WATCHER);
+  entries[1].message_bytes = 32;
+  entries[1].alignment = 8;
+  entries[1].schema_hash = 0x123456789abcdef0ULL;
+  write_name(entries[1].name, "/a/state");
+
+  entries[2].id = 2;
+  entries[2].kind = static_cast<std::uint16_t>(SourceKind::SENDER);
+  entries[2].message_bytes = 64;
+  entries[2].alignment = 8;
+  entries[2].schema_hash = 0xfeedfacecafebeefULL;
+  write_name(entries[2].name, "/a/command");
+
+  FileHeader fh{};
+  std::memcpy(fh.magic, FILE_MAGIC, sizeof(FILE_MAGIC));
+  fh.version = FORMAT_VERSION;
+  fh.header_bytes = sizeof(FileHeader);
+  fh.session_id = 77;
+  fh.start_monotonic_ns = 1000;
+  fh.start_wall_ns = 2000;
+  fh.manifest_count = static_cast<std::uint32_t>(entries.size());
+  fh.schema_bytes = 0;
+  write_name(fh.process_name, "resync_node");
+  fh.crc32 = crc32({reinterpret_cast<const std::byte*>(entries.data()),
+                    entries.size() * sizeof(ManifestEntry)});
+
+  std::vector<std::uint8_t> bytes;
+  bytes.reserve(sizeof(fh) + entries.size() * sizeof(ManifestEntry) +
+                kDamageBytes + kTailBytes + 512);
+  AppendBytes(bytes, &fh, sizeof(fh));
+  AppendBytes(bytes, entries.data(), entries.size() * sizeof(ManifestEntry));
+
+  AppendRecord(bytes, EventKind::TIMER, 0, 1, 1000, 1010, {});
+  std::vector<std::byte> msg(32, std::byte{0});
+  msg[0] = std::byte{0xaa};
+  msg[15] = std::byte{0x55};
+  AppendRecord(bytes, EventKind::MESSAGE, 1, 2, 2000, 2020, msg);
+
+  const std::uint64_t damage_offset = bytes.size();
+  for (std::size_t i = 0; i < kDamageBytes; i += sizeof(RECORD_MAGIC)) {
+    AppendBytes(bytes, &RECORD_MAGIC, sizeof(RECORD_MAGIC));
+  }
+
+  std::vector<std::byte> snd(64, std::byte{0x11});
+  AppendRecord(bytes, EventKind::SEND, 2, 3, 3000, 3050, snd);
+  AppendRecord(bytes, EventKind::EXIT, 0, 4, 4000, 4050, {});
+
+  const std::uint64_t tail_offset = bytes.size();
+  for (std::size_t i = 0; i < kTailBytes; i += sizeof(RECORD_MAGIC)) {
+    AppendBytes(bytes, &RECORD_MAGIC, sizeof(RECORD_MAGIC));
+  }
+
+  TempLogFile file;
+  file.Write(bytes);
+
+  struct CapturedRecord {
+    std::uint64_t offset{0};
+    RecordHeader header{};
+    std::vector<std::byte> payload;
+  };
+  std::vector<CapturedRecord> expected;
+  LogReader lr{file.path()};
+  LogReader::Record rec;
+  while (lr.next(rec)) {
+    expected.push_back(
+        {rec.offset, rec.header, {rec.payload.begin(), rec.payload.end()}});
+  }
+  ASSERT_EQ(expected.size(), 4u);
+  EXPECT_EQ(lr.record_count(), 4u);
+  EXPECT_EQ(lr.damage().spans, 1u);
+  EXPECT_EQ(lr.damage().skipped_bytes, kDamageBytes);
+  EXPECT_EQ(lr.damage().first_offset, damage_offset);
+  EXPECT_EQ(lr.damage().tail_bytes, kTailBytes);
+  EXPECT_EQ(lr.damage().tail_offset, tail_offset);
+  EXPECT_TRUE(lr.truncated());
+
+  WindowedLogReader wr{file.path()};
+  std::size_t idx = 0;
+  while (wr.next(rec)) {
+    ASSERT_LT(idx, expected.size());
+    EXPECT_EQ(rec.offset, expected[idx].offset);
+    EXPECT_EQ(rec.header.kind, expected[idx].header.kind);
+    EXPECT_EQ(rec.header.source_id, expected[idx].header.source_id);
+    EXPECT_EQ(rec.header.dispatch_index, expected[idx].header.dispatch_index);
+    ASSERT_EQ(rec.payload.size(), expected[idx].payload.size());
+    if (!rec.payload.empty()) {
+      EXPECT_EQ(std::memcmp(rec.payload.data(), expected[idx].payload.data(),
+                            rec.payload.size()),
+                0);
+    }
+    ++idx;
+  }
+  EXPECT_EQ(idx, expected.size());
+  EXPECT_EQ(wr.record_count(), lr.record_count());
+  EXPECT_EQ(wr.damage().spans, lr.damage().spans);
+  EXPECT_EQ(wr.damage().skipped_bytes, lr.damage().skipped_bytes);
+  EXPECT_EQ(wr.damage().first_offset, lr.damage().first_offset);
+  EXPECT_EQ(wr.damage().tail_bytes, lr.damage().tail_bytes);
+  EXPECT_EQ(wr.damage().tail_offset, lr.damage().tail_offset);
+  EXPECT_TRUE(wr.truncated());
+
+  wr.seek(expected[2].offset);
+  ASSERT_TRUE(wr.next(rec));
+  EXPECT_EQ(rec.offset, expected[2].offset);
+  ASSERT_TRUE(wr.next(rec));
+  EXPECT_EQ(rec.offset, expected[3].offset);
+  EXPECT_FALSE(wr.next(rec));
+  EXPECT_EQ(wr.damage().spans, 0u);
+  EXPECT_EQ(wr.damage().tail_bytes, kTailBytes);
+}
+
+// REQ-OPS-42, REQ-CONTRACT-20: both LogReader and WindowedLogReader must reject
+// headers claiming header_bytes > kMaxFileHeaderBytes, manifest_count >
+// kMaxManifestEntries, or schema_bytes > kMaxSchemaBlockBytes with a hard
+// std::runtime_error (not IncompleteLogHeader) before reading or allocating.
+TEST(LogFuzzTest, OversizedHeaderManifestAndSchemaRejectedByBothReaders) {
+  static_assert(kMaxFileHeaderBytes == (std::uint32_t{64} << 10));
+  static_assert(kMaxManifestEntries == std::uint32_t{65536});
+  static_assert(kMaxSchemaBlockBytes == (std::uint64_t{16} << 20));
+
+  auto make_header = [] {
+    FileHeader fh{};
+    std::memcpy(fh.magic, FILE_MAGIC, sizeof(FILE_MAGIC));
+    fh.version = FORMAT_VERSION;
+    fh.header_bytes = sizeof(FileHeader);
+    fh.crc32 = crc32({});
+    return fh;
+  };
+
+  const auto expect_rejected = [](const std::string& path) {
+    auto check = [](auto open_fn) {
+      try {
+        open_fn();
+        ADD_FAILURE() << "expected std::runtime_error for oversized header";
+      } catch (const IncompleteLogHeader& e) {
+        ADD_FAILURE() << "expected non-IncompleteLogHeader runtime_error, got: "
+                      << e.what();
+      } catch (const std::runtime_error& e) {
+        EXPECT_NE(e.what(), nullptr);
+      }
+    };
+    check([&] { (void)LogReader{path}; });
+    check([&] { (void)WindowedLogReader{path}; });
+  };
+
+  TempLogFile file;
+
+  // Exact upper bound on header_bytes (64 KiB, empty manifest/schema, valid
+  // CRC) is accepted by both readers.
+  {
+    FileHeader fh = make_header();
+    fh.header_bytes = kMaxFileHeaderBytes;
+    std::vector<std::uint8_t> bytes(kMaxFileHeaderBytes, 0);
+    std::memcpy(bytes.data(), &fh, sizeof(fh));
+    file.Write(bytes);
+    LogReader lr{file.path()};
+    WindowedLogReader wr{file.path()};
+    LogReader::Record rec;
+    EXPECT_FALSE(lr.next(rec));
+    EXPECT_FALSE(wr.next(rec));
+  }
+
+  // header_bytes exceeding kMaxFileHeaderBytes (even with valid CRC and full
+  // length on disk) is rejected by both readers.
+  {
+    FileHeader fh = make_header();
+    fh.header_bytes = kMaxFileHeaderBytes + 1;
+    std::vector<std::uint8_t> bytes(kMaxFileHeaderBytes + 1, 0);
+    std::memcpy(bytes.data(), &fh, sizeof(fh));
+    file.Write(bytes);
+    expect_rejected(file.path());
+  }
+
+  // manifest_count exceeding kMaxManifestEntries on a multi-MiB file is
+  // rejected before streaming/allocating.
+  constexpr std::size_t kMultiMiB = std::size_t{2} << 20;
+  std::vector<std::uint8_t> multi_mib(kMultiMiB, 0);
+  for (const std::uint32_t bad_count :
+       {kMaxManifestEntries + 1, std::numeric_limits<std::uint32_t>::max()}) {
+    FileHeader fh = make_header();
+    fh.manifest_count = bad_count;
+    std::memcpy(multi_mib.data(), &fh, sizeof(fh));
+    file.Write(multi_mib);
+    expect_rejected(file.path());
+  }
+
+  // schema_bytes exceeding kMaxSchemaBlockBytes on a multi-MiB file is
+  // rejected before streaming/allocating.
+  for (const std::uint64_t bad_schema :
+       {kMaxSchemaBlockBytes + 1, std::numeric_limits<std::uint64_t>::max()}) {
+    FileHeader fh = make_header();
+    fh.schema_bytes = bad_schema;
+    std::memcpy(multi_mib.data(), &fh, sizeof(fh));
+    file.Write(multi_mib);
+    expect_rejected(file.path());
+  }
+}
+
+// REQ-OPS-12: when durable_sync of the finished segment fails during
+// rotate_to(), LogFileSink must abort immediately without creating, writing, or
+// unlinking `<path>.next`, keeping `<path>` intact on disk.
+TEST(LogFuzzTest, RotateToDurableSyncEioSkipsOpeningNext) {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::path{::testing::TempDir()} /
+                       ("talos_rotate_eio_" + std::to_string(::getpid()));
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+  ASSERT_TRUE(fs::create_directories(dir, ec)) << ec.message();
+
+  const std::string path = (dir / "node.tlog").string();
+  const std::string staged = path + ".next";
+
+  std::map<int, std::string> fd_paths;
+  int next_open_calls = 0;
+  int rename_calls = 0;
+  int unlink_calls = 0;
+  int path_sync_calls = 0;
+
+  LogFileSinkOps ops;
+  ops.open = [&](const char* target, int flags, mode_t mode) {
+    if (std::string_view{target} == staged) {
+      ++next_open_calls;
+    }
+    const int fd = (flags & O_CREAT) != 0 ? ::open(target, flags, mode)
+                                          : ::open(target, flags);
+    if (fd >= 0) fd_paths[fd] = target;
+    return fd;
+  };
+  ops.close = [&](int fd) {
+    fd_paths.erase(fd);
+    return ::close(fd);
+  };
+  ops.durable_sync = [&](int fd) {
+    const auto it = fd_paths.find(fd);
+    if (it != fd_paths.end() && it->second == path) {
+      ++path_sync_calls;
+      errno = EIO;
+      return -1;
+    }
+    return ::fsync(fd);
+  };
+  ops.rename = [&](const char* from, const char* to) {
+    ++rename_calls;
+    return ::rename(from, to);
+  };
+  ops.unlink = [&](const char* target) {
+    ++unlink_calls;
+    return ::unlink(target);
+  };
+
+  const std::vector<std::byte> prefix(128, std::byte{0x5a});
+  const std::vector<std::byte> body(32, std::byte{0x3c});
+  {
+    LogFileSink sink{path, ops};
+    sink.open_sync();
+    sink.configure_segments(prefix, /*segment_count=*/2);
+    sink.write_prefix_sync();
+    ASSERT_EQ(sink.write_bytes(body.data(), body.size()), body.size());
+
+    sink.rotate_to(1);
+
+    EXPECT_EQ(path_sync_calls, 1);
+    EXPECT_TRUE(sink.failed());
+    EXPECT_FALSE(sink.error().empty());
+    EXPECT_FALSE(sink.is_open());
+    EXPECT_TRUE(sink.needs_durable_sync());
+    EXPECT_EQ(sink.file_segment(), 0u);
+    EXPECT_EQ(next_open_calls, 0);
+    EXPECT_EQ(rename_calls, 0);
+    EXPECT_EQ(unlink_calls, 0);
+  }
+
+  ASSERT_TRUE(fs::exists(path, ec)) << ec.message();
+  EXPECT_EQ(fs::file_size(path, ec), prefix.size() + body.size());
+  EXPECT_FALSE(fs::exists(staged, ec));
+  EXPECT_FALSE(fs::exists(LogSegmentPath(path, 0), ec));
+
+  fs::remove_all(dir, ec);
 }
 
 }  // namespace
