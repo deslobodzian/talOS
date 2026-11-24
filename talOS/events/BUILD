@@ -106,14 +106,20 @@ cc_test(
     ],
 )
 
-# Integration tier (fork, SIGKILL): its own target, out of log_test's lane.
+# Integration tier (fork, SIGKILL): its own exclusive target with StallMeter
+# host qualification so parallel Bazel jobs do not starve the background writer
+# or the 1 ms host-qualification probe (docs/TESTING.md §6.7).
 cc_test(
     name = "log_kill_test",
     size = "small",
     srcs = ["log/log_kill_test.cc"],
-    tags = ["integration"],
+    tags = [
+        "exclusive",
+        "integration",
+    ],
     deps = [
         ":events_log",
+        "//talOS/process:host_qualification",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],

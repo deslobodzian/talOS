@@ -180,6 +180,11 @@ struct LogWriterOptions {
   // Empty otherwise.
   std::function<void()> before_flush_wait;
 
+  // Tests only: called by the writer thread before each timed write_interval
+  // wait with the computed wait duration (min(write_at, sync_at) - now). Empty
+  // otherwise.
+  std::function<void(std::chrono::nanoseconds)> before_timed_wait;
+
   // Tests only: optional OS syscall seams forwarded to LogFileSink. Empty
   // fields call the corresponding POSIX / process::DurableSync functions
   // directly.
