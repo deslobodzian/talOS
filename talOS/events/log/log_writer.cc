@@ -421,16 +421,15 @@ void LogWriter::State::append(RecordHeader header,
       };
 
       const bool gap_stops = simulate(gap_total, header.now_ns);
-      const std::uint64_t after_gap_submitted = sim_submitted;
       if (!gap_stops) {
         simulate(record_total, header.now_ns);
       }
       if (sim_submitted + 1 > free_chunks) {
-        // If an already-filled non-GAP active chunk prevents GAP from starting
-        // in it and the total chunks needed exceed the pool size, hand over
-        // those earlier records now so future resumes see active == nullptr.
-        if (sim_submitted + 1 > pool.size() && after_gap_submitted > 0 &&
-            active != nullptr && active->used > 0) {
+        // If an already-filled non-GAP active chunk prevents GAP and the
+        // resuming record from fitting within the pool, hand over those earlier
+        // records now so future resumes see active == nullptr.
+        if (sim_submitted + 1 > pool.size() && active != nullptr &&
+            active->used > 0) {
           submit_active();
         }
         gaps.lose(header, payload_bytes);
@@ -472,22 +471,30 @@ bool LogWriter::State::close_at_stop() noexcept {
   const auto open = [this] {
     return !sink.failed() && capture_error.load() == CaptureError::NONE;
   };
-  bool took = false;
+  bool pending = false;
   if (gaps.is_losing()) {
     gaps.close();
     if (open()) {
       gaps.mark_closed_at_flush();
-      took = take_gap(gaps.stop_gap_now_ns()) == Take::kTaken;
+      pending = take_gap(gaps.stop_gap_now_ns()) == Take::kTaken;
     }
   }
   if (std::optional<RecordHeader> exit = gaps.take_held_exit();
       exit.has_value()) {
+    if (pending) {
+      // Flush the closing GAP before taking a held EXIT: with a 1-chunk pool,
+      // rotating a segment between GAP and EXIT would otherwise find the sole
+      // chunk still outstanding and drop the held EXIT.
+      submit_active();
+      wait_written();
+      pending = false;
+    }
     if (open() && take(*exit, SealRecord(*exit, {})) == Take::kTaken) {
       gaps.note_accepted(exit->dispatch_index);
-      took = true;
+      pending = true;
     }
   }
-  return took;
+  return pending;
 }
 
 void LogWriter::State::wait_written() noexcept {
