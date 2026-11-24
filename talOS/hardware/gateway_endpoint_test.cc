@@ -1387,5 +1387,81 @@ TEST(Endpoint, EmitsExactlyOneStatePerTickWhileDisabledAndEnabled) {
   check_phase("configured enabled", 8, /*enabled=*/true, /*configured=*/true);
   check_phase("disabled again", 4, /*enabled=*/false, /*configured=*/true);
 }
+
+int g_ack_send_error = 0;
+int g_state_send_error = 0;
+int g_state_send_attempts = 0;
+int EndpointSendErrorSeam(protocol::FrameType type) {
+  if (type == protocol::FrameType::kHardwareConfigAck) {
+    return g_ack_send_error;
+  }
+  if (type == protocol::FrameType::kHardwareState) {
+    ++g_state_send_attempts;
+    return g_state_send_error;
+  }
+  return 0;
+}
+
+// A kSocketError from SendAck must never be masked behind a later kWouldBlock
+// State send, and a permanent SendAck error (SendErrorNeedsNewSocket, e.g.
+// ENETUNREACH) must skip sending State so its fatal status and errno reach
+// SocketRetry intact.
+// REQ-CONTRACT-04, REQ-RT-22
+TEST(Endpoint,
+     AckSocketErrorIsNotMaskedByStateWouldBlockAndFatalAckSkipsState) {
+  FakeBackend backend;
+  Gateway gateway{backend, 3018};
+  Endpoint endpoint{gateway};
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+
+  // Push a valid config so Endpoint queues an ACK and tries to send it.
+  const auto cfg = SwerveConfig(true);
+  for (const auto& chunk : CreateConfigChunks(cfg)) {
+    ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig,
+                                  protocol::kFlagNone, 1000, chunk.data(),
+                                  chunk.size()),
+              protocol::UdpStatus::kOk);
+  }
+
+  // 1. Transient SendAck kSocketError (ECONNREFUSED) + State kWouldBlock:
+  // State send still runs, but Worse() prioritizes kSocketError over
+  // kWouldBlock.
+  g_ack_send_error = ECONNREFUSED;
+  g_state_send_error = EAGAIN;
+  g_state_send_attempts = 0;
+  endpoint.SetSendErrorSeam(&EndpointSendErrorSeam);
+  uint64_t now_us = 2000;
+  ASSERT_TRUE(Eventually([&] {
+    const auto status = endpoint.Tick(now_us, false);
+    now_us += 1000;
+    if (!gateway.configured()) return false;
+    EXPECT_EQ(status, protocol::UdpStatus::kSocketError);
+    return true;
+  }));
+  EXPECT_GT(g_state_send_attempts, 0);
+
+  // 2. Permanent SendAck kSocketError (ENETUNREACH, SendErrorNeedsNewSocket)
+  // on the queued ACK retry at the start of Tick: skips State send entirely
+  // and returns kSocketError (cannot be masked by EAGAIN or overwritten by a
+  // transient State send error).
+  g_ack_send_error = ENETUNREACH;
+  g_state_send_error = EAGAIN;
+  g_state_send_attempts = 0;
+  EXPECT_EQ(endpoint.Tick(now_us, false), protocol::UdpStatus::kSocketError);
+  EXPECT_EQ(g_state_send_attempts, 0);
+  now_us += 1000;
+
+  // 3. Once the error clears, the still-queued ACK and State both go out.
+  endpoint.SetSendErrorSeam(nullptr);
+  ASSERT_EQ(endpoint.Tick(now_us, false), protocol::UdpStatus::kOk);
+  protocol::DecodedFrame frame;
+  ASSERT_TRUE(
+      companion.Receive(protocol::FrameType::kHardwareConfigAck, &frame));
+  ConfigAckPayload ack{};
+  ASSERT_TRUE(DecodeConfigAck({frame.payload, frame.payload_size}, ack));
+  EXPECT_EQ(ack.status, ConfigAckStatus::kOk);
+  EXPECT_EQ(ack.config_id, ConfigurationId(cfg));
+}
 }  // namespace
 }  // namespace talos::hardware
