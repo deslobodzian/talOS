@@ -15,6 +15,7 @@ from datetime import timedelta
 import io
 import math
 import os
+import struct
 import tempfile
 import unittest
 from unittest import mock
@@ -24,6 +25,7 @@ from control.VelocityTarget import VelocityTarget
 from demo.Goal import Goal
 import talos
 from talos import _abi
+from talos._messages import message_type
 from talos.mechanisms import (PositionMechanism, RollerWithSensor,
                               VelocityMechanism)
 from talos.testing import Sim, SimHardware, Stick
@@ -104,6 +106,58 @@ class SafetyParityTest(unittest.TestCase):
         self.assertIn("hardware request", results[0][1])
         self.assertEqual(hw.motor_request("roller", "wheel").mode,
                          talos.Mode.NEUTRAL)
+
+    # REQ-SAFE-14, REQ-SAFE-09: Python/C-ABI cannot forge an active
+    # TargetEnvelope by calling talos_publisher_send on a TargetLane slot
+    # while OperatorArming is disarmed.
+    def test_publisher_send_refuses_target_lane_slot(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        hw = SimHardware(sim)
+        results = []
+        goal_type = message_type(Goal)
+
+        class Consumer:
+            def __init__(self, node):
+                self.target = talos.Target(node, Goal)
+                self.received = []
+
+            def update(self):
+                t = self.target.get()
+                if t is not None:
+                    self.received.append(t)
+
+        class ForgedLane:
+            def __init__(self, node):
+                self.node = node
+                self.ds = talos.DriverStation(node)
+                self.arming = talos.OperatorArming(node)
+                # First publisher on this node -> slot 0.
+                self.lane = talos.TargetLane(
+                    node, Goal, "roller", "teleop", arming=self.arming)
+
+            def update(self):
+                gen = sim.driver_station_generation
+                if gen == 0 or results:
+                    return
+                header = struct.pack("<QB7x", gen, 1)
+                body = goal_type.encode(
+                    {"height_rot": 2.0, "enabled": True, "tick_count": 7})
+                payload = header + body
+                status = _abi.lib.talos_publisher_send(
+                    self.node._handle, 0, payload, len(payload))
+                err = _abi.lib.talos_last_error().decode()
+                results.append((status, err))
+
+        consumer = sim.add(Consumer, "roller")
+        sim.add(ForgedLane, "driver")
+        hw.enable(True)
+        hw.set_driver_station(enabled=True, teleop=True)
+        sim.step(0.04)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0][0], _abi.ERR)
+        self.assertIn("target lane", results[0][1])
+        self.assertEqual(consumer.received, [])
 
     # REQ-CONTRACT-14: a failed Sim.add() invalidates the Python Node handle
     # and wrappers built before the failure so surviving references raise

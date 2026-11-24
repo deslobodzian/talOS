@@ -1416,8 +1416,13 @@ struct LateSubscriber {
 TEST(Node, RegistrationOutsideTheConstructorThrows) {
   auto sim = Sim::FromToml(kRobotToml);
   sim.add<LateSubscriber>("listener");
+  // Calling every() after NodeAccess::start() and before the loop's first
+  // run() must throw std::logic_error instead of mutating timers after start()
+  // already computed Delivery.
+  EXPECT_THROW(sim.node("listener").every(5ms, [] {}), std::logic_error);
   EXPECT_THROW(sim.step(10ms), std::logic_error);
   EXPECT_THROW(sim.node("listener").after_update([] {}), std::logic_error);
+  EXPECT_THROW(sim.node("listener").every(5ms, [] {}), std::logic_error);
 }
 
 // --- byte topics -----------------------------------------------------------
@@ -1652,9 +1657,10 @@ TEST(BytePublisher, ClaimsItsRtmsTopicWhenRegisteredAndDropsNewestWhenFull) {
   ::shm_unlink(ShmObjectName(topic).c_str());
 }
 
-// REQ-SAFE-27: NodeDetail::publisher_send (the public-API thunk backing
-// Publisher<M>::send) refuses to write into a hardware request slot registered
-// via NodeAccess::add_hardware_request; only NodeAccess::publisher_send may.
+// REQ-SAFE-27, REQ-SAFE-09, REQ-SAFE-14: NodeDetail::publisher_send (the
+// public-API thunk backing Publisher<M>::send and talos_publisher_send) refuses
+// to write into a hardware request slot or a TargetLane slot; only
+// NodeAccess::publisher_send may.
 TEST(NodeDetail, RefusesPublisherSendOnHardwareRequestSlot) {
   const std::string config_path = Runfile("TALOS_TEST_CONFIG");
   const auto robot_config = std::make_shared<const config::RobotConfig>(
@@ -1670,6 +1676,9 @@ TEST(NodeDetail, RefusesPublisherSendOnHardwareRequestSlot) {
   });
   const std::size_t hw_slot = detail::NodeAccess::add_hardware_request(
       *node, sizeof(Count), kMessageAlignment, schema::Of<Count>());
+  const std::size_t lane_slot = detail::NodeAccess::add_target_lane_publisher(
+      *node, "/arm/target/teleop", sizeof(Count), kMessageAlignment,
+      schema::Of<Count>(), /*operator_arming=*/true);
   const std::size_t normal_slot = detail::NodeDetail::add_publisher(
       *node, "/test_node/state", sizeof(Count), kMessageAlignment,
       schema::Of<Count>());
@@ -1679,8 +1688,13 @@ TEST(NodeDetail, RefusesPublisherSendOnHardwareRequestSlot) {
   EXPECT_THROW(
       detail::NodeDetail::publisher_send(*node, hw_slot, &msg, sizeof(msg)),
       std::logic_error);
+  EXPECT_THROW(
+      detail::NodeDetail::publisher_send(*node, lane_slot, &msg, sizeof(msg)),
+      std::logic_error);
   EXPECT_TRUE(
       detail::NodeAccess::publisher_send(*node, hw_slot, &msg, sizeof(msg)));
+  EXPECT_TRUE(
+      detail::NodeAccess::publisher_send(*node, lane_slot, &msg, sizeof(msg)));
   EXPECT_TRUE(detail::NodeDetail::publisher_send(*node, normal_slot, &msg,
                                                  sizeof(msg)));
 }
