@@ -225,9 +225,12 @@ limiter acting as configured is not a fault (`kMotorNotFaultFlags` in
 `messages.h`, the one list the bridge, the hardware log and the RoboRIO's
 console share). Those bits stay in each sample's `fault_flags`; every other
 FaultField bit faults the motor. `PhoenixBackend` reports none of them from a
-FaultField signal 50 ms old or older, since an old switch or limiter state is
+FaultField signal at or past `DiagnosticMaxAgeUs(status_hz)` (`50 ms` for
+`status_hz >= 50 Hz`, scaling as `ceil(2.5 s / status_hz)` below `50 Hz`, e.g.
+`250 ms` at `10 Hz`; `feedback.h`), since an old switch or limiter state is
 a wrong display, but keeps that signal's last fault bits: losing the signal
-does not un-fault a motor.
+does not un-fault a motor. The same `DiagnosticMaxAgeUs(status_hz)` bound
+gates `MotorVoltage`, `StatorCurrent`, and `SupplyCurrent` reads.
 `sim::PhysicsSimBackend` holds forward or reverse output neutral, and reports
 the bit, while a test presses a switch
 (`SetForwardLimitPressed`/`SetReverseLimitPressed`; `sim_gateway`'s
@@ -351,10 +354,11 @@ Each closed-loop request selects gain slot 0, 1, or 2. Drive motors use rotor
 feedback divided by the configured mechanism ratio. Steering uses
 `RemoteCANcoder` with continuous wrapping. The backend uses Phoenix's voltage
 controls, which need Phoenix Pro only for a motor configured `foc = true`
-(above). A torque-current request is TorqueCurrentFOC with peak torque
-current ±`max_torque_current_a` (0 A on a motor without the key) and a
-maximum duty cycle of `max_voltage` over the RoboRIO's last battery reading
-that was finite and above 1 V (0, no output, before the first);
+(above). Duty-cycle (`DutyCycleOut`) and torque-current (`TorqueCurrentFOC`)
+requests both cap output duty cycle at `max_voltage` over the RoboRIO's last
+battery reading that was finite and above 1 V (0, no output, before the first);
+a torque-current request also bounds peak torque current to
+±`max_torque_current_a` (0 A on a motor without the key), and
 `stator_limit_a` and `supply_limit_a` apply too. Positive amperes drive the
 direction positive volts do, after `inverted`. The request is one-shot, so
 its cap is as old as the last command the RoboRIO applied: one node period
@@ -1233,8 +1237,8 @@ battery's 12.8 V (`kSimRestingSupplyV`, `sim_backend.h`) by default, so a
 healthy simulated robot passes the pre-match battery check;
 `SetPowerHealth(volts, brownout)` injects low-power telemetry. Physics also uses
 the reported voltage as its motor supply: a duty-cycle demand applies that
-fraction of it (0.5 is 6.4 V at 12.8 V rest), while voltage, closed-loop and
-torque-current modes are clamped to `max_voltage` (12 V when unset) and the
+fraction of it (0.5 is 6.4 V at 12.8 V rest), clamped to `max_voltage` (12 V
+when unset) along with voltage, closed-loop and torque-current modes, and the
 motor models keep their 12 V free-speed and stall ratings. With
 `SetBatteryModel` (`[simulation.battery]`), `PhysicsSimBackend` models
 internal-resistance voltage sag (`V_batt = V_oc − R_int × max(0, base_current_a
@@ -1264,7 +1268,7 @@ pulse as 0, as the RoboRIO's `PWM::GetSpeed()` does after `SetDisabled`.
 | Torque current | Not modelled: velocity and voltage read 0, as for duty cycle | The volts that pass the demand through the winding at the rotor's speed, I R + back-EMF in the motor's direction (`TorqueCurrentVolts`, using the same `R` and `k_e` as `StatorCurrent`), the current clamped to `max_torque_current_a` and `stator_limit_a`, the volts to `max_voltage` and the supply; powered at 0 A, modelled as zero stator current (slowly coasting only under the motor's no-load drag rather than braking; hardware unmeasured: [Supported Hardware Requests](#supported-hardware-requests)). FOC is not modelled |
 | Stator and supply current | Stator zero; supply placeholder `|voltage| / 12 × supply_limit_a` | Winding model with free current and stall torque: `R = 12 V / stall_current`, `k_e = (12 V − free_current × R) / free_speed`, `k_t = stall_torque / stall_current`, `back_emf = k_e × rotor_rps` (`MotorModelFor`: Kraken X60 6000 rpm, 366 A stall, 2.0 A free, 7.09 N·m stall, default; Kraken X44 7530 rpm, 275 A stall, 2.0 A free, 4.05 N·m stall; Falcon 500 6380 rpm, 257 A stall, 1.5 A free, 4.69 N·m stall). Stator current is `|applied_volts − back_emf| / R` (equals `free_current` at 12 V free speed and `stall_current` at 12 V stall), 0 while unpowered. `stator_limit_a` and `supply_limit_a` clamp effective winding voltage before rotor integration and are reflected in `applied_volts_` and reported currents. Supply current follows signed power conservation `(rotor_volts × signed_stator_current) / supply_v` (positive battery draw clamped to `supply_limit_a`, negative regenerative braking kept signed, 0 when unpowered or `supply_v <= 0`). A motor held at a hard stop or soft limit is stalled. The type is the motor's `motor_type` key (above) |
 | Home switch | None: a digital input reads what `SetDigitalInput` set, false if unset | `SetHomeSwitches` (`sim::HomeSwitch`): a named digital input reads closed exactly while a named motor's reported position is at or beyond a point (below or above it), with no hysteresis, and reads `closed_reads` while closed (default false: normally open); bound by name, it survives a pushed config. `sim_gateway` binds each input's `sim_motor` keys (above); an input without them reads false at every position |
-| Faults | Device resets, digital/analog/encoder setters | Plus frozen feedback (valid) and per-device disconnect (invalid), each read as `PhoenixBackend` reads a device whose frames stopped: ages growing from its last sample, limit bits cleared once that sample is 50 ms old and temperature 0 once it is 500 ms old (`kFaultFieldMaxAgeUs`, `kTemperatureMaxAgeUs`, `feedback.h`); controller restart |
+| Faults | Device resets, digital/analog/encoder setters | Plus frozen feedback (valid) and per-device disconnect (invalid), each read like `PhoenixBackend` when frames stop: ages growing from its last sample, limit bits cleared once that sample is 50 ms old (`kFaultFieldMaxAgeUs`; scaling to `DiagnosticMaxAgeUs(status_hz)` for `< 50 Hz` configs is tracked in `TODO.md`) and temperature 0 once it is 500 ms old (`kTemperatureMaxAgeUs`, `feedback.h`); controller restart |
 | Device restore | The chain `BeginRestoreAfterReset` reapplies (its motors, their followers, motors on a listed remote CANcoder: `RestoredWith`, `feedback.h`) reads invalid until `PollRestore` completes it, as `PhoenixBackend::Read` reports it (the gateway masks it in those States either way); completes at the next poll, unless `SetRestoreFails` fails restores: the chain then stays invalid until one succeeds | The same |
 
 Tests live in `sim_physics_test.cc`. The standalone `sim_gateway` runs the

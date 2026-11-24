@@ -530,11 +530,12 @@ export class DriveModel {
   private onSnapshot(s: Snapshot, now: number) {
     const held = this.latest;
     const sameSocket = this.tickThisSocket;
+    const olderSameStream = held !== null && s.stream_id === held.stream_id &&
+        BigInt(s.sequence_id) < BigInt(held.sequence_id);
     // Ignore out-of-order (decreasing sequence_id) frames on the same socket
     // and stream: rolling `latest` backward would let a subsequent heartbeat
     // repeat of `held` falsely look newer and refresh fresh().
-    if (sameSocket && held !== null && s.stream_id === held.stream_id &&
-        BigInt(s.sequence_id) < BigInt(held.sequence_id)) {
+    if (sameSocket && olderSameStream) {
       return;
     }
     const newer = held === null || s.stream_id !== held.stream_id ||
@@ -542,7 +543,7 @@ export class DriveModel {
     const dictChanged = sameSocket && held !== null &&
         (s.stream_id !== held.stream_id || s.dictionary_id !== held.dictionary_id);
     const keyframe = !this.tickThisSocket;
-    this.latest = s;
+    if (!olderSameStream) this.latest = s;
     if (keyframe) {
       this.tickThisSocket = true;
       this.keyframeAt = now;

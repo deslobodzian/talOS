@@ -49,7 +49,7 @@ T Read(const toml::table& tbl, std::string_view key, T def) {
     if (auto v = node.value_exact<bool>()) return *v;
     throw std::invalid_argument(field + " must be a boolean");
   } else if constexpr (std::is_integral_v<T>) {
-    if (auto v = node.value<int64_t>(); v && std::in_range<T>(*v)) {
+    if (auto v = node.value_exact<int64_t>(); v && std::in_range<T>(*v)) {
       return static_cast<T>(*v);
     }
     throw std::invalid_argument(field + " must be an integer in range");
@@ -107,18 +107,19 @@ bool IsIpv4Address(std::string_view address) {
 
 int64_t ReadPositive(const toml::table& tbl, const char* key, int64_t def,
                      const char* table_name) {
-  const int64_t v = Read(tbl, key, def);
-  if (v < 1) {
+  if (!tbl.contains(key)) return def;
+  const auto v = tbl[key].value_exact<int64_t>();
+  if (!v || *v < 1) {
     throw std::invalid_argument(std::string(table_name) + " field '" + key +
                                 "' must be a positive integer");
   }
-  return v;
+  return *v;
 }
 
 uint16_t ReadPort(const toml::table& tbl, const char* key, uint16_t def,
                   const char* table_name) {
   if (!tbl.contains(key)) return def;
-  auto v = tbl[key].value<int64_t>();
+  auto v = tbl[key].value_exact<int64_t>();
   if (!v || *v < 1 || *v > 65535) {
     throw std::invalid_argument(std::string(table_name) + " field '" + key +
                                 "' must be a port in [1, 65535]");
@@ -710,7 +711,9 @@ RawDevice ParseMotor(const toml::table& t, const std::string& name) {
   // The sensor is resolved to a logical id after numbering, so Validate
   // never sees the name; the parser checks the pairing.
   RawDevice raw{.name = name};
-  raw.follow_motor = Read<std::string>(t, "follow", "");
+  if (t.contains("follow")) {
+    raw.follow_motor = ReadNonEmpty(t, "follow", "", "motor");
+  }
   m.oppose_master = Read(t, "oppose_master", false);
   if (t.contains("oppose_master") && raw.follow_motor.empty()) {
     throw std::invalid_argument("oppose_master requires follow for " + name);
@@ -728,7 +731,9 @@ RawDevice ParseMotor(const toml::table& t, const std::string& name) {
   m.max_torque_current_a =
       Read(t, "max_torque_current_a", m.max_torque_current_a);
   const std::string feedback = Read<std::string>(t, "feedback", "Rotor");
-  raw.feedback_sensor = Read<std::string>(t, "feedback_sensor", "");
+  if (t.contains("feedback_sensor")) {
+    raw.feedback_sensor = ReadNonEmpty(t, "feedback_sensor", "", "motor");
+  }
   if (feedback == "RemoteCANcoder") {
     m.feedback = hardware::Feedback::kRemoteCANcoder;
     if (raw.feedback_sensor.empty()) {
@@ -1207,9 +1212,10 @@ void MergeManifests(toml::array& base_arr, const toml::array& child_arr,
   }
 }
 
-toml::table ExpandManifest(const toml::array& manifest, const std::string& path,
-                           bool paths_normalized, const ReaderCallback& read,
-                           const DataFileCallback& data) {
+toml::table ExpandManifest(
+    const toml::array& manifest, const std::string& path, bool paths_normalized,
+    const ReaderCallback& read, const DataFileCallback& data,
+    std::map<std::string, TrajectorySources>* deferred_sources = nullptr) {
   namespace fs = std::filesystem;
   const fs::path base = fs::path(path).parent_path();
   auto resolve_entry_path = [&](std::string_view p) {
@@ -1294,9 +1300,13 @@ toml::table ExpandManifest(const toml::array& manifest, const std::string& path,
       sub_file = std::move(merged);
       header = sub_file["subsystem"].as_table();
     }
-    // Only the effective entries, after the defaults merge, are listed and
-    // required.
-    RequireTrajectories(sub_file, sources, file, data);
+    // Only the effective entries, after any defaults or overlay merge, are
+    // listed and required.
+    if (deferred_sources != nullptr) {
+      (*deferred_sources)[name] = std::move(sources);
+    } else {
+      RequireTrajectories(sub_file, sources, file, data);
+    }
     toml::table view;
     if (header != nullptr) {
       for (auto&& [k, v] : *header) {
@@ -1637,6 +1647,20 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
                                     std::string(k.str()) + "'");
       }
     }
+    for (const char* key : {"name", "hardware_node", "sim_gateway"}) {
+      if (robot->contains(key)) {
+        ReadNonEmpty(*robot, key, "", "[robot]");
+      }
+    }
+    if (robot->contains("max_restarts")) {
+      const auto max_restarts = (*robot)["max_restarts"].value_exact<int64_t>();
+      if (!max_restarts || *max_restarts < 1 ||
+          *max_restarts > std::numeric_limits<int>::max()) {
+        throw std::invalid_argument(
+            "[robot] max_restarts must be an integer >= 1 (only --max-restarts "
+            "0 disables restarts)");
+      }
+    }
     hw.period_us = Read(*robot, "period_us", hw.period_us);
     hw.command_timeout_us =
         Read(*robot, "command_timeout_us", hw.command_timeout_us);
@@ -1711,7 +1735,7 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
     s.webroot = ReadNonEmpty(*studio, "webroot", s.webroot, "[studio]");
     s.http_port = ReadPort(*studio, "http_port", s.http_port, "[studio]");
     if (studio->contains("max_clients")) {
-      const auto clients = (*studio)["max_clients"].value<int64_t>();
+      const auto clients = (*studio)["max_clients"].value_exact<int64_t>();
       if (!clients || *clients < 1 || *clients > 64) {
         throw std::invalid_argument(
             "[studio] field 'max_clients' must be an integer in [1, 64]");
@@ -1749,6 +1773,10 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
     // silently leave the subsystem without a process.
     if (sub_tbl->contains("node")) {
       ReadNonEmpty(*sub_tbl, "node", "",
+                   ("[subsystems." + sub_name + "]").c_str());
+    }
+    if (sub_tbl->contains("period_us")) {
+      ReadPositive(*sub_tbl, "period_us", 0,
                    ("[subsystems." + sub_name + "]").c_str());
     }
     // Fail closed: unknown nodes are required for safe robot operation.
@@ -1852,7 +1880,16 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
           c.name = dev.name;
         },
         dev.config);
-    by_name.try_emplace(dev.name, &dev);
+    if (auto [it, inserted] = by_name.try_emplace(dev.name, &dev); !inserted) {
+      const RawDevice* first = it->second;
+      if (first->subsystem == dev.subsystem) {
+        throw std::invalid_argument("duplicate device name '" + dev.name +
+                                    "' in subsystem '" + dev.subsystem + "'");
+      }
+      throw std::invalid_argument("duplicate device name '" + dev.name +
+                                  "' in subsystems '" + first->subsystem +
+                                  "' and '" + dev.subsystem + "'");
+    }
     if (std::holds_alternative<hardware::MotorConfig>(dev.config)) {
       motors_by_name.try_emplace(dev.name, &dev);
     }
@@ -2025,9 +2062,19 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
               mod.drive + "'");
         }
         auto check_motor = [&](const char* role, const std::string& name) {
-          if (!motors_by_name.contains(name)) {
+          const auto motor_it = motors_by_name.find(name);
+          if (motor_it == motors_by_name.end()) {
             throw std::invalid_argument(entry_where + ": " + role + " '" +
                                         name + "' names no configured motor");
+          }
+          const auto* motor_raw = motor_it->second;
+          const auto& motor_cfg =
+              std::get<hardware::MotorConfig>(motor_raw->config);
+          if (motor_cfg.master_id != 0) {
+            throw std::invalid_argument(
+                entry_where + ": " + role + " motor '" + name + "' follows '" +
+                motor_raw->follow_motor +
+                "'; configure the swerve module on its master instead");
           }
           if (!seen_motors.insert(name).second) {
             throw std::invalid_argument(
@@ -2330,11 +2377,19 @@ toml::table ResolveRobotConfig(const std::string& path,
       if (auto* child_subs = tbl["subsystems"].as_array()) {
         MergeManifests(*base_subs, *child_subs, path);
         tbl.erase("subsystems");
-      } else if (tbl.contains("subsystems")) {
+      } else if (tbl["subsystems"].is_table()) {
+        std::map<std::string, TrajectorySources> manifest_sources;
         base.insert_or_assign(
             "subsystems",
             ExpandManifest(*base_subs, inc_file, /*paths_normalized=*/true,
-                           read, data));
+                           read, data, &manifest_sources));
+        for (auto& [subsystem, entries] : table_sources) {
+          for (auto& [entry, where] : entries) {
+            manifest_sources[subsystem].insert_or_assign(entry,
+                                                         std::move(where));
+          }
+        }
+        table_sources = std::move(manifest_sources);
       }
     }
     MergeTables(base, tbl);

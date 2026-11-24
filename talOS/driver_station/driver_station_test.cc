@@ -292,6 +292,37 @@ TEST(ModeTrackerTest, DetachedDriverStationShowsNoMode) {
   EXPECT_EQ(Stamp(tracker, 1020, kTeleop), 1000u);
 }
 
+// REQ-SAFE-10
+TEST(ModeTrackerTest, DetachedWithEnabledSetStripsModeBitsAndTracksEnabled) {
+  ModeTracker tracker;
+  DriverStationData ds = Sample(1000, kEnabled | kTeleop);
+  tracker.Stamp(ds);
+  EXPECT_EQ(ds.fms.flags, kEnabled);
+  EXPECT_EQ(ds.mode_since_us, 1000u);
+
+  // Mode-bit changes while detached do not change ModeKey (all strip to
+  // kEnabled), so the generation stays at 1000.
+  tracker.Observe(kEnabled | kAutonomous, 1005);
+  tracker.Observe(kEnabled | kTest, 1010);
+  EXPECT_EQ(Stamp(tracker, 1020, kEnabled), 1000u);
+
+  // Dropping and restoring kEnabled while still detached starts a new
+  // generation, even when it flaps between samples.
+  tracker.Observe(0, 1030);
+  tracker.Observe(kEnabled | kTeleop, 1040);
+  DriverStationData after_flap = Sample(1050, kEnabled | kTeleop);
+  tracker.Stamp(after_flap);
+  EXPECT_EQ(after_flap.fms.flags, kEnabled);
+  EXPECT_EQ(after_flap.mode_since_us, 1040u);
+
+  // Attaching the Driver Station starts a new generation and restores the mode
+  // bit.
+  DriverStationData attached = Sample(1060, kTeleopEnabled);
+  tracker.Stamp(attached);
+  EXPECT_EQ(attached.fms.flags, kTeleopEnabled);
+  EXPECT_EQ(attached.mode_since_us, 1060u);
+}
+
 TEST(ModeTrackerTest, GenerationIsNeverZeroAndAlwaysMovesForward) {
   ModeTracker tracker;
   // A sampler whose clock starts at 0 still stamps a generation no target

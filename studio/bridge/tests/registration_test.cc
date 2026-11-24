@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -342,6 +343,118 @@ TEST(BridgeRegistration, SupervisedFailsFastWhenRegistryIsFull) {
 
   held.clear();
   std::filesystem::remove_all(webroot);
+}
+
+// REQ-OPS-34: --config=<val> and --idle-timeout-s=<val> accept the same `=`
+// syntax as the other options, reject empty --config= and out-of-range
+// --idle-timeout-s=, and --describe honors --config=<val>.
+TEST(BridgeRegistration, CliEqualsFlagsAndEmptyConfigValidation) {
+  const std::string binary = BridgeBinary();
+  const std::string topic = "/test/telemetry/cli" + std::to_string(::getpid());
+  const std::string dir =
+      ::testing::TempDir() + "/bridge_cli_" + std::to_string(::getpid());
+  std::filesystem::create_directories(dir);
+  const std::string config_file = dir + "/robot.toml";
+  {
+    std::ofstream out(config_file);
+    out << "[robot]\n"
+           "name = \"cli_test\"\n"
+           "[studio]\n"
+           "topic = \"/talos/telemetry/custom\"\n"
+           "[subsystems]\n";
+  }
+
+  // Empty --config= and invalid --idle-timeout-s= are rejected with exit 2.
+  EXPECT_EQ(RunToExit({binary, topic, "0", dir, "--config="}), 2);
+  EXPECT_EQ(RunToExit({binary, topic, "0", dir, "--config", ""}), 2);
+  EXPECT_EQ(RunToExit({binary, "--describe", "--config="}), 2);
+  EXPECT_EQ(RunToExit({binary, topic, "0", dir, "--idle-timeout-s="}), 2);
+  EXPECT_EQ(RunToExit({binary, topic, "0", dir, "--idle-timeout-s=7"}), 2);
+  EXPECT_EQ(RunToExit({binary, topic, "0", dir, "--idle-timeout-s=961"}), 2);
+  EXPECT_EQ(RunToExit({binary, topic, "0", dir, "--idle-timeout-s=abc"}), 2);
+
+  // --describe --config=<path> reads [studio] topic from the config.
+  {
+    int stdout_pipe[2]{-1, -1};
+    ASSERT_EQ(::pipe(stdout_pipe), 0);
+    const std::string config_flag = "--config=" + config_file;
+    const std::vector<std::string> args = {binary, "--describe", config_flag};
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+    argv.push_back(nullptr);
+    const pid_t pid = ::fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+      ::close(stdout_pipe[0]);
+      ::dup2(stdout_pipe[1], STDOUT_FILENO);
+      ::close(stdout_pipe[1]);
+      ::execv(argv[0], argv.data());
+      ::_exit(127);
+    }
+    ::close(stdout_pipe[1]);
+    std::string output;
+    char buf[4096];
+    for (;;) {
+      const ssize_t n = ::read(stdout_pipe[0], buf, sizeof(buf));
+      if (n <= 0) break;
+      output.append(buf, static_cast<std::size_t>(n));
+    }
+    ::close(stdout_pipe[0]);
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << output;
+    const auto doc = nlohmann::json::parse(output);
+    ASSERT_TRUE(doc.contains("sources") && doc["sources"].size() == 1u)
+        << output;
+    EXPECT_EQ(doc["sources"][0]["name"].get<std::string>(),
+              "/talos/telemetry/custom")
+        << output;
+  }
+
+  // Normal startup accepts --config=<path> and --idle-timeout-s=<valid>.
+  {
+    int stdout_pipe[2]{-1, -1};
+    ASSERT_EQ(::pipe(stdout_pipe), 0);
+    const std::vector<std::string> args = {binary,
+                                           topic,
+                                           "0",
+                                           dir,
+                                           "--config=" + config_file,
+                                           "--idle-timeout-s=20"};
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+    argv.push_back(nullptr);
+    const pid_t pid = ::fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+      ::close(stdout_pipe[0]);
+      ::dup2(stdout_pipe[1], STDOUT_FILENO);
+      ::close(stdout_pipe[1]);
+      ::execv(argv[0], argv.data());
+      ::_exit(127);
+    }
+    ::close(stdout_pipe[1]);
+    std::string line;
+    char ch = '\0';
+    while (::read(stdout_pipe[0], &ch, 1) == 1) {
+      if (ch == '\n') break;
+      line.push_back(ch);
+    }
+    ::close(stdout_pipe[0]);
+    ASSERT_TRUE(line.starts_with("listening ")) << line;
+    const auto port = static_cast<uint16_t>(std::stoul(line.substr(10)));
+    EXPECT_FALSE(HttpGet(port, "/system.json").empty());
+    ::kill(pid, SIGTERM);
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+
+  std::filesystem::remove_all(dir);
 }
 
 }  // namespace

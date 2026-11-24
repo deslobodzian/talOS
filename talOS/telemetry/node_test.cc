@@ -2309,5 +2309,204 @@ node = "//talOS/telemetry:node"
   }
 }
 
+// Publishes `/pose_estimator/state` with a verified reflection.Schema whose
+// `objects` vector is empty (0 objects) or omitted.
+class EmptyObjectsPoseTopicNode {
+ public:
+  explicit EmptyObjectsPoseTopicNode(talos::Node& node) {
+    flatbuffers::FlatBufferBuilder fbb;
+    std::vector<flatbuffers::Offset<reflection::Object>> objects;
+    std::vector<flatbuffers::Offset<reflection::Enum>> enums;
+    reflection::FinishSchemaBuffer(
+        fbb, reflection::CreateSchemaDirect(fbb, &objects, &enums));
+    const std::string bfbs{
+        reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
+    talos::detail::NodeAccess::add_publisher(
+        node, "/pose_estimator/state", 24, 8,
+        talos::schema::Identity{"pose_test.EmptySchema", 333, bfbs});
+  }
+};
+
+class OmittedObjectsPoseTopicNode {
+ public:
+  explicit OmittedObjectsPoseTopicNode(talos::Node& node) {
+    flatbuffers::FlatBufferBuilder fbb;
+    const auto start = fbb.StartTable();
+    const flatbuffers::Offset<reflection::Schema> empty{fbb.EndTable(start)};
+    reflection::FinishSchemaBuffer(fbb, empty);
+    const std::string bfbs{
+        reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
+    talos::detail::NodeAccess::add_publisher(
+        node, "/pose_estimator/state", 24, 8,
+        talos::schema::Identity{"pose_test.OmittedObjects", 334, bfbs});
+  }
+};
+
+// REQ-OPS-22, REQ-CONTRACT-20: a schema with empty or omitted `objects()` must
+// be refused with std::invalid_argument naming the schema and/or pose topic,
+// never dereferenced.
+TEST(TelemetryTest, PoseExtractionRefusesSchemaWithEmptyOrOmittedObjects) {
+  constexpr const char* kConfig = R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+pose_topic = "/pose_estimator/state"
+[subsystems.pose_estimator]
+node = "//pose_estimator:node"
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)";
+  {
+    Sim sim = Sim::FromToml(kConfig);
+    sim.add<EmptyObjectsPoseTopicNode>("pose_estimator");
+    try {
+      sim.add<Telemetry>("telemetry");
+      ADD_FAILURE() << "constructed despite empty schema->objects()";
+    } catch (const std::invalid_argument& error) {
+      const std::string_view msg = error.what();
+      EXPECT_NE(msg.find("pose_test.EmptySchema"), std::string_view::npos)
+          << msg;
+      EXPECT_NE(msg.find("/pose_estimator/state"), std::string_view::npos)
+          << msg;
+    }
+  }
+  {
+    Sim sim = Sim::FromToml(kConfig);
+    sim.add<OmittedObjectsPoseTopicNode>("pose_estimator");
+    try {
+      sim.add<Telemetry>("telemetry");
+      ADD_FAILURE() << "constructed despite omitted schema->objects()";
+    } catch (const std::invalid_argument& error) {
+      const std::string_view msg = error.what();
+      EXPECT_NE(msg.find("/pose_estimator/state"), std::string_view::npos)
+          << msg;
+    }
+  }
+}
+
+// REQ-CONTRACT-28, REQ-OPS-22: on tick 0 (and every 100th tick), Telemetry
+// emits every dictionary page followed by every value page in one tick into
+// the 64-slot `/talos/telemetry` ring. A dictionary whose combined page count
+// exceeds `telemetry_wire::slot_count` would silently lap its own dictionary
+// pages on tick 0, so construction must refuse it naming the page counts and
+// `slot_count`.
+TEST(TelemetryTest, CombinedPagesExceedingRingSlotCountIsRefused) {
+  // 2000 long-named channels + pose/valid = 2001 channels (<= kMaxChannels):
+  // fits in <= 64 combined pages (dictionary + value).
+  {
+    Sim fits = Sim::FromToml(LongNamesConfig(1900, kLongestFieldName));
+    fits.add<LongNamesNode>("budget");
+    const auto& telemetry = fits.add<Telemetry>("telemetry");
+    const PageBudget budget = MeasurePages(telemetry.dictionary());
+    EXPECT_LE(budget.dictionary_pages + budget.value_pages,
+              telemetry_wire::slot_count);
+  }
+
+  // 2047 long-named channels + pose/valid = 2048 channels (== kMaxChannels),
+  // but 41 dictionary pages + 25 value pages = 66 > 64 slots.
+  Sim over = Sim::FromToml(LongNamesConfig(2047, kLongestFieldName));
+  over.add<LongNamesNode>("budget");
+  try {
+    over.add<Telemetry>("telemetry");
+    ADD_FAILURE() << "accepted dictionary whose resend tick exceeds 64 slots";
+  } catch (const std::runtime_error& error) {
+    const std::string_view msg = error.what();
+    EXPECT_NE(msg.find(std::to_string(telemetry_wire::slot_count)),
+              std::string_view::npos)
+        << msg;
+    EXPECT_NE(msg.find("dictionary"), std::string_view::npos) << msg;
+    EXPECT_NE(msg.find("value"), std::string_view::npos) << msg;
+  }
+}
+
+// Publishes a 3-segment topic `/big/state/sub` with 2100 doubles so excess
+// channels past the flattening cap must bucket under `big/state` together with
+// the built channels rather than splitting into `big/state/sub`.
+class ThreeSegmentOversizedNode {
+ public:
+  explicit ThreeSegmentOversizedNode(talos::Node& node)
+      : schema_{MakeDoubleStructSchema("big.Sub", 2100, 4)} {
+    talos::detail::NodeAccess::add_publisher(
+        node, "/big/state/sub", 2100 * sizeof(double), 8,
+        talos::schema::Identity{"big.Sub", 6789, schema_});
+  }
+
+ private:
+  std::string schema_;
+};
+
+// REQ-OPS-22: excess channels on a 3-segment topic bucket under `owner/role`
+// together with its built channels in the cap refusal.
+TEST(TelemetryTest, ExcessChannelsBucketByOwnerAndRole) {
+  Sim sim = Sim::FromToml(R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+[subsystems.big]
+node = "//big:node"
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)");
+  sim.add<ThreeSegmentOversizedNode>("big");
+  try {
+    sim.add<Telemetry>("telemetry");
+    ADD_FAILURE() << "a dictionary past the channel cap constructed";
+  } catch (const std::runtime_error& error) {
+    const std::string_view msg = error.what();
+    EXPECT_NE(msg.find("2101 channels"), std::string_view::npos) << msg;
+    EXPECT_NE(msg.find("big/state (2100)"), std::string_view::npos) << msg;
+    EXPECT_EQ(msg.find("big/state/sub"), std::string_view::npos) << msg;
+  }
+}
+
+// REQ-OPS-38, REQ-CONTRACT-10: an explicit empty `labels = []` in
+// `[subsystems.telemetry]` constructs cleanly and records a read of `"labels"`
+// so `LintParameterKeys` never flags it as unread.
+TEST(TelemetryTest, EmptyLabelsArrayRecordsParamRead) {
+  const char* tmp = std::getenv("TEST_TMPDIR");
+  ASSERT_NE(tmp, nullptr);
+  const std::string config_path = std::string{tmp} +
+                                  "/telemetry_empty_labels_" +
+                                  std::to_string(::getpid()) + ".toml";
+  {
+    std::ofstream out{config_path};
+    out << R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+labels = []
+)";
+  }
+  const auto config = std::make_shared<const config::RobotConfig>(
+      config::ParseRobotConfig(config_path));
+  event::SimulationEnvironment env;
+  event::SimulatedEventLoop<> loop{env};
+  talos::detail::LoopPortFor<event::SimulatedEventLoop<>> port{loop};
+  auto node = talos::detail::NodeAccess::create(talos::detail::NodeSetup{
+      .name = "telemetry",
+      .config_path = config_path,
+      .config = config,
+      .loop = &port,
+  });
+  Telemetry telemetry{*node};
+  const auto desc = talos::detail::DescribeNode(
+      *node, "//talOS/telemetry:node", loop.manifest(),
+      introspect::LoopSourceFlags(loop));
+  ASSERT_TRUE(desc.params.has_value());
+  bool saw_labels = false;
+  for (const auto& read : *desc.params) {
+    if (read.subsystem == "telemetry" && read.key == "labels") {
+      saw_labels = true;
+    }
+  }
+  EXPECT_TRUE(saw_labels);
+  std::remove(config_path.c_str());
+}
+
 }  // namespace
 }  // namespace talos::telemetry

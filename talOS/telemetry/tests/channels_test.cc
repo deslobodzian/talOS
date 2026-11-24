@@ -338,6 +338,13 @@ TEST(TelemetryChannels, HostileSchemaIsRefusedNamingTheTopic) {
       {"field has out-of-range BaseType (127)",
        {{CraftedField::Raw(127, static_cast<std::int8_t>(kNone), -1, 0)}},
        {}},
+      {"scalar array with zero fixed_length",
+       {{{BaseType::Array, BaseType::Double, -1, 0}}},
+       {8}},
+      {"struct array with zero fixed_length",
+       {{{BaseType::Array, BaseType::Obj, 1, 0}},
+        {{BaseType::Double, kNone, -1, 0}}},
+       {8, 8}},
   };
   for (const auto& c : cases) {
     SCOPED_TRACE(c.name);
@@ -458,6 +465,113 @@ TEST(TelemetryChannels, EnumLabelsNullSafeAndSeededMutationFuzz) {
     std::array<std::uint64_t, kDriverStationChannelCount> ds{};
     (void)ReadDriverStation(payload, ds);
   }
+}
+
+// REQ-OPS-41, REQ-OPS-42: scalar-array expansion is bounded per topic even
+// when `options.truncate` is true or `options.keep` rejects every channel, so
+// a crafted `.bfbs` cannot spin through millions of scalar elements.
+TEST(TelemetryChannels, ScalarArrayExpansionIsBoundedUnderTruncateAndExclude) {
+  using reflection::BaseType;
+  // Single huge scalar array: [double: 65535].
+  const std::string single_huge =
+      CraftSchema({{{BaseType::Array, BaseType::Double, -1, 65535}}},
+                  {65535 * static_cast<std::int32_t>(sizeof(double))});
+  // Nested struct array whose total scalar elements exceed the per-topic
+  // element cap while staying well under kMaxTopicStructs: 200 * 100 = 20000.
+  const std::string nested_huge =
+      CraftSchema({{{BaseType::Array, BaseType::Obj, 1, 200}},
+                   {{BaseType::Array, BaseType::Double, -1, 100}}},
+                  {200 * 100 * static_cast<std::int32_t>(sizeof(double)),
+                   100 * static_cast<std::int32_t>(sizeof(double))});
+
+  for (const auto& [label, bfbs] :
+       {std::pair{"single [double:65535]", &single_huge},
+        std::pair{"nested 200x[double:100]", &nested_huge}}) {
+    SCOPED_TRACE(label);
+    {
+      FlattenOptions opts;
+      opts.truncate = true;
+      try {
+        FlattenTopic("/dos/state", "t.o00", *bfbs, opts);
+        ADD_FAILURE() << "accepted unbounded scalar array under truncate=true";
+      } catch (const std::invalid_argument& error) {
+        EXPECT_NE(std::string{error.what()}.find("/dos/state"),
+                  std::string::npos)
+            << error.what();
+      }
+    }
+    {
+      FlattenOptions opts;
+      opts.keep = [](std::string_view) { return false; };
+      try {
+        FlattenTopic("/dos/state", "t.o00", *bfbs, opts);
+        ADD_FAILURE() << "accepted unbounded scalar array under keep=false";
+      } catch (const std::invalid_argument& error) {
+        EXPECT_NE(std::string{error.what()}.find("/dos/state"),
+                  std::string::npos)
+            << error.what();
+      }
+    }
+  }
+}
+
+// REQ-OPS-41, REQ-OPS-42: a crafted `.bfbs` with `type.index() >= 0` on a
+// Float, Double, or Bool field must not attach enum labels or drop the numeric
+// field's unit suffix; integer fields still receive enum labels.
+TEST(TelemetryChannels, NonIntegerFieldsIgnoreEnumTypeIndex) {
+  flatbuffers::FlatBufferBuilder fbb;
+  auto make_field = [&](const char* name, reflection::BaseType base,
+                        std::int32_t index, std::uint16_t id,
+                        std::uint16_t offset) {
+    const auto type = reflection::CreateType(
+        fbb, base, reflection::BaseType::None, index, 0, 1, 0);
+    return reflection::CreateFieldDirect(fbb, name, type, id, offset);
+  };
+  std::vector<flatbuffers::Offset<reflection::Field>> fields{
+      make_field("dist_m", reflection::BaseType::Double, 0, 0, 0),
+      make_field("speed_mps", reflection::BaseType::Float, 0, 1, 8),
+      make_field("alert_error_fault", reflection::BaseType::Bool, 0, 2, 12),
+      make_field("mode", reflection::BaseType::UByte, 0, 3, 13),
+  };
+  const auto obj =
+      reflection::CreateObjectDirect(fbb, "t.Crafted", &fields, true, 8, 16);
+  std::vector<flatbuffers::Offset<reflection::Object>> objects{obj};
+
+  std::vector<flatbuffers::Offset<reflection::EnumVal>> vals{
+      reflection::CreateEnumValDirect(fbb, "OFF", 0),
+      reflection::CreateEnumValDirect(fbb, "ON", 1),
+  };
+  const auto enum_type =
+      reflection::CreateType(fbb, reflection::BaseType::UByte,
+                             reflection::BaseType::None, -1, 0, 1, 0);
+  const auto enum_def =
+      reflection::CreateEnumDirect(fbb, "t.Mode", &vals, false, enum_type);
+  std::vector<flatbuffers::Offset<reflection::Enum>> enums{enum_def};
+  reflection::FinishSchemaBuffer(
+      fbb, reflection::CreateSchemaDirect(fbb, &objects, &enums));
+  const std::string bfbs{reinterpret_cast<const char*>(fbb.GetBufferPointer()),
+                         fbb.GetSize()};
+
+  const std::vector<Channel> channels =
+      FlattenTopic("/demo/status", "t.Crafted", bfbs);
+  ASSERT_EQ(channels.size(), 4u);
+
+  EXPECT_EQ(channels[0].name, "demo/status/dist_m");
+  EXPECT_EQ(channels[0].unit, "m");
+  EXPECT_TRUE(channels[0].labels.empty());
+
+  EXPECT_EQ(channels[1].name, "demo/status/speed_mps");
+  EXPECT_EQ(channels[1].unit, "m/s");
+  EXPECT_TRUE(channels[1].labels.empty());
+
+  EXPECT_EQ(channels[2].name, "demo/status/alert_error_fault");
+  EXPECT_EQ(channels[2].unit, "");
+  EXPECT_TRUE(channels[2].labels.empty());
+  EXPECT_EQ(channels[2].alert, Talos::Telemetry::AlertLevel_Error);
+
+  EXPECT_EQ(channels[3].name, "demo/status/mode");
+  EXPECT_EQ(channels[3].unit, "");
+  EXPECT_EQ(channels[3].labels, (std::vector<std::string>{"OFF", "ON"}));
 }
 
 }  // namespace

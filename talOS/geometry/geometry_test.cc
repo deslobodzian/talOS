@@ -421,5 +421,48 @@ TEST(SO3, SmallAngleRightJacobianAndSE3LeftVAvoidCancellation) {
   }
 }
 
+TEST(SO3, SmallAngleExpAvoidsCancellation) {
+  for (const double theta : {1.5e-8, 2e-8, 5e-8, 1e-7, 1e-6, 1e-5, 1e-4}) {
+    SCOPED_TRACE(theta);
+    const double c = theta / std::sqrt(2.0);
+    const Eigen::Vector3d w(c, c, 0.0);
+    const double theta_sq = theta * theta;
+    const double expected_a = 1.0 - theta_sq / 6.0;
+    const double expected_b = 0.5 - theta_sq / 24.0;
+
+    const Eigen::Matrix3d r = SO3<double>::Exp(w).rotationMatrix();
+    const double r_a = r(0, 2) / c;
+    const double r_b = r(0, 1) / (c * c);
+    EXPECT_NEAR(r_a, expected_a, 1e-10);
+    EXPECT_NEAR(r_b, expected_b, 1e-10);
+    EXPECT_TRUE(
+        (r.transpose() * r).isApprox(Eigen::Matrix3d::Identity(), 1e-12));
+  }
+}
+
+TEST(SE2, DiscretizeHandlesFullTurnMultiplesAndHugeInputs) {
+  // Pure rotation at nonzero 2*pi multiples and huge angular rates stays exact
+  // and finite without 0/0 or inf*0 -> NaN.
+  for (const double omega :
+       {2.0 * kPi, -2.0 * kPi, 4.0 * kPi, 1e200, -1e200, 1e308}) {
+    SCOPED_TRACE(omega);
+    const Eigen::Vector3d pure = SE2<double>::Discretize(0.0, 0.0, omega, 1.0);
+    ASSERT_TRUE(pure.allFinite());
+    EXPECT_DOUBLE_EQ(pure(0), omega);
+    EXPECT_DOUBLE_EQ(pure(1), 0.0);
+    EXPECT_DOUBLE_EQ(pure(2), 0.0);
+  }
+
+  // Nonzero linear velocity with huge |omega * dt| or overflowing omega * dt
+  // stays finite (no 0/0 -> NaN from underflowed denom or sin(+inf)).
+  for (const double omega : {2.0 * kPi, -2.0 * kPi, 1e200, 1e308}) {
+    SCOPED_TRACE(omega);
+    const Eigen::Vector3d twist =
+        SE2<double>::Discretize(1.0, -0.5, omega, 2.0);
+    EXPECT_TRUE(twist.allFinite()) << twist.transpose();
+    EXPECT_DOUBLE_EQ(twist(0), omega);
+  }
+}
+
 }  // namespace
 }  // namespace talos::geometry

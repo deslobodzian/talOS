@@ -36,6 +36,7 @@ let playback: PlaybackState|null = null;
 let system: SystemState|null = null;
 let frames: Snapshot[] = [];
 let pieces: PiecesSnapshot|null = null;
+let postedFrameChunks: {reset: boolean; count: number}[] = [];
 // The main thread's render cache, fed as studio.ts feeds it.
 const store = new TelemetryStore(cb => cb());
 function apply(m: Record<string, unknown>) {
@@ -44,9 +45,11 @@ function apply(m: Record<string, unknown>) {
   else if (m.type === 'manifest') {
     if (m.manifest) store.pushManifest(m.manifest as SessionManifest);
   } else if (m.type === 'frames') {
+    const chunk = m.frames as Snapshot[];
+    postedFrameChunks.push({reset: m.reset as boolean, count: chunk.length});
     if (m.reset) frames = [];
-    frames.push(...(m.frames as Snapshot[]));
-    store.ingest(m.frames as Snapshot[], m.reset as boolean);
+    frames.push(...chunk);
+    store.ingest(chunk, m.reset as boolean);
   } else if (m.type === 'alerts') {
     store.setAlertLatch(m.latch as AlertLatch);
   } else if (m.type === 'pieces') {
@@ -541,4 +544,41 @@ test('the bridge\'s game pieces reach the page beside telemetry, and a new conne
   connect();
   advance(40);
   assert.equal(pieces, null, 'a new connection starts with no pieces');
+});
+
+// REQ-OPS-37: multi-chunk postFrames() (> 2000 frames after a reset, e.g. log
+// import) sends reset: true only on chunk 1 and reset: false on subsequent
+// chunks so the store retains every imported frame in order.
+test('postFrames chunks > 2000 reset frames with reset:true on chunk 1 and reset:false on chunk 2', () => {
+  const specs = [{name: 'x', unit: 'm', kind: ChannelKind.Double}];
+  const dictId = dictionaryId(specs);
+  const chassis = {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0};
+  const total = 2500;
+  const pages: Uint8Array[] = encodeDictionaryPages(
+      {streamId: 91n, sequenceId: 1n, timestampNs: 1_000_000n,
+       dictionaryId: dictId, channelCount: 1},
+      specs);
+  for (let i = 1; i <= total; i++) {
+    pages.push(...encodeValuePages(
+        {streamId: 91n, sequenceId: BigInt(i), timestampNs: BigInt(i) * 1_000_000n,
+         dictionaryId: dictId, channelCount: 1},
+        chassis, i === 1, [[0, rawFromDouble(i)]]));
+  }
+  const log = concatPages(pages);
+
+  postedFrameChunks = [];
+  send({type: 'import', buffer: log.slice().buffer});
+  // Tick twice so WorkerUpdateStream flushes both chunks (each chunk <= 2000).
+  advance(4);
+  advance(4);
+
+  const nonEmpty = postedFrameChunks.filter(c => c.count > 0 || c.reset);
+  assert.deepEqual(nonEmpty, [
+    {reset: true, count: 2000},
+    {reset: false, count: 500}
+  ]);
+  assert.equal(frames.length, total);
+  assert.equal(frames[0].sequence_id, '1');
+  assert.equal(frames[total - 1].sequence_id, String(total));
+  assert.equal(store.series(['x'], 'all', String(total * 1_000_000)).times.length, total);
 });

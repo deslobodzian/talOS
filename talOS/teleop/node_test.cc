@@ -1569,5 +1569,244 @@ period_us = 20000
   }
 }
 
+// REQ-SAFE-14: when controller port 0 is armed and driving subsystem A, a
+// second bound controller (port 1) connecting or reconnecting with a held
+// input disarms shared arming_ and releases subsystem A's lane until every
+// connected bound input returns to neutral.
+TEST(TeleopNode, MultiControllerConnectAndReconnectWithHeldInputDisarmsAll) {
+  constexpr const char* kTwoStickToml = R"(
+[robot]
+period_us = 20000
+command_timeout_us = 100000
+
+[subsystems.roller]
+period_us = 20000
+
+[subsystems.roller.teleop]
+defaults = { feedforward_v = 0.0 }
+
+[[subsystems.roller.teleop.bindings]]
+port = 0
+button = 1
+while_held = { velocity_rps = 60.0 }
+
+[subsystems.arm]
+period_us = 20000
+
+[subsystems.arm.teleop]
+defaults = { feedforward_v = 0.0 }
+
+[[subsystems.arm.teleop.bindings]]
+port = 1
+axis = 0
+field = "velocity_rps"
+scale = 10.0
+deadband_frac = 0.1
+
+[subsystems.teleop]
+period_us = 20000
+)";
+  Sim sim = MakeSim(kTwoStickToml);
+  auto& roller = sim.add<ConsumerNode<control::VelocityTarget>>("roller");
+  auto& arm = sim.add<ConsumerNode<control::VelocityTarget>>("arm");
+  sim.add<Teleop>("teleop");
+  SimHardware hw{sim};
+  hw.enable();
+
+  const auto push_sticks = [&](const ds::JoystickData& stick0,
+                               const ds::JoystickData& stick1) {
+    ds::DriverStationData data{};
+    data.fms.flags = kTeleopEnabled;
+    data.joysticks[0] = stick0;
+    data.joysticks[1] = stick1;
+    Push(hw, sim, data);
+  };
+  const auto latest_status = [&sim] {
+    return sim.latest<::teleop::TeleopStatus>(::teleop::topics::kStatus);
+  };
+  const ds::JoystickData disconnected = MakeStick(0, 0, 0, 0, false);
+
+  // Arm with only port 0 connected, then drive roller from port 0.
+  push_sticks(MakeStick(), disconnected);
+  push_sticks(MakeStick(0, 0, 0, 1), disconnected);
+  ASSERT_TRUE(roller.seen.has_value());
+  EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(), 60.0);
+  ASSERT_TRUE(RollerLane(sim).has_value());
+  EXPECT_EQ(RollerLane(sim)->active, 1);
+  ASSERT_TRUE(latest_status().has_value());
+  EXPECT_TRUE(latest_status()->armed());
+
+  // Port 1 connects with a held axis: shared arming_ disarms and roller's lane
+  // is released even though port 0 stayed connected.
+  push_sticks(MakeStick(0, 0, 0, 1), MakeStick(0.8f));
+  EXPECT_FALSE(roller.seen.has_value());
+  EXPECT_FALSE(arm.seen.has_value());
+  EXPECT_EQ(RollerLane(sim)->active, 0);
+  ASSERT_TRUE(latest_status().has_value());
+  EXPECT_FALSE(latest_status()->armed());
+  EXPECT_TRUE(latest_status()->alert_warning_disarmed());
+
+  // Releasing port 0 alone is not enough while port 1 stays deflected.
+  push_sticks(MakeStick(), MakeStick(0.8f));
+  push_sticks(MakeStick(0, 0, 0, 1), MakeStick(0.8f));
+  EXPECT_FALSE(roller.seen.has_value());
+  EXPECT_FALSE(arm.seen.has_value());
+
+  // Both controllers neutral -> rearms; fresh inputs drive both lanes.
+  push_sticks(MakeStick(), MakeStick());
+  ASSERT_TRUE(latest_status().has_value());
+  EXPECT_TRUE(latest_status()->armed());
+  push_sticks(MakeStick(0, 0, 0, 1), MakeStick(1.0f));
+  ASSERT_TRUE(roller.seen.has_value());
+  ASSERT_TRUE(arm.seen.has_value());
+  EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(), 60.0);
+  EXPECT_NEAR(arm.seen->velocity_rps(), 10.0, 1e-6);
+
+  // Port 1 disconnects, then reconnects with held axis while port 0 is driving
+  // roller: reconnect disarms shared arming_ and releases roller's lane again.
+  push_sticks(MakeStick(0, 0, 0, 1), disconnected);
+  ASSERT_TRUE(roller.seen.has_value());
+  EXPECT_EQ(RollerLane(sim)->active, 1);
+
+  push_sticks(MakeStick(0, 0, 0, 1), MakeStick(0.8f));
+  EXPECT_FALSE(roller.seen.has_value());
+  EXPECT_FALSE(arm.seen.has_value());
+  EXPECT_EQ(RollerLane(sim)->active, 0);
+  ASSERT_TRUE(latest_status().has_value());
+  EXPECT_FALSE(latest_status()->armed());
+  EXPECT_TRUE(latest_status()->alert_warning_disarmed());
+}
+
+// REQ-CONTRACT-24: when a button binding and an axis binding target the same
+// field, the earlier live binding in config order sets field_set and wins; an
+// inactive earlier binding (e.g. axis inside deadband) yields to the later one.
+TEST(TeleopNode, CombinedButtonAndAxisOnSameFieldRespectsBindingOrder) {
+  const std::string button_binding =
+      "[[subsystems.roller.teleop.bindings]]\n"
+      "button = 1\n"
+      "while_held = { velocity_rps = 60.0 }\n";
+  const std::string axis_binding =
+      "[[subsystems.roller.teleop.bindings]]\n"
+      "axis = 0\n"
+      "field = \"velocity_rps\"\n"
+      "scale = 10.0\n"
+      "deadband_frac = 0.125\n";
+
+  for (const bool button_first : {true, false}) {
+    SCOPED_TRACE(button_first ? "button_first" : "axis_first");
+    const std::string config =
+        "[robot]\nperiod_us = 20000\ncommand_timeout_us = 100000\n"
+        "[subsystems.roller]\nperiod_us = 20000\n"
+        "[subsystems.roller.teleop]\n"
+        "defaults = { velocity_rps = 0.0, feedforward_v = 0.0 }\n" +
+        (button_first ? button_binding + axis_binding
+                      : axis_binding + button_binding) +
+        "[subsystems.teleop]\nperiod_us = 20000\n";
+    Sim sim = MakeSim(config);
+    auto& roller = sim.add<ConsumerNode<control::VelocityTarget>>("roller");
+    sim.add<Teleop>("teleop");
+    SimHardware hw{sim};
+    hw.enable();
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+
+    // Button only (axis inside deadband): button writes even when axis is
+    // listed first.
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.05f, 0, 0, 1)));
+    ASSERT_TRUE(roller.seen.has_value());
+    EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(), 60.0);
+
+    // Axis only: axis writes even when button is listed first.
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1.0f, 0, 0, 0)));
+    ASSERT_TRUE(roller.seen.has_value());
+    EXPECT_NEAR(roller.seen->velocity_rps(), 10.0, 1e-6);
+
+    // Both live simultaneously: first binding in config order wins.
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1.0f, 0, 0, 1)));
+    ASSERT_TRUE(roller.seen.has_value());
+    EXPECT_NEAR(roller.seen->velocity_rps(), button_first ? 60.0 : 10.0, 1e-6);
+
+    // Release the winning input while keeping the other live: fallback takes
+    // over cleanly.
+    if (button_first) {
+      Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1.0f, 0, 0, 0)));
+      ASSERT_TRUE(roller.seen.has_value());
+      EXPECT_NEAR(roller.seen->velocity_rps(), 10.0, 1e-6);
+    } else {
+      Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.0f, 0, 0, 1)));
+      ASSERT_TRUE(roller.seen.has_value());
+      EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(), 60.0);
+    }
+  }
+}
+
+// REQ-SAFE-14, REQ-CONTRACT-24: an invalid (overflowing) axis on one subsystem
+// releases only that subsystem's lane and leaves another subsystem's live lane
+// unaffected (including a subsystem evaluated later in map order).
+TEST(TeleopNode, InvalidAxisOnOneSubsystemLeavesOtherSubsystemUnaffected) {
+  constexpr const char* kTwoSubToml = R"(
+[robot]
+period_us = 20000
+command_timeout_us = 100000
+
+[subsystems.mechanism]
+period_us = 20000
+
+[subsystems.mechanism.teleop]
+defaults = { flag = false, position_m = 0.0, level = 'NONE', sample_count = 0, speed_frac = 0.0, 'inner/mode' = 'OFF', 'inner/offset_m' = 0.0 }
+
+[[subsystems.mechanism.teleop.bindings]]
+axis = 0
+field = "inner/offset_m"
+scale = 1e40
+
+[subsystems.roller]
+period_us = 20000
+
+[subsystems.roller.teleop]
+defaults = { feedforward_v = 0.0 }
+
+[[subsystems.roller.teleop.bindings]]
+button = 1
+while_held = { velocity_rps = 60.0 }
+
+[subsystems.teleop]
+period_us = 20000
+)";
+  Sim sim = MakeSim(kTwoSubToml);
+  auto& mechanism = sim.add<ConsumerNode<schema_test::Mixed>>("mechanism");
+  auto& roller = sim.add<ConsumerNode<control::VelocityTarget>>("roller");
+  sim.add<Teleop>("teleop");
+  SimHardware hw{sim};
+  hw.enable();
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+
+  // Both subsystems live with finite values.
+  constexpr float kSmall = 0.06f;
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(kSmall, 0, 0, 1)));
+  ASSERT_TRUE(mechanism.seen.has_value());
+  ASSERT_TRUE(roller.seen.has_value());
+  EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(), 60.0);
+
+  // Overflow mechanism's float field (invalid_axis = true): mechanism's lane
+  // releases, while roller (evaluated after mechanism) stays live untouched.
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(4.0f, 0, 0, 1)));
+  EXPECT_FALSE(mechanism.seen.has_value());
+  const auto mech_lane = talos::testing::LatestTarget<schema_test::Mixed>(
+      sim, "mechanism", "teleop");
+  ASSERT_TRUE(mech_lane.has_value());
+  EXPECT_EQ(mech_lane->active, 0);
+  ASSERT_TRUE(roller.seen.has_value());
+  EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(), 60.0);
+  ASSERT_TRUE(RollerLane(sim).has_value());
+  EXPECT_EQ(RollerLane(sim)->active, 1);
+
+  // Returning mechanism's axis to a finite output recovers mechanism while
+  // roller stays live.
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(kSmall, 0, 0, 1)));
+  ASSERT_TRUE(mechanism.seen.has_value());
+  ASSERT_TRUE(roller.seen.has_value());
+  EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(), 60.0);
+}
+
 }  // namespace
 }  // namespace talos::teleop

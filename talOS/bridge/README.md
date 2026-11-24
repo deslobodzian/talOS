@@ -53,14 +53,18 @@ reasons:
    `kPassBudget` (8); when either is spent, `Run()` uses `sleep_for`
    (`wait.ignore_input`) to sleep through input until the window ends or a timed
    duty falls due—a mode `RealtimeEventLoop` does not have.
-4. **Selective `.tlog` recording and synthetic-time unit tests.**
+4. **Selective `.tlog` recording and synthetic-time tests.**
    `HardwareNode` records only its outbound `/hw/state`, `/hw/command`, and
    `/hw/status` `SEND`s (omitting `/hw/state/driver_station` and raw UDP
-   reads), and its component and integration tests (`trust_test.cc`,
-   `hardware_node_test.cc`) drive `Tick(now_us)` and `Pass(now_us)` directly
-   with deterministic synthetic microsecond timestamps and an in-process
-   gateway (`in_process_gateway.h`), avoiding any wall-clock or event-loop
-   scheduling overhead.
+   reads), and its tests drive `Tick(now_us)` and `Pass(now_us)` directly on
+   deterministic synthetic microsecond timestamps—without event-loop
+   scheduling overhead: component tests in `trust_test.cc`
+   (`//talOS/bridge:trust_test`) use the in-process gateway
+   (`in_process_gateway.h`) with no socket, while integration tests in
+   `hardware_node_test.cc` (`//talOS/bridge:node_test`) run against a fake
+   gateway over real loopback UDP (`node_test_support.h`,
+   `talOS/protocol/udp_test_helpers.h`) to prove the socket reaches the same
+   frame handler (see [docs/TESTING.md](../../docs/TESTING.md#where-a-behaviour-is-tested)).
 
 ## `State` Ordering and Forward-Jump Gate
 
