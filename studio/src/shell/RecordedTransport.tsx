@@ -35,6 +35,9 @@ export function RecordedTransport({source, stepNs, onStepNs, onClose}: {
   const stepOk = /^[1-9]\d{0,17}$/.test(stepNs);
   const playing = playback.mode === 'REPLAY_PLAYING';
   const spanMs = Number((end - start) / 1000000n);
+  const maxMs = Math.max(1, Number.isFinite(spanMs) ? spanMs : 1);
+  const rawPosMs = Number((cursor - start) / 1000000n);
+  const posMs = Number.isFinite(rawPosMs) ? Math.max(0, Math.min(maxMs, rawPosMs)) : 0;
   const modes = recordedModeLanes(source.bounds, source.timeline);
   const alerts = alertMarks(source.bounds, source.timeline);
   const restarts = restartMarks(source.bounds, source.timeline);
@@ -51,7 +54,11 @@ export function RecordedTransport({source, stepNs, onStepNs, onClose}: {
       <button aria-label="Step forward" disabled={!stepOk}
               onClick={() => source.step(stepNs)}>▶▕</button>
       <select aria-label="Playback rate" value={rate}
-              onChange={e => source.setRate(Number(e.target.value) as PlayRate)}>
+              onChange={e => {
+                const next = Number(e.target.value);
+                if ((PLAY_RATES as readonly number[]).includes(next))
+                  source.setRate(next as PlayRate);
+              }}>
         {PLAY_RATES.map(r => <option key={r} value={r}>{r}x</option>)}
       </select>
     </div>
@@ -85,11 +92,13 @@ export function RecordedTransport({source, stepNs, onStepNs, onClose}: {
       </div>
       <div className="scrub-track">
         <input type="range" className="scrub-range" aria-label="Recorded session time"
-               min={0} max={Math.max(1, spanMs)} step={1}
-               value={Number((cursor - start) / 1000000n)}
-               onChange={e => source.seek(
-                   (start + BigInt(Math.round(Number(e.target.value))) * 1000000n)
-                       .toString())}/>
+               min={0} max={maxMs} step={1}
+               value={posMs}
+               onChange={e => {
+                 const ms = Number(e.target.value);
+                 if (!Number.isFinite(ms)) return;
+                 source.seek((start + BigInt(Math.round(ms)) * 1000000n).toString());
+               }}/>
         {gaps.map((band, i) =>
           <span key={i} className="scrub-gap" title={band.title} aria-label={band.title}
                 style={{left: `${band.left * 100}%`, width: `${band.width * 100}%`}}/>)}

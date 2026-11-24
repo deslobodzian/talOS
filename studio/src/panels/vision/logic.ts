@@ -19,15 +19,17 @@ const finite = (n: number | null | undefined): n is number =>
 // a window with no observed transition is null, not 0% or 100%.
 export function validObservationRate(
     sampleTimeNs: ArrayLike<number>, valid: ArrayLike<number>): number|null {
+  const n = Math.min(sampleTimeNs.length, valid.length);
   let total = 0;
   let ok = 0;
   let last: number | undefined;
-  for (let i = 0; i < sampleTimeNs.length; i++) {
+  for (let i = 0; i < n; i++) {
     const t = sampleTimeNs[i];
-    if (!finite(t)) continue;
+    const v = valid[i];
+    if (!finite(t) || !finite(v)) continue;
     if (last !== undefined && t !== last) {
       total++;
-      if (valid[i] === 1) ok++;
+      if (v === 1) ok++;
     }
     last = t;
   }
@@ -46,11 +48,22 @@ export function disagreement(camera: Planar, estimator: Planar): number {
 export function latestValidPose(
     times: ArrayLike<number>, x: ArrayLike<number>, y: ArrayLike<number>,
     valid: ArrayLike<number>): Planar|null {
-  const now = times[times.length - 1];
+  const n = Math.min(times.length, x.length, y.length, valid.length);
+  let now = NaN;
+  for (let i = n - 1; i >= 0; i--) {
+    if (finite(times[i])) {
+      now = times[i];
+      break;
+    }
+  }
+  if (!finite(now)) return null;
   const maxAge = Number(STALE_AFTER_NS) / 1e9;
-  for (let i = valid.length - 1; i >= 0 && now - times[i] < maxAge; i--) {
+  for (let i = n - 1; i >= 0; i--) {
+    const t = times[i];
+    if (!finite(t)) continue;
+    if (now - t >= maxAge) break;
     if (valid[i] === 1 && finite(x[i]) && finite(y[i]))
-      return {x: x[i] as number, y: y[i] as number};
+      return {x: x[i], y: y[i]};
   }
   return null;
 }
@@ -75,7 +88,8 @@ export function counterDelta(values: ArrayLike<number>): number|null {
 // Frame rate from a frame period in microseconds; null when absent/nonpositive.
 export function fpsFromPeriod(periodUs: number|null|undefined): number|null {
   if (!finite(periodUs) || periodUs <= 0) return null;
-  return 1e6 / periodUs;
+  const fps = 1e6 / periodUs;
+  return finite(fps) ? fps : null;
 }
 
 // Frame-rate series from a frame-period series (microseconds), point by point
@@ -92,9 +106,10 @@ export function fpsSeries(periodUs: ArrayLike<number>): Float64Array {
 // Null when there is no delta to divide (no observations at all).
 export function acceptancePct(
     accepted: number|null, rejected: number|null): number|null {
-  if (accepted === null || rejected === null) return null;
+  if (!finite(accepted) || !finite(rejected) || accepted < 0 || rejected < 0)
+    return null;
   const total = accepted + rejected;
-  return total === 0 ? null : accepted / total;
+  return total > 0 && finite(total) ? accepted / total : null;
 }
 
 // Maximum time skew (seconds) between a camera observation and its nearest

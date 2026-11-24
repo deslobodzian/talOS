@@ -42,10 +42,14 @@ const parseConfig = (_raw: unknown): SessionConfig => ({});
 // other panel needs a wall-clock date, and the shared formatters stay about
 // durations and relative ages.
 function wallClock(ns: string): string {
-  const ms = Number(BigInt(ns) / 1_000_000n);
-  const date = new Date(ms);
-  if (!Number.isFinite(ms) || Number.isNaN(date.getTime())) return '—';
-  return date.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC');
+  try {
+    const ms = Number(BigInt(ns) / 1_000_000n);
+    const date = new Date(ms);
+    if (!Number.isFinite(ms) || Number.isNaN(date.getTime())) return '—';
+    return date.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC');
+  } catch {
+    return '—';
+  }
 }
 
 // Elapsed nanoseconds as a human uptime. The shared `duration` formatter tops
