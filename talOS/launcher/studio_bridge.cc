@@ -91,6 +91,7 @@ StudioBridge::StudioBridge(std::size_t index, const NodeSpec& spec,
               options.heartbeat_periods),
           std::chrono::milliseconds{options.heartbeat_startup_grace_ms},
           options.construction_timeout} {
+  if (options.simulation) args_.push_back("--sim");
   proc.log_path.clear();
 }
 
@@ -261,11 +262,19 @@ void StudioBridge::Finish(NodeProcessInfo& proc, bool stop_requested) {
   if (running_ && !settled_ && proc.pid > 0 && !proc.exited) {
     SignalProcessGroup(proc.pid, SIGKILL);
     int status = 0;
-    while (::waitpid(proc.pid, &status, 0) < 0 && errno == EINTR) {
-    }
+    pid_t reaped = -1;
+    do {
+      reaped = ::waitpid(proc.pid, &status, 0);
+    } while (reaped < 0 && errno == EINTR);
     FinishProcessGroup(proc.pid);
     proc.exited = true;
-    proc.exit_signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+    if (reaped == proc.pid) {
+      proc.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+      proc.exit_signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+    } else {
+      proc.exit_code = -1;
+      proc.exit_signal = 0;
+    }
     proc.EndRun(kRunStop);
     running_ = false;
   }

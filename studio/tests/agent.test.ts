@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
+import {execFileSync} from 'node:child_process';
 import dgram from 'node:dgram';
 import {once} from 'node:events';
-import fs, {readdirSync, readFileSync} from 'node:fs';
+import fs, {existsSync, readdirSync, readFileSync, readlinkSync, statSync} from 'node:fs';
 import {createServer} from 'node:http';
 import type {AddressInfo} from 'node:net';
+import path from 'node:path';
 import {test} from 'node:test';
+import {fileURLToPath} from 'node:url';
 
 import {WebSocket, WebSocketServer} from 'ws';
 
@@ -758,27 +761,199 @@ test('oversized RPC WebSocket payloads close only the offending client', async (
 // REQ-SAFE-35: the agent is a viewer. It may follow a bridge and answer RPC
 // over TCP, and nothing else: no UDP socket (the only way it could reach the
 // RoboRIO gateway), no process, and no file opened for writing.
-const AGENT_DIR = new URL('../agent/', import.meta.url);
+const AGENT_DIR = fileURLToPath(new URL('../agent/', import.meta.url));
+const STUDIO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const FORBIDDEN_MODULES = new Set([
   'dgram', 'fs', 'fs/promises', 'child_process', 'worker_threads', 'cluster',
   'dns', 'net', 'tls', 'http2', 'vm', 'module'
 ]);
 
-test('REQ-SAFE-35: no agent source imports a module that could write or send',
+function walkAgentSourceFiles(dir: string): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(dir, {withFileTypes: true})) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...walkAgentSourceFiles(full));
+    } else if (entry.isFile() && /\.(?:[cm]?js|tsx?)$/.test(entry.name)) {
+      files.push(full);
+    }
+  }
+  return files;
+}
+
+function stripJsComments(source: string): string {
+  // Preserve string and template literals so URLs like 'http://...' stay
+  // intact while line and block comments are blanked out.
+  return source.replace(
+      /'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`|\/\/[^\n]*|\/\*[\s\S]*?\*\//g,
+      match => match.startsWith('//') || match.startsWith('/*') ?
+          match.replace(/[^\n]/g, ' ') :
+          match);
+}
+
+function resolveLocalImport(fromFile: string, specifier: string): string {
+  const base = path.resolve(path.dirname(fromFile), specifier);
+  const candidates = [base];
+  if (/\.(?:[cm]?js)$/.test(base)) {
+    const stem = base.replace(/\.(?:[cm]?js)$/, '');
+    candidates.push(`${stem}.ts`, `${stem}.tsx`, `${stem}.mts`, `${stem}.cts`);
+  }
+  candidates.push(
+      `${base}.ts`, `${base}.tsx`, `${base}.mts`, `${base}.cts`,
+      `${base}.js`, `${base}.mjs`, `${base}.cjs`,
+      path.join(base, 'index.ts'), path.join(base, 'index.tsx'),
+      path.join(base, 'index.js'), path.join(base, 'index.mjs'));
+  for (const candidate of candidates) {
+    if (existsSync(candidate) && statSync(candidate).isFile()) return candidate;
+  }
+  assert.fail(
+      `Cannot resolve local import '${specifier}' from ${path.relative(STUDIO_ROOT, fromFile)}`);
+}
+
+function assertNoOsUdpOrRawSockets(expectedTcpPort: number): void {
+  if (process.platform === 'linux') {
+    const held = new Set<number>();
+    for (const fd of readdirSync(`/proc/${process.pid}/fd`)) {
+      let target: string;
+      try {
+        target = readlinkSync(`/proc/${process.pid}/fd/${fd}`);
+      } catch {
+        continue;
+      }
+      if (target.startsWith('socket:[') && target.endsWith(']')) {
+        held.add(Number(target.slice('socket:['.length, -1)));
+      }
+    }
+    const tableInodes = (tables: string[]) => {
+      const inodes = new Set<number>();
+      for (const table of tables) {
+        const tablePath = `/proc/net/${table}`;
+        if (!existsSync(tablePath)) continue;
+        const lines = readFileSync(tablePath, 'utf8').split('\n').slice(1);
+        for (const line of lines) {
+          const cols = line.trim().split(/\s+/);
+          if (cols.length > 9) inodes.add(Number(cols[9]));
+        }
+      }
+      return inodes;
+    };
+    const forbidden = tableInodes(['udp', 'udp6', 'udplite', 'udplite6', 'raw', 'raw6']);
+    const bad = [...held].filter(inode => forbidden.has(inode));
+    assert.deepEqual(bad, [], `agent process holds UDP or raw sockets: ${bad.join(', ')}`);
+    const tcp = tableInodes(['tcp', 'tcp6']);
+    assert.ok([...held].some(inode => tcp.has(inode)),
+              `none of ${[...held].join(', ')} is TCP: live socket inspection saw no TCP socket`);
+    return;
+  }
+  if (process.platform === 'darwin') {
+    const lsof = existsSync('/usr/sbin/lsof') ? '/usr/sbin/lsof' : 'lsof';
+    let udpOut = '';
+    try {
+      udpOut = execFileSync(
+          lsof, ['-n', '-P', '-a', '-p', String(process.pid), '-i', 'UDP'],
+          {encoding: 'utf8'});
+    } catch (e: unknown) {
+      const err = e as {status?: number; stderr?: string; stdout?: string};
+      assert.equal(err.status, 1, `lsof -i UDP failed: ${String(err.stderr ?? e)}`);
+      assert.equal(String(err.stderr ?? ''), '', `lsof -i UDP stderr: ${err.stderr}`);
+      udpOut = String(err.stdout ?? '');
+    }
+    assert.equal(udpOut.trim(), '', `agent process holds UDP sockets:\n${udpOut}`);
+    const allOut = execFileSync(
+        lsof, ['-n', '-P', '-a', '-p', String(process.pid), '-F', 'ftPTn'],
+        {encoding: 'utf8'});
+    let sawExpectedTcp = false;
+    let current: Record<string, string> = {};
+    const flush = () => {
+      const type = current.t ?? '';
+      const proto = current.P ?? '';
+      const name = current.n ?? '';
+      assert.notEqual(proto, 'UDP', `agent holds UDP socket: ${JSON.stringify(current)}`);
+      assert.notEqual(proto, 'RAW', `agent holds RAW socket: ${JSON.stringify(current)}`);
+      assert.notEqual(type, 'RAW', `agent holds RAW socket: ${JSON.stringify(current)}`);
+      if (proto === 'TCP' && name.includes(`:${expectedTcpPort}`)) {
+        sawExpectedTcp = true;
+      }
+    };
+    for (const line of allOut.split('\n')) {
+      if (!line) continue;
+      if (line[0] === 'f') {
+        if (current.f) flush();
+        current = {f: line.slice(1)};
+      } else {
+        current[line[0]] = line.slice(1);
+      }
+    }
+    if (current.f) flush();
+    assert.ok(sawExpectedTcp,
+              `lsof did not observe agent TCP listener on port ${expectedTcpPort}`);
+  }
+}
+
+test('REQ-SAFE-35: no agent source or transitive local import can write or send',
      () => {
        const imported: string[] = [];
-       for (const name of readdirSync(AGENT_DIR)) {
-         if (!/\.(ts|mjs)$/.test(name)) continue;
-         const text = readFileSync(new URL(name, AGENT_DIR), 'utf8');
+       const visited = new Set<string>();
+       const queue: string[] = walkAgentSourceFiles(AGENT_DIR);
+
+       while (queue.length > 0) {
+         const file = queue.pop()!;
+         if (visited.has(file)) continue;
+         visited.add(file);
+         const rel = path.relative(STUDIO_ROOT, file).replaceAll('\\', '/');
+         const text = stripJsComments(readFileSync(file, 'utf8'));
+
+         assert.ok(!/\bgetBuiltinModule\b/.test(text),
+                   `${rel} references getBuiltinModule`);
+         assert.ok(
+             !/\bprocess\s*(?:\.\s*|\[\s*['"])(?:binding|_linkedBinding)\b/.test(text) &&
+                 !/\b_linkedBinding\b/.test(text) &&
+                 !/\.\s*binding\s*\(/.test(text),
+             `${rel} references process.binding / _linkedBinding`);
+
+         const recordSpecifier = (specifier: string) => {
+           imported.push(`${rel}: ${specifier}`);
+           assert.ok(!FORBIDDEN_MODULES.has(specifier.replace(/^node:/, '')),
+                     `${rel} imports ${specifier}`);
+           if (specifier.startsWith('.')) {
+             queue.push(resolveLocalImport(file, specifier));
+           }
+         };
+
+         // Static import / export ... from '...' and side-effect import '...'
          for (const m of text.matchAll(
-                  /(?:from|import|require)\s*\(?\s*['"]([^'"]+)['"]/g)) {
-           imported.push(`${name}: ${m[1]}`);
-           assert.ok(!FORBIDDEN_MODULES.has(m[1].replace(/^node:/, '')),
-                     `${name} imports ${m[1]}`);
+                  /(?<![.\w$])(?:import|export)\b[\w$*,{}\s]+\bfrom\s*['"]([^'"]+)['"]|(?<![.\w$])import\s*['"]([^'"]+)['"]/g)) {
+           recordSpecifier(m[1] ?? m[2]);
+         }
+         // Dynamic import(...) must use a plain string literal.
+         for (const m of text.matchAll(/(?<![.\w$])import\s*\(/g)) {
+           const rest = text.slice(m.index! + m[0].length);
+           const lit = rest.match(/^\s*(?:'([^'\\\n]+)'|"([^"\\\n]+)")\s*\)/);
+           assert.ok(lit, `${rel} uses non-literal dynamic import(...)`);
+           recordSpecifier(lit[1] ?? lit[2]);
+         }
+         // require(...) must also use a plain string literal.
+         for (const m of text.matchAll(/(?<![.\w$])require\s*\(/g)) {
+           const rest = text.slice(m.index! + m[0].length);
+           const lit = rest.match(/^\s*(?:'([^'\\\n]+)'|"([^"\\\n]+)")\s*\)/);
+           assert.ok(lit, `${rel} uses non-literal require(...)`);
+           recordSpecifier(lit[1] ?? lit[2]);
          }
        }
-       // The scan found the agent's own imports, so an empty one cannot pass.
+
+       // Confirm the scan walked both studio/agent/ and transitive ../src/ files,
+       // so an empty or shallow walk cannot pass.
+       const relVisited = new Set(
+           [...visited].map(f => path.relative(STUDIO_ROOT, f).replaceAll('\\', '/')));
        assert.ok(imported.some(i => i.endsWith(': ws')), imported.join('\n'));
+       for (const expected of [
+              'agent/server.ts', 'agent/rpc.ts', 'agent/run.mjs',
+              'src/core.ts', 'src/history.ts', 'src/system.ts',
+              'src/data/freshness.ts', 'src/data/validate.ts', 'src/encode.ts'
+            ]) {
+         assert.ok(relVisited.has(expected),
+                   `expected transitive scan to include ${expected}; saw ${[...relVisited].join(', ')}`);
+       }
      });
 
 test('REQ-SAFE-35: a running agent opens no datagram socket and no file for writing',
@@ -820,6 +995,7 @@ test('REQ-SAFE-35: a running agent opens no datagram socket and no file for writ
        };
        const bridge = await fakeBridge(demoDeclaredGraph(), demoPacket(0n));
        const agent = startAgent(0, bridge.url);
+       let wsClient: WebSocket|undefined;
        try {
          await settle(() => !!agent.context().declared &&
                             agent.timeline.latest() !== null,
@@ -827,13 +1003,57 @@ test('REQ-SAFE-35: a running agent opens no datagram socket and no file for writ
          agent.ingestSystemGraph(demoSystemGraph(500n));
          await settle(() => !!agent.server.address(), 'agent did not listen');
          const {port} = agent.server.address() as AddressInfo;
-         const rpc = await fetch(`http://127.0.0.1:${port}/rpc`, {
-           method: 'POST', headers: {'Content-Type': 'application/json'},
-           body: JSON.stringify(
-               {jsonrpc: '2.0', id: 1, method: 'get_system_graph'})
-         });
-         assert.equal(rpc.status, 200);
+
+         // Exercise /health plus every advertised RPC method over HTTP POST /rpc.
+         const health = await fetch(`http://127.0.0.1:${port}/health`);
+         assert.equal(health.status, 200);
+
+         const latestFrame = agent.timeline.latest()!;
+         const rpcParams: Record<(typeof RPC_METHODS)[number], Record<string, unknown>> = {
+           get_latest: {},
+           get_schema_tree: {},
+           query_state_at: {timestamp_ns: latestFrame.timestamp_ns, mode: 'exact'},
+           scan_channel_events: {
+             topic: 'velocity',
+             condition: {op: 'gt', value: -1e9}
+           },
+           get_system_graph: {},
+           describe_topic: {topic: '/pose_estimator/state'},
+           get_declared_graph: {}
+         };
+         for (let i = 0; i < RPC_METHODS.length; i++) {
+           const method = RPC_METHODS[i];
+           const rpc = await fetch(`http://127.0.0.1:${port}/rpc`, {
+             method: 'POST', headers: {'Content-Type': 'application/json'},
+             body: JSON.stringify(
+                 {jsonrpc: '2.0', id: i + 1, method, params: rpcParams[method]})
+           });
+           assert.equal(rpc.status, 200, `${method} HTTP status`);
+           const body = await rpc.json() as {result?: unknown; error?: unknown};
+           assert.equal(body.error, undefined, `${method} returned error: ${JSON.stringify(body.error)}`);
+           assert.notEqual(body.result, undefined, `${method} returned no result`);
+         }
+
+         // Exercise the WebSocket /rpc transport as well.
+         wsClient = new WebSocket(`ws://127.0.0.1:${port}/rpc`);
+         await once(wsClient, 'open');
+         const wsReply = once(wsClient, 'message');
+         wsClient.send(JSON.stringify([
+           {jsonrpc: '2.0', id: 100, method: 'get_latest'},
+           {jsonrpc: '2.0', id: 101, method: 'get_system_graph'}
+         ]));
+         const [rawReply] = await wsReply;
+         const batch = JSON.parse(String(rawReply)) as {result?: unknown; error?: unknown}[];
+         assert.equal(batch.length, 2);
+         for (const entry of batch) {
+           assert.equal(entry.error, undefined);
+           assert.notEqual(entry.result, undefined);
+         }
+
+         // Inspect real OS open sockets while the agent is live and serving.
+         assertNoOsUdpOrRawSockets(port);
        } finally {
+         wsClient?.terminate();
          agent.close();
          bridge.close();
          Object.assign(dgram, {createSocket: real.createSocket});

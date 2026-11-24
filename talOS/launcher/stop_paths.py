@@ -2,7 +2,9 @@
 
 Reads the bench motor's streams (/hw/state, /hw/command,
 /hw/state/driver_station, /hw/request/motor, /motor/target/teleop) with
-log_dump and prints, for the publishing process of each stream, one line when
+log_dump and prints, for the publishing process of each stream (falling back
+to one subscriber's MESSAGE stream for /hw/state/driver_station when no SEND
+is logged), one line when
 its value changes (with when the previous value was last seen), a PAUSE line
 for every silence of more than 30 ms in a stream published every tick, and a
 LOG GAP line where a log lost records (a pause inside one is the log's, not
@@ -19,11 +21,17 @@ from pathlib import Path
 import subprocess
 import sys
 
-from talOS.launcher.session_report import ENVELOPE_HEADER, HARDWARE_NOT_DECODED, log_dump_path
+from talOS.launcher.session_report import (
+    ENVELOPE_HEADER,
+    HARDWARE_NOT_DECODED,
+    log_dump_path,
+    stream as select_stream,
+)
 
 PAUSE_MS = 30
 MOTOR = "kraken"
-TOPICS = ("/hw/state", "/hw/command", "/hw/state/driver_station", "/hw/request/motor",
+DRIVER_STATION_TOPIC = "/hw/state/driver_station"
+TOPICS = ("/hw/state", "/hw/command", DRIVER_STATION_TOPIC, "/hw/request/motor",
           "/motor/target/teleop")
 # Published every tick: a silence longer than PAUSE_MS is a PAUSE.
 TICKED = ("/hw/state", "/hw/request/motor", "/motor/target/teleop")
@@ -35,6 +43,13 @@ class NotDecoded(Exception):
 
 def trial_lines(records):
     """The lines for log_dump's JSONL records, in their order."""
+    records = list(records)
+    # hardware_node publishes /hw/state/driver_station via ds_pub_->write
+    # without logging SEND records; prefer SEND when present, else fall back
+    # to one subscriber's MESSAGE stream without pooling duplicate readers.
+    _, ds_records = select_stream(records, DRIVER_STATION_TOPIC)
+    ds_stream = ((ds_records[0]["process"], ds_records[0]["kind"])
+                 if ds_records else None)
     last_key, last_ms, seq = {}, {}, {}
     for r in records:
         topic, ms = r["topic"], r["publish_ms"]
@@ -43,7 +58,10 @@ def trial_lines(records):
             yield (f"{g['start_ms']:12.3f} {r['process']:<14} LOG GAP to {g['end_ms']:.3f}: "
                    f"{g['records']} records lost ({g['cause']})")
             continue
-        if r["kind"] != "SEND":
+        if topic == DRIVER_STATION_TOPIC:
+            if (r["process"], r["kind"]) != ds_stream:
+                continue
+        elif r["kind"] != "SEND":
             continue
         stream = (r["process"], topic)
         if topic.startswith("/hw/") and "hardware" not in r:

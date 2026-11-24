@@ -3802,31 +3802,117 @@ TEST(LauncherSessions, RetentionProtectsOnlyTheNewestUnclassifiableSessions) {
   std::filesystem::remove_all(root);
 }
 
+// Writes a bridge event log (`hardware_node.tlog`) in `dir` that publishes one
+// `/hw/status` record carrying `protocol_version_id = protocol_version`.
+void WriteBridgeStatusLog(const std::string& dir, uint64_t id,
+                          uint16_t protocol_version) {
+  event::Registration status_source;
+  status_source.id = 1;
+  status_source.kind = event::SourceKind::SENDER;
+  status_source.name = std::string{::bridge::topics::kStatus};
+  status_source.message_bytes = sizeof(::bridge::BridgeStatus);
+  status_source.schema = schema::Of<::bridge::BridgeStatus>();
+  event::log::LogWriter writer{
+      dir + "/hardware_node.tlog", "hardware_node",
+      event::log::LogWriterOptions{1 << 14, 1, /*background=*/false}, id};
+  writer.start({status_source},
+               event::MonotonicTime::from_nanos(1'000'000'000));
+  ::bridge::BridgeStatus status{};
+  status.mutate_protocol_version_id(protocol_version);
+  event::Context ctx{};
+  ctx.kind = event::EventKind::SEND;
+  ctx.event_time = event::MonotonicTime::from_nanos(1'020'000'000);
+  ctx.now = ctx.event_time;
+  ctx.publish_time = ctx.event_time;
+  writer.send(ctx, 1, std::as_bytes(std::span{&status, 1}), 0, 1);
+  writer.flush();
+  ASSERT_FALSE(writer.failed()) << writer.error();
+}
+
 // REQ-OPS-51: retention reads a session's Driver Station packets only under
-// the hardware protocol they were recorded in. A session whose manifest
-// records another is unknown (kept like a match), not `other` (removed
-// first) from packets decoded in this build's layout. An `other` verdict a
-// build of another protocol cached is read again, not trusted: here a
-// session the cached line calls `other` whose log shows the FMS.
+// the hardware protocol they were recorded in: the bridge's `/hw/status`
+// `protocol_version_id` first, else `manifest.json`. A session whose manifest
+// or bridge `/hw/status` records another protocol is unknown (kept like a
+// match), not `other` (removed first) from packets decoded in this build's
+// layout, even when `manifest.json` records this build's version or omits it;
+// conversely, a bridge `/hw/status` matching this build overrides a mismatched
+// manifest. An `other` verdict a build of another protocol cached is read
+// again, not trusted: here a session the cached line calls `other` whose log
+// shows the FMS.
 TEST(LauncherSessions, ClassifiesOnlyUnderTheRecordedHardwareProtocol) {
   const std::string root = TempPath("protocol_class");
   std::filesystem::remove_all(root);
-  SessionManifest manifest;
-  manifest.session_id = 1;
-  manifest.start_wall_ns = 1'001'000'000'000;
-  manifest.hardware_protocol_version = protocol::kProtocolVersion - 1;
-  const std::string other = root + "/1";
-  std::filesystem::create_directories(other);
-  std::ofstream{other + "/manifest.json"} << manifest.ToJson();
-  WriteDriverStationLog(other, "late", 1, {false});
-  EXPECT_EQ(InspectSession(other).verdict, MatchVerdict::kUnknown);
+  constexpr uint16_t kCurrent = protocol::kProtocolVersion;
+  constexpr uint16_t kOther = kCurrent - 1;
 
-  const std::string cached = root + "/2";
-  WriteSessionManifest(cached, 2, 1002);
-  WriteDriverStationLog(cached, "late", 2, {true});
-  std::ofstream{cached + "/" + std::string{kSessionClassFile}}
-      << "other " << std::filesystem::file_size(cached + "/late.tlog") << "\n";
-  EXPECT_EQ(InspectSession(cached).verdict, MatchVerdict::kMatch);
+  // Manifest-only mismatch (no bridge /hw/status log).
+  {
+    SessionManifest manifest;
+    manifest.session_id = 1;
+    manifest.start_wall_ns = 1'001'000'000'000;
+    manifest.hardware_protocol_version = kOther;
+    const std::string other = root + "/1";
+    std::filesystem::create_directories(other);
+    std::ofstream{other + "/manifest.json"} << manifest.ToJson();
+    WriteDriverStationLog(other, "late", 1, {false});
+    EXPECT_EQ(InspectSession(other).verdict, MatchVerdict::kUnknown);
+  }
+
+  // Cached `other` verdict without this build's reader identity is ignored.
+  {
+    const std::string cached = root + "/2";
+    WriteSessionManifest(cached, 2, 1002);
+    WriteDriverStationLog(cached, "late", 2, {true});
+    std::ofstream{cached + "/" + std::string{kSessionClassFile}}
+        << "other " << std::filesystem::file_size(cached + "/late.tlog")
+        << "\n";
+    EXPECT_EQ(InspectSession(cached).verdict, MatchVerdict::kMatch);
+  }
+
+  // Bridge `/hw/status` records a mismatched protocol while `manifest.json`
+  // records this build's current version: retention must inspect `/hw/status`
+  // (not manifest-only) and classify as unknown.
+  {
+    const std::string bridge_mismatch = root + "/3";
+    WriteSessionManifest(bridge_mismatch, 3, 1003);
+    WriteDriverStationLog(bridge_mismatch, "late", 3, {false});
+    WriteBridgeStatusLog(bridge_mismatch, 3, kOther);
+    EXPECT_EQ(InspectSession(bridge_mismatch).verdict, MatchVerdict::kUnknown);
+  }
+
+  // Bridge `/hw/status` records a mismatched protocol while `manifest.json`
+  // omits `hardware_protocol_version`: still classified as unknown.
+  {
+    SessionManifest manifest;
+    manifest.session_id = 4;
+    manifest.start_wall_ns = 1'004'000'000'000;
+    manifest.hardware_protocol_version.reset();
+    const std::string bridge_mismatch_omitted = root + "/4";
+    std::filesystem::create_directories(bridge_mismatch_omitted);
+    std::ofstream{bridge_mismatch_omitted + "/manifest.json"}
+        << manifest.ToJson();
+    WriteDriverStationLog(bridge_mismatch_omitted, "late", 4, {false});
+    WriteBridgeStatusLog(bridge_mismatch_omitted, 4, kOther);
+    EXPECT_EQ(InspectSession(bridge_mismatch_omitted).verdict,
+              MatchVerdict::kUnknown);
+  }
+
+  // Positive control: bridge `/hw/status` records this build's protocol while
+  // `manifest.json` records another: bridge `/hw/status` takes precedence so
+  // Driver Station packets are decoded as `other`.
+  {
+    SessionManifest manifest;
+    manifest.session_id = 5;
+    manifest.start_wall_ns = 1'005'000'000'000;
+    manifest.hardware_protocol_version = kOther;
+    const std::string bridge_current = root + "/5";
+    std::filesystem::create_directories(bridge_current);
+    std::ofstream{bridge_current + "/manifest.json"} << manifest.ToJson();
+    WriteDriverStationLog(bridge_current, "late", 5, {false});
+    WriteBridgeStatusLog(bridge_current, 5, kCurrent);
+    EXPECT_EQ(InspectSession(bridge_current).verdict, MatchVerdict::kOther);
+  }
+
   std::filesystem::remove_all(root);
 }
 
@@ -5309,12 +5395,17 @@ TEST(LauncherSessions, ARosterRunPutsBackTheStopSignalDispositions) {
 // A stop that arrives while the roster is being described ends the launch
 // without waiting for a probe that has not answered: the probe is killed
 // rather than given the rest of its describe deadline, nothing of a session
-// is written after it (no graph.json, no manifest), and the launcher exits 0.
+// is written after it (no graph.json, no manifest, no topic segments), both
+// session locks are released, and the launcher exits 0.
 // REQ-OPS-06
 TEST(LauncherSessions, AStopWhileProbingKillsTheProbeAndStartsNothing) {
   const std::string tag = "stop_while_probing";
   auto options = SessionFixture(tag);
   std::filesystem::remove_all(options.output_dir);
+  // Ensure neither topic segment exists before the launch starts.
+  for (const std::string topic : {"/alpha/state", "/beta/state"}) {
+    ::shm_unlink(ShmObjectName(topic).c_str());
+  }
   // The deadline a stop must not wait out.
   const std::chrono::milliseconds describe_deadline{std::chrono::seconds{30}};
   options.describe_timeout_ms = static_cast<int>(describe_deadline.count());
@@ -5324,6 +5415,11 @@ TEST(LauncherSessions, AStopWhileProbingKillsTheProbeAndStartsNothing) {
   options.binary_overrides["//example/alpha:node"] = WriteStubNode(
       tag + "_alpha", "#!/bin/sh\necho $$ > '" + probe + ".tmp' && mv '" +
                           probe + ".tmp' '" + probe + "'\nexec sleep 60\n");
+  // Beta completes its probe with a real topic; a stop before segment creation
+  // must still create no segment for it.
+  options.binary_overrides["//example/beta:node"] = WriteStubNode(
+      tag + "_beta",
+      DescribingStub("beta", "//example/beta:node", {Sender("/beta/state")}));
   const pid_t launcher = ForkLauncher(options);
   ASSERT_GE(launcher, 0);
   pid_t probe_pid = 0;
@@ -5354,6 +5450,35 @@ TEST(LauncherSessions, AStopWhileProbingKillsTheProbeAndStartsNothing) {
   const std::string session = options.output_dir + "/1";
   EXPECT_FALSE(std::filesystem::exists(session + "/graph.json"));
   EXPECT_FALSE(std::filesystem::exists(session + "/manifest.json"));
+  for (const std::string topic : {"/alpha/state", "/beta/state"}) {
+    const std::string shm = ShmObjectName(topic);
+    errno = 0;
+    const int fd = ::shm_open(shm.c_str(), O_RDONLY, 0);
+    if (fd >= 0) {
+      ::close(fd);
+      ::shm_unlink(shm.c_str());
+    }
+    EXPECT_LT(fd, 0) << topic << " segment was created before stop";
+    EXPECT_EQ(errno, ENOENT) << topic << ": " << std::strerror(errno);
+  }
+  EXPECT_FALSE(SessionDirectoryLock::Held(session, false))
+      << "session.lock remained held after stop while probing";
+  const std::string namespace_lock =
+      introspect::LockFilePath(ShmObjectName(kSessionLockName));
+  const bool namespaced =
+      ShmObjectName(introspect::kRegistryPath).starts_with("/~");
+  if (namespaced) {
+    EXPECT_FALSE(std::filesystem::exists(namespace_lock))
+        << "namespace session lock file " << namespace_lock
+        << " survived stop while probing";
+  }
+  std::string lock_error;
+  {
+    const auto reacquired = SessionLock::Acquire(lock_error);
+    EXPECT_TRUE(reacquired.has_value())
+        << "namespace session lock remained held: " << lock_error;
+  }
+  if (namespaced) ::unlink(namespace_lock.c_str());
   std::filesystem::remove_all(options.output_dir);
   ::remove(probe.c_str());
 }
@@ -6608,6 +6733,64 @@ TEST(LauncherTest, ManifestWriterStopsBeforeTeardownOnException) {
   const std::string talos_log =
       ReadFile(session_dir + "/" + std::string{kLauncherOutputFile});
   EXPECT_NE(talos_log.find("cannot persist"), std::string::npos) << talos_log;
+}
+
+// REQ-RT-08, REQ-OPS-30: the launcher forwards --sim to studio_bridge if and
+// only if the session runs under --sim, so studio_bridge stays timeshare in
+// simulation (unless TALOS_REALTIME=1) and requests observer realtime on the
+// robot.
+TEST(LauncherTest, StudioBridgeReceivesSimFlagIffSessionIsSimulation) {
+  for (const bool simulation : {false, true}) {
+    SCOPED_TRACE(simulation ? "simulation" : "robot");
+    const std::string tag =
+        simulation ? "bridge_sim_flag_on" : "bridge_sim_flag_off";
+    auto options = SessionFixture(tag);
+    std::filesystem::remove_all(options.output_dir);
+    options.simulation = simulation;
+    if (simulation) options.remote = "127.0.0.1";
+    options.start_studio_bridge = true;
+    options.max_restarts = 0;
+    const std::string invoked = TempPath(tag + "_invoked");
+    const std::string done_fifo = TempPath(tag + "_fifo");
+    std::filesystem::remove(invoked);
+    std::filesystem::remove(done_fifo);
+    ASSERT_EQ(::mkfifo(done_fifo.c_str(), 0600), 0);
+
+    // Hold alpha open until studio_bridge records its launch args and signals
+    // the FIFO, so StudioBridge::Finish never SIGKILLs studio_bridge before
+    // exec completes.
+    options.binary_overrides["//example/alpha:node"] =
+        WriteStubNode(tag + "_alpha",
+                      "#!/bin/sh\n"
+                      "for arg in \"$@\"; do\n"
+                      "  if [ \"$arg\" = \"--describe\" ]; then\n"
+                      "    printf '%s\\n' '" +
+                          DescribeJson("alpha", "//example/alpha:node",
+                                       {Sender("/alpha/state")}) +
+                          "'\n"
+                          "    exit 0\n"
+                          "  fi\n"
+                          "done\n"
+                          "read _ < '" +
+                          done_fifo +
+                          "'\n"
+                          "exit 0\n");
+    options.binary_overrides["//studio/bridge:studio_bridge"] = WriteStubNode(
+        tag + "_bridge",
+        BridgeDescribeThen("echo \"studio_bridge $*\" >> '" + invoked +
+                           "'\necho ok > '" + done_fifo + "'\nexit 0\n"));
+
+    ASSERT_EQ(Launcher{options}.Run(), 0);
+    const std::string launched = ReadFile(invoked);
+    ASSERT_FALSE(launched.empty()) << "studio_bridge did not record args";
+    const bool has_sim = launched.find(" --sim ") != std::string::npos ||
+                         launched.find(" --sim\n") != std::string::npos;
+    EXPECT_EQ(has_sim, simulation) << launched;
+
+    std::filesystem::remove_all(options.output_dir);
+    std::filesystem::remove(invoked);
+    std::filesystem::remove(done_fifo);
+  }
 }
 
 }  // namespace

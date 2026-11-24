@@ -9,6 +9,9 @@ import {
   dictionaryKey,
   exportPages,
   JitterBuffer,
+  MAX_CHANNELS,
+  MAX_DICTIONARY_PAGES,
+  MAX_DICTIONARY_STRING_BYTES,
   MAX_ENUM_LABELS,
   MAX_FRAME_BYTES,
   poseError,
@@ -240,6 +243,190 @@ test('every dictionary the producer may emit decodes; one past its limits does n
   // text past the frame itself are a decode bomb, not a dictionary.
   assert.throws(() => decode([], {dictionary: ['a', 'b', 'c', 'd', 'e', 'f'], labels}),
                 /exceeds its frame/);
+});
+
+// REQ-CONTRACT-28: Studio's decoder accepts exact telemetry caps and rejects
+// one past each cap (string bytes, channel count, dictionary pages, frame
+// bytes).
+test('TelemetryDecoder enforces exact accept/reject boundaries for every wire cap', () => {
+  const buildDictPage = (opts: {
+    id: number; page: number; pageCount: number; channelCount: number;
+    firstChannel: number; names: string[]; unit?: string; labels?: string[];
+    kinds?: ChannelKind[];
+  }): Uint8Array => {
+    const b = new Builder(256);
+    const entries = opts.names.map((name, i) => {
+      const n = b.createString(name);
+      const u = opts.unit ? b.createString(opts.unit) : 0;
+      const l = opts.labels?.length ?
+          ChannelInfo.createLabelsVector(
+              b, opts.labels.map(label => b.createString(label))) :
+          0;
+      ChannelInfo.startChannelInfo(b);
+      ChannelInfo.addName(b, n);
+      if (u) ChannelInfo.addUnit(b, u);
+      if (l) ChannelInfo.addLabels(b, l);
+      ChannelInfo.addKind(b, opts.kinds?.[i] ?? ChannelKind.Double);
+      return ChannelInfo.endChannelInfo(b);
+    });
+    const dict = Frame.createDictionaryVector(b, entries);
+    Frame.startFrame(b);
+    Frame.addStreamId(b, 42n);
+    Frame.addSequenceId(b, 0n);
+    Frame.addTimestampNs(b, 1n);
+    Frame.addDictionaryId(b, opts.id);
+    Frame.addPage(b, opts.page);
+    Frame.addPageCount(b, opts.pageCount);
+    Frame.addChannelCount(b, opts.channelCount);
+    Frame.addFirstChannel(b, opts.firstChannel);
+    Frame.addDictionary(b, dict);
+    Frame.finishSizePrefixedFrameBuffer(b, Frame.endFrame(b));
+    return b.asUint8Array().slice();
+  };
+  const chassis = {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0};
+
+  // 1) MAX_DICTIONARY_STRING_BYTES: 256 accepted / 257 rejected for channel
+  // name, unit, and enum label.
+  {
+    assert.equal(MAX_DICTIONARY_STRING_BYTES, 256);
+    const okName = 'n'.repeat(MAX_DICTIONARY_STRING_BYTES);
+    const okUnit = 'u'.repeat(MAX_DICTIONARY_STRING_BYTES);
+    const okLabel = 'l'.repeat(MAX_DICTIONARY_STRING_BYTES);
+    const d = new TelemetryDecoder();
+    assert.equal(
+        d.decode(buildDictPage({
+          id: 101, page: 0, pageCount: 1, channelCount: 1, firstChannel: 0,
+          names: [okName], unit: okUnit, labels: [okLabel],
+          kinds: [ChannelKind.UInt]
+        })),
+        null);
+    const snap = d.decode(encodeValuePages(
+        {streamId: 42n, sequenceId: 1n, timestampNs: 2n, dictionaryId: 101,
+         channelCount: 1},
+        chassis, true, [[0, 0n]])[0])!;
+    assert.equal(snap.units[okName], okUnit);
+    assert.equal(channelDisplay(snap, okName), okLabel);
+
+    const overName = 'n'.repeat(MAX_DICTIONARY_STRING_BYTES + 1);
+    const overUnit = 'u'.repeat(MAX_DICTIONARY_STRING_BYTES + 1);
+    const overLabel = 'l'.repeat(MAX_DICTIONARY_STRING_BYTES + 1);
+    assert.throws(
+        () => new TelemetryDecoder().decode(buildDictPage({
+          id: 102, page: 0, pageCount: 1, channelCount: 1, firstChannel: 0,
+          names: [overName]
+        })),
+        /Name too long/);
+    assert.throws(
+        () => new TelemetryDecoder().decode(buildDictPage({
+          id: 103, page: 0, pageCount: 1, channelCount: 1, firstChannel: 0,
+          names: ['ch'], unit: overUnit
+        })),
+        /Name too long/);
+    assert.throws(
+        () => new TelemetryDecoder().decode(buildDictPage({
+          id: 104, page: 0, pageCount: 1, channelCount: 1, firstChannel: 0,
+          names: ['ch'], labels: [overLabel], kinds: [ChannelKind.UInt]
+        })),
+        /Name too long/);
+  }
+
+  // 2) MAX_CHANNELS: 2048 accepted / 2049 rejected.
+  {
+    assert.equal(MAX_CHANNELS, 2048);
+    const channels = Array.from(
+        {length: MAX_CHANNELS}, (_, i) => ({name: `c${i}`, unit: ''}));
+    const header = {
+      streamId: 42n, sequenceId: 0n, timestampNs: 1n, dictionaryId: 201,
+      channelCount: MAX_CHANNELS
+    };
+    const d = new TelemetryDecoder();
+    for (const p of encodeDictionaryPages(header, channels)) {
+      assert.equal(d.decode(p), null);
+    }
+    assert.equal(d.currentDictionary()!.names.length, MAX_CHANNELS);
+    const snap = d.decode(encodeValuePages(
+        {...header, sequenceId: 1n, timestampNs: 2n}, chassis, true,
+        [[0, rawFromDouble(1.25)], [MAX_CHANNELS - 1, rawFromDouble(9.5)]])[0])!;
+    assert.equal(snap.channels['c0'], 1.25);
+    assert.equal(snap.channels[`c${MAX_CHANNELS - 1}`], 9.5);
+
+    const overChannels = [...channels, {name: `c${MAX_CHANNELS}`, unit: ''}];
+    const overPages = encodeDictionaryPages(
+        {...header, dictionaryId: 202, channelCount: MAX_CHANNELS + 1},
+        overChannels);
+    const dOver = new TelemetryDecoder();
+    assert.throws(() => {
+      for (const p of overPages) dOver.decode(p);
+    }, /Too many channels/);
+  }
+
+  // 3) MAX_DICTIONARY_PAGES: 2048 accepted / 2049 rejected.
+  {
+    assert.equal(MAX_DICTIONARY_PAGES, 2048);
+    const d = new TelemetryDecoder();
+    for (let page = 0; page < MAX_DICTIONARY_PAGES; page++) {
+      assert.equal(
+          d.decode(buildDictPage({
+            id: 301, page, pageCount: MAX_DICTIONARY_PAGES,
+            channelCount: MAX_DICTIONARY_PAGES, firstChannel: page,
+            names: [`p${page}`]
+          })),
+          null);
+    }
+    assert.equal(d.currentDictionary()!.names.length, MAX_DICTIONARY_PAGES);
+    const snap = d.decode(encodeValuePages(
+        {streamId: 42n, sequenceId: 1n, timestampNs: 2n, dictionaryId: 301,
+         channelCount: MAX_DICTIONARY_PAGES},
+        chassis, true,
+        [[0, rawFromDouble(3)], [MAX_DICTIONARY_PAGES - 1, rawFromDouble(7)]])[0])!;
+    assert.equal(snap.channels['p0'], 3);
+    assert.equal(snap.channels[`p${MAX_DICTIONARY_PAGES - 1}`], 7);
+
+    assert.throws(
+        () => new TelemetryDecoder().decode(buildDictPage({
+          id: 302, page: 0, pageCount: MAX_DICTIONARY_PAGES + 1,
+          channelCount: MAX_CHANNELS, firstChannel: 0, names: ['p0']
+        })),
+        /Too many dictionary pages/);
+  }
+
+  // 4) MAX_FRAME_BYTES: exact 16384-byte valid frame accepted / 16385-byte
+  // otherwise-valid frame rejected.
+  {
+    assert.equal(MAX_FRAME_BYTES, 16384);
+    const resizeValidFrame = (base: Uint8Array, targetBytes: number): Uint8Array => {
+      assert.ok(base.length <= targetBytes);
+      const out = new Uint8Array(targetBytes);
+      out.set(base, 0);
+      new DataView(out.buffer).setUint32(0, targetBytes - 4, true);
+      return out;
+    };
+    const baseDict = buildDictPage({
+      id: 401, page: 0, pageCount: 1, channelCount: 1, firstChannel: 0,
+      names: ['boundary/value']
+    });
+    const baseVal = encodeValuePages(
+        {streamId: 42n, sequenceId: 1n, timestampNs: 2n, dictionaryId: 401,
+         channelCount: 1},
+        chassis, true, [[0, rawFromDouble(42.5)]])[0];
+
+    const exactDict = resizeValidFrame(baseDict, MAX_FRAME_BYTES);
+    const exactVal = resizeValidFrame(baseVal, MAX_FRAME_BYTES);
+    assert.equal(exactDict.length, MAX_FRAME_BYTES);
+    assert.equal(exactVal.length, MAX_FRAME_BYTES);
+    const d = new TelemetryDecoder();
+    assert.equal(d.decode(exactDict), null);
+    const snap = d.decode(exactVal)!;
+    assert.equal(snap.channels['boundary/value'], 42.5);
+
+    const overDict = resizeValidFrame(baseDict, MAX_FRAME_BYTES + 1);
+    const overVal = resizeValidFrame(baseVal, MAX_FRAME_BYTES + 1);
+    assert.equal(overDict.length, MAX_FRAME_BYTES + 1);
+    assert.equal(overVal.length, MAX_FRAME_BYTES + 1);
+    assert.throws(() => new TelemetryDecoder().decode(overDict),
+                  /Invalid size prefix/);
+    assert.throws(() => d.decode(overVal), /Invalid size prefix/);
+  }
 });
 test('a new stream invalidates the old dictionary', () => {
   const decoder = new TelemetryDecoder();

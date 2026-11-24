@@ -262,6 +262,61 @@ TEST_F(VelocityMechanismTest, AtSpeedDropsOnAVelocitySampleOlderThanTheBound) {
   EXPECT_TRUE(flywheel().at_speed());
 }
 
+// The velocity age bound follows [robot] status_hz (four status periods), not
+// a hardcoded 20 ms default: at 100 Hz, 40'000 us keeps at_speed and 40'001 us
+// drops it while still driving.
+// REQ-DEV-22
+TEST(VelocityMechanismStatusRate, ReadinessAgeBoundFollowsConfiguredStatusHz) {
+  auto sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+status_hz = 100.0
+
+[subsystems.shooter.motors.flywheel]
+can_id = 1
+max_velocity_rps = 80.0
+[subsystems.shooter.flywheel]
+at_speed_entry_rps = 2.0
+at_speed_exit_frac = 0.1
+at_speed_entry_tick_count = 3
+spin_down_rps2 = 100.0
+
+[subsystems.neighbor.motors.wheel]
+can_id = 2
+)");
+  auto& shooter = sim.add<Shooter>("shooter");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+  sim.step(10ms);
+
+  const auto drive = [&](std::chrono::milliseconds duration) {
+    for (auto t = 0ms; t < duration; t += 5ms) {
+      PublishTarget(sim, "shooter", "teleop",
+                    control::VelocityTarget{60.0, 0.0});
+      sim.step(5ms);
+    }
+  };
+
+  hw.set_motor("shooter", "flywheel", 0.0, 60.0);
+  sim.step(5ms);
+  drive(20ms);
+  ASSERT_TRUE(shooter.flywheel.at_speed());
+
+  hw.set_motor("shooter", "flywheel", 0.0, 60.0, 0, 40'000);
+  drive(10ms);
+  ASSERT_TRUE(robot_enabled(sim.node("shooter")));
+  EXPECT_TRUE(shooter.flywheel.at_speed());
+  EXPECT_TRUE(shooter.flywheel.driving());
+
+  hw.set_motor("shooter", "flywheel", 0.0, 60.0, 0, 40'001);
+  drive(10ms);
+  ASSERT_TRUE(robot_enabled(sim.node("shooter")));
+  EXPECT_FALSE(shooter.flywheel.at_speed());
+  EXPECT_TRUE(shooter.flywheel.driving());
+}
+
 // The velocity's age comes from the State, so at_speed does not wait for
 // the bridge's clock mapping: three in-band ticks right after the first
 // States reach it while HardwareLink::sample_time() is still unknown.

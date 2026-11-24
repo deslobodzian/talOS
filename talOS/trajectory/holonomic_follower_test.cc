@@ -14,6 +14,7 @@
 #include <numbers>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "talOS/geometry/se2.h"
@@ -341,42 +342,80 @@ TEST(HolonomicFollowerTest, FinishesOnlyAtTheEndAndInTolerance) {
 }
 
 // Guards: a non-finite pose, time or period, or a negative period gives zero
-// speeds and !valid, and does not disturb the integrator.
+// speeds and !valid, and leaves every axis's integrator, derivative history
+// and pending_dt_s untouched.
 // REQ-DEV-15
 TEST(HolonomicFollowerTest, NonFiniteInputCommandsZero) {
   FollowerConfig config;
-  config.translation.ki = 1.0;
-  config.translation.integral_limit = 1.0;
+  config.translation = {.kp = 1.0, .ki = 1.0, .kd = 0.5, .integral_limit = 5.0};
+  config.heading = {.kp = 1.0, .ki = 1.0, .kd = 0.5, .integral_limit = 5.0};
+  config.max_linear_mps = 100.0;
+  config.max_angular_radps = 100.0;
   HolonomicFollower follower(config);
   HolonomicFollower reference(config);
+  const Trajectory trajectory = AtOrigin();
+
+  // Populate nonzero integral, previous_error, derivative and pending_dt_s on
+  // all three axes before injecting non-finite inputs.
+  for (const auto& [pose, dt_s] : std::vector<std::pair<Pose, double>>{
+           {MakePose(-1.0, 0.8, -0.6), 0.02},
+           {MakePose(-0.4, 0.2, -0.1), 0.02},
+           {MakePose(-0.3, 0.1, -0.05), 1e-6},
+       }) {
+    ASSERT_TRUE(
+        follower.step(trajectory, 0.1, pose, dt_s, SpeedsFrame::kField).valid);
+    ASSERT_TRUE(
+        reference.step(trajectory, 0.1, pose, dt_s, SpeedsFrame::kField).valid);
+  }
+
   const double nan = std::numeric_limits<double>::quiet_NaN();
   const double inf = std::numeric_limits<double>::infinity();
-  const Trajectory trajectory = AtOrigin();
+  const Pose valid_pose = MakePose(0, 0, 0);
+  for (const double bad : {nan, inf, -inf}) {
+    for (const FollowerOutput& out :
+         {follower.step(trajectory, 0.1, Pose(0, Pose::Vector2(bad, 0)), 0.02,
+                        SpeedsFrame::kRobot),
+          follower.step(trajectory, 0.1, Pose(0, Pose::Vector2(0, bad)), 0.02,
+                        SpeedsFrame::kRobot),
+          follower.step(trajectory, 0.1, Pose(bad, Pose::Vector2(0, 0)), 0.02,
+                        SpeedsFrame::kRobot),
+          follower.step(trajectory, bad, valid_pose, 0.02, SpeedsFrame::kRobot),
+          follower.step(trajectory, 0.1, valid_pose, bad,
+                        SpeedsFrame::kRobot)}) {
+      EXPECT_FALSE(out.valid);
+      EXPECT_EQ(out.speeds.vx_mps, 0.0);
+      EXPECT_EQ(out.speeds.vy_mps, 0.0);
+      EXPECT_EQ(out.speeds.omega_radps, 0.0);
+    }
+  }
   for (const FollowerOutput& out :
-       {follower.step(trajectory, 0.1, MakePose(nan, 0, 0), 0.02,
-                      SpeedsFrame::kRobot),
-        follower.step(trajectory, nan, MakePose(0, 0, 0), 0.02,
-                      SpeedsFrame::kRobot),
-        follower.step(trajectory, 0.1, MakePose(0, 0, 0), nan,
-                      SpeedsFrame::kRobot),
-        follower.step(trajectory, 0.1, MakePose(0, 0, 0), -0.02,
-                      SpeedsFrame::kRobot),
-        follower.step(trajectory, 0.1, MakePose(0, 0, 0), inf,
-                      SpeedsFrame::kRobot),
-        follower.step(trajectory, 0.1, MakePose(0, 0, 0), -inf,
-                      SpeedsFrame::kRobot),
-        follower.step(Trajectory{}, 0.1, MakePose(0, 0, 0), 0.02,
+       {follower.step(trajectory, 0.1, valid_pose, -0.02, SpeedsFrame::kRobot),
+        follower.step(Trajectory{}, 0.1, valid_pose, 0.02,
                       SpeedsFrame::kRobot)}) {
     EXPECT_FALSE(out.valid);
     EXPECT_EQ(out.speeds.vx_mps, 0.0);
     EXPECT_EQ(out.speeds.vy_mps, 0.0);
     EXPECT_EQ(out.speeds.omega_radps, 0.0);
   }
-  const FollowerOutput a = follower.step(trajectory, 0.1, MakePose(-1, 0, 0),
-                                         0.02, SpeedsFrame::kField);
-  const FollowerOutput b = reference.step(trajectory, 0.1, MakePose(-1, 0, 0),
-                                          0.02, SpeedsFrame::kField);
-  EXPECT_EQ(a.speeds.vx_mps, b.speeds.vx_mps);
+
+  // First valid step with dt_s == 0 reads held derivative and integral; second
+  // valid step with dt_s == 0.02 differentiates using previous_error and
+  // pending_dt_s (1e-6 + 0.02). Both must match reference bit-for-bit on all
+  // three axes.
+  for (const auto& [pose, dt_s] : std::vector<std::pair<Pose, double>>{
+           {MakePose(-0.2, 0.15, -0.25), 0.0},
+           {MakePose(-0.7, 0.5, -0.4), 0.02},
+       }) {
+    const FollowerOutput a =
+        follower.step(trajectory, 0.1, pose, dt_s, SpeedsFrame::kField);
+    const FollowerOutput b =
+        reference.step(trajectory, 0.1, pose, dt_s, SpeedsFrame::kField);
+    ASSERT_TRUE(a.valid);
+    ASSERT_TRUE(b.valid);
+    EXPECT_EQ(a.speeds.vx_mps, b.speeds.vx_mps);
+    EXPECT_EQ(a.speeds.vy_mps, b.speeds.vy_mps);
+    EXPECT_EQ(a.speeds.omega_radps, b.speeds.omega_radps);
+  }
 }
 
 // Guards: huge finite position errors (where kp * error or hypot(vx, vy)

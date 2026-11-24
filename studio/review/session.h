@@ -49,9 +49,11 @@
 // A read selects records by publication time while walking a file by event
 // time: each LogFile tracks its observed maximum second-level lead and lag
 // between checkpoint event time and publication time so reads widen their
-// event-time scan window to cover any skew, and keeps a lazy out-of-line
-// presence bitset for source ids >= 63 (0 bytes when all source ids are < 63)
-// so Checkpoint stays 24 B (REQ-OPS-42).
+// event-time scan window to cover any skew, and keeps a bounded, lazy
+// out-of-line presence bitset for source ids >= 63 (0 bytes when all source
+// ids are < 63; capped at kMaxOverflowSources and kMaxOverflowBytesPerFile per
+// file, falling back to Checkpoint::sources bit 63 past either cap) so
+// Checkpoint stays 24 B and heap stays bounded (REQ-OPS-42).
 
 #include <array>
 #include <cstddef>
@@ -116,10 +118,28 @@ inline constexpr std::size_t kMaxTimelineModes = 4096;
 inline constexpr std::size_t kMaxTimelineAlerts = 4096;
 inline constexpr std::size_t kMaxTimelineRuns = 4096;
 
+// Fixed ceiling on total channels across all topics in one open session
+// (REQ-OPS-42): well above live telemetry's 2048-channel dictionary cap and
+// kMaxSnapshotChannels (8192), while bounding per-session heap and
+// /channels.json size even for crafted multi-topic logs. A session exceeding
+// this cap is refused in Session::Open (HTTP 422 for that session only).
+inline constexpr std::size_t kMaxSessionChannels = 16384;
+
 // Fixed ceiling on channels returned by one Session::Snapshot (REQ-OPS-42):
 // well above live telemetry's 2048-channel dictionary cap, while bounding
 // snapshot memory even for a crafted session with huge channel counts.
 inline constexpr std::size_t kMaxSnapshotChannels = 8192;
+
+// Fixed ceilings on one LogFile's out-of-line presence bitset for source ids
+// >= 63 (REQ-OPS-42): at most kMaxOverflowSources distinct sources (4 words =
+// 32 B/checkpoint) and at most kMaxOverflowBytesPerFile bytes (32 KiB) per
+// file. Past either ceiling, reads fall back conservatively to
+// Checkpoint::sources bit 63 (which flags any source_id >= 63 present in that
+// second), keeping reads exact with bounded heap.
+inline constexpr std::size_t kMaxOverflowWordsPerCheckpoint = 4;
+inline constexpr std::size_t kMaxOverflowSources =
+    kMaxOverflowWordsPerCheckpoint * 64;
+inline constexpr std::size_t kMaxOverflowBytesPerFile = std::size_t{32} << 10;
 
 enum class ModeKind : std::uint8_t {
   kDisabled,
@@ -148,11 +168,16 @@ struct LogFile {
   // max_lag_s  = max(0, FloorSecond(publish_ns) - checkpoint.second).
   std::int64_t max_lead_s{0};
   std::int64_t max_lag_s{0};
-  // Lazy out-of-line presence bitset for source ids >= 63, allocated only when
-  // a value record with source_id >= 63 is indexed (0 bytes for <= 63 sources).
+  // Lazy, bounded out-of-line presence bitset for source ids >= 63, allocated
+  // only when a reviewed value record with source_id >= 63 is indexed (0 bytes
+  // for <= 63 sources; capped at kMaxOverflowSources and
+  // kMaxOverflowBytesPerFile). When overflow_capped is true, any source_id >=
+  // 63 absent from overflow_source_ids or any checkpoint past overflow_bits
+  // falls back to Checkpoint::sources bit 63.
   std::vector<std::uint16_t> overflow_source_ids;
   std::vector<std::uint64_t> overflow_bits;
   std::size_t overflow_words_per_cp{0};
+  bool overflow_capped{false};
 
   std::optional<std::size_t> OverflowBit(std::uint16_t source_id) const;
   bool HasSource(std::size_t cp_idx, std::uint16_t source_id,

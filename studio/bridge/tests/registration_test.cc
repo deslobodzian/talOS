@@ -1,5 +1,5 @@
-// Studio bridge live-registry registration, loop-progress reporting, and
-// /system.json deduplication (REQ-OPS-30).
+// Studio bridge live-registry registration, loop-progress reporting, realtime
+// scheduling (REQ-RT-08), and /system.json deduplication (REQ-OPS-30).
 
 #include <arpa/inet.h>
 #include <gtest/gtest.h>
@@ -150,6 +150,7 @@ TEST(BridgeRegistration, RegistersAdvancesProgressAndDeduplicatesSystemJson) {
   const pid_t pid = ::fork();
   ASSERT_GE(pid, 0);
   if (pid == 0) {
+    ::unsetenv("TALOS_REALTIME");
     ::close(stdout_pipe[0]);
     ::dup2(stdout_pipe[1], STDOUT_FILENO);
     ::close(stdout_pipe[1]);
@@ -177,7 +178,7 @@ TEST(BridgeRegistration, RegistersAdvancesProgressAndDeduplicatesSystemJson) {
   EXPECT_GE(first->generation, 1u);
   ASSERT_TRUE(first->realtime().has_value());
   EXPECT_EQ(first->realtime()->tier, talos::process::LoopTier::kObserver);
-  EXPECT_FALSE(first->realtime()->requested);
+  EXPECT_TRUE(first->realtime()->requested);
   ASSERT_EQ(first->sources.size(), 1u);
   EXPECT_EQ(first->sources[0].kind, talos::event::SourceKind::WATCHER);
   EXPECT_EQ(first->sources[0].name, topic);
@@ -443,6 +444,111 @@ TEST(BridgeRegistration, CliEqualsFlagsAndEmptyConfigValidation) {
   }
 
   std::filesystem::remove_all(dir);
+}
+
+// REQ-RT-08: studio_bridge runs at LoopTier::kObserver and invokes
+// ConfigureRealtime when RealtimeRequested(simulation) is true (non-sim by
+// default, or TALOS_REALTIME=1 even under --sim), and reports requested=false
+// when false (--sim without TALOS_REALTIME=1, or TALOS_REALTIME=0).
+TEST(BridgeRegistration, RealtimeSchedulingHonorsEnvironmentAndSim) {
+  const std::string binary = BridgeBinary();
+  const std::string webroot =
+      ::testing::TempDir() + "/bridge_rt_" + std::to_string(::getpid());
+  std::filesystem::create_directories(webroot);
+
+  struct Case {
+    const char* label;
+    bool simulation;
+    std::optional<const char*> env_realtime;
+    bool expect_requested;
+  };
+  const Case cases[] = {
+      {"default_robot", false, std::nullopt, true},
+      {"sim_default", true, std::nullopt, false},
+      {"sim_with_env_1", true, "1", true},
+      {"robot_with_env_1", false, "1", true},
+      {"robot_with_env_0", false, "0", false},
+      {"sim_with_env_0", true, "0", false},
+  };
+
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.label);
+    const std::string topic =
+        "/test/telemetry/rt_" + std::to_string(::getpid());
+    std::vector<std::string> args = {binary,  topic,          "0",
+                                     webroot, "--session-id", "12345"};
+    if (c.simulation) args.push_back("--sim");
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+    argv.push_back(nullptr);
+
+    int stdout_pipe[2]{-1, -1};
+    ASSERT_EQ(::pipe(stdout_pipe), 0);
+    const pid_t pid = ::fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+      if (c.env_realtime.has_value()) {
+        ::setenv("TALOS_REALTIME", *c.env_realtime, 1);
+      } else {
+        ::unsetenv("TALOS_REALTIME");
+      }
+      ::close(stdout_pipe[0]);
+      ::dup2(stdout_pipe[1], STDOUT_FILENO);
+      ::close(stdout_pipe[1]);
+      ::execv(argv[0], argv.data());
+      ::_exit(127);
+    }
+    ::close(stdout_pipe[1]);
+
+    std::string line;
+    char ch = '\0';
+    while (::read(stdout_pipe[0], &ch, 1) == 1) {
+      if (ch == '\n') break;
+      line.push_back(ch);
+    }
+    ::close(stdout_pipe[0]);
+
+    struct ChildGuard {
+      pid_t pid;
+      bool reaped = false;
+      int stop() {
+        if (reaped || pid <= 0) return 0;
+        ::kill(pid, SIGTERM);
+        int status = 0;
+        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        }
+        reaped = true;
+        return status;
+      }
+      ~ChildGuard() { stop(); }
+    } child{pid};
+
+    if (!line.starts_with("listening ")) {
+      child.stop();
+      ADD_FAILURE() << "bridge did not listen: " << line;
+      continue;
+    }
+
+    const auto row = FindRow(pid);
+    ASSERT_TRUE(row.has_value()) << "studio_bridge did not register a row";
+    EXPECT_EQ((row->flags & talos::introspect::kFlagSimulation) != 0,
+              c.simulation);
+    ASSERT_TRUE(row->realtime().has_value());
+    EXPECT_EQ(row->realtime()->tier, talos::process::LoopTier::kObserver);
+    EXPECT_EQ(row->realtime()->requested, c.expect_requested);
+    if (!c.expect_requested) {
+      EXPECT_EQ(row->realtime()->refused, 0u);
+      EXPECT_EQ(row->realtime()->grant(),
+                talos::process::RealtimeGrant::kNotRequested);
+    }
+
+    const int status = child.stop();
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    EXPECT_FALSE(FindRow(pid).has_value());
+  }
+
+  std::filesystem::remove_all(webroot);
 }
 
 }  // namespace
