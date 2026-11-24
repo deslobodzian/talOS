@@ -75,18 +75,24 @@ bazel_dep(name = "nlohmann_json", version = "3.12.0.bcr.1")
 # repository, and 4.0.0 has a sparse-solver bug.
 bazel_dep(name = "mujoco", version = "3.17.0")
 
-# Root-only, like OpenCV's below: MuJoCo 3.17.0's `mjCMesh_::transformed_`
-# (src/user/user_objects.h) has no initializer and no constructor sets it, so
-# the implicit copy every nested `<default class>` makes while parsing an MJCF
-# loads an uninitialised bool, which --config=asan's UBSan reports. The value
-# is copied but never read, so the patch (`= false`) changes no behaviour.
-# A repository depending on talOS builds MuJoCo as upstream ships it, and only
-# its own UBSan run reports this. Drop the patch on the MuJoCo release that
-# initialises the member.
+# Root-only, like OpenCV's below: one patch per undefined behaviour MuJoCo
+# 3.17.0 (and upstream main) has that --config=asan's UBSan reports, none
+# changing what MuJoCo computes (docs/INSTALL.md lists them; TODO.md SIM-12):
+# `mjCMesh_::transformed_` and `mjCFlex_::interpolated` have no initializer
+# and are copied with every default class (parsing, `mjs_attach`), and
+# `mju_copy`, `mju_zero`, `mju_copyInt` and `mju_zeroInt` pass the NULL, empty
+# arrays of a model with no degrees of freedom to `memcpy` and `memset`. A
+# repository depending on talOS builds MuJoCo as upstream ships it, and only
+# its own UBSan run reports these. Drop each patch on the MuJoCo release that
+# fixes its defect.
 single_version_override(
     module_name = "mujoco",
     patch_strip = 1,
-    patches = ["//third_party:mujoco_mesh_transformed_init.patch"],
+    patches = [
+        "//third_party:mujoco_mesh_transformed_init.patch",
+        "//third_party:mujoco_flex_interpolated_init.patch",
+        "//third_party:mujoco_vector_copy_empty.patch",
+    ],
 )
 
 # Hedron's Compile Commands Extractor for Bazel

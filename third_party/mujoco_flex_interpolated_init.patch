@@ -1,0 +1,11 @@
+--- a/src/user/user_objects.h
++++ b/src/user/user_objects.h
+@@ -1201,7 +1201,7 @@
+   int                              matid;         // material id
+   bool                             rigid;         // all vertices attached to the same body
+   bool                             centered;      // all vertices coordinates (0,0,0)
+-  bool                             interpolated;  // vertices are interpolated from nodes
++  bool                             interpolated = false;  // vertices are interpolated from nodes
+   std::vector<int>                 vertbodyid;    // vertex body ids
+   std::vector<int>                 nodebodyid;    // node body ids
+   std::vector<std::pair<int, int>> edge;          // edge vertex ids

@@ -76,8 +76,8 @@ build:asan --copt=-O1 --cxxopt=-O1
 # No dependency exemptions: AprilTag's pjpeg (offline DetectImageFile only;
 # live detection takes raw camera buffers) is patched for its signed shifts and
 # an out-of-range coefficient run (third_party/apriltag_pjpeg_bounds.patch).
-# MuJoCo's uninitialised mesh flag is patched too
-# (third_party/mujoco_mesh_transformed_init.patch; root-only, so a dependent
+# MuJoCo's two uninitialised flags and its zero-length memcpy are patched too
+# (third_party/mujoco_*.patch, listed in docs/INSTALL.md; root-only, so a dependent
 # builds MuJoCo unpatched).
 test:asan --test_tag_filters=-no_asan
 build:tsan --copt=-fsanitize=thread --linkopt=-fsanitize=thread
