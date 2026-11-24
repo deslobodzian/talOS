@@ -1,7 +1,9 @@
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -10,6 +12,8 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -42,24 +46,7 @@ int main(int argc, char** argv) try {
   // MuJoCo gateway does (REQ-DEV-43): 504 pieces in a 30-wide grid 0.2 m
   // apart from (1, 1) m, the last 48 out of play, and pieces 0 to 9 moving
   // 10 mm in x each message.
-  std::optional<RTMSQueue> pieces;
-  if (std::erase(args, "--pieces") > 0) {
-    pieces.emplace(
-        ::sim::topics::kPieces, sizeof(::sim::GamePieces),
-        alignof(::sim::GamePieces), talos::schema::Of<::sim::GamePieces>(),
-        talos::hardware::sim::kPiecesSlots,
-        RTMSOptions{.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
-                    .read_mode = ReadMode::SEQUENCE,
-                    .publisher = true});
-  }
-  RTMSQueue queue(args.size() > 1 ? args[1] : "/talos/telemetry",
-                  wire::slot_bytes, 8, talos::schema::Bytes(), wire::slot_count,
-                  {.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
-                   .read_mode = ReadMode::SEQUENCE,
-                   .publisher = true});
-  // The segment exists now; tests wait for this line.
-  std::cout << "ready\n" << std::flush;
-
+  const bool with_pieces = std::erase(args, "--pieces") > 0;
   std::vector<ChannelDef> dictionary = {
       {"drive/velocity", "m/s", {}, Talos::Telemetry::ChannelKind_Double},
       {"intake/inhibit",
@@ -69,8 +56,15 @@ int main(int argc, char** argv) try {
        Talos::Telemetry::ChannelKind_UInt},
       {"pose/valid", "", {}, Talos::Telemetry::ChannelKind_Bool},
   };
-  const auto channels =
-      args.size() > 2 ? std::stoul(args[2]) : dictionary.size();
+  std::size_t channels = dictionary.size();
+  if (args.size() > 2) {
+    const std::string_view arg = args[2];
+    const auto [end, ec] =
+        std::from_chars(arg.data(), arg.data() + arg.size(), channels);
+    if (ec != std::errc{} || end != arg.data() + arg.size()) {
+      throw std::runtime_error("invalid mock channel count: " + args[2]);
+    }
+  }
   if (channels < dictionary.size() ||
       channels > talos::telemetry_wire::kMaxChannels) {
     throw std::runtime_error(
@@ -85,6 +79,23 @@ int main(int argc, char** argv) try {
                           {},
                           Talos::Telemetry::ChannelKind_Double});
   }
+  std::optional<RTMSQueue> pieces;
+  if (with_pieces) {
+    pieces.emplace(
+        ::sim::topics::kPieces, sizeof(::sim::GamePieces),
+        alignof(::sim::GamePieces), talos::schema::Of<::sim::GamePieces>(),
+        talos::hardware::sim::kPiecesSlots,
+        RTMSOptions{.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
+                    .read_mode = ReadMode::LATEST,
+                    .publisher = true});
+  }
+  RTMSQueue queue(args.size() > 1 ? args[1] : "/talos/telemetry",
+                  wire::slot_bytes, 8, talos::schema::Bytes(), wire::slot_count,
+                  {.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
+                   .read_mode = ReadMode::SEQUENCE,
+                   .publisher = true});
+  // The segment exists now; tests wait for this line.
+  std::cout << "ready\n" << std::flush;
   const std::uint32_t dictionary_id =
       talos::telemetry::DictionaryId(dictionary);
   std::random_device device;
@@ -93,12 +104,18 @@ int main(int argc, char** argv) try {
 
   std::array<std::byte, wire::slot_bytes> slot{};
   // The buffer already starts with its size prefix; the slot is that prefix
-  // plus buffer followed by unused padding.
+  // plus buffer followed by zeroed unused padding.
   const auto publish = [&](std::span<const std::uint8_t> page) {
     if (page.size() > slot.size())
       throw std::runtime_error("page exceeds slot");
     std::memcpy(slot.data(), page.data(), page.size());
-    queue.write(std::span<const std::byte>{slot.data(), slot.size()});
+    if (page.size() < slot.size()) {
+      std::memset(slot.data() + page.size(), 0, slot.size() - page.size());
+    }
+    if (queue.write(std::span<const std::byte>{slot.data(), slot.size()}) !=
+        WriteResult::SUCCESS) {
+      throw std::runtime_error("mock: failed to write telemetry slot");
+    }
   };
   flatbuffers::FlatBufferBuilder builder;
   std::vector<std::uint32_t> indices(dictionary.size());
@@ -166,8 +183,10 @@ int main(int argc, char** argv) try {
         message.mutable_z_m()->Mutate(at, 0.075F);
         message.mutable_in_play()->Mutate(at, i < 456);
       }
-      pieces->write(
-          std::as_bytes(std::span<const ::sim::GamePieces, 1>{&message, 1}));
+      if (pieces->write(std::as_bytes(std::span<const ::sim::GamePieces, 1>{
+              &message, 1})) != WriteResult::SUCCESS) {
+        throw std::runtime_error("mock: failed to write pieces slot");
+      }
     }
     if (on_stdin) {
       // Tells the test the tick is in the topic.
