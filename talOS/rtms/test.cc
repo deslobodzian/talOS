@@ -838,10 +838,12 @@ TEST(SingleProcess, ReaderSequenceAndMovedFromQueueGuardInvalidAccess) {
   EXPECT_EQ(queue.reader_sequence(MAX_READERS + 100), 0u);
 
   const auto check_moved_from = [&](RTMSQueue& moved_from) {
+    // NOLINTBEGIN(clang-analyzer-cplusplus.Move)
     EXPECT_EQ(moved_from.reader_sequence(id), 0u);
     EXPECT_EQ(moved_from.read_next(id, std::span<std::byte>(buffer), info),
               ReadResult::INVALID);
     EXPECT_EQ(moved_from.write(BytesOf(message)).result, WriteResult::FAILURE);
+    // NOLINTEND(clang-analyzer-cplusplus.Move)
   };
   RTMSQueue* moved_from_ptr = &queue;
   RTMSQueue moved = std::move(queue);

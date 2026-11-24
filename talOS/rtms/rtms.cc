@@ -87,8 +87,9 @@ void ThrowIfVersionMismatch(const std::string& path) {
     }
   }
   ::close(fd);
-  if (version.has_value() && *version != kRtmsVersion) {
-    throw VersionMismatchError(path, *version);
+  const std::uint64_t found_version = version.value_or(kRtmsVersion);
+  if (found_version != kRtmsVersion) {
+    throw VersionMismatchError(path, found_version);
   }
 }
 

@@ -1163,12 +1163,45 @@ TEST(SimHardwareNonFinite,
       hardware::Command bad_motor = DriveAll(active, devices);
       bad_motor.motors[0].mode = Mode::kDutyCycle;
       bad_motor.motors[0].demand = bad;
-      SendRequest(sim, "mech", bad_motor);
+      hardware::Packet rejected{};
+      EXPECT_EQ(hardware::Encode(bad_motor, rejected.data), 0u);
 
       hardware::Command bad_pwm = DriveAll(active, devices);
       bad_pwm.pwm_outputs[0].mode = hardware::PwmMode::kPulse;
       bad_pwm.pwm_outputs[0].output = bad;
-      SendRequest(sim, "mech", bad_pwm);
+      EXPECT_EQ(hardware::Encode(bad_pwm, rejected.data), 0u);
+
+      // Corrupt the raw wire double bytes of an otherwise valid Command so
+      // SimHardware::Collect's decode-side rejection is also exercised.
+      const auto send_corrupted_double = [&](const hardware::Command& valid,
+                                             std::size_t byte_offset,
+                                             double expected_original,
+                                             double corrupted_value) {
+        hardware::Packet packet{};
+        packet.data.fill(0);
+        packet.size =
+            static_cast<std::uint32_t>(hardware::Encode(valid, packet.data));
+        ASSERT_GE(packet.size, byte_offset + sizeof(double));
+        double encoded_value = 0.0;
+        std::memcpy(&encoded_value, packet.data.data() + byte_offset,
+                    sizeof(double));
+        ASSERT_DOUBLE_EQ(encoded_value, expected_original);
+        std::memcpy(packet.data.data() + byte_offset, &corrupted_value,
+                    sizeof(double));
+        sim.publish(hardware::RequestTopic("mech"), packet);
+      };
+      const hardware::Command base_cmd = DriveAll(active, devices);
+      constexpr std::size_t kCommandHeaderBytes = 38;
+      constexpr std::size_t kMotorRecordBytes = 20;
+      constexpr std::size_t kDigitalOutputRecordBytes = 3;
+      // Motor 0 demand follows id (2) + mode (1) + slot (1).
+      send_corrupted_double(base_cmd, kCommandHeaderBytes + 4, 40.0, bad);
+      // PWM 0 output follows header + motors + digital outputs + id (2) + mode
+      // (1).
+      const std::size_t pwm0_output_offset =
+          kCommandHeaderBytes + base_cmd.count * kMotorRecordBytes +
+          base_cmd.digital_output_count * kDigitalOutputRecordBytes + 3;
+      send_corrupted_double(base_cmd, pwm0_output_offset, 0.75, bad);
 
       sim.step(5ms);
       EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kVelocity);

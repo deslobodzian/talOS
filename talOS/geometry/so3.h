@@ -28,7 +28,7 @@ class SO3 {
     const Eigen::JacobiSVD<Matrix3> svd(
         r, Eigen::ComputeFullU | Eigen::ComputeFullV);
     if (svd.info() != Eigen::Success) return Identity();
-    const Matrix3 u = svd.matrixU();
+    const Matrix3& u = svd.matrixU();
     const Matrix3 vt = svd.matrixV().transpose();
     Matrix3 normalized = u * vt;
     if (normalized.determinant() < Scalar(0)) {
