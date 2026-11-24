@@ -1353,7 +1353,8 @@ struct LayoutChannels {
   std::string routine = "shooter/status/routine_index";
   std::string phase = "shooter/status/supply_v";  // optional key
   std::string pose = "pose_estimator/state/pose";
-  std::string series = "pose_estimator/state/localized";  // channels[1]
+  std::string localized = "pose_estimator/state/localized";  // optional key
+  std::string series = "pose_estimator/state/localized";     // channels[1]
   std::string item = "shooter/status/alert_error_link_lost";
 };
 
@@ -1376,6 +1377,9 @@ pose = ")" +
          c.pose +
          R"("
 valid = "pose_estimator/state/valid"
+localized = ")" +
+         c.localized +
+         R"("
 [[widgets]]
 kind = "graph"
 at = [0, 2, 4, 2]
@@ -1391,6 +1395,35 @@ kind = "alerts"
 at = [4, 2, 3, 2]
 )";
 }
+
+// Publishes `/signed_int/state` with one signed 32-bit integer field
+// `mode_index` (ChannelKind_Int, unlabelled) for REQ-OPS-38 label tests.
+class SignedIntNode {
+ public:
+  explicit SignedIntNode(talos::Node& node) {
+    flatbuffers::FlatBufferBuilder fbb;
+    const auto type =
+        reflection::CreateType(fbb, reflection::BaseType::Int,
+                               reflection::BaseType::None, -1, 0, 4, 0);
+    std::vector<flatbuffers::Offset<reflection::Field>> fields{
+        reflection::CreateFieldDirect(fbb, "mode_index", type, 0, 0)};
+    std::vector<flatbuffers::Offset<reflection::Object>> objects{
+        reflection::CreateObjectDirect(fbb, "signed_int.State", &fields,
+                                       /*is_struct=*/true, /*minalign=*/4,
+                                       /*bytesize=*/4)};
+    std::vector<flatbuffers::Offset<reflection::Enum>> enums;
+    reflection::FinishSchemaBuffer(
+        fbb, reflection::CreateSchemaDirect(fbb, &objects, &enums));
+    schema_.assign(reinterpret_cast<const char*>(fbb.GetBufferPointer()),
+                   fbb.GetSize());
+    talos::detail::NodeAccess::add_publisher(
+        node, "/signed_int/state", sizeof(std::int32_t), alignof(std::int32_t),
+        talos::schema::Identity{"signed_int.State", 7777, schema_});
+  }
+
+ private:
+  std::string schema_;
+};
 
 // REQ-OPS-38: a [[subsystem.labels]] entry that cannot label an integer
 // channel with a string array refuses construction, naming its key, rather
@@ -1474,6 +1507,93 @@ from = "autonomous.exact_len"
     ASSERT_TRUE(dict.contains("shooter/status/routine_index"));
     EXPECT_EQ(dict.at("shooter/status/routine_index")->labels,
               (std::vector<std::string>{max_label_str}));
+  }
+  // REQ-OPS-38: ApplyLabelSpecs accepts a signed integer (ChannelKind_Int)
+  // channel, not only unsigned integers.
+  {
+    Sim sim = Sim::FromToml(R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+[subsystems.signed_int]
+node = "//signed_int:node"
+[subsystems.autonomous]
+node = "//autonomous:node"
+routines = ["preload", "none", "taxi"]
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+[[subsystems.telemetry.labels]]
+channel = "signed_int/state/mode_index"
+from = "autonomous.routines"
+)");
+    sim.add<SignedIntNode>("signed_int");
+    const auto& telemetry = sim.add<Telemetry>("telemetry");
+    const auto dict = DictionaryMap(telemetry);
+    ASSERT_TRUE(dict.contains("signed_int/state/mode_index"));
+    EXPECT_EQ(dict.at("signed_int/state/mode_index")->kind,
+              Talos::Telemetry::ChannelKind_Int);
+    EXPECT_EQ(dict.at("signed_int/state/mode_index")->labels,
+              (std::vector<std::string>{"preload", "none", "taxi"}));
+  }
+  // REQ-OPS-38: non-array `labels` and non-table elements inside `labels` are
+  // refused naming `labels` and `labels[0]`.
+  struct RawLabelsCase {
+    const char* what;
+    const char* body;
+    const char* key;
+  };
+  for (const RawLabelsCase& c : {
+           RawLabelsCase{"non-array labels", "labels = \"bad\"\n", "labels"},
+           RawLabelsCase{"non-table labels element", "labels = [\"bad\"]\n",
+                         "labels[0]"},
+       }) {
+    SCOPED_TRACE(c.what);
+    Sim sim = Sim::FromToml(std::string{R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)"} + c.body);
+    try {
+      sim.add<Telemetry>("telemetry");
+      ADD_FAILURE() << "constructed";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string_view{error.what()}.find(c.key),
+                std::string_view::npos)
+          << error.what();
+    }
+  }
+  // REQ-OPS-38: an .fbs enum channel already carries labels from reflection
+  // and must be refused with "already has labels", not overwritten.
+  {
+    Sim sim = Sim::FromToml(R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+[subsystems.demo]
+node = "//demo:node"
+[subsystems.autonomous]
+node = "//autonomous:node"
+routines = ["preload", "none", "taxi"]
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+[[subsystems.telemetry.labels]]
+channel = "demo/state/inner/mode"
+from = "autonomous.routines"
+)");
+    sim.add<ShapesNode>("demo");
+    try {
+      sim.add<Telemetry>("telemetry");
+      ADD_FAILURE() << "constructed";
+    } catch (const std::invalid_argument& error) {
+      const std::string_view msg = error.what();
+      EXPECT_NE(msg.find("labels[0].channel"), std::string_view::npos) << msg;
+      EXPECT_NE(msg.find("already has labels"), std::string_view::npos) << msg;
+    }
   }
 
   struct Case {
@@ -1631,6 +1751,9 @@ at = [1, 0, 1, 1]
            {"absent pose fields",
             with([](auto& c) { c.pose = "pose_estimator/state/nope"; }), "",
             "widgets[2].pose"},
+           {"absent field localized channel",
+            with([](auto& c) { c.localized = "pose_estimator/state/nope"; }),
+            "", "widgets[2].localized"},
            {"absent graph series",
             with([](auto& c) { c.series = "shooter/status/nope"; }), "",
             "widgets[3].channels[1]"},
@@ -1639,6 +1762,9 @@ at = [1, 0, 1, 1]
             "widgets[4].items[0].channel"},
            {"excluded fixed channel", DashboardLayoutText({}),
             "exclude = [\"hw/state/driver_station/alliance\"]\n",
+            "widgets[0].kind"},
+           {"absent power fixed channels",
+            "[[widgets]]\nkind = \"power\"\nat = [0, 0, 2, 1]\n", "",
             "widgets[0].kind"},
            {"over budget with alert channels", over_budget, "",
             "[dashboard].budget_bytes_per_s"},
@@ -2416,38 +2542,207 @@ node = "//talOS/telemetry:node"
   }
 }
 
-// REQ-CONTRACT-28, REQ-OPS-22: on tick 0 (and every 100th tick), Telemetry
-// emits every dictionary page followed by every value page in one tick into
-// the 64-slot `/talos/telemetry` ring. A dictionary whose combined page count
-// exceeds `telemetry_wire::slot_count` would silently lap its own dictionary
-// pages on tick 0, so construction must refuse it naming the page counts and
-// `slot_count`.
-TEST(TelemetryTest, CombinedPagesExceedingRingSlotCountIsRefused) {
-  // 2000 long-named channels + pose/valid = 2001 channels (<= kMaxChannels):
-  // fits in <= 64 combined pages (dictionary + value).
-  {
-    Sim fits = Sim::FromToml(LongNamesConfig(1900, kLongestFieldName));
-    fits.add<LongNamesNode>("budget");
-    const auto& telemetry = fits.add<Telemetry>("telemetry");
-    const PageBudget budget = MeasurePages(telemetry.dictionary());
-    EXPECT_LE(budget.dictionary_pages + budget.value_pages,
-              telemetry_wire::slot_count);
+// Publishes `/budget/state` as a struct of `field_count` unsigned bytes
+// (`f0`..`f<N-1>`) so attaching large label arrays puts exactly one channel per
+// dictionary page while keeping <= 83 channels in one value page.
+class LabelledBytesSourceNode {
+ public:
+  explicit LabelledBytesSourceNode(talos::Node& node)
+      : node_{node},
+        count_{static_cast<std::size_t>(
+            node.param<std::int64_t>("field_count", 1))},
+        payload_(count_, 1) {
+    flatbuffers::FlatBufferBuilder fbb;
+    std::vector<flatbuffers::Offset<reflection::Field>> fields;
+    fields.reserve(count_);
+    for (std::size_t i = 0; i < count_; ++i) {
+      const auto type =
+          reflection::CreateType(fbb, reflection::BaseType::UByte,
+                                 reflection::BaseType::None, -1, 0, 1, 0);
+      fields.push_back(reflection::CreateFieldDirect(
+          fbb, ("f" + std::to_string(i)).c_str(), type,
+          static_cast<std::uint16_t>(i), static_cast<std::uint16_t>(i)));
+    }
+    std::vector<flatbuffers::Offset<reflection::Object>> objects{
+        reflection::CreateObjectDirect(fbb, "budget.Bytes", &fields,
+                                       /*is_struct=*/true, /*minalign=*/1,
+                                       static_cast<std::int32_t>(count_))};
+    std::vector<flatbuffers::Offset<reflection::Enum>> enums;
+    reflection::FinishSchemaBuffer(
+        fbb, reflection::CreateSchemaDirect(fbb, &objects, &enums));
+    schema_.assign(reinterpret_cast<const char*>(fbb.GetBufferPointer()),
+                   fbb.GetSize());
+    pub_index_ = talos::detail::NodeAccess::add_publisher(
+        node, "/budget/state", count_, 1,
+        talos::schema::Identity{"budget.Bytes", 98765, schema_});
   }
 
-  // 2047 long-named channels + pose/valid = 2048 channels (== kMaxChannels),
-  // but 41 dictionary pages + 25 value pages = 66 > 64 slots.
-  Sim over = Sim::FromToml(LongNamesConfig(2047, kLongestFieldName));
-  over.add<LongNamesNode>("budget");
+  void update() {
+    talos::detail::NodeAccess::publisher_send(node_, pub_index_,
+                                              payload_.data(), payload_.size());
+  }
+
+ private:
+  talos::Node& node_;
+  std::size_t count_;
+  std::string schema_;
+  std::size_t pub_index_{0};
+  std::vector<std::uint8_t> payload_;
+};
+
+// REQ-CONTRACT-28, REQ-OPS-22: on tick 0 (and every 100th tick), Telemetry
+// emits every dictionary page followed by every value page in one tick into
+// the 64-slot OVERWRITE_OLDEST `/talos/telemetry` ring, whose intact burst
+// capacity is `slot_count - 1` (63 pages). Exact boundary: 63 combined pages
+// construct and drain through a 64-slot OVERWRITE_OLDEST RTMSQueue with 0
+// drops; 64 combined pages would self-lap page 0 and are refused naming the
+// page counts, burst limit and `slot_count`.
+TEST(TelemetryTest, CombinedPagesExceedingRingSlotCountIsRefused) {
+  std::string big_labels = "[";
+  for (std::size_t i = 0; i < 80; ++i) {
+    if (i > 0) big_labels += ", ";
+    big_labels +=
+        "\"l" + std::to_string(i) + "_" + std::string(136, 'x') + "\"";
+  }
+  big_labels += "]";
+  const auto make_config = [&big_labels](std::size_t count) {
+    std::string toml =
+        "[robot]\nperiod_us = 10000\n"
+        "[studio]\ntopic = \"/talos/telemetry\"\n"
+        "[subsystems.budget]\nnode = \"//budget:node\"\n"
+        "field_count = " +
+        std::to_string(count) +
+        "\n"
+        "big_labels = " +
+        big_labels +
+        "\n"
+        "[subsystems.telemetry]\nnode = \"//talOS/telemetry:node\"\n";
+    for (std::size_t i = 0; i < count; ++i) {
+      toml += "[[subsystems.telemetry.labels]]\nchannel = \"budget/state/f" +
+              std::to_string(i) + "\"\nfrom = \"budget.big_labels\"\n";
+    }
+    return toml;
+  };
+
+  // Exact boundary 63 (62 dictionary + 1 value): accepted, and tick 0 drains
+  // all 63 pages intact (dropped == 0) through a 64-slot OVERWRITE_OLDEST ring.
+  {
+    const char* tmp = std::getenv("TEST_TMPDIR");
+    ASSERT_NE(tmp, nullptr);
+    const std::string config_path = std::string{tmp} + "/telemetry_burst63_" +
+                                    std::to_string(::getpid()) + ".toml";
+    {
+      std::ofstream out{config_path};
+      out << make_config(telemetry_wire::slot_count - 2);
+    }
+    const auto config = std::make_shared<const config::RobotConfig>(
+        config::ParseRobotConfig(config_path));
+
+    event::SimulationEnvironment env;
+    event::SimulatedEventLoop<> src_loop{env};
+    talos::detail::LoopPortFor<event::SimulatedEventLoop<>> src_port{src_loop};
+    auto src_node = talos::detail::NodeAccess::create(talos::detail::NodeSetup{
+        .name = "budget",
+        .config_path = config_path,
+        .config = config,
+        .loop = &src_port,
+    });
+    LabelledBytesSourceNode src{*src_node};
+    talos::detail::NodeAccess::set_update(*src_node, [&] { src.update(); });
+    talos::detail::NodeAccess::start(*src_node);
+
+    talos::detail::DeclaredGraph graph;
+    graph.push_back(talos::detail::DescribeNode(
+        *src_node, "//budget:node", src_loop.manifest(),
+        introspect::LoopSourceFlags(src_loop)));
+
+    std::vector<FrameHolder> collected;
+    event::SimulatedEventLoop<> tel_loop{env};
+    CollectingPort tel_port{tel_loop, collected};
+    auto tel_node = talos::detail::NodeAccess::create(talos::detail::NodeSetup{
+        .name = "telemetry",
+        .config_path = config_path,
+        .config = config,
+        .loop = &tel_port,
+        .graph = [&graph] { return &graph; },
+    });
+    Telemetry telemetry{*tel_node};
+    const PageBudget budget = MeasurePages(telemetry.dictionary());
+    ASSERT_EQ(budget.dictionary_pages, telemetry_wire::slot_count - 2);
+    ASSERT_EQ(budget.value_pages, 1u);
+    ASSERT_EQ(budget.dictionary_pages + budget.value_pages,
+              telemetry_wire::slot_count - 1);
+
+    talos::detail::NodeAccess::set_update(*tel_node,
+                                          [&] { telemetry.update(); });
+    talos::detail::NodeAccess::start(*tel_node);
+    const auto at = event::MonotonicTime::from_nanos(10'000'000LL);
+    src_loop.run_until(at);
+    tel_loop.run_until(at);
+    ASSERT_EQ(collected.size(), telemetry_wire::slot_count - 1);
+
+    const std::string topic = "/test/telemetry/b" + std::to_string(::getpid());
+    RTMSQueue writer{topic,
+                     telemetry_wire::slot_bytes,
+                     kMessageAlignment,
+                     schema::Bytes(),
+                     kTopicOptions.slots,
+                     {.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
+                      .read_mode = ReadMode::SEQUENCE,
+                      .publisher = true}};
+    RTMSQueue reader_q{topic,
+                       telemetry_wire::slot_bytes,
+                       kMessageAlignment,
+                       schema::Bytes(),
+                       telemetry_wire::slot_count,
+                       {.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
+                        .read_mode = ReadMode::SEQUENCE}};
+    const auto reader = reader_q.register_reader();
+    ASSERT_TRUE(reader.has_value());
+
+    for (std::size_t i = 0; i < collected.size(); ++i) {
+      ASSERT_EQ(writer.write(collected[i].bytes).result, WriteResult::SUCCESS)
+          << i;
+    }
+    std::vector<std::byte> slot(telemetry_wire::slot_bytes);
+    MessageInfo info{};
+    for (std::size_t i = 0; i < collected.size(); ++i) {
+      ASSERT_EQ(reader_q.read_next(*reader, slot, info), ReadResult::OK) << i;
+      EXPECT_EQ(info.dropped, 0u) << i;
+      const auto payload = telemetry_wire::payload(slot);
+      ASSERT_EQ(payload.size(), collected[i].bytes.size()) << i;
+      const Frame* frame = Talos::Telemetry::GetSizePrefixedFrame(slot.data());
+      ASSERT_NE(frame, nullptr) << i;
+      if (i < budget.dictionary_pages) {
+        ASSERT_NE(frame->dictionary(), nullptr) << i;
+        EXPECT_EQ(frame->page(), i);
+        EXPECT_EQ(frame->page_count(), budget.dictionary_pages);
+      } else {
+        EXPECT_EQ(frame->dictionary(), nullptr) << i;
+        EXPECT_TRUE(frame->keyframe());
+        EXPECT_EQ(frame->page(), 0u);
+        EXPECT_EQ(frame->page_count(), 1u);
+      }
+    }
+    EXPECT_EQ(reader_q.read_next(*reader, slot, info), ReadResult::EMPTY);
+    reader_q.release_reader(*reader);
+    std::remove(config_path.c_str());
+  }
+
+  // Exact boundary 64 (63 dictionary + 1 value): refused because writing 64
+  // pages into a 64-slot OVERWRITE_OLDEST ring self-laps dictionary page 0.
+  Sim over = Sim::FromToml(make_config(telemetry_wire::slot_count - 1));
+  over.add<LabelledBytesSourceNode>("budget");
   try {
     over.add<Telemetry>("telemetry");
-    ADD_FAILURE() << "accepted dictionary whose resend tick exceeds 64 slots";
+    ADD_FAILURE() << "accepted dictionary requiring 64 combined pages";
   } catch (const std::runtime_error& error) {
     const std::string_view msg = error.what();
-    EXPECT_NE(msg.find(std::to_string(telemetry_wire::slot_count)),
-              std::string_view::npos)
+    EXPECT_NE(msg.find("64 pages"), std::string_view::npos) << msg;
+    EXPECT_NE(msg.find("63 dictionary + 1 value"), std::string_view::npos)
         << msg;
-    EXPECT_NE(msg.find("dictionary"), std::string_view::npos) << msg;
-    EXPECT_NE(msg.find("value"), std::string_view::npos) << msg;
+    EXPECT_NE(msg.find("63-page"), std::string_view::npos) << msg;
+    EXPECT_NE(msg.find("64-slot"), std::string_view::npos) << msg;
   }
 }
 
@@ -2537,6 +2832,63 @@ labels = []
   }
   EXPECT_TRUE(saw_labels);
   std::remove(config_path.c_str());
+}
+
+// REQ-OPS-42: EnvelopeChannels prepends two header channels (`mode_since_us`,
+// `active`) and bounds total channels to `kMaxTopicChannels` (2048), admitting
+// 2046 inner fields and refusing 2047.
+TEST(TelemetryTest, EnvelopeChannelsEnforcesMaxTopicChannels) {
+  const std::string ok_bfbs =
+      MakeDoubleStructSchema("env.InnerOk", kMaxTopicChannels - 2, 4);
+  const std::vector<Channel> ok =
+      EnvelopeChannels("/demo/target/teleop", "env.InnerOk", ok_bfbs);
+  ASSERT_EQ(ok.size(), kMaxTopicChannels);
+  EXPECT_EQ(ok[0].name, "demo/target/teleop/mode_since_us");
+  EXPECT_EQ(ok[1].name, "demo/target/teleop/active");
+  EXPECT_EQ(ok[2].name, "demo/target/teleop/message/0xxx");
+
+  const std::string over_bfbs =
+      MakeDoubleStructSchema("env.InnerOver", kMaxTopicChannels - 1, 4);
+  EXPECT_THROW(static_cast<void>(EnvelopeChannels("/demo/target/teleop",
+                                                  "env.InnerOver", over_bfbs)),
+               std::invalid_argument);
+}
+
+// REQ-OPS-37, REQ-CONTRACT-33: FlattenTopic tags alert levels identically on
+// `status` topics with or without a leading `/`, and leaves alert-shaped bools
+// as AlertLevel_None on non-`status` topics.
+TEST(TelemetryTest, FlattenTopicTagsAlertsOnSlashlessStatusTopic) {
+  const schema::Identity alerts = schema::Of<schema_test::Alerts>();
+  const std::vector<Channel> slashed =
+      FlattenTopic("/shooter/status", alerts.name, alerts.bfbs);
+  const std::vector<Channel> slashless =
+      FlattenTopic("shooter/status", alerts.name, alerts.bfbs);
+  ASSERT_EQ(slashless.size(), slashed.size());
+  for (std::size_t i = 0; i < slashed.size(); ++i) {
+    EXPECT_EQ(slashless[i].name, slashed[i].name);
+    EXPECT_EQ(static_cast<int>(slashless[i].alert),
+              static_cast<int>(slashed[i].alert))
+        << slashless[i].name;
+  }
+  auto level_of = [](const std::vector<Channel>& channels,
+                     std::string_view name) {
+    for (const auto& ch : channels) {
+      if (ch.name == name) return ch.alert;
+    }
+    return Talos::Telemetry::AlertLevel_None;
+  };
+  EXPECT_EQ(level_of(slashless, "shooter/status/alert_error_link_lost"),
+            Talos::Telemetry::AlertLevel_Error);
+  EXPECT_EQ(level_of(slashless, "shooter/status/alert_warning_hot"),
+            Talos::Telemetry::AlertLevel_Warning);
+  EXPECT_EQ(level_of(slashless, "shooter/status/alert_info_homed"),
+            Talos::Telemetry::AlertLevel_Info);
+
+  const std::vector<Channel> non_status =
+      FlattenTopic("shooter/state", alerts.name, alerts.bfbs);
+  for (const auto& ch : non_status) {
+    EXPECT_EQ(ch.alert, Talos::Telemetry::AlertLevel_None) << ch.name;
+  }
 }
 
 }  // namespace

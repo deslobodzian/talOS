@@ -106,38 +106,45 @@ TEST(ConfigValidationTest, BuildDictionaryAccumulatesUncountedByOwnerRole) {
 }
 
 // REQ-CONTRACT-28, REQ-OPS-22: CheckDictionaryPageBudget admits dictionaries
-// whose dictionary + value pages fit within `telemetry_wire::slot_count` and
-// refuses dictionaries whose resend tick would exceed the 64-slot ring.
-TEST(ConfigValidationTest, PageBudgetRefusesCombinedPagesOverSlotCount) {
-  std::vector<ChannelDef> fits;
-  for (std::size_t i = 0; i < 64; ++i) {
-    fits.push_back(ChannelDef{
-        .name = "demo/state/c" + std::to_string(i),
-        .kind = Talos::Telemetry::ChannelKind_Double,
-    });
-  }
-  const PageBudget ok = CheckDictionaryPageBudget(fits);
-  EXPECT_LE(ok.dictionary_pages + ok.value_pages, telemetry_wire::slot_count);
+// whose dictionary + value pages fit within the 63-page burst limit of the
+// 64-slot OVERWRITE_OLDEST ring (`telemetry_wire::slot_count - 1`) and refuses
+// 64 combined pages (which would self-lap dictionary page 0).
+TEST(ConfigValidationTest, PageBudgetRefusesCombinedPagesAtOrOverSlotCount) {
+  // Each channel carries ~12 KiB of enum labels -> 1 dictionary page per
+  // channel; <= 83 channels fit in 1 value page.
+  const auto make_heavy = [](std::size_t count) {
+    std::vector<ChannelDef> dict;
+    dict.reserve(count);
+    const std::vector<std::string> big_labels(80, std::string(140, 'l'));
+    for (std::size_t i = 0; i < count; ++i) {
+      dict.push_back(ChannelDef{
+          .name = "demo/state/enum_" + std::to_string(i),
+          .labels = big_labels,
+          .kind = Talos::Telemetry::ChannelKind_UInt,
+      });
+    }
+    return dict;
+  };
 
-  // 64 channels each carrying ~12 KiB of enum labels -> 64 dictionary pages +
-  // 1 value page = 65 > 64 slots.
-  std::vector<ChannelDef> over;
-  const std::vector<std::string> big_labels(80, std::string(140, 'l'));
-  for (std::size_t i = 0; i < 64; ++i) {
-    over.push_back(ChannelDef{
-        .name = "demo/state/enum_" + std::to_string(i),
-        .labels = big_labels,
-        .kind = Talos::Telemetry::ChannelKind_UInt,
-    });
-  }
+  // Exact boundary accepted: 62 dictionary pages + 1 value page = 63 pages.
+  const PageBudget ok =
+      CheckDictionaryPageBudget(make_heavy(telemetry_wire::slot_count - 2));
+  EXPECT_EQ(ok.dictionary_pages, telemetry_wire::slot_count - 2);
+  EXPECT_EQ(ok.value_pages, 1u);
+  EXPECT_EQ(ok.dictionary_pages + ok.value_pages,
+            telemetry_wire::slot_count - 1);
+
+  // Exact boundary refused: 63 dictionary pages + 1 value page = 64 pages.
   try {
-    static_cast<void>(CheckDictionaryPageBudget(over));
-    ADD_FAILURE() << "accepted dictionary exceeding 64 combined pages";
+    static_cast<void>(
+        CheckDictionaryPageBudget(make_heavy(telemetry_wire::slot_count - 1)));
+    ADD_FAILURE() << "accepted dictionary requiring 64 combined pages";
   } catch (const std::runtime_error& error) {
     const std::string_view msg = error.what();
-    EXPECT_NE(msg.find("65 pages"), std::string_view::npos) << msg;
-    EXPECT_NE(msg.find("64 dictionary + 1 value"), std::string_view::npos)
+    EXPECT_NE(msg.find("64 pages"), std::string_view::npos) << msg;
+    EXPECT_NE(msg.find("63 dictionary + 1 value"), std::string_view::npos)
         << msg;
+    EXPECT_NE(msg.find("63-page"), std::string_view::npos) << msg;
     EXPECT_NE(msg.find("64-slot"), std::string_view::npos) << msg;
   }
 }

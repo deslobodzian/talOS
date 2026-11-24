@@ -283,7 +283,103 @@ TEST(DashboardLayoutTest, RefusesAnInvalidLayoutNamingFileIndexAndKey) {
        "[dashboard].column"},
       {"unknown top-level key", "[layout]\ncolumns = 4\n" + first, "layout"},
       {"no widgets", "[dashboard]\ntitle = \"Drive\"\n", "widgets"},
+      {"non-table [dashboard]", "dashboard = 1\n" + first, "[dashboard]"},
+      {"non-array widgets", "widgets = \"bad\"\n", "widgets"},
       {"TOML syntax error", first + "at = [\n", "dashboard.toml"},
+      {"dashboard title over 64 bytes",
+       "[dashboard]\ntitle = \"" +
+           std::string(kDashboardMaxTextBytes + 1, 't') + "\"\n" + first,
+       "[dashboard].title"},
+      {"widget title over 64 bytes",
+       first + "[[widgets]]\nkind = \"alerts\"\nat = [2, 0, 1, 1]\ntitle = \"" +
+           std::string(kDashboardMaxTextBytes + 1, 't') + "\"\n",
+       "widgets[1].title"},
+      {"widget label over 64 bytes",
+       first +
+           "[[widgets]]\nkind = \"number\"\nat = [2, 0, 1, 1]\nchannel = "
+           "\"a/s/a\"\nlabel = \"" +
+           std::string(kDashboardMaxTextBytes + 1, 'l') + "\"\n",
+       "widgets[1].label"},
+      {"channel over 256 bytes",
+       first +
+           "[[widgets]]\nkind = \"number\"\nat = [2, 0, 1, 1]\nchannel = "
+           "\"a/s/" +
+           std::string(253, 'c') + "\"\n",
+       "widgets[1].channel"},
+      {"pose prefix + /yaw_rad over 256 bytes",
+       first +
+           "[[widgets]]\nkind = \"field\"\nat = [2, 0, 2, 2]\npose = "
+           "\"a/s/" +
+           std::string(245, 'p') + "\"\n",
+       "widgets[1].pose"},
+      {"duplicate graph channels",
+       first + "[[widgets]]\nkind = \"graph\"\nat = [2, 0, 4, 2]\nchannels = "
+               "[\"a/s/a\", \"a/s/a\"]\n",
+       "widgets[1].channels[1]"},
+      {"duplicate subsystems nodes",
+       first + "[[widgets]]\nkind = \"subsystems\"\nat = [2, 0, 4, 2]\nnodes = "
+               "[\"drivetrain\", \"drivetrain\"]\n",
+       "widgets[1].nodes[1]"},
+      {"check at_least > at_most",
+       first + "[[widgets]]\nkind = \"checks\"\nat = [2, 0, 4, 2]\nitems = [{ "
+               "label = \"L\", channel = \"a/s/a\", at_least = 5, at_most = 4 "
+               "}]\n",
+       "widgets[1].items[0].at_most"},
+      {"check empty equals",
+       first + "[[widgets]]\nkind = \"checks\"\nat = [2, 0, 4, 2]\nitems = [{ "
+               "label = \"L\", channel = \"a/s/a\", equals = \"\" }]\n",
+       "widgets[1].items[0].equals"},
+      {"check empty label",
+       first + "[[widgets]]\nkind = \"checks\"\nat = [2, 0, 4, 2]\nitems = [{ "
+               "label = \"\", channel = \"a/s/a\", equals = true }]\n",
+       "widgets[1].items[0].label"},
+      {"check label over 64 bytes",
+       first +
+           "[[widgets]]\nkind = \"checks\"\nat = [2, 0, 4, 2]\nitems = [{ "
+           "label = \"" +
+           std::string(kDashboardMaxTextBytes + 1, 'l') +
+           "\", channel = \"a/s/a\", equals = true }]\n",
+       "widgets[1].items[0].label"},
+      {"power warn_below_v at 0",
+       first + "[[widgets]]\nkind = \"power\"\nat = [2, 0, 2, 1]\n"
+               "warn_below_v = 0\n",
+       "widgets[1].warn_below_v"},
+      {"power warn_below_v above 20",
+       first + "[[widgets]]\nkind = \"power\"\nat = [2, 0, 2, 1]\n"
+               "warn_below_v = 20.1\n",
+       "widgets[1].warn_below_v"},
+      {"power warn_below_v non-finite",
+       first + "[[widgets]]\nkind = \"power\"\nat = [2, 0, 2, 1]\n"
+               "warn_below_v = nan\n",
+       "widgets[1].warn_below_v"},
+      {"field trail_s below 0",
+       first + "[[widgets]]\nkind = \"field\"\nat = [2, 0, 2, 2]\npose = "
+               "\"p/s/pose\"\ntrail_s = -0.1\n",
+       "widgets[1].trail_s"},
+      {"field trail_s above 30",
+       first + "[[widgets]]\nkind = \"field\"\nat = [2, 0, 2, 2]\npose = "
+               "\"p/s/pose\"\ntrail_s = 30.1\n",
+       "widgets[1].trail_s"},
+      {"number precision below 0",
+       first + "[[widgets]]\nkind = \"number\"\nat = [2, 0, 1, 1]\nchannel = "
+               "\"a/s/a\"\nprecision = -1\n",
+       "widgets[1].precision"},
+      {"number precision above 6",
+       first + "[[widgets]]\nkind = \"number\"\nat = [2, 0, 1, 1]\nchannel = "
+               "\"a/s/a\"\nprecision = 7\n",
+       "widgets[1].precision"},
+      {"number warn_below == warn_above",
+       first + "[[widgets]]\nkind = \"number\"\nat = [2, 0, 1, 1]\nchannel = "
+               "\"a/s/a\"\nwarn_below = 5\nwarn_above = 5\n",
+       "widgets[1].warn_above"},
+      {"number warn_below > warn_above",
+       first + "[[widgets]]\nkind = \"number\"\nat = [2, 0, 1, 1]\nchannel = "
+               "\"a/s/a\"\nwarn_below = 6\nwarn_above = 5\n",
+       "widgets[1].warn_above"},
+      {"boolean non-bool good",
+       first + "[[widgets]]\nkind = \"boolean\"\nat = [2, 0, 1, 1]\nchannel = "
+               "\"a/s/a\"\ngood = \"yes\"\n",
+       "widgets[1].good"},
   };
   for (const auto& c : cases) {
     SCOPED_TRACE(c.name);
@@ -332,6 +428,107 @@ TEST(DashboardLayoutTest, WorstCaseBudgetIsHeldAtItsBoundary) {
   // added to the one the layout names.
   EXPECT_NO_THROW(CheckDashboardBudget(fits, 1));
   EXPECT_THROW(CheckDashboardBudget(fits, 2), DashboardLayoutError);
+}
+
+// REQ-OPS-39: Boundary limits for widgets (<=64), distinct channels (<=256),
+// text length (<=64), channel/pose length (<=256), trail_s ([0, 30]),
+// precision ([0, 6]), power warn_below_v ((0, 20]), and checks at_least ==
+// at_most are accepted at their exact limits and refused one past.
+TEST(DashboardLayoutTest, ExactBoundsAcceptedAndOnePastRefused) {
+  // Exact 64-byte title/label, 256-byte channel, 248-byte pose (+ "/yaw_rad" =
+  // 256), trail_s = 0 and 30, precision = 0 and 6, warn_below_v = 20, and
+  // checks at_least == at_most all parse cleanly.
+  const std::string max_text(kDashboardMaxTextBytes, 'x');
+  const std::string max_channel = "a/s/" + std::string(252, 'c');
+  const std::string max_pose = "a/s/" + std::string(244, 'p');
+  EXPECT_NO_THROW(Parse(
+      "[dashboard]\n"
+      "title = \"" +
+      max_text +
+      "\"\n"
+      "[[widgets]]\nkind = \"number\"\nat = [0, 0, 1, 1]\n"
+      "title = \"" +
+      max_text +
+      "\"\n"
+      "label = \"" +
+      max_text +
+      "\"\n"
+      "channel = \"" +
+      max_channel +
+      "\"\n"
+      "precision = 0\n"
+      "[[widgets]]\nkind = \"number\"\nat = [1, 0, 1, 1]\n"
+      "channel = \"a/s/b\"\nprecision = 6\n"
+      "[[widgets]]\nkind = \"field\"\nat = [2, 0, 2, 2]\n"
+      "pose = \"" +
+      max_pose +
+      "\"\ntrail_s = 0\n"
+      "[[widgets]]\nkind = \"field\"\nat = [4, 0, 2, 2]\n"
+      "pose = \"p/s/pose\"\ntrail_s = 30\n"
+      "[[widgets]]\nkind = \"power\"\nat = [6, 0, 2, 1]\n"
+      "warn_below_v = 20\n"
+      "[[widgets]]\nkind = \"checks\"\nat = [8, 0, 2, 1]\n"
+      "items = [{ label = \"" +
+      max_text + "\", channel = \"a/s/c\", at_least = 5, at_most = 5 }]\n"));
+
+  // Exact 64 widgets accepted; 65th refused naming widgets[64].
+  auto make_widgets = [](std::size_t count) {
+    std::string toml;
+    for (std::size_t i = 0; i < count; ++i) {
+      toml += "[[widgets]]\nkind = \"alerts\"\nat = [" +
+              std::to_string(i % 12) + ", " + std::to_string(i / 12) +
+              ", 1, 1]\n";
+    }
+    return toml;
+  };
+  EXPECT_EQ(Parse(make_widgets(kDashboardMaxWidgets)).widgets.size(),
+            kDashboardMaxWidgets);
+  try {
+    static_cast<void>(Parse(make_widgets(kDashboardMaxWidgets + 1)));
+    ADD_FAILURE() << "accepted 65 widgets";
+  } catch (const DashboardLayoutError& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find(kFile), std::string::npos) << what;
+    EXPECT_NE(what.find("widgets[64]"), std::string::npos) << what;
+  }
+
+  // Exact 256 distinct channels (16 checks widgets x 16 items) accepted; 257th
+  // refused naming widgets[16].
+  auto make_channels = [](std::size_t extra_channels) {
+    std::string toml =
+        "[dashboard]\nupdate_hz = 1\ndrive_clients = 1\n"
+        "budget_bytes_per_s = 80000\n";
+    std::size_t ch = 0;
+    for (std::size_t w = 0; w < 16; ++w) {
+      toml += "[[widgets]]\nkind = \"checks\"\nat = [" +
+              std::to_string(w % 12) + ", " + std::to_string(w / 12) +
+              ", 1, 1]\nitems = [\n";
+      for (std::size_t k = 0; k < kDashboardMaxCheckItems; ++k) {
+        toml += "  { label = \"c" + std::to_string(ch) +
+                "\", channel = \"a/s/c" + std::to_string(ch) +
+                "\", equals = true },\n";
+        ++ch;
+      }
+      toml += "]\n";
+    }
+    for (std::size_t e = 0; e < extra_channels; ++e) {
+      const std::size_t w = 16 + e;
+      toml += "[[widgets]]\nkind = \"number\"\nat = [" +
+              std::to_string(w % 12) + ", " + std::to_string(w / 12) +
+              ", 1, 1]\nchannel = \"a/s/c" + std::to_string(ch++) + "\"\n";
+    }
+    return toml;
+  };
+  EXPECT_EQ(RequiredChannels(Parse(make_channels(0))).size(),
+            kDashboardMaxChannels);
+  try {
+    static_cast<void>(Parse(make_channels(1)));
+    ADD_FAILURE() << "accepted 257 distinct channels";
+  } catch (const DashboardLayoutError& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find(kFile), std::string::npos) << what;
+    EXPECT_NE(what.find("widgets[16]"), std::string::npos) << what;
+  }
 }
 
 // REQ-OPS-39: ParseDashboardLayout(path) must refuse a directory path with the

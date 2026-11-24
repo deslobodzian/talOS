@@ -114,12 +114,16 @@ void CheckDictionaryChannelCap(
 PageBudget CheckDictionaryPageBudget(std::span<const ChannelDef> dictionary) {
   const PageBudget budget = MeasurePages(dictionary);
   const std::size_t combined = budget.dictionary_pages + budget.value_pages;
-  if (combined > telemetry_wire::slot_count) {
+  // `/talos/telemetry` is an `OVERWRITE_OLDEST` ring of `slot_count` slots,
+  // whose intact burst capacity before lapping page 0 is `slot_count - 1`.
+  constexpr std::size_t kMaxBurstPages = telemetry_wire::slot_count - 1;
+  if (combined > kMaxBurstPages) {
     throw std::runtime_error(
         "telemetry: a dictionary-resend tick needs " +
         std::to_string(combined) + " pages (" +
         std::to_string(budget.dictionary_pages) + " dictionary + " +
         std::to_string(budget.value_pages) + " value), over the " +
+        std::to_string(kMaxBurstPages) + "-page burst limit of the " +
         std::to_string(telemetry_wire::slot_count) +
         "-slot /talos/telemetry ring; exclude channels in telemetry.toml" +
         std::string{kReadmeHint});
