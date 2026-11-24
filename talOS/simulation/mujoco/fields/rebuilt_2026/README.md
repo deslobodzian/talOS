@@ -7,11 +7,12 @@ TOWERs, both DEPOTs, both OUTPOSTs, the 32 AprilTag panels and all 504 FUEL
 the dimension table at its top and the official tag poses
 (`//talOS/vision/testdata:2026-rebuilt-welded.json`); nothing generated is
 checked in. Packages under `//talOS/simulation` take the file as `data`
-through `:rebuilt_2026`.
+through `:rebuilt_2026`. `:rebuilt_2026_glb` writes the same field for
+viewers ([Viewing the field](#viewing-the-field)).
 
 ```sh
 bazel build //talOS/simulation/mujoco/fields/rebuilt_2026:rebuilt_2026_xml
-bazel test //talOS/simulation/mujoco/fields/rebuilt_2026:field_test
+bazel test //talOS/simulation/mujoco/fields/rebuilt_2026:all
 ```
 
 Every field structure is a static geom of the world body; the 504 fuel are
@@ -20,6 +21,35 @@ step, 20 iterations and sleeping off are settings measured on 2026 field
 scenes for step cost (REQ-DEV-37); the elliptic cone, `implicitfast`, the
 1e-8 tolerance and every contact value below are chosen, not measured.
 `<size memory="64M"/>`.
+
+## Viewing the field
+
+`:rebuilt_2026_glb` writes `rebuilt_2026.glb`, a self-contained glTF binary
+of the field (REQ-DEV-42), from the same element list as the MJCF model:
+every geom but the fuel and the two carpet planes is one node named as its
+geom, with the geom's pose, size and colour. The carpet is left out because
+the viewport draws its own floor over the field's area (16.541 x 8.069 m,
+top at z = 0), and a coplanar carpet would flicker against it. The 504 FUEL
+are not in the model. Colours are the MJCF's rgba, which MuJoCo shows as
+sRGB, converted to glTF's linear `baseColorFactor` so a viewer shows the
+same colours. Every primitive is closed and faces outward, and materials are
+single-sided. The scene's one root node, `field`, turns the field frame into
+glTF's Y-up frame, so field (x, y, z) is glTF (x, z, -y), metres; a viewer
+that turns the scene +90 degrees about x, as Studio's 3D viewport does,
+sees the field in the field frame below. To load it in Studio:
+
+```sh
+bazel build //talOS/simulation/mujoco/fields/rebuilt_2026:rebuilt_2026_glb
+```
+
+then, in the 3D Viewport panel, choose "Load field GLB" and pick
+`bazel-bin/talOS/simulation/mujoco/fields/rebuilt_2026/rebuilt_2026.glb` in
+the workspace. `:field_gltf_test` checks the file is a valid,
+self-contained GLB of closed, outward-facing primitives and compares every
+node with its geom in the compiled model; `//studio:field_glb_test` loads
+it through the viewport's own loader and checks where it lands;
+`:generate_field_test` checks that two generations in one process give
+identical bytes for both files.
 
 ## Frame
 

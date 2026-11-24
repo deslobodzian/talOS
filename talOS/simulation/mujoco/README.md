@@ -25,7 +25,7 @@ contract `a*b+c` into a fused multiply-add, x86-64 ones do not without
 `-mfma`, so a Mac and a Linux machine can produce different bits.
 
 [`fields/rebuilt_2026`](fields/rebuilt_2026/README.md) is the 2026 field as
-a generated MuJoCo model.
+a generated MuJoCo model, and as a glTF binary for Studio's 3D viewport.
 
 ## `mujoco_gateway`
 
