@@ -59,6 +59,7 @@ std::string_view ToString(ReadinessReason reason) {
 ReadinessReason CheckReadiness(const ReadinessInput& input,
                                const ReadinessLimits& limits) {
   if (limits.max_pose_age_us <= 0 || input.pose_age_us < 0 ||
+      input.pose_age_us == ReadinessInput::kUnknownAge_us ||
       input.pose_age_us > limits.max_pose_age_us) {
     return ReadinessReason::kStale;
   }

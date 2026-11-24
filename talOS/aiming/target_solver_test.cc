@@ -435,9 +435,10 @@ TEST(TargetSolverTurret, UnreachableHoldsTheLimitNearestTheTurret) {
   EXPECT_EQ(at_min.turret_rad, -kPi / 2.0);
 }
 
-// A full-turn travel: the needed angle jittering across the +-pi seam while
-// the turret sits there holds the turret at the seam limit instead of
-// sweeping it to the other end; past the hysteresis it does go around.
+// A full-turn travel: the needed angle jittering across either the +pi or -pi
+// seam while the turret sits near that limit holds the limit instead of
+// sweeping to the other end; past the hysteresis it goes around. When the
+// turret is away from the crossed limit, seam hysteresis does not fire.
 // REQ-DEV-18
 TEST(TargetSolverTurret, SeamHysteresisStopsAFullTurnSweep) {
   const ShotTable table = RealisticTable();
@@ -454,7 +455,7 @@ TEST(TargetSolverTurret, SeamHysteresisStopsAFullTurnSweep) {
     ASSERT_TRUE(s.valid);
     if (seam_crossed) {
       EXPECT_FALSE(s.turret_reachable) << "tick " << tick;
-      EXPECT_EQ(s.turret_rad, kPi) << "tick " << tick;
+      EXPECT_DOUBLE_EQ(s.turret_rad, kPi) << "tick " << tick;
     } else {
       EXPECT_TRUE(s.turret_reachable) << "tick " << tick;
       EXPECT_NEAR(s.turret_rad, kPi - 0.005, kTight) << "tick " << tick;
@@ -468,6 +469,53 @@ TEST(TargetSolverTurret, SeamHysteresisStopsAFullTurnSweep) {
       kPi - 0.01);
   EXPECT_TRUE(around.turret_reachable);
   EXPECT_NEAR(around.turret_rad, -kPi + 0.2, kTight);
+
+  // Narrow-travel oscillation guard: parked at -1.0 with an unreachable target
+  // jittering across +1.05 holds -1.0 for both sides rather than sweeping to
+  // +1.0 when within seam_hysteresis_rad of +1.0.
+  const TargetSolver narrow(Turret(0.0, 0.0, 0.0, {-1.0, 1.0, 0.05}), table);
+  for (const double needed_rad : {1.04, 1.06}) {
+    SCOPED_TRACE(needed_rad);
+    const Eigen::Vector2d target(4.0 * std::cos(needed_rad),
+                                 4.0 * std::sin(needed_rad));
+    const Solution s = narrow.SolveStatic(origin, target, -1.0);
+    ASSERT_TRUE(s.valid);
+    EXPECT_FALSE(s.turret_reachable);
+    EXPECT_DOUBLE_EQ(s.turret_rad, -1.0);
+  }
+  for (const double needed_rad : {-1.04, -1.06}) {
+    SCOPED_TRACE(needed_rad);
+    const Eigen::Vector2d target(4.0 * std::cos(needed_rad),
+                                 4.0 * std::sin(needed_rad));
+    const Solution s = narrow.SolveStatic(origin, target, 1.0);
+    ASSERT_TRUE(s.valid);
+    EXPECT_FALSE(s.turret_reachable);
+    EXPECT_DOUBLE_EQ(s.turret_rad, 1.0);
+  }
+
+  // Reachable-target trap guard: with turret mid-travel at 0.5, a target at
+  // Wrap(3.53) whose nearest wrap (3.53) lies inside max_rad's hysteresis band
+  // must wrap to the reachable angle (~-2.7532) rather than holding 3.5.
+  const TargetSolver wide(Turret(0.0, 0.0, 0.0, {-3.5, 3.5, 0.05}), table);
+  const double target_pos_rad = Wrap(3.53);
+  const Solution reach_pos =
+      wide.SolveStatic(origin,
+                       Eigen::Vector2d(4.0 * std::cos(target_pos_rad),
+                                       4.0 * std::sin(target_pos_rad)),
+                       0.5);
+  ASSERT_TRUE(reach_pos.valid);
+  EXPECT_TRUE(reach_pos.turret_reachable);
+  EXPECT_NEAR(reach_pos.turret_rad, target_pos_rad, kTight);
+
+  const double target_neg_rad = Wrap(-3.53);
+  const Solution reach_neg =
+      wide.SolveStatic(origin,
+                       Eigen::Vector2d(4.0 * std::cos(target_neg_rad),
+                                       4.0 * std::sin(target_neg_rad)),
+                       -0.5);
+  ASSERT_TRUE(reach_neg.valid);
+  EXPECT_TRUE(reach_neg.turret_reachable);
+  EXPECT_NEAR(reach_neg.turret_rad, target_neg_rad, kTight);
 }
 
 // Symmetric seam hysteresis at min_rad = -pi: jittering across the seam from
@@ -574,6 +622,36 @@ TEST(TargetSolverTurret, ExactLimitsWithHysteresisStayReachable) {
     EXPECT_FALSE(out_min.turret_reachable);
     EXPECT_DOUBLE_EQ(out_min.turret_rad, travel.min_rad);
   }
+
+  // Shifted wraps onto an exact finite limit clamp ULP overshoot so opposite-
+  // limit and multi-turn exact targets stay reachable.
+  {
+    const TargetSolver asym(Turret(0.0, 0.0, 0.0, {-0.7, 3.7, 0.05}), table);
+    const Solution s = asym.SolveStatic(
+        origin, Eigen::Vector2d(4.0 * std::cos(-0.7), 4.0 * std::sin(-0.7)),
+        3.7);
+    ASSERT_TRUE(s.valid);
+    EXPECT_TRUE(s.turret_reachable);
+    EXPECT_DOUBLE_EQ(s.turret_rad, -0.7);
+  }
+  {
+    const TargetSolver pos(Turret(0.0, 0.0, 0.0, {0.0, 4.0, 0.0}), table);
+    const Solution s = pos.SolveStatic(
+        origin, Eigen::Vector2d(4.0 * std::cos(4.0), 4.0 * std::sin(4.0)),
+        14.0);
+    ASSERT_TRUE(s.valid);
+    EXPECT_TRUE(s.turret_reachable);
+    EXPECT_DOUBLE_EQ(s.turret_rad, 4.0);
+  }
+  {
+    const TargetSolver neg(Turret(0.0, 0.0, 0.0, {-4.0, 0.0, 0.0}), table);
+    const Solution s = neg.SolveStatic(
+        origin, Eigen::Vector2d(4.0 * std::cos(-4.0), 4.0 * std::sin(-4.0)),
+        -14.0);
+    ASSERT_TRUE(s.valid);
+    EXPECT_TRUE(s.turret_reachable);
+    EXPECT_DOUBLE_EQ(s.turret_rad, -4.0);
+  }
 }
 
 // Extreme measured turret angles, half-infinite travel limits, exact limit
@@ -653,6 +731,19 @@ TEST(TargetSolverTurret, ExtremeInputsStayFiniteInTravelAndPreserveAim) {
     ASSERT_TRUE(east.valid && north.valid);
     EXPECT_NEAR(Wrap(north.robot_heading_rad - east.robot_heading_rad),
                 kPi / 2.0, 1e-6);
+  }
+
+  // Large unwrapped robot yaw does not swallow turret target bearing precision.
+  {
+    const TargetSolver turret(Turret(0.0, 0.0, 0.0), table);
+    const SE2<double> huge_pose = Pose(0.0, 0.0, 1e17);
+    const Solution east =
+        turret.SolveStatic(huge_pose, Eigen::Vector2d(3.0, 0.0));
+    const Solution north =
+        turret.SolveStatic(huge_pose, Eigen::Vector2d(0.0, 3.0));
+    ASSERT_TRUE(east.valid && north.valid);
+    EXPECT_TRUE(east.turret_reachable && north.turret_reachable);
+    EXPECT_NEAR(Wrap(north.turret_rad - east.turret_rad), kPi / 2.0, 1e-6);
   }
 }
 
@@ -745,7 +836,7 @@ struct MovingCase {
 // REQ-DEV-17
 TEST(TargetSolverMoving, CompensatedShotLandsWhereNaiveShotMisses) {
   const ShotTable table = RealisticTable();
-  const std::array<MovingCase, 4> cases = {{
+  const std::array<MovingCase, 5> cases = {{
       {"turret, offset, translating and rotating", Turret(-0.15, 0.1, 0.0),
        Pose(2.0, 1.0, 0.4), FieldTwist{1.5, -2.0, 1.2},
        Eigen::Vector2d(6.5, 4.0)},
@@ -758,6 +849,9 @@ TEST(TargetSolverMoving, CompensatedShotLandsWhereNaiveShotMisses) {
       {"turret far off centre, spinning in place (tangential lead only)",
        Turret(0.0, 0.6, 0.0), Pose(4.0, 4.0, 1.0), FieldTwist{0.0, 0.0, 4.0},
        Eigen::Vector2d(9.0, 2.0)},
+      {"fixed laterally offset shooter, translating and rotating",
+       Fixed(0.0, 0.5, 0.0), Pose(1.0, -0.5, 0.3), FieldTwist{0.8, -0.6, 3.0},
+       Eigen::Vector2d(6.0, 2.0)},
   }};
   for (const MovingCase& c : cases) {
     SCOPED_TRACE(c.name);
@@ -789,10 +883,12 @@ TEST(TargetSolverMoving, CompensatedShotLandsWhereNaiveShotMisses) {
 // virtual target, and report a consistent virtual target.
 // REQ-DEV-17
 TEST(TargetSolverMoving, OffsetFixedShooterWithYawRateConvergesAccurately) {
-  const SolverConfig config = Fixed(0.5, 0.0, 0.0);
-  const SE2<double> pose = Pose(0.0, 0.0, 0.0);
-  const FieldTwist velocity{0.4, 0.0, 4.0};
-  const Eigen::Vector2d target_m(5.0, 0.0);
+  const std::array<MovingCase, 2> cases = {{
+      {"longitudinal offset", Fixed(0.5, 0.0, 0.0), Pose(0.0, 0.0, 0.0),
+       FieldTwist{0.4, 0.0, 4.0}, Eigen::Vector2d(5.0, 0.0)},
+      {"lateral offset", Fixed(0.0, 0.5, 0.0), Pose(1.0, -0.5, 0.3),
+       FieldTwist{0.8, -0.6, 3.0}, Eigen::Vector2d(6.0, 2.0)},
+  }};
 
   const std::array<ShotRow, 2> constant_rows = {{
       {1.0, 50.0, 0.4, 0.9},
@@ -801,33 +897,37 @@ TEST(TargetSolverMoving, OffsetFixedShooterWithYawRateConvergesAccurately) {
   const ShotTable realistic = RealisticTable();
   const ShotTable constant_tof(constant_rows);
 
-  for (const auto& [name, table] :
-       std::array<std::pair<const char*, const ShotTable*>, 2>{
-           {{"realistic", &realistic}, {"constant_tof", &constant_tof}}}) {
-    SCOPED_TRACE(name);
-    const TargetSolver solver(config, *table);
-    const Solution s = solver.SolveWithFieldVelocity(pose, velocity, target_m);
-    ASSERT_TRUE(s.valid);
-    EXPECT_TRUE(s.converged);
-    EXPECT_TRUE(s.in_range);
-    EXPECT_LT(s.iteration_count, solver.config().max_iteration_count);
+  for (const MovingCase& c : cases) {
+    for (const auto& [name, table] :
+         std::array<std::pair<const char*, const ShotTable*>, 2>{
+             {{"realistic", &realistic}, {"constant_tof", &constant_tof}}}) {
+      SCOPED_TRACE(::testing::Message() << c.name << " / " << name);
+      const TargetSolver solver(c.config, *table);
+      const Solution s =
+          solver.SolveWithFieldVelocity(c.pose, c.field_velocity, c.target_m);
+      ASSERT_TRUE(s.valid);
+      EXPECT_TRUE(s.converged);
+      EXPECT_TRUE(s.in_range);
+      EXPECT_LT(s.iteration_count, solver.config().max_iteration_count);
 
-    const Eigen::Vector2d hit_m =
-        SimulateLanding(config, *table, pose, velocity, s);
-    EXPECT_LT((hit_m - target_m).norm(), kLandingTolerance_m)
-        << "landed at " << hit_m.transpose();
+      const Eigen::Vector2d hit_m =
+          SimulateLanding(c.config, *table, c.pose, c.field_velocity, s);
+      EXPECT_LT((hit_m - c.target_m).norm(), kLandingTolerance_m)
+          << "landed at " << hit_m.transpose();
 
-    // Reported virtual_target matches target - shooter_velocity * tof for the
-    // converged shooter position.
-    const Eigen::Vector2d offset_m(s.shooter_x_m - pose.translation().x(),
-                                   s.shooter_y_m - pose.translation().y());
-    const Eigen::Vector2d shooter_v_mps(
-        velocity.vx_mps - velocity.omega_radps * offset_m.y(),
-        velocity.vy_mps + velocity.omega_radps * offset_m.x());
-    const Eigen::Vector2d expected_virtual_m =
-        target_m - shooter_v_mps * s.time_of_flight_s;
-    EXPECT_NEAR(s.virtual_target_x_m, expected_virtual_m.x(), kTight);
-    EXPECT_NEAR(s.virtual_target_y_m, expected_virtual_m.y(), kTight);
+      // Reported virtual_target matches target - shooter_velocity * tof for the
+      // converged shooter position.
+      const Eigen::Vector2d offset_m(s.shooter_x_m - c.pose.translation().x(),
+                                     s.shooter_y_m - c.pose.translation().y());
+      const Eigen::Vector2d shooter_v_mps(
+          c.field_velocity.vx_mps - c.field_velocity.omega_radps * offset_m.y(),
+          c.field_velocity.vy_mps +
+              c.field_velocity.omega_radps * offset_m.x());
+      const Eigen::Vector2d expected_virtual_m =
+          c.target_m - shooter_v_mps * s.time_of_flight_s;
+      EXPECT_NEAR(s.virtual_target_x_m, expected_virtual_m.x(), kTight);
+      EXPECT_NEAR(s.virtual_target_y_m, expected_virtual_m.y(), kTight);
+    }
   }
 }
 
@@ -870,51 +970,72 @@ TEST(TargetSolverMoving, SolveWithChassisVelocityLandsOnTarget) {
 // REQ-DEV-17
 TEST(TargetSolverMoving, NonConvergenceIsBoundedAndFlagged) {
   // Time of flight jumps from 0.1 s to 2.0 s over one metre: at 2 m/s
-  // toward the target, the virtual target leaps between 3.3 m ahead and
-  // 0.5 m behind, a two-cycle that never settles.
+  // toward the target, iterate 1 aims at 3.5 m (tof 2.0 s -> -0.5 m), then the
+  // virtual target alternates between -0.5 m (even iterates, tof 0.1 s) and
+  // 3.3 m (odd iterates >= 3, tof 2.0 s), a two-cycle that never settles.
   const std::array<ShotRow, 2> rows = {{
       {1.0, 40.0, 0.2, 0.1},
       {2.0, 50.0, 0.3, 2.0},
   }};
   const ShotTable steep(rows);
-  SolverConfig config = Turret(0.0, 0.0, 0.0);
-  config.max_iteration_count = 7;
-  const TargetSolver solver(config, steep);
-  const Solution s = solver.SolveWithFieldVelocity(Pose(0.0, 0.0, 0.0),
-                                                   FieldTwist{2.0, 0.0, 0.0},
-                                                   Eigen::Vector2d(3.5, 0.0));
-  ASSERT_TRUE(s.valid);
-  EXPECT_FALSE(s.converged);
-  EXPECT_EQ(s.iteration_count, 7);
-  EXPECT_NEAR(s.virtual_target_x_m, 3.3, kTight);
-  EXPECT_NEAR(s.distance_m, 3.3, kTight);
-  EXPECT_NEAR(s.time_of_flight_s, 2.0, kTight);
-  for (const double value :
-       {s.distance_m, s.shot_heading_rad, s.turret_rad, s.flywheel_rps,
-        s.hood_rad, s.time_of_flight_s, s.virtual_target_x_m}) {
-    EXPECT_TRUE(std::isfinite(value));
-  }
+  const auto expect_all_finite = [](const Solution& sol) {
+    for (const double value :
+         {sol.distance_m, sol.shot_heading_rad, sol.robot_heading_rad,
+          sol.turret_rad, sol.flywheel_rps, sol.hood_rad, sol.time_of_flight_s,
+          sol.shooter_x_m, sol.shooter_y_m, sol.virtual_target_x_m,
+          sol.virtual_target_y_m}) {
+      EXPECT_TRUE(std::isfinite(value));
+    }
+  };
 
-  // Even iteration bound stops on the opposite half of the two-cycle.
-  config.max_iteration_count = 6;
-  const TargetSolver even_solver(config, steep);
-  const Solution even = even_solver.SolveWithFieldVelocity(
-      Pose(0.0, 0.0, 0.0), FieldTwist{2.0, 0.0, 0.0},
-      Eigen::Vector2d(3.5, 0.0));
-  ASSERT_TRUE(even.valid);
-  EXPECT_FALSE(even.converged);
-  EXPECT_EQ(even.iteration_count, 6);
-  EXPECT_NEAR(even.virtual_target_x_m, -0.5, kTight);
-  EXPECT_NEAR(even.distance_m, 0.5, kTight);
-  EXPECT_NEAR(even.time_of_flight_s, 0.1, kTight);
-  for (const double value : {even.distance_m, even.shot_heading_rad,
-                             even.turret_rad, even.flywheel_rps, even.hood_rad,
-                             even.time_of_flight_s, even.virtual_target_x_m}) {
-    EXPECT_TRUE(std::isfinite(value));
-  }
+  SolverConfig config7 = Turret(0.0, 0.0, 0.0);
+  config7.max_iteration_count = 7;
+  const TargetSolver solver7(config7, steep);
+  const Solution s7 = solver7.SolveWithFieldVelocity(Pose(0.0, 0.0, 0.0),
+                                                     FieldTwist{2.0, 0.0, 0.0},
+                                                     Eigen::Vector2d(3.5, 0.0));
+  ASSERT_TRUE(s7.valid);
+  EXPECT_FALSE(s7.converged);
+  EXPECT_EQ(s7.iteration_count, 7);
+  expect_all_finite(s7);
+  // Exact 7th iterate (distinct from iterate 1's 3.5 m).
+  EXPECT_NEAR(s7.distance_m, 3.3, kTight);
+  EXPECT_NEAR(s7.shot_heading_rad, 0.0, kTight);
+  EXPECT_NEAR(s7.robot_heading_rad, 0.0, kTight);
+  EXPECT_NEAR(s7.turret_rad, 0.0, kTight);
+  EXPECT_DOUBLE_EQ(s7.flywheel_rps, 50.0);
+  EXPECT_DOUBLE_EQ(s7.hood_rad, 0.3);
+  EXPECT_DOUBLE_EQ(s7.time_of_flight_s, 2.0);
+  EXPECT_NEAR(s7.shooter_x_m, 0.0, kTight);
+  EXPECT_NEAR(s7.shooter_y_m, 0.0, kTight);
+  EXPECT_NEAR(s7.virtual_target_x_m, 3.3, kTight);
+  EXPECT_NEAR(s7.virtual_target_y_m, 0.0, kTight);
+
+  SolverConfig config6 = Turret(0.0, 0.0, 0.0);
+  config6.max_iteration_count = 6;
+  const TargetSolver solver6(config6, steep);
+  const Solution s6 = solver6.SolveWithFieldVelocity(Pose(0.0, 0.0, 0.0),
+                                                     FieldTwist{2.0, 0.0, 0.0},
+                                                     Eigen::Vector2d(3.5, 0.0));
+  ASSERT_TRUE(s6.valid);
+  EXPECT_FALSE(s6.converged);
+  EXPECT_EQ(s6.iteration_count, 6);
+  expect_all_finite(s6);
+  // Exact 6th iterate (virtual target at -0.5 m behind the shooter).
+  EXPECT_NEAR(s6.distance_m, 0.5, kTight);
+  EXPECT_NEAR(s6.shot_heading_rad, kPi, kTight);
+  EXPECT_NEAR(s6.robot_heading_rad, 0.0, kTight);
+  EXPECT_NEAR(s6.turret_rad, kPi, kTight);
+  EXPECT_DOUBLE_EQ(s6.flywheel_rps, 40.0);
+  EXPECT_DOUBLE_EQ(s6.hood_rad, 0.2);
+  EXPECT_DOUBLE_EQ(s6.time_of_flight_s, 0.1);
+  EXPECT_NEAR(s6.shooter_x_m, 0.0, kTight);
+  EXPECT_NEAR(s6.shooter_y_m, 0.0, kTight);
+  EXPECT_NEAR(s6.virtual_target_x_m, -0.5, kTight);
+  EXPECT_NEAR(s6.virtual_target_y_m, 0.0, kTight);
   // The same table converges standing still.
   const Solution standing =
-      solver.SolveStatic(Pose(0.0, 0.0, 0.0), Eigen::Vector2d(1.5, 0.0));
+      solver7.SolveStatic(Pose(0.0, 0.0, 0.0), Eigen::Vector2d(1.5, 0.0));
   EXPECT_TRUE(standing.converged);
   EXPECT_NEAR(standing.time_of_flight_s, 1.05, kTight);
 }
