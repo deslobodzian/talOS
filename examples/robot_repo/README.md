@@ -250,5 +250,6 @@ every time (`external`); it runs no Bazel.
 Nothing is copied for talOS's patched toml++: talOS fetches it as its own
 patched archive. talOS's OpenCV patch is a `single_version_override`, which
 applies only in talOS's own workspace, so a repository that depends on talOS
-builds OpenCV unpatched; it differs only under `--config=tsan`
-([docs/INSTALL.md](../../docs/INSTALL.md)).
+builds OpenCV unpatched; it differs only under `--config=tsan`. Its MuJoCo
+patch is one too, so a dependent builds MuJoCo unpatched, which differs only
+under `--config=asan` ([docs/INSTALL.md](../../docs/INSTALL.md)).

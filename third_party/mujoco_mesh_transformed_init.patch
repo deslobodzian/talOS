@@ -1,0 +1,11 @@
+--- a/src/user/user_objects.h
++++ b/src/user/user_objects.h
+@@ -1354,7 +1354,7 @@
+ 
+   // mesh processed flags
+   bool processed_;    // has the mesh been processed yet
+-  bool transformed_;  // has the mesh been transformed to CoM and inertial frame
++  bool transformed_ = false;  // has the mesh been transformed to CoM and inertial frame
+ 
+   // mesh properties computed by Compile
+   double pos_[3];    // CoM position

@@ -168,6 +168,14 @@ Third-party patches in `third_party/` that sanitizer runs depend on:
   only its `--config=tsan` runs report that flag's race. (talOS fetches
   toml++ as its own patched archive instead, so its parser patch reaches
   every repository that depends on talOS.)
+- `third_party/mujoco_mesh_transformed_init.patch`: MuJoCo 3.17.0's
+  `mjCMesh_::transformed_` (`src/user/user_objects.h`) is initialised to
+  `false`; upstream leaves it uninitialised, and the copy every nested
+  `<default class>` makes while an MJCF is parsed trips UBSan under
+  `--config=asan`. The value is never read, so behaviour is unchanged. Like
+  OpenCV's, it is a root-only `single_version_override`: a repository that
+  depends on talOS builds MuJoCo unpatched, and only its `--config=asan` runs
+  report the load.
 - `third_party/apriltag_pjpeg_bounds.patch`: bounds, overflow, malformed-header/file,
   and restart-marker (`RST`) DC-predictor fixes in AprilTag's JPEG decoder (`pjpeg.c`),
   used only by the offline `DetectImageFile` API; live capture passes raw GREY/YUYV
