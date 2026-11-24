@@ -406,10 +406,15 @@ TEST(BridgeRegistration, CliEqualsFlagsAndEmptyConfigValidation) {
     }
     ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << output;
     const auto doc = nlohmann::json::parse(output);
-    ASSERT_TRUE(doc.contains("sources") && doc["sources"].size() == 1u)
+    // Two sources: the telemetry topic the flag names, and the simulator's
+    // game pieces (REQ-DEV-43), which no flag renames.
+    ASSERT_TRUE(doc.contains("sources") && doc["sources"].size() == 2u)
         << output;
     EXPECT_EQ(doc["sources"][0]["name"].get<std::string>(),
               "/talos/telemetry/custom")
+        << output;
+    EXPECT_EQ(doc["sources"][1]["name"].get<std::string>(),
+              "/sim/telemetry/pieces")
         << output;
   }
 
