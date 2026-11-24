@@ -321,6 +321,68 @@ TEST(RuntimeUdpTest, PeerRestartRebaselinesSequenceGapCounting) {
   ::close(raw_sender);
 }
 
+// REQ-RT-22, REQ-OPS-20: three or more ascending reordered frames during a long
+// run (seq > kReorderWindow) must not trigger short_run_restart, roll
+// last_received_sequence backwards, or invent phantom sequence gaps.
+TEST(RuntimeUdpTest, LongRunAscendingReorderDoesNotTriggerShortRunRestart) {
+  RuntimeUdpPeer receiver;
+  UdpSocketOptions unconnected;
+  unconnected.connect_peer = false;
+  ASSERT_EQ(receiver.Open("127.0.0.1", 0, "127.0.0.1", 0, unconnected),
+            UdpStatus::kOk);
+  const uint16_t rx_port = BoundPort(receiver);
+  ASSERT_NE(rx_port, 0);
+
+  const int raw_sender = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  ASSERT_GE(raw_sender, 0);
+  sockaddr_in dest{};
+  dest.sin_family = AF_INET;
+  dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dest.sin_port = htons(rx_port);
+
+  const auto send_seq = [&](uint64_t seq) {
+    std::array<uint8_t, kFrameHeaderSize> buf{};
+    const std::size_t n =
+        EncodeFrame(FrameType::kClockProbe, kFlagNone, seq, seq * 1000, nullptr,
+                    0, buf.data(), buf.size());
+    ASSERT_EQ(n, kFrameHeaderSize);
+    ASSERT_EQ(::sendto(raw_sender, buf.data(), n, 0,
+                       reinterpret_cast<const sockaddr*>(&dest), sizeof(dest)),
+              static_cast<ssize_t>(n));
+    DecodedFrame frame;
+    ASSERT_EQ(testing::ReceiveFrame(receiver, &frame), UdpStatus::kOk);
+    EXPECT_EQ(frame.header.sequence, seq);
+  };
+
+  send_seq(2000);
+  send_seq(2005);  // jumped 2001..2004 -> 4 missed frames
+  EXPECT_EQ(receiver.stats().last_received_sequence, 2005u);
+  EXPECT_EQ(receiver.stats().sequence_gaps, 4u);
+  EXPECT_EQ(receiver.stats().out_of_order_frames, 0u);
+
+  // Delayed frames arriving in ascending order must stay out-of-order without
+  // rolling last_received_sequence back from 2005.
+  send_seq(2001);
+  send_seq(2002);
+  send_seq(2003);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 2005u);
+  EXPECT_EQ(receiver.stats().sequence_gaps, 4u);
+  EXPECT_EQ(receiver.stats().out_of_order_frames, 3u);
+
+  send_seq(2004);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 2005u);
+  EXPECT_EQ(receiver.stats().sequence_gaps, 4u);
+  EXPECT_EQ(receiver.stats().out_of_order_frames, 4u);
+
+  send_seq(2006);  // contiguous after 2005 -> no phantom gap
+  EXPECT_EQ(receiver.stats().last_received_sequence, 2006u);
+  EXPECT_EQ(receiver.stats().sequence_gaps, 4u);
+  EXPECT_EQ(receiver.stats().out_of_order_frames, 4u);
+  EXPECT_EQ(receiver.stats().received_frames, 7u);
+
+  ::close(raw_sender);
+}
+
 // REQ-RT-22: a non-EAGAIN recv() error records errno in last_recv_error.
 TEST(RuntimeUdpTest, RecordsLastRecvErrorOnSocketError) {
   const uint16_t unbound = FreeLoopbackPort();
@@ -647,23 +709,32 @@ TEST(RuntimeUdpTest, MovedFromPeerCannotReopen) {
 
   RuntimeUdpPeer first;
   ASSERT_EQ(first.Open("127.0.0.1", port, "127.0.0.1", remote), UdpStatus::kOk);
+  ASSERT_EQ(first.SendFrame(FrameType::kClockProbe, kFlagNone, 1, nullptr, 0),
+            UdpStatus::kOk);
+  ASSERT_EQ(first.next_send_sequence(), 2u);
 
   RuntimeUdpPeer second{std::move(first)};
   // NOLINTBEGIN(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
   EXPECT_FALSE(first.IsOpen());
+  EXPECT_EQ(first.NativeFd(), -1);
   EXPECT_EQ(first.Reopen(), UdpStatus::kInvalidArgument);
   // NOLINTEND(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
   EXPECT_TRUE(second.IsOpen());
+  EXPECT_EQ(second.next_send_sequence(), 2u);
   EXPECT_EQ(second.Reopen(), UdpStatus::kOk);
+  EXPECT_EQ(second.next_send_sequence(), 2u);
 
   RuntimeUdpPeer third;
   third = std::move(second);
   // NOLINTBEGIN(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
   EXPECT_FALSE(second.IsOpen());
+  EXPECT_EQ(second.NativeFd(), -1);
   EXPECT_EQ(second.Reopen(), UdpStatus::kInvalidArgument);
   // NOLINTEND(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
   EXPECT_TRUE(third.IsOpen());
+  EXPECT_EQ(third.next_send_sequence(), 2u);
   EXPECT_EQ(third.Reopen(), UdpStatus::kOk);
+  EXPECT_EQ(third.next_send_sequence(), 2u);
 }
 
 // REQ-CONTRACT-01: Open() rejects remote_port == 0 when connect_peer is true,
