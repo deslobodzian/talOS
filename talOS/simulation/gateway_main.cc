@@ -343,7 +343,7 @@ int Run(int argc, char** argv,
     if (extension == nullptr && robot_config.simulation.mujoco) {
       std::fprintf(stderr,
                    "sim_gateway: ignoring [simulation.mujoco]; "
-                   "//talOS/simulation/mujoco:mujoco_gateway simulates it\n");
+                   "//talOS/simulation/mujoco:sim_gateway simulates it\n");
     }
     {
       ports = talos::simulation::ResolveGatewayPorts(robot_config, port_flag,

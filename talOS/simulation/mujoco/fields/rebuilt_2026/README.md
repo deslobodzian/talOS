@@ -232,9 +232,9 @@ counter and its exit randomness.
 `:rules` (`rules.h`, `MakeRebuilt2026Rules`) is the 2026 game on this model:
 a `GameRules` ([`game.h`](../../game.h)), the [world
 rule](../../world_rules.h) a `MujocoPlant` runs after every MuJoCo step
-(`MujocoPlant::AddRules`), REQ-DEV-40. `mujoco_gateway` adds it to a config
+(`MujocoPlant::AddRules`), REQ-DEV-40. The MuJoCo gateway adds it to a config
 whose `field` is `rebuilt_2026` ([the
-match](../../README.md#mujoco_gateway)). It reads only this model's
+match](../../README.md#the-mujoco-gateway)). It reads only this model's
 contract: the FUEL range numerics above, `*_hub_score`, `*_hub_exit_0..3`,
 and a robot model's sites `preload_0` to `preload_7`; `Attach` refuses a
 model without one of them, naming it. It sees the plant's `MatchInput`

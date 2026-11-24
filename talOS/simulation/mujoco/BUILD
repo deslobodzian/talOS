@@ -17,7 +17,7 @@ cc_test(
     ],
 )
 
-# The MuJoCo world behind mujoco_gateway (REQ-DEV-37): the robot MJCF
+# The MuJoCo world behind the MuJoCo gateway (REQ-DEV-37): the robot MJCF
 # attached to a field MJCF or a flat carpet, stepped as an ExternalPlant of
 # PhysicsSimBackend. Visible only inside this package tree, so @mujoco stays
 # behind it (TODO.md SIM-11).
@@ -99,10 +99,12 @@ cc_test(
     ],
 )
 
-# mujoco_gateway (README.md): sim_gateway --physics with the MuJoCo world as
-# the plant (REQ-DEV-37). A config names it in [robot] sim_gateway.
+# The MuJoCo gateway (README.md): sim_gateway --physics with the MuJoCo world
+# as the plant (REQ-DEV-37). A config names it in [robot] sim_gateway, whose
+# roster member is sim_gateway, hence the rule's name (the node label rule,
+# talOS/NAMING.md "Nodes").
 cc_binary(
-    name = "mujoco_gateway",
+    name = "sim_gateway",
     srcs = ["mujoco_gateway.cc"],
     visibility = ["//visibility:public"],
     deps = [
@@ -190,12 +192,12 @@ py_test(
     size = "small",
     srcs = ["mujoco_gateway_test.py"],
     data = [
-        ":mujoco_gateway",
+        ":sim_gateway",
         "//talOS/simulation:sim_gateway",
     ] + glob(["testdata/**"]),
     env = {
         "ARM_XML": "$(rlocationpath testdata/arm/arm.xml)",
-        "MUJOCO_GATEWAY": "$(rlocationpath :mujoco_gateway)",
+        "MUJOCO_GATEWAY": "$(rlocationpath :sim_gateway)",
         "ROVER_CONFIG": "$(rlocationpath testdata/rover/robot.toml)",
         "SIM_GATEWAY": "$(rlocationpath //talOS/simulation:sim_gateway)",
         "UNLISTED_MESH_CONFIG": "$(rlocationpath testdata/unlisted_mesh/robot.toml)",
@@ -206,6 +208,29 @@ py_test(
         "//talOS/build:udp_ports",
         "@rules_python//python/runfiles",
     ],
+)
+
+# REQ-DEV-37: the launcher accepts a config whose [robot] sim_gateway is
+# the program: its roster member passes the node label rule and is
+# described with /sim/state/match. Integration lane: the launcher probes
+# the bridge and the program (--describe-only).
+py_test(
+    name = "launcher_describe_test",
+    size = "small",
+    srcs = ["launcher_describe_test.py"],
+    data = [
+        "testdata/arm/arm.xml",
+        ":sim_gateway",
+        "//talOS/bridge:hardware_node",
+        "//talOS/launcher",
+    ],
+    env = {
+        "ARM_XML": "$(rlocationpath testdata/arm/arm.xml)",
+        "LAUNCHER": "$(rlocationpath //talOS/launcher)",
+    },
+    legacy_create_init = False,
+    tags = ["integration"],
+    deps = ["@rules_python//python/runfiles"],
 )
 
 # REQ-DEV-37: the field names config load accepts are the ones the gateway
@@ -262,10 +287,10 @@ cc_test(
     data = [
         "testdata/rover/robot.toml",
         "testdata/rover/rover.xml",
-        ":mujoco_gateway",
+        ":sim_gateway",
     ],
     env = {
-        "MUJOCO_GATEWAY": "$(rlocationpath :mujoco_gateway)",
+        "MUJOCO_GATEWAY": "$(rlocationpath :sim_gateway)",
         "ROVER_CONFIG": "$(rlocationpath testdata/rover/robot.toml)",
     },
     tags = ["integration"],

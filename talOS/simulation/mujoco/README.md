@@ -27,9 +27,9 @@ contract `a*b+c` into a fused multiply-add, x86-64 ones do not without
 [`fields/rebuilt_2026`](fields/rebuilt_2026/README.md) is the 2026 field as
 a generated MuJoCo model, and as a glTF binary for Studio's 3D viewport.
 
-## `mujoco_gateway`
+## The MuJoCo gateway
 
-`//talOS/simulation/mujoco:mujoco_gateway` stands in for the RoboRIO as
+`//talOS/simulation/mujoco:sim_gateway`, the MuJoCo gateway, stands in for the RoboRIO as
 `sim_gateway --physics` does ([simulator](../README.md)), with a MuJoCo
 world as the plant (REQ-DEV-37): the robot's MJCF model on a field model,
 attached to `sim::PhysicsSimBackend` as its
@@ -71,8 +71,8 @@ probe and the run agree. The same model, config, seed and tick times give
 the same States and the same `/sim/state/match`.
 
 A config selects it in `[robot] sim_gateway`
-(`"//talOS/simulation/mujoco:mujoco_gateway"`, or
-`"@talos//talOS/simulation/mujoco:mujoco_gateway"` from a robot
+(`"//talOS/simulation/mujoco:sim_gateway"`, or
+`"@talos//talOS/simulation/mujoco:sim_gateway"` from a robot
 repository), and the launcher starts it under `--sim --start-sim-gateway`
 ([launcher](../../launcher/README.md#lightweight-simulation-gateway)). The
 model is the config's `[simulation.mujoco]`
@@ -125,7 +125,7 @@ failure, naming the MuJoCo warning, and exits 1 without a summary.
 To check a model, run it for ten ticks and read the binding table:
 
 ```sh
-bazel run //talOS/simulation/mujoco:mujoco_gateway -- \
+bazel run //talOS/simulation/mujoco:sim_gateway -- \
   --config "$PWD/<robot>/main_processor/configuration/robot_sim.toml" \
   --duration-s 0.05
 ```
@@ -265,7 +265,7 @@ The joint's positive direction shoots, and the actuator's `gear` is
 positive. `MakeScriptedShooters`
 (`scripted_shooter.h`) finds every such motor in a compiled model and
 returns them as one world rule (below), or none when no actuator carries any
-part of the contract; `mujoco_gateway` adds it (the match, above). It
+part of the contract; the MuJoCo gateway adds it (the match, above). It
 refuses, naming the motor and the element, a
 missing site or numeric, a numeric without exactly two values, an
 efficiency outside (0, 1] or a contact radius that is not positive, an inlet
@@ -308,7 +308,7 @@ the shooter changes nothing but the launched body and the flywheel's speed.
 
 **World rules.** What changes the world after a step besides physics is a
 `WorldRules` (`world_rules.h`), added to the plant with
-`MujocoPlant::AddRules` before its first `Step`; `mujoco_gateway` adds the
+`MujocoPlant::AddRules` before its first `Step`; the MuJoCo gateway adds the
 robot's scripted shooters, then the field's game. After each MuJoCo step
 that passes the failure check below, the plant brings positions and
 velocities up to the step's end (`mj_kinematics`, `mj_comPos`, `mj_comVel`;
@@ -372,6 +372,10 @@ registry row declares what `--describe` declares. `mujoco_gateway_test`
 extension, from the backend, from the plant's `Bind` and from a scripted
 shooter's broken contract, each named on stderr; a model file
 `robot_model_files` omits, against the same config where the file is; a
-diverging model; and 50 ms on the 2026 field. `testdata/` holds small
+diverging model; and 50 ms on the 2026 field. `launcher_describe_test`
+(integration) runs the launcher's `--sim --start-sim-gateway
+--describe-only` on a config naming the program: the graph is accepted,
+with the `sim_gateway` member described and `/sim/state/match` among its
+endpoints. `testdata/` holds small
 models and configs (an arm on a welded root, a free-root rover with a
 rangefinder input, a model reading an unlisted mesh).

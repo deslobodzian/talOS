@@ -101,7 +101,7 @@ config::RobotConfig WriteConfig() {
   return config::ParseRobotConfig((dir / "robot.toml").string());
 }
 
-// The program's assembly, as mujoco_gateway's main and RunSimGateway make
+// The program's assembly, as the MuJoCo gateway's main and RunSimGateway make
 // it: MuJoCo's process handlers, the local motor types, the extension's
 // Configure, then the gateway's Reconfigure, which binds the plant.
 struct Assembly {

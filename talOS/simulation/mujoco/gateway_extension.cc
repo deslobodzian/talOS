@@ -50,7 +50,7 @@ static_assert(std::tuple_size_v<decltype(FmsReport::game_specific_message)> ==
 std::string OwnsChassis(std::string_view key) {
   return std::string(key) +
          ": the robot model's root body has a freejoint, so the model owns "
-         "the chassis and its wheels; remove it from a mujoco_gateway config";
+         "the chassis and its wheels; remove it from a MuJoCo gateway config";
 }
 
 constexpr int64_t kReportPeriodNs = 1'000'000'000;
@@ -63,9 +63,9 @@ FieldResolver RunfilesFieldResolver(std::string argv0) {
   return [argv0 = std::move(argv0)](std::string_view field) -> std::string {
     const FieldEntry* known = FindField(field);
     if (known == nullptr) {
-      throw std::invalid_argument("[simulation.mujoco] field = '" +
-                                  std::string(field) +
-                                  "': mujoco_gateway has no such field model");
+      throw std::invalid_argument(
+          "[simulation.mujoco] field = '" + std::string(field) +
+          "': the MuJoCo gateway has no such field model");
     }
     const std::string rlocation(known->rlocation);
     // The environment's runfiles first (bazel test, talos_sim), then the tree
@@ -105,7 +105,7 @@ void MujocoGatewayExtension::Configure(
   if (!config.simulation.mujoco) {
     throw std::invalid_argument(
         "[simulation.mujoco] robot_model: the config sets no robot model; "
-        "mujoco_gateway simulates one (sim_gateway runs a config without "
+        "the MuJoCo gateway simulates one (sim_gateway runs a config without "
         "[simulation.mujoco])");
   }
   const config::SimulationMujocoConfig& model = *config.simulation.mujoco;

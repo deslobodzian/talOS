@@ -1,7 +1,7 @@
 // Integration tier (fork/exec, loopback UDP, shared memory, the live
-// registry), REQ-DEV-40: mujoco_gateway on the 2026 field referees the match
-// its mode schedule plays. /sim/state/match reports the periods in order and
-// a countdown, the Driver Station packets carry the match time and game
+// registry), REQ-DEV-40: the MuJoCo gateway on the 2026 field referees the
+// match its mode schedule plays. /sim/state/match reports the periods in order
+// and a countdown, the Driver Station packets carry the match time and game
 // message, and the live registry row declares what --describe declares, as
 // the launcher's live-endpoint check requires.
 #include <arpa/inet.h>

@@ -1,5 +1,5 @@
 // REQ-DEV-37: every field name config load accepts
-// (config::kSimulationMujocoFields) is a model mujoco_gateway finds in its
+// (config::kSimulationMujocoFields) is a model the MuJoCo gateway finds in its
 // runfiles and loads (the compiled world holds that field's FUEL), a field
 // with a game attaches its rules to that world, and the gateway knows no
 // field config load would refuse.

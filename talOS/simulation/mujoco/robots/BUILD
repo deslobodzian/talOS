@@ -2,7 +2,7 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 load("//talOS/build:robot_model.bzl", "robot_model_sync_test")
 
-# Robot models for mujoco_gateway, generated from a parameter file
+# Robot models for the MuJoCo gateway, generated from a parameter file
 # (README.md). REQ-DEV-41.
 
 # robot_model_sync_test (//talOS/build:robot_model.bzl) runs the script as
