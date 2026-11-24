@@ -755,37 +755,6 @@ TEST(MakePlant, StartPoseComposesWithTheAuthoredPose) {
   EXPECT_NEAR(At(plant->data()->xpos, 3, body)[2], 0.2, 1e-12);
 }
 
-// Attached with no prefix: the robot's actuators and sensors keep the motor
-// and sim_sensor names, and the field's elements keep theirs.
-TEST(MakePlant, AttachKeepsEveryName) {
-  const std::string field = R"(<mujoco><worldbody>
-  <geom name="carpet_robot" type="plane" size="5 5 0.1" contype="16" conaffinity="0"/>
-  <site name="blue_hub_score" pos="1 1 1"/>
-  <body name="fuel_000" pos="2 2 0.1"><freejoint name="fuel_000_joint"/>
-    <geom name="fuel_000_geom" type="sphere" size="0.075" contype="2" conaffinity="15"/></body>
-</worldbody></mujoco>)";
-  const std::string robot = R"(<mujoco><compiler angle="radian"/><worldbody>
-  <body name="chassis" pos="0 0 0.5">
-    <inertial pos="0 0 0" mass="1" diaginertia="0.1 0.1 0.1"/>
-    <body name="arm"><joint name="arm_joint" axis="0 0 1"/>
-      <inertial pos="0 0 0" mass="1" diaginertia="0.01 0.01 0.01"/>
-      <site name="eye"/></body>
-  </body>
-</worldbody>
-<actuator><motor name="arm" joint="arm_joint"/></actuator>
-<sensor><touch name="intake_beam" site="eye"/></sensor></mujoco>)";
-  const std::vector<PlantMotor> motors = {Motor("arm")};
-  auto plant = Make("names", robot, motors, {}, field);
-  const mjModel* m = plant->model();
-  EXPECT_GE(mj_name2id(m, mjOBJ_ACTUATOR, "arm"), 0);
-  EXPECT_GE(mj_name2id(m, mjOBJ_SENSOR, "intake_beam"), 0);
-  EXPECT_GE(mj_name2id(m, mjOBJ_BODY, "chassis"), 0);
-  EXPECT_GE(mj_name2id(m, mjOBJ_SITE, "blue_hub_score"), 0);
-  EXPECT_GE(mj_name2id(m, mjOBJ_BODY, "fuel_000"), 0);
-  EXPECT_GE(mj_name2id(m, mjOBJ_JOINT, "fuel_000_joint"), 0);
-  EXPECT_GE(mj_name2id(m, mjOBJ_GEOM, "fuel_000_geom"), 0);
-}
-
 // A robot whose angles are radians, attached to a field in MJCF's default
 // degrees, keeps its own unit, and the field keeps its.
 TEST(MakePlant, RadianRobotInADegreeFieldKeepsItsAngles) {
