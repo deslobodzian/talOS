@@ -6610,5 +6610,63 @@ TEST(LauncherTest, ManifestWriterStopsBeforeTeardownOnException) {
   EXPECT_NE(talos_log.find("cannot persist"), std::string::npos) << talos_log;
 }
 
+// REQ-RT-08, REQ-OPS-30: the launcher forwards --sim to studio_bridge if and
+// only if the session runs under --sim, so studio_bridge stays timeshare in
+// simulation (unless TALOS_REALTIME=1) and requests observer realtime on the
+// robot.
+TEST(LauncherTest, StudioBridgeReceivesSimFlagIffSessionIsSimulation) {
+  for (const bool simulation : {false, true}) {
+    SCOPED_TRACE(simulation ? "simulation" : "robot");
+    const std::string tag =
+        simulation ? "bridge_sim_flag_on" : "bridge_sim_flag_off";
+    auto options = SessionFixture(tag);
+    std::filesystem::remove_all(options.output_dir);
+    options.simulation = simulation;
+    if (simulation) options.remote = "127.0.0.1";
+    options.start_studio_bridge = true;
+    options.max_restarts = 0;
+    const std::string invoked = TempPath(tag + "_invoked");
+    const std::string done_fifo = TempPath(tag + "_fifo");
+    std::filesystem::remove(invoked);
+    std::filesystem::remove(done_fifo);
+    ASSERT_EQ(::mkfifo(done_fifo.c_str(), 0600), 0);
+
+    // Hold alpha open until studio_bridge records its launch args and signals
+    // the FIFO, so StudioBridge::Finish never SIGKILLs studio_bridge before
+    // exec completes.
+    options.binary_overrides["//example/alpha:node"] =
+        WriteStubNode(tag + "_alpha",
+                      "#!/bin/sh\n"
+                      "for arg in \"$@\"; do\n"
+                      "  if [ \"$arg\" = \"--describe\" ]; then\n"
+                      "    printf '%s\\n' '" +
+                          DescribeJson("alpha", "//example/alpha:node",
+                                       {Sender("/alpha/state")}) +
+                          "'\n"
+                          "    exit 0\n"
+                          "  fi\n"
+                          "done\n"
+                          "read _ < '" +
+                          done_fifo +
+                          "'\n"
+                          "exit 0\n");
+    options.binary_overrides["//studio/bridge:studio_bridge"] = WriteStubNode(
+        tag + "_bridge",
+        BridgeDescribeThen("echo \"studio_bridge $*\" >> '" + invoked +
+                           "'\necho ok > '" + done_fifo + "'\nexit 0\n"));
+
+    ASSERT_EQ(Launcher{options}.Run(), 0);
+    const std::string launched = ReadFile(invoked);
+    ASSERT_FALSE(launched.empty()) << "studio_bridge did not record args";
+    const bool has_sim = launched.find(" --sim ") != std::string::npos ||
+                         launched.find(" --sim\n") != std::string::npos;
+    EXPECT_EQ(has_sim, simulation) << launched;
+
+    std::filesystem::remove_all(options.output_dir);
+    std::filesystem::remove(invoked);
+    std::filesystem::remove(done_fifo);
+  }
+}
+
 }  // namespace
 }  // namespace talos::launcher

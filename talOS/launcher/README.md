@@ -508,8 +508,8 @@ bundled bridge), and the bundle's webroot replaces a relative
 no bridge: the flag adds none to the roster and the launcher says the bundle
 carries no Studio. The bridge answers `--describe`
 like any other node, and the launcher starts it with `--session-id`, the
-session's `graph.json` as `--declared` and the session's `manifest.json` as
-`--manifest`; its stdout and stderr land in
+session's `graph.json` as `--declared`, the session's `manifest.json` as
+`--manifest`, and `--sim` in simulation; its stdout and stderr land in
 `<output_dir>/<session_id>/studio_bridge.log` (plaintext, not a `.tlog`) beside
 the manifest, like every member's [output](#node-output), but are not echoed to
 the launcher's stdout.

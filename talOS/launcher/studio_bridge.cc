@@ -91,6 +91,7 @@ StudioBridge::StudioBridge(std::size_t index, const NodeSpec& spec,
               options.heartbeat_periods),
           std::chrono::milliseconds{options.heartbeat_startup_grace_ms},
           options.construction_timeout} {
+  if (options.simulation) args_.push_back("--sim");
   proc.log_path.clear();
 }
 
