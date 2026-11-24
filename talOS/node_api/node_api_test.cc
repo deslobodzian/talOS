@@ -1379,8 +1379,8 @@ TEST_F(NodeApi, IndexedTargetLookupsValidateIndexAndLoopThread) {
 TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {
   struct ClockRoller {
     Roller roller;
-    int32_t gyro = -1;
-    int32_t cc = -1;
+    int64_t gyro = -1;
+    int64_t cc = -1;
   } state;
   auto build = [](TalosNode* n, void* user) -> int32_t {
     auto& s = *static_cast<ClockRoller*>(user);

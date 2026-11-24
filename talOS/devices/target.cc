@@ -364,15 +364,17 @@ std::size_t TargetAccess::open_arming(Node& node) {
   // Refuse post-start registration without mutating node state:
   // Node::after_update checks `started` (throwing std::logic_error) before
   // rejecting an empty callback (throwing std::invalid_argument).
+  bool in_construction = false;
   try {
     node.after_update({});
   } catch (const std::invalid_argument&) {
-    // Still in construction.
+    in_construction = true;
   } catch (const std::logic_error&) {
     throw std::logic_error(
         std::string{node.name()} +
         ": OperatorArming must be opened in the constructor");
   }
+  (void)in_construction;
   DriverStation ds = DriverStationAccess::internal(node);
   auto& armings = node.extension<Targets>().armings;
   armings.push_back(ArmingState{.ds = ds});
