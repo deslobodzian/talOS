@@ -4,7 +4,7 @@
 // shell so the command palette can trigger the same picker; this header just
 // calls onImportClick.
 
-import {useState} from 'react';
+import {useEffect, useState} from 'react';
 
 import {usePlayback} from '../data/hooks';
 import {StatusDot} from '../ui/primitives';
@@ -25,6 +25,18 @@ export function Header({url, onUrl, onConnect, onDemo, onImportClick, onExport, 
 }) {
   const playback = usePlayback();
   const [menuOpen, setMenuOpen] = useState(false);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [menuOpen]);
 
   return <header>
     <div className="brand">

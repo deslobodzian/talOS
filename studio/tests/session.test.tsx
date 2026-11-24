@@ -12,7 +12,7 @@ import {readFileSync} from 'node:fs';
 import {parseManifest, type SessionManifest} from '../src/data/manifest';
 import {createStaticStudio, type Studio, StudioProvider} from '../src/data/studio';
 import {sessionPanel} from '../src/panels/session';
-import {mergeProcesses, summarize, worstLatency} from '../src/panels/session/logic';
+import {loopRate, mergeProcesses, summarize, worstLatency} from '../src/panels/session/logic';
 import {
   type DeclaredGraph,
   type DeclaredNode,
@@ -277,6 +277,18 @@ test('worstLatency measures only timer and watcher dispatches', () => {
   assert.equal(worstLatency(snode({sources: [
     ...passive, source({kind: 'WATCHER', max_latency_ns: '123'})
   ]})), 123);
+});
+
+test('loopRate ignores non-finite source rates', () => {
+  const n = snode({
+    name: 'loop',
+    sources: [
+      source({id: 0, kind: 'TIMER'}),
+      source({id: 1, kind: 'TIMER'})
+    ]
+  });
+  assert.equal(loopRate(n, {'loop 0': NaN, 'loop 1': 200}), 200);
+  assert.equal(loopRate(n, {'loop 0': Infinity, 'loop 1': NaN}), null);
 });
 
 test('summarize counts running, total and restarts', () => {

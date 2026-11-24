@@ -6,10 +6,11 @@ import {useMemo, useState} from 'react';
 
 import {useSystem} from '../../data/hooks';
 import {nodeLiveness} from '../../data/freshness';
-import {rateKey, type SystemSource} from '../../system';
+import {graphVersionMismatch, rateKey, type SystemNode, type SystemSource} from '../../system';
 import {duration, hertz, integer} from '../../ui/formatters';
 import {EmptyState} from '../../ui/primitives';
 import {GraphFreshnessNotice} from '../../ui/FreshnessNotice';
+import {GraphVersionNotice} from '../system/GraphVersionNotice';
 import type {PanelDefinition} from '../types';
 import './timing.css';
 
@@ -21,10 +22,58 @@ const parseConfig = (_raw: unknown): TimingConfig => ({});
 export type TimingColumn =
     'node'|'kind'|'name'|'period'|'rate'|'events'|'latency'|'max'|'dropped';
 
+export type TimingRow = {
+  node: SystemNode;
+  source: SystemSource;
+  rate: number|undefined;
+  declared: number|undefined;
+};
+
 const periodRate = (source: SystemSource) => {
   const period = Number(source.period_ns);
-  return period > 0 ? 1e9 / period : undefined;
+  if (!Number.isFinite(period) || period <= 0) return undefined;
+  const hz = 1e9 / period;
+  return Number.isFinite(hz) ? hz : undefined;
 };
+
+const finiteOr = (value: number|undefined, fallback = -1) =>
+    value !== undefined && Number.isFinite(value) ? value : fallback;
+
+export function sortTimingRows(
+    rows: readonly TimingRow[],
+    sort: {column: TimingColumn; descending: boolean}): TimingRow[] {
+  const key = (row: TimingRow): number|string => {
+    switch (sort.column) {
+      case 'node':
+        return row.node.name;
+      case 'kind':
+        return row.source.kind;
+      case 'name':
+        return row.source.name;
+      case 'period':
+        return finiteOr(row.declared);
+      case 'rate':
+        return finiteOr(row.rate);
+      case 'events':
+        return finiteOr(Number(row.source.events));
+      case 'latency':
+        return row.source.kind === 'TIMER' || row.source.kind === 'WATCHER' ?
+            finiteOr(Number(row.source.last_latency_ns)) : -1;
+      case 'max':
+        return row.source.kind === 'TIMER' || row.source.kind === 'WATCHER' ?
+            finiteOr(Number(row.source.max_latency_ns)) : -1;
+      case 'dropped':
+        return finiteOr(Number(row.source.dropped));
+    }
+  };
+  return [...rows].sort((a, b) => {
+    const left = key(a), right = key(b);
+    const order = typeof left === 'string' ?
+        String(left).localeCompare(String(right)) :
+        Number(left) - Number(right);
+    return sort.descending ? -order : order;
+  });
+}
 
 function TimingPanel() {
   const system = useSystem();
@@ -36,7 +85,7 @@ function TimingPanel() {
   const rows = useMemo(() => {
     if (!graph) return [];
     const needle = filter.trim().toLowerCase();
-    const flat = graph.nodes.flatMap(
+    const flat: TimingRow[] = graph.nodes.flatMap(
         node => node.sources
                     .filter(
                         source => !needle ||
@@ -48,43 +97,15 @@ function TimingPanel() {
                            rate: system.rates[rateKey(node.name, source.id)],
                            declared: periodRate(source)
                          })));
-    const key = (row: typeof flat[number]): number|string => {
-      switch (sort.column) {
-        case 'node':
-          return row.node.name;
-        case 'kind':
-          return row.source.kind;
-        case 'name':
-          return row.source.name;
-        case 'period':
-          return Number(row.source.period_ns);
-        case 'rate':
-          return row.rate ?? -1;
-        case 'events':
-          return Number(row.source.events);
-        case 'latency':
-          return row.source.kind === 'TIMER' || row.source.kind === 'WATCHER' ?
-              Number(row.source.last_latency_ns) : -1;
-        case 'max':
-          return row.source.kind === 'TIMER' || row.source.kind === 'WATCHER' ?
-              Number(row.source.max_latency_ns) : -1;
-        case 'dropped':
-          return Number(row.source.dropped);
-      }
-    };
-    return flat.sort((a, b) => {
-      const left = key(a), right = key(b);
-      const order = typeof left === 'string' ?
-          String(left).localeCompare(String(right)) :
-          Number(left) - Number(right);
-      return sort.descending ? -order : order;
-    });
+    return sortTimingRows(flat, sort);
   }, [graph, system.rates, filter, sort]);
 
-  if (!graph) return <div className="system"><EmptyState>
-    {system.error ? system.error :
-                    'No system graph yet. Connect to a robot bridge, or start demo data to explore the viewer.'}
-  </EmptyState></div>;
+  if (!graph) return <div className="system">
+    {graphVersionMismatch(system.error) ? <GraphVersionNotice/> : <EmptyState>
+      {system.error ? system.error :
+                      'No system graph yet. Connect to a robot bridge, or start demo data to explore the viewer.'}
+    </EmptyState>}
+  </div>;
 
   const header = (column: TimingColumn, label: string, right = false) =>
       <th className={(right ? 'right ' : '') + 'sortable' +

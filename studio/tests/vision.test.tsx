@@ -30,6 +30,10 @@ test('validObservationRate counts new observations, not repeated samples', () =>
   assert.equal(validObservationRate([10, 10, 10], [1, 1, 1]), null);
   assert.equal(validObservationRate([10, 10, 10], [0, 0, 0]), null);
   assert.equal(validObservationRate([10], [1]), null);
+  // Absent or NaN valid samples yield unknown (null), never a fake 0%.
+  assert.equal(validObservationRate([10, 20, 30], []), null);
+  assert.equal(validObservationRate([10, 20, 30], [NaN, NaN, NaN]), null);
+  assert.equal(validObservationRate([10, 20, 20], [1, NaN, 1]), 1);
 });
 
 test('counterDelta sums increments and ignores a reset', () => {
@@ -46,7 +50,7 @@ test('counterDelta sums increments and ignores a reset', () => {
 // frame rate as a reading.
 test('fpsFromPeriod is the frame rate, or unknown for a period that is not one', () => {
   assert.equal(fpsFromPeriod(20000), 50);
-  for (const period of [0, -20000, NaN, Infinity, null, undefined]) {
+  for (const period of [0, -20000, NaN, Infinity, 1e-308, null, undefined]) {
     assert.equal(fpsFromPeriod(period), null, String(period));
   }
 });
@@ -66,12 +70,18 @@ test('latestValidPose walks back to the most recent current accepted pose', () =
   // the robot has moved since, so there is nothing to compare.
   assert.equal(latestValidPose([0, 0.5, 1], x, y, [1, 0, 0]), null);
   assert.equal(latestValidPose([], [], [], []), null);
+  // Intermediate or trailing NaN timestamps do not abort the backward scan.
+  assert.deepEqual(latestValidPose([0, 0.5, NaN, 0.75], x, y, [0, 1, 0, 0]), {x: 2, y: 20});
+  assert.deepEqual(latestValidPose([0, 0.5, NaN], [1, 2, 3], [10, 20, 30], [0, 1, 0]),
+                   {x: 2, y: 20});
 });
 
 test('acceptancePct divides accepted by the total, or null', () => {
   assert.equal(acceptancePct(8, 2), 0.8);
   assert.equal(acceptancePct(0, 0), null);
   assert.equal(acceptancePct(null, 2), null);
+  assert.equal(acceptancePct(-1, 5), null);
+  assert.equal(acceptancePct(Infinity, 1), null);
 });
 
 test('observationErrors compares only accepted observations', () => {
@@ -102,8 +112,11 @@ test('observationErrors compares only accepted observations', () => {
 // --- rendering --------------------------------------------------------------
 
 test('vision compares against sim truth only when sim has finite data', () => {
-  for (const [simX, reference] of [
-    [undefined, 'vs estimator'], [NaN, 'vs estimator'], [1, 'vs sim truth']
+  for (const [simX, simY, reference] of [
+    [undefined, undefined, 'vs estimator'],
+    [NaN, 2, 'vs estimator'],
+    [1, NaN, 'vs estimator'],
+    [1, 2, 'vs sim truth']
   ] as const) {
     const channels: Record<string, number> = {
       'pose_estimator/state/pose/x_m': 1,
@@ -113,7 +126,7 @@ test('vision compares against sim truth only when sim has finite data', () => {
     };
     if (simX !== undefined) {
       channels['sim/state/pose/x_m'] = simX;
-      channels['sim/state/pose/y_m'] = 2;
+      channels['sim/state/pose/y_m'] = simY!;
     }
     // Sim pose is declared in the dictionary in every case.
     const units: Record<string, string> = {
