@@ -473,8 +473,8 @@ and flag, against a welded root that accepts them, and the match input
 each Driver Station state gives. `fields_test` holds
 the field names config load accepts to the ones the program loads, each
 with its FUEL, and attaches each field's game. `match_state_test`
-(integration, REQ-DEV-40) runs the program on the 2026 field through a mode
-schedule: `/sim/state/match` walks None, AUTO and TELEOP counting down,
+(integration, REQ-DEV-40) runs the program on the 2026 field, sleeping on,
+through a mode schedule: `/sim/state/match` walks None, AUTO and TELEOP counting down,
 each Driver Station packet carries the time left and game message of its
 own tick's `/sim/state/match`, the first TELEOP packet included,
 `/sim/telemetry/pieces` carries the 504 FUEL on every 10th tick, and the live

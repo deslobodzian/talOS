@@ -274,7 +274,7 @@ TRENCH geom.
 file and model (`mujoco_rig_sync_test`; the example's `model_twin_test` holds
 its own copy to the same bytes). `rig_shot_test` (REQ-DEV-37, 39 to 41) is
 that example's shot without processes: the model on the 2026 field,
-assembled as the MuJoCo gateway assembles it (`MujocoGatewayExtension`) at
+sleeping on as the example's config has it, assembled as the MuJoCo gateway assembles it (`MujocoGatewayExtension`) at
 the example's start pose and given its nodes' commands (disabled, then
 TELEOP, the flywheel at 43 rps from 2 s, the feeder at 30 rps from 4 s), launches all
 eight preloads and scores at least seven, with the same `/sim/state/match`

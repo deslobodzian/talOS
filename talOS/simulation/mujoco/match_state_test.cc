@@ -48,9 +48,13 @@ namespace {
 
 namespace ds = driver_station;
 
-// 0.2 s disabled, 0.4 s of AUTO, then TELEOP until the run ends.
-constexpr const char* kModeSchedule = "disabled:0.2,auto:0.4,teleop:0.6";
-constexpr const char* kDurationS = "1.2";
+// 0.2 s disabled, 0.4 s of AUTO, then TELEOP until the test stops the
+// gateway (RunGateway, once it holds what the cases judge).
+constexpr const char* kModeSchedule = "disabled:0.2,auto:0.4,teleop:30";
+// A hang bound only, inside the test's own timeout (size small, 60 s): a
+// gateway that never gives the data ends here, and the cases fail on what
+// it gave. A run that gives it is stopped well before.
+constexpr const char* kDurationS = "30";
 
 std::string Runfile(const char* env) {
   std::string error;
@@ -149,6 +153,31 @@ struct MatchRun {
   std::string log;
 };
 
+// The rover's config with `[simulation.mujoco] sleeping = true`, beside a
+// copy of its model, so resting FUEL sleeps and a tick costs what the awake
+// trees cost: the run then holds real time on a slow host (a sanitizer
+// build), as a user's config does (README.md "When the host cannot hold real
+// time"). Nothing judged here reads a FUEL's motion: the periods and their
+// countdown, the Driver Station packets against their tick's match, the
+// pieces message's count and cadence and the live row are the same asleep.
+std::string SleepingRoverConfig() {
+  const std::filesystem::path source{Runfile("ROVER_CONFIG")};
+  const std::filesystem::path dir{TempPath("rover")};
+  std::filesystem::create_directories(dir);
+  std::filesystem::copy_file(source.parent_path() / "rover.xml",
+                             dir / "rover.xml",
+                             std::filesystem::copy_options::overwrite_existing);
+  const std::string toml = ReadFile(source.string());
+  // [simulation.mujoco] is the file's last table; the key goes into it.
+  const std::size_t table = toml.rfind("[simulation.mujoco]\n");
+  if (table == std::string::npos ||
+      toml.find('[', table + 1) != std::string::npos) {
+    throw std::runtime_error("rover config: [simulation.mujoco] is not last");
+  }
+  std::ofstream{dir / "robot.toml"} << toml << "sleeping = true\n";
+  return (dir / "robot.toml").string();
+}
+
 MatchRun RunGateway() {
   MatchRun run;
   const std::string start_file = TempPath("schedule_start");
@@ -161,7 +190,7 @@ MatchRun RunGateway() {
   const std::string log = TempPath("gateway.log");
   std::vector<std::string> args{Runfile("MUJOCO_GATEWAY"),
                                 "--config",
-                                Runfile("ROVER_CONFIG"),
+                                SleepingRoverConfig(),
                                 "--port",
                                 std::to_string(FreePortBelowEphemeral()),
                                 "--remote-port",
@@ -197,13 +226,46 @@ MatchRun RunGateway() {
       }
     }
   };
+  // The run ends on data, not on the clock, so a slow host (a sanitizer
+  // build) gives the cases the same sample, only later. It holds enough
+  // once it has:
+  // - TELEOP in /sim/state/match (PublishesThePeriodsInOrderCountingDown:
+  //   None, AUTO and TELEOP, each counting down);
+  // - a TELEOP Driver Station packet (DriverStationPacketsCarryTheirTicksMatch
+  //   judges the first one; every packet's match comes with the last drain);
+  // - the live registry row (LiveRowDeclaresWhatDescribeDeclares);
+  // - 11 pieces messages stamped at or after the first recorded tick
+  //   (PublishesThePiecesEveryTenthTick: 10 checked gaps).
+  const auto holds_enough = [&] {
+    const bool teleop_match =
+        !run.matches.empty() &&
+        run.matches.back().period() == ::sim::MatchPeriod::Teleop;
+    const bool teleop_packet = std::any_of(
+        run.packets.begin(), run.packets.end(),
+        [](const auto& p) { return (p.fms.flags & ds::kTeleop) != 0; });
+    const auto recorded = std::count_if(
+        run.pieces.begin(), run.pieces.end(), [&](const auto& message) {
+          return !run.matches.empty() &&
+                 message.sample_time_ns() >=
+                     run.matches.front().sample_time_ns();
+        });
+    return teleop_match && teleop_packet && run.row.has_value() &&
+           recorded >= 11;
+  };
   // The counts only bound a hang: 200 receives that time out (10 s without
   // a datagram), or 20000 datagrams (100 s of State at 200 Hz).
   int idle = 0;
   int received = 0;
+  bool stopped = false;
   std::array<uint8_t, protocol::kMaxFrameSize> buffer{};
   while (idle < 200 && received < 20000) {
     drain();
+    if (!stopped && holds_enough()) {
+      // The launcher's stop (talOS/launcher kStopSignal); the gateway's stop
+      // handlers end its loop and it exits 0.
+      ::kill(child, SIGINT);
+      stopped = true;
+    }
     if (!run.row) {
       if (const auto reader = introspect::RegistryReader::open()) {
         for (const auto& row : reader->nodes()) {
