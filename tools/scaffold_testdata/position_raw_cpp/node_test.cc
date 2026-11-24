@@ -318,6 +318,29 @@ TEST_F(PositionRawCppTest, StuckSwitchStopsWithinTheMargin) {
   }
   EXPECT_EQ(Request(), Mode::kNeutral);
   EXPECT_EQ(Latest().homing(), PositionRawCppHoming::FAILED);
+
+  // Recover by disabling, leave the switch and drive past kHomeMarginRot,
+  // then drop the zero (motor reset) at a non-zero position with the
+  // switch stuck closed: the second zero must enforce kHomeMarginRot again.
+  SetHome(false);
+  hw.set_driver_station(DsPacket(ds::kTeleop));  // disabled
+  sim.step(40ms);
+  Teleop();
+  Hold(1.0, 60ms);
+  ASSERT_EQ(Request(), Mode::kMotionMagic);
+  ASSERT_NEAR(Latest().position_rot(), 1.0, 1e-9);
+
+  SetHome(true);
+  hw.reset_device("position_raw_cpp", "position_raw_cpp");
+  sim.step(80ms);  // past the masked reset states; re-zeroes on the switch
+  ASSERT_EQ(Latest().homing(), PositionRawCppHoming::HOMED);
+  for (int tick = 0; tick < 10; ++tick) {
+    Hold(1.5, 20ms);
+    EXPECT_LE(hw.motor_request("position_raw_cpp", "position_raw_cpp").demand,
+              2.9 + 0.15 + 1e-9);
+  }
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_EQ(Latest().homing(), PositionRawCppHoming::FAILED);
 }
 
 // REQ-DEV-01: off the switch, a goal past either end of the travel
