@@ -268,3 +268,14 @@ capped for 8 m/s², and tilts it 15° nose down, with all eight preloads still i
 hopper; and drives it under the 2026 field's
 TRENCH at 6 V, its back bumper beyond the arm within 3 s, touching no
 TRENCH geom.
+
+`testdata/mujoco_rig/` is the
+[MuJoCo rig example](../../../../examples/mujoco_rig/README.md)'s parameter
+file and model (`mujoco_rig_sync_test`; the example's `model_twin_test` holds
+its own copy to the same bytes). `rig_shot_test` (REQ-DEV-37, 39 to 41) is
+that example's shot without processes: the model on the 2026 field,
+assembled as the MuJoCo gateway assembles it (`MujocoGatewayExtension`) at
+the example's start pose and given its nodes' commands (disabled, then
+TELEOP, the flywheel at 41 rps from 2 s, the feeder at 30 rps from 4 s), launches all
+eight preloads and scores at least seven, with the same `/sim/state/match`
+every tick of two runs.
