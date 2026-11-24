@@ -50,6 +50,9 @@ filegroup(
 # REQ-DEV-38: the model's names, symmetry and dimensions, its agreement with
 # the official AprilTag poses, and fuel behaviour at rest, through the hub,
 # out of the chute and against every wall. About 2 s unsanitized.
+# Five shards, so each has its own timeout under --config=tsan: gtest gives
+# case i to shard i % 5, which leaves StagedFuelIsAtRest (case 4, 2 s of the
+# whole field) with only two cheap cases and keeps the hub cases apart.
 cc_test(
     name = "field_test",
     size = "small",
@@ -62,6 +65,7 @@ cc_test(
         "FIELD_XML": "$(rlocationpath :rebuilt_2026.xml)",
         "TAGS_JSON": "$(rlocationpath //talOS/vision/testdata:2026-rebuilt-welded.json)",
     },
+    shard_count = 5,
     deps = [
         "@googletest//:gtest_main",
         "@mujoco",
@@ -125,12 +129,16 @@ cc_library(
 # parking and release from an empty pocket, the shift order, the grace edge,
 # preloads, the match report and Driver Station stamp, the seeded stream,
 # bit-identical runs and no allocation.
+# Six shards, so each has its own timeout under --config=tsan: gtest gives
+# case i to shard i % 6, which puts each two-scenario case
+# (RunsAreBitIdentical, TheSeedMatters) beside one cheap case.
 cc_test(
     name = "rules_test",
     size = "small",
     srcs = ["rules_test.cc"],
     data = [":rebuilt_2026.xml"],
     env = {"FIELD_XML": "$(rlocationpath :rebuilt_2026.xml)"},
+    shard_count = 6,
     deps = [
         ":rules",
         "//talOS/hardware:sim_messages",
