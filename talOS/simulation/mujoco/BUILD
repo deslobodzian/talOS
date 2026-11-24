@@ -42,6 +42,18 @@ cc_library(
     visibility = ["//talOS/simulation/mujoco:__subpackages__"],
 )
 
+# A field's game (game.h): the GameRules a field's rules package implements
+# and the gateway's field table names (REQ-DEV-40).
+cc_library(
+    name = "game",
+    hdrs = ["game.h"],
+    visibility = ["//talOS/simulation/mujoco:__subpackages__"],
+    deps = [
+        ":world_rules",
+        "//talOS/hardware:sim_messages",
+    ],
+)
+
 # The robot model's scripted shooters (README.md "Scripted shooter";
 # REQ-DEV-39), a WorldRules.
 cc_library(
