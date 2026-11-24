@@ -1,6 +1,7 @@
 #include "talOS/launcher/session_retention.h"
 
 #include <gtest/gtest.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstdint>
@@ -9,6 +10,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <system_error>
 
 #include "talOS/events/session_manifest.h"
 #include "talOS/launcher/session.h"
@@ -169,6 +171,55 @@ TEST(SessionRetentionTest, CachedRecordedMatchReadsCacheOnly) {
   EXPECT_EQ(CachedRecordedMatch(dir, 0), MatchVerdict::kMatch);
 
   fs::remove_all(dir);
+}
+
+// REQ-OPS-11, REQ-OPS-12: session_class reads and writes never follow symlinks
+// or block on FIFOs, and cache writes replace session_class atomically as a
+// regular file.
+TEST(SessionRetentionTest, SessionClassRefusesSymlinksAndFifos) {
+  const fs::path root = TempDir("confinement");
+  const fs::path dir = root / "session";
+  fs::create_directories(dir);
+
+  // Symlink session_class -> external_victim: CachedRecordedMatch refuses to
+  // follow it, and RecordedMatch(kReadWrite) replaces the symlink atomically
+  // without modifying external_victim.
+  const fs::path victim = root / "external_victim";
+  {
+    std::ofstream out{victim};
+    out << "match 999\n";
+  }
+  const fs::path cache = dir / std::string{kSessionClassFile};
+  fs::create_symlink(victim, cache);
+
+  EXPECT_EQ(CachedRecordedMatch(dir, 0), std::nullopt);
+  EXPECT_EQ(RecordedMatch(dir, ClassCache::kReadWrite), MatchVerdict::kOther);
+
+  std::ifstream victim_in{victim};
+  std::string victim_content;
+  std::getline(victim_in, victim_content);
+  EXPECT_EQ(victim_content, "match 999");
+  std::error_code ec;
+  EXPECT_EQ(fs::symlink_status(cache, ec).type(), fs::file_type::regular);
+  EXPECT_FALSE(ec);
+  EXPECT_EQ(CachedRecordedMatch(dir, 0), MatchVerdict::kOther);
+
+  // FIFO at session_class: neither read nor read-write cache paths block.
+  const fs::path fifo_dir = root / "fifo_session";
+  fs::create_directories(fifo_dir);
+  const fs::path fifo_cache = fifo_dir / std::string{kSessionClassFile};
+  ASSERT_EQ(::mkfifo(fifo_cache.c_str(), 0644), 0);
+
+  EXPECT_EQ(CachedRecordedMatch(fifo_dir, 0), std::nullopt);
+  EXPECT_EQ(RecordedMatch(fifo_dir, ClassCache::kReadOnly),
+            MatchVerdict::kOther);
+  EXPECT_EQ(fs::symlink_status(fifo_cache, ec).type(), fs::file_type::fifo);
+  EXPECT_EQ(RecordedMatch(fifo_dir, ClassCache::kReadWrite),
+            MatchVerdict::kOther);
+  EXPECT_EQ(fs::symlink_status(fifo_cache, ec).type(), fs::file_type::regular);
+  EXPECT_EQ(CachedRecordedMatch(fifo_dir, 0), MatchVerdict::kOther);
+
+  fs::remove_all(root);
 }
 
 }  // namespace

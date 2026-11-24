@@ -222,9 +222,10 @@ ENVELOPE_HEADER = re.compile(r"\{mode_since_us: (\d+), active: (true|false)")
 TARGET_AGE_LIMIT_MS = 25
 
 
-# log_dump's stderr line for a log whose reader skipped damaged records or a
-# damaged tail: the file, then its byte offsets (LogReader, DescribeDamage).
-DAMAGED_LOG = re.compile(r"^warning: (damaged log .*)$", re.MULTILINE)
+# log_dump's stderr lines for a log whose reader skipped damaged records, a
+# damaged tail, or an incomplete header (LogReader, DescribeDamage, log_merge).
+# `warning: log gap in ...` is intentionally left unmatched (handled via GAP).
+DAMAGED_LOG = re.compile(r"^warning: ((?:damaged log|skipping) .*)$", re.MULTILINE)
 
 # log_dump's one stderr line for a session whose hardware packets it did
 # not decode: it records another hardware protocol, or this
@@ -344,6 +345,64 @@ def launcher_drops(session, manifest):
     found = [(m.start(), describe(m)) for pattern, describe in LAUNCHER_DROPS
              for m in pattern.finditer(text)]
     return [line for _, line in sorted(found)]
+
+
+def missing_logs(session, manifest):
+    """One issue per event log listed on a node in `manifest` that is absent
+    beside `manifest.json` (neither `<name>` nor any rotated
+    `<stem>.segment<k>.tlog`, talOS/events/log/format.h)."""
+    if not isinstance(manifest, dict):
+        return []
+    nodes = manifest.get("nodes")
+    if not isinstance(nodes, list):
+        return []
+    session_dir = Path(session)
+    file_names = set()
+    try:
+        for entry in session_dir.iterdir():
+            try:
+                if entry.is_file():
+                    file_names.add(entry.name)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    issues = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        node_name = node.get("name")
+        raw_paths = node.get("log_paths")
+        candidates = []
+        if isinstance(raw_paths, list):
+            candidates.extend(raw_paths)
+        log_path = node.get("log_path")
+        if log_path is not None:
+            candidates.append(log_path)
+        seen_raw = set()
+        seen_names = set()
+        for raw in candidates:
+            if not isinstance(raw, str) or not raw or raw in seen_raw:
+                continue
+            seen_raw.add(raw)
+            if "\x00" in raw:
+                issues.append(f"{node_name}: missing log {raw}")
+                continue
+            name = Path(raw).name
+            if not name:
+                issues.append(f"{node_name}: missing log {raw}")
+                continue
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            if name in file_names:
+                continue
+            stem = name[:-5] if name.endswith(".tlog") else name
+            segment_re = re.compile(re.escape(stem) + r"\.segment\d+\.tlog")
+            if any(segment_re.fullmatch(entry) for entry in file_names):
+                continue
+            issues.append(f"{node_name}: missing log {name}")
+    return issues
 
 
 def log_gaps(records):
@@ -868,7 +927,8 @@ def recorded_bound(manifest, key):
     return None
 
 
-def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_decoded=None):
+def analyze(manifest, records, log_damage=(), output_drops=None,
+            hardware_not_decoded=None, missing_logs=()):
     if not isinstance(manifest, dict):
         raise ValueError("manifest must be a JSON object")
     manifest_nodes = manifest.get("nodes")
@@ -1100,6 +1160,9 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
                if n.get(flag)]
     # A record the reader skipped is missing from every measurement above.
     issues += list(log_damage)
+    # A manifest-listed event log missing on disk is absent from every
+    # measurement above.
+    issues += list(missing_logs)
     # Records a writer dropped: only the intervals they could fall in went
     # unmeasured, but the session is not whole evidence.
     issues += [gap_issue(gap) for gap in gap_list]
@@ -1446,7 +1509,8 @@ def main():
         report = analyze(manifest, records,
                          DAMAGED_LOG.findall(result.stderr),
                          launcher_drops(args.session, manifest),
-                         not_decoded[1] if not_decoded else None)
+                         not_decoded[1] if not_decoded else None,
+                         missing_logs(args.session, manifest))
         print(json.dumps(report, indent=2, allow_nan=False) if args.json else markdown(report))
         if not args.strict:
             return 0
