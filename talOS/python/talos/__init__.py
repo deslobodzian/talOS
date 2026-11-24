@@ -26,6 +26,7 @@ message fields such as sample_time_ns carry).
 import ctypes
 import enum
 import gc
+import hashlib
 import importlib.util
 import math
 import os
@@ -482,15 +483,31 @@ def load(path):
     its name with the `intake` message package it imports, and must not
     shadow it.
     """
-    path = os.path.abspath(path)
+    path = os.path.abspath(os.fspath(path))
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"no such Python file: {path}")
+    if not os.path.isfile(path):
+        raise ValueError(f"cannot load {path}: not a file")
+    stem = os.path.splitext(os.path.basename(path))[0]
+    digest = hashlib.sha256(
+        path.encode("utf-8", errors="surrogateescape")).hexdigest()[:16]
+    name = f"_talos_node_{stem}_{digest}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"cannot load Python module from {path}")
     directory = os.path.dirname(path)
     sys.path[:] = [p for p in sys.path if os.path.abspath(p) != directory]
-    stem = os.path.splitext(os.path.basename(path))[0]
-    name = f"_talos_node_{stem}"
-    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(name)
     sys.modules[name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+        raise
     return module
 
 

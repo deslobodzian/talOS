@@ -4,12 +4,16 @@
 
 #if defined(__linux__)
 #include <linux/videodev2.h>
+#include <poll.h>
+#include <sys/time.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -235,5 +239,67 @@ inline TimestampKind V4L2TimestampKind(uint32_t flags,
   return driver == "uvcvideo" ? TimestampKind::kDelivery
                               : TimestampKind::kStartOfExposure;
 }
+
+inline constexpr int64_t kMaxV4L2DriverTimestampAgeNs = 5'000'000'000LL;
+
+struct V4L2ResolvedTimestamp {
+  int64_t capture_time_ns{0};
+  int64_t raw_timestamp_ns{0};
+  TimestampKind kind{TimestampKind::kDelivery};
+  constexpr bool operator==(const V4L2ResolvedTimestamp&) const = default;
+};
+
+// Maps a V4L2 buffer timestamp into the node clock domain. A monotonic driver
+// timestamp is trusted only when it is nonzero and lies in
+// [delivery - 5 s, delivery] (matching AVFoundation's sanity window); zero,
+// future, stale, or malformed timestamps fall back to `node_delivery_ns` with
+// TimestampKind::kDelivery.
+inline V4L2ResolvedTimestamp ResolveV4L2Timestamp(
+    uint32_t flags, const timeval& driver_timestamp, int64_t delivery_ns,
+    int64_t node_delivery_ns, std::string_view driver = {}) {
+  const V4L2ResolvedTimestamp fallback{node_delivery_ns, delivery_ns,
+                                       TimestampKind::kDelivery};
+  if ((flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) !=
+      V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC) {
+    return fallback;
+  }
+  if (driver_timestamp.tv_sec < 0 || driver_timestamp.tv_usec < 0 ||
+      driver_timestamp.tv_usec >= 1'000'000) {
+    return fallback;
+  }
+  constexpr int64_t kMaxSec =
+      (std::numeric_limits<int64_t>::max() - 999'999'000LL) / 1'000'000'000LL;
+  if (driver_timestamp.tv_sec > kMaxSec) {
+    return fallback;
+  }
+  const int64_t driver_ns =
+      static_cast<int64_t>(driver_timestamp.tv_sec) * 1'000'000'000LL +
+      static_cast<int64_t>(driver_timestamp.tv_usec) * 1'000LL;
+  if (driver_ns <= 0 || driver_ns > delivery_ns) {
+    return fallback;
+  }
+  const int64_t age_ns = delivery_ns - driver_ns;
+  if (age_ns < 0 || age_ns >= kMaxV4L2DriverTimestampAgeNs ||
+      node_delivery_ns < age_ns) {
+    return fallback;
+  }
+  return {node_delivery_ns - age_ns, driver_ns,
+          V4L2TimestampKind(flags, driver)};
+}
+
+// OS syscalls used by the Linux V4L2 CameraSource; tests can substitute a fake
+// device without touching /dev/videoN.
+struct V4L2Syscalls {
+  std::function<int(const char*, int)> open_fn;
+  std::function<int(int)> close_fn;
+  // NOLINTNEXTLINE(google-runtime-int): glibc ioctl request type
+  std::function<int(int, unsigned long, void*)> ioctl_fn;
+  std::function<void*(void*, size_t, int, int, int, off_t)> mmap_fn;
+  std::function<int(void*, size_t)> munmap_fn;
+  std::function<int(pollfd*, nfds_t, int)> poll_fn;
+};
+
+std::unique_ptr<CameraSource> CreateV4L2CameraSourceForTest(
+    const CameraSourceConfig& config, V4L2Syscalls syscalls);
 }  // namespace talos::vision
 #endif

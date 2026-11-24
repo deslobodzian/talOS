@@ -4,11 +4,21 @@
 extern "C" {
 #endif
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "apriltag.h"
 #include "common/image_u8.h"
 #include "common/zarray.h"
+
+/**
+ * Returns true if (width, height) are safe to pass to upstream AprilTag
+ * detection under td->quad_decimate: both original and decimated dimensions
+ * are in [4, 32768) (avoiding threshold() tile underflow below 4x4 and
+ * uint16_t 2x coordinate overflow at >= 32768).
+ */
+bool apriltag_image_dimensions_supported(const apriltag_detector_t* td,
+                                         int width, int height);
 
 /**
  * Executes steps 2..4 of apriltag_quad_thresh (connected_components,

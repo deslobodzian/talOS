@@ -48,6 +48,21 @@ def _generation(mode_since_us):
         _abi.check_int(mode_since_us, 0, _abi.UINT64_MAX, "mode_since_us")))
 
 
+def _destroy_hardware_cell(cell, sim_ref=None,
+                           fallback_destroy=lib.talos_sim_hardware_destroy):
+    """Destroys the native SimHardware in `cell` at most once and drops it
+    from its Sim's registry if the Sim is still alive."""
+    handle = cell[0]
+    if handle is not None:
+        cell[0] = None
+        destroy = getattr(lib, "talos_sim_hardware_destroy", fallback_destroy)
+        destroy(handle)
+    if sim_ref is not None:
+        sim = sim_ref()
+        if sim is not None:
+            sim._hardwares.pop(id(cell), None)
+
+
 class Sim:
     """One simulated clock hosting several nodes; topics are in memory.
 
@@ -59,7 +74,7 @@ class Sim:
         self._handle = _handle or _abi.handle(
             lib.talos_sim_create(_abi.encode(config_path)))
         self._nodes = {}  # node_name -> (Node, object), alive while hosted
-        self._hardwares = []  # weakref.ref(SimHardware) attached to this Sim
+        self._hardwares = {}  # id(cell) -> [TalosSimHardware handle or None]
 
     @classmethod
     def from_toml(cls, robot_toml):
@@ -79,14 +94,15 @@ class Sim:
             self._handle = None
             # Garbage collection may finalize this Sim while other objects
             # of the same unreachable cycle still hold its SimHardware or
-            # nodes: destroy attached SimHardwares first (they hold a C++
-            # Sim&), and invalidate every handle so none reaches freed memory.
-            for ref in getattr(self, "_hardwares", ()):
-                hw = ref()
-                if hw is not None:
-                    hw._invalidate()
-            if hasattr(self, "_hardwares"):
-                self._hardwares.clear()
+            # nodes: destroy attached SimHardwares via their shared handle
+            # cells first (weakrefs to SimHardware are cleared before __del__
+            # under PEP 442), and invalidate every handle so none reaches
+            # freed memory.
+            hardwares = getattr(self, "_hardwares", None)
+            if hardwares is not None:
+                for cell in list(hardwares.values()):
+                    _destroy_hardware_cell(cell)
+                hardwares.clear()
             for node, _ in self._nodes.values():
                 node._native = None
                 node._callbacks.clear()
@@ -139,6 +155,13 @@ class Sim:
         """Advances virtual time, running every node's timers and messages."""
         _abi.ok(lib.talos_sim_step(
             self._handle, _abi.duration_ns(seconds, "seconds")))
+
+    def _step_ns(self, duration_ns):
+        """Advances virtual time by exact integer nanoseconds."""
+        _abi.ok(lib.talos_sim_step(
+            self._handle,
+            _abi.check_int(duration_ns, _abi.INT64_MIN, _abi.INT64_MAX,
+                           "duration_ns")))
 
     def pause(self, node_name, seconds):
         """Stops one node's timers and deliveries while its clock advances."""
@@ -245,25 +268,28 @@ class SimHardware:
 
     def __init__(self, sim):
         self._sim = sim  # outlives this
-        self._native = _abi.handle(lib.talos_sim_hardware_create(sim._handle))
-        sim._hardwares = [ref for ref in sim._hardwares if ref() is not None]
-        sim._hardwares.append(weakref.ref(self))
+        if getattr(sim, "_handle", None) is None:
+            raise _abi.TalosError("this Sim has been destroyed")
+        cell = [_abi.handle(lib.talos_sim_hardware_create(sim._handle))]
+        self._cell = cell
+        sim._hardwares[id(cell)] = cell
+        self._finalizer = weakref.finalize(
+            self, _destroy_hardware_cell, cell, weakref.ref(sim))
 
     @property
     def _handle(self):
-        if self._native is None:
+        cell = getattr(self, "_cell", None)
+        sim = getattr(self, "_sim", None)
+        if (cell is None or cell[0] is None or sim is None
+                or getattr(sim, "_handle", None) is None):
             raise _abi.TalosError(
                 "this SimHardware or its Sim has been destroyed")
-        return self._native
+        return cell[0]
 
     def _invalidate(self):
-        handle = getattr(self, "_native", None)
-        if handle:
-            self._native = None
-            lib.talos_sim_hardware_destroy(handle)
-
-    def __del__(self):
-        self._invalidate()
+        cell = getattr(self, "_cell", None)
+        if cell is not None:
+            _destroy_hardware_cell(cell)
 
     def enable(self, on=True):
         _abi.ok(lib.talos_sim_hardware_enable(self._handle, bool(on)))
@@ -326,10 +352,14 @@ class SimHardware:
     def set_gateway_clock(self, offset=0.0, latency=0.0):
         """From now on the gateway clock reads sim time + `offset` seconds,
         and each state is sampled `latency` seconds before it goes out."""
+        offset_ns = _abi.duration_ns(offset, "offset")
+        latency_ns = _abi.duration_ns(latency, "latency")
+        handle = self._handle
+        if getattr(self._sim, "_handle", None) is None:
+            raise _abi.TalosError(
+                "this SimHardware or its Sim has been destroyed")
         _abi.ok(lib.talos_sim_hardware_set_gateway_clock(
-            self._handle,
-            _abi.duration_ns(offset, "offset"),
-            _abi.duration_ns(latency, "latency")))
+            handle, offset_ns, latency_ns))
 
     def set_connected(self, node, device, connected):
         """A disconnected device reports connected False (a motor's sample
