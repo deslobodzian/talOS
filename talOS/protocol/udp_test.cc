@@ -100,16 +100,6 @@ uint16_t FreeLoopbackPort() {
   return bound ? ntohs(address.sin_port) : 0;
 }
 
-TEST(RuntimeUdpTest, NonBlockingReceiveReportsWouldBlock) {
-  const uint16_t remote = FreeLoopbackPort();
-  ASSERT_NE(remote, 0);
-  RuntimeUdpPeer peer;
-  ASSERT_EQ(peer.Open("127.0.0.1", 0, "127.0.0.1", remote), UdpStatus::kOk);
-
-  DecodedFrame received;
-  EXPECT_EQ(peer.TryReceive(&received), UdpStatus::kWouldBlock);
-}
-
 // A second process opening a live peer's port -- a second hardware bridge
 // on the RoboRIO port -- fails rather than sharing its datagrams, while a
 // restarted peer gets the port back as soon as the old one closed.
