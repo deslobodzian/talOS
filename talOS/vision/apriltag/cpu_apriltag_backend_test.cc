@@ -15,7 +15,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -368,8 +370,10 @@ TEST(CpuAprilTagBackendTest, ProductionPoseReprojectsDetectedCorners) {
       .fx = 500.0, .fy = 500.0, .cx = 320.0, .cy = 240.0};
   constexpr double kTagSizeMeters = 0.16;
 
-  const PoseEstimation pose_std =
+  const std::optional<PoseEstimation> pose_opt =
       backend.EstimatePose(det, intrinsics, kTagSizeMeters);
+  ASSERT_TRUE(pose_opt.has_value());
+  const PoseEstimation& pose_std = *pose_opt;
   EXPECT_GT(pose_std.translation.z(), 0.3);
 
   // Verify Reprojection of 3D tag corners back to image plane
@@ -426,9 +430,10 @@ TEST(CpuAprilTagBackendTest, PoseUsesUndistortedCorners) {
   detection.homography.setIdentity();
   CpuAprilTagBackend backend;
   const auto estimate = backend.EstimatePose(detection, intrinsics, size);
-  EXPECT_LT((estimate.translation - translation).norm(), 1e-4);
-  EXPECT_NEAR(estimate.rotation.determinant(), 1.0, 1e-10);
-  EXPECT_LT((estimate.rotation.transpose() * estimate.rotation -
+  ASSERT_TRUE(estimate.has_value());
+  EXPECT_LT((estimate->translation - translation).norm(), 1e-4);
+  EXPECT_NEAR(estimate->rotation.determinant(), 1.0, 1e-10);
+  EXPECT_LT((estimate->rotation.transpose() * estimate->rotation -
              Eigen::Matrix3d::Identity())
                 .norm(),
             1e-10);
@@ -555,6 +560,133 @@ TEST(CpuAprilTagBackendTest,
       EXPECT_TRUE(backend.Detect(small.data(), 6, 6, 6).empty());
     }
   }
+}
+
+TEST(CpuAprilTagBackendTest, RejectsOversizedDimensionsBeforeAllocating) {
+  const std::vector<uint8_t> small(64, 128);
+  DetectorOptions options;
+  options.family_name = "tag36h11";
+  options.quad_decimate = 1.0f;
+  options.threads = 1;
+  CpuAprilTagBackend backend(options);
+
+  // stride != width previously called image_u8_create(w, h) before
+  // ImageDimensionsSupported, attempting a multi-GB allocation or 32-bit
+  // overflow and reading past `small`.
+  EXPECT_TRUE(backend.Detect(small.data(), 32768, 32768, 32769).empty());
+  EXPECT_TRUE(backend.Detect(small.data(), 65536, 65536, 65537).empty());
+
+  // Huge finite quad_decimate must not invoke float-to-int UB.
+  options.quad_decimate = 1e20f;
+  backend.SetOptions(options);
+  EXPECT_TRUE(backend.Detect(small.data(), 8, 8, 8).empty());
+}
+
+TEST(CpuAprilTagBackendTest, ValidatesOptionsAndCommitsSetOptionsAtomically) {
+  for (const int bad_threads : {0, -1}) {
+    DetectorOptions opts;
+    opts.threads = bad_threads;
+    EXPECT_THROW(CpuAprilTagBackend{opts}, std::invalid_argument);
+  }
+  for (const float bad_decimate : {std::numeric_limits<float>::quiet_NaN(),
+                                   std::numeric_limits<float>::infinity(),
+                                   -std::numeric_limits<float>::infinity()}) {
+    DetectorOptions opts;
+    opts.quad_decimate = bad_decimate;
+    EXPECT_THROW(CpuAprilTagBackend{opts}, std::invalid_argument);
+  }
+
+  DetectorOptions valid;
+  valid.family_name = "tag36h11";
+  valid.quad_decimate = 1.0f;
+  valid.threads = 1;
+  CpuAprilTagBackend backend(valid);
+
+  // Failed SetOptions must leave options_ and the active detector intact.
+  DetectorOptions bad_family = valid;
+  bad_family.family_name = "no_such_family";
+  bad_family.threads = 2;
+  EXPECT_THROW(backend.SetOptions(bad_family), std::invalid_argument);
+  EXPECT_EQ(backend.options().family_name, "tag36h11");
+  EXPECT_EQ(backend.options().threads, 1);
+
+  DetectorOptions bad_threads = valid;
+  bad_threads.threads = 0;
+  EXPECT_THROW(backend.SetOptions(bad_threads), std::invalid_argument);
+  EXPECT_EQ(backend.options().threads, 1);
+
+  const std::string path = GetTestdataPath("scene_single_tag0.png");
+  const auto detections = backend.DetectImageFile(path);
+  ASSERT_EQ(detections.size(), 1u);
+  EXPECT_EQ(detections[0].id, 0);
+}
+
+TEST(CpuAprilTagBackendTest,
+     PoseEstimationReturnsNulloptOnFailureAndSetsHasAlternativeFromError) {
+  DetectorOptions options;
+  options.family_name = "tag36h11";
+  options.quad_decimate = 1.0f;
+  CpuAprilTagBackend backend(options);
+
+  // Invalid intrinsics must leave det.pose unset instead of an identity pose.
+  const std::string path = GetTestdataPath("scene_single_tag0.png");
+  const CameraIntrinsics invalid_intrinsics{
+      .fx = 0.0, .fy = 0.0, .cx = 320.0, .cy = 240.0};
+  const auto dets = backend.DetectImageFile(path, invalid_intrinsics, 0.16);
+  ASSERT_EQ(dets.size(), 1u);
+  EXPECT_FALSE(dets[0].pose.has_value());
+
+  // Direct EstimatePose rejects invalid intrinsics, non-positive tag size, and
+  // degenerate collinear corners with std::nullopt.
+  const CameraIntrinsics valid_intrinsics{
+      .fx = 700.0, .fy = 700.0, .cx = 640.0, .cy = 360.0};
+  EXPECT_FALSE(
+      backend.EstimatePose(dets[0], invalid_intrinsics, 0.16).has_value());
+  EXPECT_FALSE(
+      backend.EstimatePose(dets[0], valid_intrinsics, 0.0).has_value());
+  Detection collinear;
+  collinear.corners = {Point2D{100.0, 100.0}, Point2D{200.0, 100.0},
+                       Point2D{300.0, 100.0}, Point2D{400.0, 100.0}};
+  EXPECT_FALSE(
+      backend.EstimatePose(collinear, valid_intrinsics, 0.16).has_value());
+
+  // Pinned failed-secondary-search corners (new_minima > 1 -> ambiguity == 1.0
+  // while alternative_error == +Inf): has_alternative must be false.
+  Detection missing_secondary;
+  missing_secondary.corners = {
+      Point2D{488.490112, 242.771851}, Point2D{497.506744, 250.814423},
+      Point2D{504.358826, 243.886002}, Point2D{498.08548, 236.256561}};
+  const auto missing_alt =
+      backend.EstimatePose(missing_secondary, valid_intrinsics, 0.1651);
+  ASSERT_TRUE(missing_alt.has_value());
+  EXPECT_TRUE(std::isinf(missing_alt->alternative_error));
+  EXPECT_FALSE(missing_alt->has_alternative);
+
+  // Clean tilted synthetic tag with finite dual minimum must report
+  // has_alternative == true and an orthonormal alternative rotation.
+  const CameraIntrinsics clean_intr{
+      .fx = 600.0, .fy = 600.0, .cx = 320.0, .cy = 240.0};
+  constexpr double kTagSize = 0.2;
+  const auto rot =
+      talos::geometry::SO3<double>::Exp(Eigen::Vector3d(0.25, -0.35, 0.1));
+  const Eigen::Vector3d trans(0.2, -0.1, 2.5);
+  Detection tilted;
+  constexpr double xs[4] = {-1.0, 1.0, 1.0, -1.0};
+  constexpr double ys[4] = {1.0, 1.0, -1.0, -1.0};
+  for (int i = 0; i < 4; ++i) {
+    Eigen::Vector2d px;
+    ASSERT_TRUE(clean_intr.ProjectPoint(
+        rot.act(Eigen::Vector3d(xs[i] * kTagSize / 2.0, ys[i] * kTagSize / 2.0,
+                                0.0)) +
+            trans,
+        &px));
+    tilted.corners[i] = Point2D{px.x(), px.y()};
+  }
+  const auto dual = backend.EstimatePose(tilted, clean_intr, kTagSize);
+  ASSERT_TRUE(dual.has_value());
+  EXPECT_TRUE(std::isfinite(dual->alternative_error));
+  EXPECT_TRUE(dual->has_alternative);
+  EXPECT_NEAR(dual->alternative_rotation.determinant(), 1.0, 1e-6);
 }
 
 }  // namespace talos::vision::apriltag

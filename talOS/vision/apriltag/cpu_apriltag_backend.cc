@@ -1,6 +1,7 @@
 #include "talOS/vision/apriltag/cpu_apriltag_backend.h"
 
 #include <array>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -60,6 +61,9 @@ void EnterBackground(void* argument) {
 }  // namespace
 
 void EnsureBackgroundWorkerPool(apriltag_detector_t* td) {
+  if (td == nullptr || td->nthreads < 1) {
+    return;
+  }
   if (td->wp != nullptr && workerpool_get_nthreads(td->wp) == td->nthreads) {
     return;
   }
@@ -126,6 +130,13 @@ image_u8* LoadGrayscaleImageFile(const std::string& filepath) {
     if (!gray.empty() && gray.cols > 0 && gray.rows > 0) {
       im = image_u8_create(static_cast<uint32_t>(gray.cols),
                            static_cast<uint32_t>(gray.rows));
+      if (im == nullptr) {
+        return nullptr;
+      }
+      if (im->buf == nullptr) {
+        image_u8_destroy(im);
+        return nullptr;
+      }
       for (int y = 0; y < gray.rows; ++y) {
         std::memcpy(im->buf + static_cast<size_t>(y) * im->stride,
                     gray.ptr<uint8_t>(y), static_cast<size_t>(gray.cols));
@@ -201,21 +212,36 @@ struct CpuAprilTagBackend::Impl {
   }
 
   void Initialize(const DetectorOptions& options) {
-    Destroy();
-    td = apriltag_detector_create();
-    tf = CreateTagFamily(options.family_name);
-    if (tf == nullptr) {
+    if (options.threads < 1) {
+      throw std::invalid_argument("AprilTag threads must be >= 1");
+    }
+    if (!std::isfinite(options.quad_decimate)) {
+      throw std::invalid_argument("AprilTag quad_decimate must be finite");
+    }
+    std::string new_family = options.family_name;
+    apriltag_family_t* new_tf = CreateTagFamily(new_family);
+    if (new_tf == nullptr) {
       throw std::invalid_argument("Unsupported AprilTag family: " +
                                   options.family_name);
     }
-    active_family = options.family_name;
-    apriltag_detector_add_family_bits(td, tf, options.max_hamming);
+    apriltag_detector_t* new_td = apriltag_detector_create();
+    if (new_td == nullptr) {
+      DestroyTagFamily(new_family, new_tf);
+      throw std::runtime_error("Failed to create AprilTag detector");
+    }
+    apriltag_detector_add_family_bits(new_td, new_tf, options.max_hamming);
 
-    td->nthreads = options.threads;
-    td->quad_decimate = options.quad_decimate;
-    td->quad_sigma = options.quad_sigma;
-    td->refine_edges = options.refine_edges ? 1 : 0;
-    td->decode_sharpening = options.decode_sharpening;
+    new_td->nthreads = options.threads;
+    new_td->quad_decimate = options.quad_decimate;
+    new_td->quad_sigma = options.quad_sigma;
+    new_td->refine_edges = options.refine_edges ? 1 : 0;
+    new_td->decode_sharpening = options.decode_sharpening;
+
+    // Commit atomically so a failure never leaves td/tf half-torn-down.
+    Destroy();
+    td = new_td;
+    tf = new_tf;
+    active_family = std::move(new_family);
   }
 };
 
@@ -236,13 +262,18 @@ CpuAprilTagBackend& CpuAprilTagBackend::operator=(
     CpuAprilTagBackend&&) noexcept = default;
 
 void CpuAprilTagBackend::SetOptions(const DetectorOptions& options) {
-  options_ = options;
-  impl_->Initialize(options_);
+  DetectorOptions next = options;
+  impl_->Initialize(next);
+  options_ = std::move(next);
 }
 
 static bool ImageDimensionsSupported(const apriltag_detector_t* td, int width,
                                      int height) {
-  if (width < 4 || height < 4 || width >= 32768 || height >= 32768) {
+  if (td == nullptr || width < 4 || height < 4 || width >= 32768 ||
+      height >= 32768) {
+    return false;
+  }
+  if (!std::isfinite(td->quad_decimate)) {
     return false;
   }
   int quad_w = width;
@@ -252,6 +283,9 @@ static bool ImageDimensionsSupported(const apriltag_detector_t* td, int width,
       quad_w = (width / 3) * 2;
       quad_h = (height / 3) * 2;
     } else {
+      if (td->quad_decimate >= 32768.0f) {
+        return false;
+      }
       const int factor = static_cast<int>(td->quad_decimate);
       if (factor > 1) {
         quad_w = 1 + (width - 1) / factor;
@@ -268,7 +302,8 @@ static std::vector<Detection> ProcessDetections(
     const CpuAprilTagBackend& backend, apriltag_detector_t* td, image_u8_t* im,
     const CameraIntrinsics* intrinsics = nullptr,
     double tag_size_meters = 0.0) {
-  if (!ImageDimensionsSupported(td, im->width, im->height)) {
+  if (td == nullptr || im == nullptr ||
+      !ImageDimensionsSupported(td, im->width, im->height)) {
     return {};
   }
   EnsureBackgroundWorkerPool(td);
@@ -292,6 +327,10 @@ std::vector<Detection> CpuAprilTagBackend::Detect(
   if (stride > 0 && stride < width) {
     return {};
   }
+  if (impl_ == nullptr || impl_->td == nullptr ||
+      !ImageDimensionsSupported(impl_->td, width, height)) {
+    return {};
+  }
   const int actual_stride = (stride > 0) ? stride : width;
 
   image_u8_t* im = nullptr;
@@ -311,6 +350,13 @@ std::vector<Detection> CpuAprilTagBackend::Detect(
   if (actual_stride != width ||
       (options_.quad_sigma != 0.0f && options_.quad_decimate <= 1.0f)) {
     im = image_u8_create(width, height);
+    if (im == nullptr) {
+      return {};
+    }
+    if (im->buf == nullptr) {
+      image_u8_destroy(im);
+      return {};
+    }
     for (int y = 0; y < height; ++y) {
       std::memcpy(&im->buf[static_cast<size_t>(y) * im->stride],
                   &gray_data[static_cast<size_t>(y) * actual_stride], width);
@@ -341,6 +387,9 @@ std::vector<Detection> CpuAprilTagBackend::DetectImageFile(
 std::vector<Detection> CpuAprilTagBackend::DetectImageFile(
     const std::string& filepath, const CameraIntrinsics& intrinsics,
     double tag_size_meters) {
+  if (impl_ == nullptr || impl_->td == nullptr) {
+    return {};
+  }
   image_u8_t* im = LoadGrayscaleImageFile(filepath);
   if (im == nullptr) {
     return {};
@@ -354,7 +403,7 @@ std::vector<Detection> CpuAprilTagBackend::DetectImageFile(
   return results;
 }
 
-PoseEstimation CpuAprilTagBackend::EstimatePose(
+std::optional<PoseEstimation> CpuAprilTagBackend::EstimatePose(
     const Detection& detection, const CameraIntrinsics& intrinsics,
     double tag_size_meters) const {
   std::array<float, 9> homography;
@@ -377,14 +426,16 @@ PoseEstimation CpuAprilTagBackend::EstimatePose(
           homography, intrinsics, tag_size_meters, &result.pose,
           &result.alternative_pose, &result.error, &result.alternative_error,
           &ambiguity, &corners)) {
-    return result;
+    return std::nullopt;
   }
   result.rotation = result.pose.rotation().rotationMatrix();
   result.translation = result.pose.translation();
-  result.has_alternative = ambiguity > 0.0;
-  result.alternative_rotation =
-      result.alternative_pose.rotation().rotationMatrix();
-  result.alternative_translation = result.alternative_pose.translation();
+  result.has_alternative = std::isfinite(result.alternative_error);
+  if (result.has_alternative) {
+    result.alternative_rotation =
+        result.alternative_pose.rotation().rotationMatrix();
+    result.alternative_translation = result.alternative_pose.translation();
+  }
   return result;
 }
 

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -176,11 +177,7 @@ class Frame {
         uint32_t height, PixelFormat format = PixelFormat::kGray8,
         uint32_t stride = 0)
       : Frame(NoStorage{}, camera_id, session_id, sequence_number, capture_time,
-              width, height,
-              (stride > 0)
-                  ? stride
-                  : width * static_cast<uint32_t>(BytesPerPixel(format)),
-              format) {
+              width, height, ResolveStride(width, format, stride), format) {
     AllocateAlignedOwned(static_cast<size_t>(stride_) * height_);
   }
 
@@ -385,6 +382,16 @@ class Frame {
 
  private:
   static constexpr size_t kPageAlignment = 4096;
+
+  static constexpr uint32_t ResolveStride(uint32_t width, PixelFormat format,
+                                          uint32_t stride) {
+    if (stride > 0) return stride;
+    const size_t row_bytes = static_cast<size_t>(width) * BytesPerPixel(format);
+    if (row_bytes > std::numeric_limits<uint32_t>::max()) {
+      return 0;
+    }
+    return static_cast<uint32_t>(row_bytes);
+  }
 
   // Selects the constructor that sets the metadata and dimensions only; the
   // public constructors delegate to it and then attach their storage.
