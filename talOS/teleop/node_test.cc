@@ -1808,5 +1808,104 @@ period_us = 20000
   EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(), 60.0);
 }
 
+// REQ-SAFE-31: when Teleop starts or restarts while /hw/state/driver_station
+// already holds kEnabled | kTeleop with a deflected stick, Teleop starts
+// disarmed (OperatorArming disarmed) and keeps its target lane released until
+// the stick returns to neutral.
+TEST(TeleopNode,
+     StartAndRestartWithPreexistingDeflectedStickStartsDisarmedAndReleased) {
+  Sim sim = MakeSim(kAxisToml);
+  auto& arm = sim.add<ConsumerNode<control::VelocityTarget>>("arm");
+  SimHardware hw{sim};
+  hw.enable();
+
+  const auto latest_status = [&sim] {
+    return sim.latest<::teleop::TeleopStatus>(::teleop::topics::kStatus);
+  };
+  const auto arm_lane = [&sim] {
+    return talos::testing::LatestTarget<control::VelocityTarget>(sim, "arm",
+                                                                 "teleop");
+  };
+
+  // Publish enabled teleop with a deflected stick BEFORE Teleop attaches.
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1.0f)));
+  ASSERT_TRUE(
+      sim.latest<talos::hardware::Packet>(talos::hardware::kDriverStationTopic)
+          .has_value());
+
+  // Cold start while /hw/state/driver_station already holds kEnabled | kTeleop
+  // with a deflected stick: starts disarmed, reports the blocking axis, and
+  // releases the lane once until the stick returns to neutral.
+  sim.add<Teleop>("teleop");
+  sim.step(60ms);
+  ASSERT_TRUE(latest_status().has_value());
+  EXPECT_FALSE(latest_status()->armed());
+  EXPECT_TRUE(latest_status()->alert_warning_disarmed());
+  EXPECT_EQ(latest_status()->blocking_kind(),
+            ::teleop::BlockingInputKind::AXIS);
+  EXPECT_EQ(latest_status()->blocking_joystick_index(), 0);
+  EXPECT_EQ(latest_status()->blocking_input_index(), 0);
+  EXPECT_FALSE(arm.seen.has_value());
+  ASSERT_TRUE(arm_lane().has_value());
+  EXPECT_EQ(arm_lane()->active, 0);
+
+  // Return to neutral to arm, then deflect to actively drive the lane.
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+  ASSERT_TRUE(latest_status().has_value());
+  EXPECT_TRUE(latest_status()->armed());
+  EXPECT_FALSE(latest_status()->alert_warning_disarmed());
+  EXPECT_FALSE(arm.seen.has_value());
+
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1.0f)));
+  ASSERT_TRUE(arm.seen.has_value());
+  EXPECT_NEAR(arm.seen->velocity_rps(), 10.0, 1e-6);
+  ASSERT_TRUE(arm_lane().has_value());
+  EXPECT_EQ(arm_lane()->active, 1);
+
+  // Restart Teleop mid-run while /hw/state/driver_station already holds
+  // kEnabled | kTeleop with the deflected stick (and while the pre-restart
+  // lane envelope is still younger than command_timeout_us): the restarted
+  // Teleop must start disarmed and immediately release the target lane once,
+  // staying silent on subsequent disarmed ticks until the stick returns to
+  // neutral.
+  const auto lane_count = [&sim] {
+    return talos::detail::SimAccess::message_count(
+        sim, "/arm/target/teleop",
+        sizeof(talos::TargetEnvelope<control::VelocityTarget>));
+  };
+  sim.remove("teleop");
+  sim.add<Teleop>("teleop");
+  sim.step(40ms);
+  ASSERT_TRUE(latest_status().has_value());
+  EXPECT_FALSE(latest_status()->armed());
+  EXPECT_TRUE(latest_status()->alert_warning_disarmed());
+  EXPECT_EQ(latest_status()->blocking_kind(),
+            ::teleop::BlockingInputKind::AXIS);
+  EXPECT_FALSE(arm.seen.has_value());
+  ASSERT_TRUE(arm_lane().has_value());
+  EXPECT_EQ(arm_lane()->active, 0);
+  const std::uint64_t count_after_release = lane_count();
+
+  // Keeping the stick deflected never rearms, drives, or spams releases.
+  sim.step(120ms);
+  EXPECT_FALSE(latest_status()->armed());
+  EXPECT_FALSE(arm.seen.has_value());
+  EXPECT_EQ(arm_lane()->active, 0);
+  EXPECT_EQ(lane_count(), count_after_release);
+
+  // Returning to neutral rearms without driving; a fresh deflection then
+  // drives again.
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+  EXPECT_TRUE(latest_status()->armed());
+  EXPECT_FALSE(latest_status()->alert_warning_disarmed());
+  EXPECT_FALSE(arm.seen.has_value());
+  EXPECT_EQ(arm_lane()->active, 0);
+
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1.0f)));
+  ASSERT_TRUE(arm.seen.has_value());
+  EXPECT_NEAR(arm.seen->velocity_rps(), 10.0, 1e-6);
+  EXPECT_EQ(arm_lane()->active, 1);
+}
+
 }  // namespace
 }  // namespace talos::teleop

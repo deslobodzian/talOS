@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -2195,6 +2196,129 @@ TEST(Target, AConsumerStartedAfterATargetWasPublishedNeverDrivesOnIt) {
   PublishTarget(sim, "lift", "teleop", Goal{0.5}, generation);
   sim.step(5ms);
   EXPECT_EQ(hw.applied_motor("lift", "m").mode, hardware::Mode::kDutyCycle);
+}
+
+// REQ-SAFE-31: when /hw/state (enabled) and /hw/state/driver_station
+// (kEnabled | kTeleop, stick deflected) are already published before an
+// actuator node attaches, the newly attached node never observes
+// robot_enabled(), never observes the pre-existing Driver Station packet, and
+// never drives on the pre-existing frames -- even if a fresh post-attach target
+// arrives -- until fresh post-attach /hw/state and /hw/state/driver_station
+// frames arrive.
+TEST(Target,
+     ActuatorAttachedAfterPreexistingHardwareAndDsNeverDrivesUntilFreshFrames) {
+  struct PreexistingActuator {
+    explicit PreexistingActuator(Node& n)
+        : node{n}, target{n}, ds{n}, motor{n, "m"} {}
+    void update() {
+      ++updates;
+      if (robot_enabled(node)) ++enabled_ticks;
+      if (ds.connected()) {
+        ++ds_connected_ticks;
+        const double axis = std::abs(ds.joystick(0).axis(0));
+        if (axis > max_axis_seen) max_axis_seen = axis;
+        if (ds.joystick(0).button(1)) saw_button_held = true;
+      }
+      if (const auto* goal = target.get()) {
+        ++target_ticks;
+        motor.set_duty_cycle(goal->position_rot());
+      }
+    }
+    Node& node;
+    Target<Goal> target;
+    DriverStation ds;
+    Motor motor;
+    int updates = 0;
+    int enabled_ticks = 0;
+    int ds_connected_ticks = 0;
+    int target_ticks = 0;
+    double max_axis_seen = 0.0;
+    bool saw_button_held = false;
+  };
+
+  auto sim = Sim::FromToml(kRobotToml);
+  SimHardware hw{sim};
+  hw.enable();
+  auto held_ds = DsPacket(kTeleop);
+  held_ds.joysticks[0].connected = true;
+  held_ds.joysticks[0].axis_count = 1;
+  held_ds.joysticks[0].axes[0] = 0.8f;
+  held_ds.joysticks[0].button_count = 1;
+  held_ds.joysticks[0].buttons = 1u;
+  hw.set_driver_station(held_ds);
+  sim.step(10ms);
+
+  ASSERT_TRUE(sim.latest<hardware::Packet>(hardware::kStateTopic).has_value());
+  ASSERT_TRUE(
+      sim.latest<hardware::Packet>(hardware::kDriverStationTopic).has_value());
+  const std::uint64_t generation = DriverStationGeneration(sim);
+  ASSERT_NE(generation, 0u);
+  PublishTarget(sim, "lift", "teleop", Goal{0.25}, generation);
+
+  // Hold back post-attach /hw/state and /hw/state/driver_station so all
+  // pre-existing frames remain fresh (< 100 ms command_timeout_us) while the
+  // newly attached actuator runs its first ticks.
+  hw.stop_driver_station();
+  hw.lose_states(4);
+  auto& lift = sim.add<PreexistingActuator>("lift");
+  EXPECT_FALSE(robot_enabled(lift.node));
+  EXPECT_FALSE(lift.ds.connected());
+
+  // Two ticks with no post-attach frames at all.
+  sim.step(10ms);
+  EXPECT_EQ(lift.updates, 2);
+  EXPECT_EQ(lift.enabled_ticks, 0);
+  EXPECT_EQ(lift.ds_connected_ticks, 0);
+  EXPECT_EQ(lift.target_ticks, 0);
+  EXPECT_DOUBLE_EQ(lift.max_axis_seen, 0.0);
+  EXPECT_FALSE(lift.saw_button_held);
+  EXPECT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kNeutral);
+  EXPECT_EQ(hw.applied_motor("lift", "m").mode, hardware::Mode::kNeutral);
+  EXPECT_EQ(detail::SimAccess::message_count(sim, "/hw/request/lift",
+                                             sizeof(hardware::Packet)),
+            0u);
+
+  // Even a fresh post-attach target cannot drive while no post-attach
+  // /hw/state or /hw/state/driver_station has arrived.
+  PublishTarget(sim, "lift", "teleop", Goal{0.5}, generation);
+  sim.step(10ms);
+  EXPECT_EQ(lift.updates, 4);
+  EXPECT_EQ(lift.enabled_ticks, 0);
+  EXPECT_EQ(lift.ds_connected_ticks, 0);
+  EXPECT_EQ(lift.target_ticks, 0);
+  EXPECT_FALSE(robot_enabled(lift.node));
+  EXPECT_FALSE(lift.ds.connected());
+  EXPECT_EQ(hw.applied_motor("lift", "m").mode, hardware::Mode::kNeutral);
+  EXPECT_EQ(detail::SimAccess::message_count(sim, "/hw/request/lift",
+                                             sizeof(hardware::Packet)),
+            0u);
+
+  // Fresh post-attach /hw/state alone makes robot_enabled() true, yet the
+  // pre-existing /hw/state/driver_station (still < 100 ms old) is never
+  // delivered, so the actuator stays neutral.
+  sim.step(10ms);
+  EXPECT_TRUE(robot_enabled(lift.node));
+  EXPECT_GT(lift.enabled_ticks, 0);
+  EXPECT_EQ(lift.ds_connected_ticks, 0);
+  EXPECT_FALSE(lift.ds.connected());
+  EXPECT_DOUBLE_EQ(lift.max_axis_seen, 0.0);
+  EXPECT_FALSE(lift.saw_button_held);
+  EXPECT_EQ(lift.target_ticks, 0);
+  EXPECT_EQ(hw.applied_motor("lift", "m").mode, hardware::Mode::kNeutral);
+
+  // Once a fresh post-attach /hw/state/driver_station arrives (same
+  // generation), the actuator sees it and drives on the post-attach target.
+  hw.set_driver_station(held_ds);
+  sim.step(10ms);
+  EXPECT_EQ(DriverStationGeneration(sim), generation);
+  EXPECT_TRUE(robot_enabled(lift.node));
+  EXPECT_TRUE(lift.ds.connected());
+  EXPECT_GT(lift.ds_connected_ticks, 0);
+  EXPECT_NEAR(lift.max_axis_seen, 0.8, 1e-6);
+  EXPECT_TRUE(lift.saw_button_held);
+  EXPECT_GT(lift.target_ticks, 0);
+  EXPECT_EQ(hw.applied_motor("lift", "m").mode, hardware::Mode::kDutyCycle);
+  EXPECT_DOUBLE_EQ(hw.applied_motor("lift", "m").demand, 0.5);
 }
 
 // REQ-CONTRACT-13: TargetEnvelopeBytes rejects sizes that would wrap size_t or
