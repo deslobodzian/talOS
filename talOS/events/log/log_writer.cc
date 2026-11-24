@@ -664,7 +664,11 @@ void LogWriter::State::start_writer() {
       lock.unlock();
       if (unwritten || (streaming && now < write_at)) {
         timed = true;
-        raw->wake.wait_until(std::min(write_at, sync_at));
+        const auto deadline = std::min(write_at, sync_at);
+        if (raw->options.before_timed_wait) {
+          raw->options.before_timed_wait(deadline - now);
+        }
+        raw->wake.wait_until(deadline);
         raw->wakeups.fetch_add(1, std::memory_order_relaxed);
       } else {
         // An empty timed wake ends the stream: the next record finds the

@@ -17,6 +17,7 @@
 #include "gtest/gtest.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/process/host_qualification.h"
 
 namespace talos::event::log {
 namespace {
@@ -143,6 +144,12 @@ TEST(LogKill, KilledWriterKeepsRecordsWrittenBeforeTheKill) {
   ASSERT_GE(child, 0);
   if (child == 0) LogUntilKilled(path, progress.ptr);
 
+  // Start StallMeter only after fork() so the child stays single-threaded.
+  // Judged only on a host whose scheduling stalls stay well inside the margin
+  // between the 10 ms write_interval and the 100 ms survival bound
+  // (docs/TESTING.md §6.7).
+  talos::process::StallMeter host;
+
   // The 10 s deadline only bounds a hang (docs/TESTING.md §6.3).
   std::chrono::steady_clock::time_point deadline{};
   std::chrono::steady_clock::time_point kill_time{};
@@ -189,6 +196,15 @@ TEST(LogKill, KilledWriterKeepsRecordsWrittenBeforeTheKill) {
   ASSERT_EQ(::kill(child, SIGKILL), 0);
   int status = 0;
   ASSERT_EQ(::waitpid(child, &status, 0), child);
+  const std::uint64_t stall_us = host.Stop();
+  constexpr std::uint64_t kMaxStallUs = 25000;
+  if (stall_us >= kMaxStallUs) {
+    ::testing::Test::RecordProperty("host_unqualified", "true");
+  }
+  ASSERT_LT(stall_us, kMaxStallUs)
+      << "[HOST_UNQUALIFIED] host unqualified: an ordinary thread's 1 ms sleep "
+         "overran by "
+      << stall_us << " us (limit " << kMaxStallUs << " us)";
   ASSERT_TRUE(WIFSIGNALED(status)) << "child exited with " << status;
   ASSERT_GE(seen, kRecords) << "the log held " << seen << " records after 10 s"
                             << " of logging at 200 Hz with no sync due";

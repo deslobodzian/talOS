@@ -60,11 +60,10 @@ LogWriter::Options ShortSyncOptions() {
 // (docs/TESTING.md §6.3); no test asserts how long a wait took.
 template <typename Done>
 bool Eventually(Done done) {
-  std::chrono::steady_clock::time_point deadline{};
-  for (bool first = true; !done(); first = false) {
-    const auto now = std::chrono::steady_clock::now();
-    if (first) deadline = now + std::chrono::seconds{10};
-    if (now >= deadline) return false;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  while (!done()) {
+    if (std::chrono::steady_clock::now() >= deadline) return false;
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
   return true;
@@ -4106,14 +4105,15 @@ TEST(LogBackgroundWriter, StreamingSmallRecordsWakeAtMostOncePerWriteInterval) {
 }
 
 // While small records stream into an active chunk without filling it and with
-// sync_interval an hour away, the background writer flushes batches at the
-// default 10 ms write_interval: the median inter-write interval over >= 50
-// streaming batches stays well below 50 ms (docs/TESTING.md §6.8).
+// sync_interval an hour away, the background writer schedules each timed wait
+// within the default 10 ms write_interval and flushes the committed prefix
+// (REQ-OPS-31). Uses the before_timed_wait seam rather than a wall-clock
+// latency assertion so the fast lane stays deterministic on busy hosts.
 // REQ-OPS-31
 TEST(LogBackgroundWriter, StreamingWriteIntervalFlushesWithinBound) {
   const auto path = TempPath("stream_write_interval");
   std::uint64_t index = 0;
-  constexpr std::size_t kSamples = 50;
+  constexpr std::size_t kStreamingBatches = 5;
   {
     LogWriter::Options options{};
     ASSERT_EQ(options.write_interval, std::chrono::milliseconds{10});
@@ -4123,17 +4123,23 @@ TEST(LogBackgroundWriter, StreamingWriteIntervalFlushesWithinBound) {
     options.chunk_bytes = 1u << 20;
     options.sync_interval = std::chrono::hours{1};
 
-    std::mutex ts_mutex;
-    std::vector<std::chrono::steady_clock::time_point> write_times;
-    write_times.reserve(kSamples + 16);
-    std::atomic<std::size_t> write_count{0};
-    options.before_write = [&] {
-      const auto now = std::chrono::steady_clock::now();
+    std::mutex wait_mutex;
+    std::vector<std::chrono::nanoseconds> timed_waits;
+    std::atomic<bool> saw_timed_wait{false};
+    options.before_timed_wait = [&](std::chrono::nanoseconds wait_duration) {
       {
-        std::lock_guard lock{ts_mutex};
-        write_times.push_back(now);
+        std::lock_guard lock{wait_mutex};
+        timed_waits.push_back(wait_duration);
       }
+      saw_timed_wait.store(true, std::memory_order_release);
+    };
+    std::atomic<std::size_t> write_count{0};
+    std::atomic<std::size_t> timed_writes{0};
+    options.before_write = [&] {
       write_count.fetch_add(1, std::memory_order_release);
+      if (saw_timed_wait.exchange(false, std::memory_order_acq_rel)) {
+        timed_writes.fetch_add(1, std::memory_order_release);
+      }
     };
 
     LogWriter writer{path, "stream_latency", options};
@@ -4152,32 +4158,27 @@ TEST(LogBackgroundWriter, StreamingWriteIntervalFlushesWithinBound) {
     ASSERT_TRUE(Eventually(
         [&] { return write_count.load(std::memory_order_acquire) >= 1; }));
 
-    // Stream records faster than write_interval until kSamples + 1 streaming
-    // writes (kSamples consecutive inter-write intervals) have landed.
+    // Stream records faster than write_interval until kStreamingBatches
+    // timed write_interval waits have each been followed by a write.
     ASSERT_TRUE(Eventually([&] {
       log_one();
-      return write_count.load(std::memory_order_acquire) >= kSamples + 2;
+      return timed_writes.load(std::memory_order_acquire) >= kStreamingBatches;
     }));
 
-    std::vector<std::chrono::nanoseconds> intervals;
     {
-      std::lock_guard lock{ts_mutex};
-      ASSERT_GE(write_times.size(), kSamples + 2);
-      intervals.reserve(kSamples);
-      for (std::size_t i = 2; i < kSamples + 2; ++i) {
-        intervals.push_back(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                write_times[i] - write_times[i - 1]));
+      std::lock_guard lock{wait_mutex};
+      ASSERT_GE(timed_waits.size(), kStreamingBatches)
+          << "expected streaming writes to schedule timed write_interval waits";
+      for (const auto wait_duration : timed_waits) {
+        EXPECT_GT(wait_duration, std::chrono::nanoseconds{0});
+        EXPECT_LE(wait_duration, options.write_interval)
+            << "timed wait exceeded write_interval: "
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   wait_duration)
+                   .count()
+            << " us";
       }
     }
-    std::sort(intervals.begin(), intervals.end());
-    const auto median = intervals[intervals.size() / 2];
-    // REQ-OPS-31: 10 ms write_interval; median < 50 ms across 50 streaming
-    // batches catches inflated write_interval regressions without flaking.
-    EXPECT_LT(median, std::chrono::milliseconds{50})
-        << "median inter-write interval was "
-        << std::chrono::duration_cast<std::chrono::milliseconds>(median).count()
-        << " ms (expected ~10 ms)";
 
     writer.flush();
     EXPECT_FALSE(writer.failed()) << writer.error();

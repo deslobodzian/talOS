@@ -29,8 +29,8 @@ talOS/bridge/node_test_support.h clock 6 integration helpers: the bridge over UD
 talOS/bridge/node_test_support.h sleep 1 integration helpers: WaitFor polls 100 us apart a condition the bridge's Run() thread makes true without notifying the test
 talOS/bridge/run_test.cc clock 6 integration: Run() on the real clock; measures registry-progress gaps (stall timeout) and wakes per elapsed window (REQ-RT-20)
 talOS/bridge/run_test.cc sleep 1 integration: samples the registry row 1 ms apart for its gaps
-talOS/events/log/log_kill_test.cc clock 2 integration: kills a writer process, waits with a deadline
-talOS/events/log/log_kill_test.cc sleep 2 integration: kills a writer process, waits with a deadline
+talOS/events/log/log_kill_test.cc clock 2 integration: kills a writer process mid-stream and checks records committed > 100 ms before SIGKILL survived, with StallMeter host qualification (REQ-OPS-31)
+talOS/events/log/log_kill_test.cc sleep 2 integration: child paces 200 Hz records and parent polls with a 10 s hang bound before SIGKILL
 talOS/events/log/log_test.cc clock 4 integration: the writer thread; Eventually's 10 s deadline only bounds a hang, and UncreatableLogFailsWithoutThrowing needs its periodic sync due
 talOS/events/log/log_test.cc sleep 6 integration: the writer thread; Eventually polls 1 ms apart, and the wakeup tests (REQ-RT-21) space records and count wakeups over a real-time window
 talOS/events/os/poller_test.cc sleep 2 integration: real kqueue/epoll timer delivery across threads
