@@ -30,14 +30,17 @@ inline double OrderPoseCandidates(talos::geometry::SE3<double>& primary,
                                   talos::geometry::SE3<double>& secondary,
                                   double& primary_error,
                                   double& secondary_error) {
-  const bool primary_nan = std::isnan(primary_error);
-  const bool secondary_nan = std::isnan(secondary_error);
-  if ((primary_nan && !secondary_nan) ||
-      (!primary_nan && !secondary_nan && secondary_error < primary_error)) {
+  const bool primary_invalid = std::isnan(primary_error) || primary_error < 0.0;
+  const bool secondary_invalid =
+      std::isnan(secondary_error) || secondary_error < 0.0;
+  if ((primary_invalid && !secondary_invalid) ||
+      (!primary_invalid && !secondary_invalid &&
+       secondary_error < primary_error)) {
     std::swap(primary, secondary);
     std::swap(primary_error, secondary_error);
   }
-  if (!std::isfinite(primary_error) || std::isnan(secondary_error)) {
+  if (!std::isfinite(primary_error) || primary_error < 0.0 ||
+      std::isnan(secondary_error) || secondary_error < 0.0) {
     return 1.0;
   }
   if (std::isinf(secondary_error)) {
@@ -56,6 +59,10 @@ inline double ComputeReprojectionError(
     const std::array<float, 8>& observed_corners,
     const talos::geometry::SE3<double>& T_camera_tag,
     const CameraIntrinsics& intrinsics, double tag_size_m) {
+  if (!intrinsics.IsValid() || !std::isfinite(tag_size_m) ||
+      tag_size_m <= 0.0 || !T_camera_tag.matrix().allFinite()) {
+    return 1e9;
+  }
   const auto model_corners = GetTagModelCorners(tag_size_m);
   double sum_sq_err = 0.0;
 
@@ -68,12 +75,16 @@ inline double ComputeReprojectionError(
 
     const double obs_u = observed_corners[i * 2];
     const double obs_v = observed_corners[i * 2 + 1];
+    if (!std::isfinite(obs_u) || !std::isfinite(obs_v)) {
+      return 1e9;
+    }
     const double du = obs_u - uv_proj.x();
     const double dv = obs_v - uv_proj.y();
     sum_sq_err += du * du + dv * dv;
   }
 
-  return std::sqrt(sum_sq_err / 4.0);
+  const double rms = std::sqrt(sum_sq_err / 4.0);
+  return std::isfinite(rms) ? rms : 1e9;
 }
 
 // Decomposes planar homography H into camera-to-tag SE(3) pose estimates
@@ -222,6 +233,7 @@ inline bool EstimateTagPoseFromHomography(
   const double solver_tag_size = extreme_size ? 1.0 : tag_size_m;
 
   temp_det.H = matd_create_data(3, 3, h_data);
+  if (!temp_det.H) return false;
 
   apriltag_detection_info_t info{
       .det = &temp_det,
@@ -452,9 +464,9 @@ inline void AnnotateDetectionReasons(std::vector<TagDetection3D>& detections,
     const auto& p = d.T_camera_tag;
     const double range = p.translation().norm();
     const double z = p.translation().z();
-    if (!std::isfinite(range) || range > max_range_m ||
-        z <= validation.min_z_m || range < validation.min_distance_m ||
-        range > validation.max_distance_m) {
+    if (!std::isfinite(range) || !(range <= max_range_m) ||
+        !(z > validation.min_z_m) || !(range >= validation.min_distance_m) ||
+        !(range <= validation.max_distance_m)) {
       d.reject_reason = "range";
       continue;
     }
@@ -568,21 +580,26 @@ inline RobotPoseEstimate ComputeRobotFieldPose(
   const double d = p.translation().norm();
   if (!p.matrix().allFinite() || !out.T_field_robot.matrix().allFinite())
     return reject(PoseInvalidReason::kInvalidRotation);
-  if (p.translation().z() <= options.min_z_m)
+  if (!(p.translation().z() > options.min_z_m))
     return reject(PoseInvalidReason::kBehindCamera);
-  if (!std::isfinite(d) || d > options.max_distance_m)
+  if (!std::isfinite(d) || !(d <= options.max_distance_m))
     return reject(PoseInvalidReason::kTooFar);
-  if (d < options.min_distance_m) return reject(PoseInvalidReason::kTooClose);
+  if (!(d >= options.min_distance_m))
+    return reject(PoseInvalidReason::kTooClose);
   if (!std::isfinite(out.reprojection_error_px) ||
-      out.reprojection_error_px >
-          options.max_reprojection_error_px * (resolved ? 1.5 : 1))
+      out.reprojection_error_px < 0.0 ||
+      !(out.reprojection_error_px <=
+        options.max_reprojection_error_px * (resolved ? 1.5 : 1.0)))
     return reject(PoseInvalidReason::kHighReprojectionError);
-  if (!std::isfinite(ambiguity) ||
-      (ambiguity > options.max_ambiguity && !resolved))
+  if (!std::isfinite(ambiguity) || ambiguity < 0.0 ||
+      (!(ambiguity <= options.max_ambiguity) && !resolved))
     return reject(PoseInvalidReason::kHighAmbiguity);
-  const auto r = p.rotation().rotationMatrix();
-  if ((r * r.transpose() - Eigen::Matrix3d::Identity()).norm() > 1e-2 ||
-      r.determinant() <= 0)
+  const auto valid_rotation = [](const Eigen::Matrix3d& r) {
+    return (r * r.transpose() - Eigen::Matrix3d::Identity()).norm() <= 1e-2 &&
+           r.determinant() > 0.0;
+  };
+  if (!valid_rotation(p.rotation().rotationMatrix()) ||
+      !valid_rotation(out.T_field_robot.rotation().rotationMatrix()))
     return reject(PoseInvalidReason::kInvalidRotation);
   out.average_distance_m = d;
   out.validity = {true, PoseInvalidReason::kValid, "Valid"};
@@ -597,14 +614,28 @@ using PoseNormalMatrix = Eigen::Matrix<double, 6, 6>;
 inline bool SetCovarianceStdDevs(const PoseNormalMatrix& normal,
                                  const PoseSolverOptions& options,
                                  RobotPoseEstimate* estimate) {
+  if (estimate == nullptr) return false;
   auto reject = [&] {
     estimate->validity = {
         false, PoseInvalidReason::kInvalidCovariance,
         "Joint pose covariance is not finite positive definite"};
     return false;
   };
+  if (!std::isfinite(options.min_xy_std_m) || options.min_xy_std_m < 0.0 ||
+      !std::isfinite(options.min_yaw_std_rad) ||
+      options.min_yaw_std_rad < 0.0 ||
+      !std::isfinite(options.mount_angle_std_rad) ||
+      options.mount_angle_std_rad < 0.0 ||
+      !std::isfinite(options.mount_translation_std_m) ||
+      options.mount_translation_std_m < 0.0 ||
+      !std::isfinite(estimate->average_distance_m) ||
+      estimate->average_distance_m < 0.0) {
+    return reject();
+  }
   if (!normal.allFinite()) return reject();
-  const Eigen::LLT<PoseNormalMatrix> factor(normal);
+  const PoseNormalMatrix sym_normal = 0.5 * (normal + normal.transpose());
+  if (!sym_normal.allFinite()) return reject();
+  const Eigen::LLT<PoseNormalMatrix> factor(sym_normal);
   if (factor.info() != Eigen::Success) return reject();
   const PoseNormalMatrix covariance =
       factor.solve(PoseNormalMatrix::Identity());
@@ -612,8 +643,9 @@ inline bool SetCovarianceStdDevs(const PoseNormalMatrix& normal,
       Eigen::LLT<PoseNormalMatrix>(covariance).info() != Eigen::Success)
     return reject();
   const auto r = estimate->T_field_robot.rotation().rotationMatrix();
+  if (!r.allFinite()) return reject();
   const double yaw_denom = r(0, 0) * r(0, 0) + r(1, 0) * r(1, 0);
-  if (yaw_denom <= 1e-12) return reject();
+  if (!std::isfinite(yaw_denom) || !(yaw_denom > 1e-12)) return reject();
   Eigen::Matrix<double, 3, 6> map = Eigen::Matrix<double, 3, 6>::Zero();
   map.block<2, 3>(0, 3) = r.topRows<2>();
   map(2, 1) = (r(1, 0) * r(0, 2) - r(0, 0) * r(1, 2)) / yaw_denom;
@@ -639,10 +671,17 @@ inline bool SetCovarianceStdDevs(const PoseNormalMatrix& normal,
   field_covariance(1, 1) += mount_xy_var;
   field_covariance(2, 2) +=
       options.mount_angle_std_rad * options.mount_angle_std_rad;
-  estimate->std_devs = {
-      std::max(options.min_xy_std_m, std::sqrt(field_covariance(0, 0))),
-      std::max(options.min_xy_std_m, std::sqrt(field_covariance(1, 1))),
-      std::max(options.min_yaw_std_rad, std::sqrt(field_covariance(2, 2)))};
+  const double x_std =
+      std::max(options.min_xy_std_m, std::sqrt(field_covariance(0, 0)));
+  const double y_std =
+      std::max(options.min_xy_std_m, std::sqrt(field_covariance(1, 1)));
+  const double yaw_std =
+      std::max(options.min_yaw_std_rad, std::sqrt(field_covariance(2, 2)));
+  if (!std::isfinite(x_std) || !std::isfinite(y_std) ||
+      !std::isfinite(yaw_std)) {
+    return reject();
+  }
+  estimate->std_devs = {x_std, y_std, yaw_std};
   return true;
 }
 }  // namespace detail
@@ -739,6 +778,18 @@ inline RobotPoseEstimate MultiTagPoseSolver::Solve(
       noise.mount_translation_std_m < 0)
     return reject(PoseInvalidReason::kInvalidCovariance,
                   "Invalid solver noise");
+  if (!std::isfinite(options.max_reprojection_error_px) ||
+      options.max_reprojection_error_px < 0.0 ||
+      !std::isfinite(options.max_ambiguity) || options.max_ambiguity < 0.0 ||
+      !std::isfinite(options.min_distance_m) || options.min_distance_m < 0.0 ||
+      !std::isfinite(options.max_distance_m) ||
+      options.max_distance_m < options.min_distance_m ||
+      !std::isfinite(options.min_z_m) || options.min_z_m < 0.0)
+    return reject(PoseInvalidReason::kInvalidCovariance,
+                  "Invalid validation options");
+  if (!mounting.T_robot_camera.matrix().allFinite())
+    return reject(PoseInvalidReason::kInvalidRotation,
+                  "Invalid camera mounting");
   // Layout ids are unique, so a repeated id is at most one real tag; the rest
   // are false decodes or printed copies elsewhere in view. Each id, in the
   // detector's order of first appearance, keeps its kMaxDetectionsPerId
@@ -749,13 +800,24 @@ inline RobotPoseEstimate MultiTagPoseSolver::Solve(
            (a.decision_margin == b.decision_margin &&
             a.reprojection_error < b.reprojection_error);
   };
+  auto corners_finite = [](const std::array<float, 8>& corners) {
+    for (const float v : corners) {
+      if (!std::isfinite(v)) return false;
+    }
+    return true;
+  };
   auto& ids = ids_;
   ids.clear();
   ids.reserve(observations.size());
   for (const auto& t : observations) {
     const double d = t.T_camera_tag.translation().norm();
-    if (!t.valid || !layout.HasTag(t.tag_id) || !std::isfinite(d) ||
-        d < options.min_distance_m || d > options.max_distance_m ||
+    const auto field_pose = layout.GetTagPose(t.tag_id);
+    const double tag_size = layout.GetTagSize(t.tag_id);
+    if (!t.valid || !field_pose || !field_pose->matrix().allFinite() ||
+        !std::isfinite(tag_size) || tag_size < 0.0 ||
+        !t.T_camera_tag.matrix().allFinite() || !corners_finite(t.corners) ||
+        !std::isfinite(d) || d < options.min_distance_m ||
+        d > options.max_distance_m ||
         t.T_camera_tag.translation().z() <= options.min_z_m)
       continue;
     auto id = std::find_if(ids.begin(), ids.end(),
@@ -919,6 +981,7 @@ inline RobotPoseEstimate MultiTagPoseSolver::Solve(
           Eigen::RowVector3d(1, sr * tp, cr * tp) / noise.floor_tilt_std_rad;
       jacobian->block<1, 3>(pixel_rows + 2, 0) =
           Eigen::RowVector3d(0, cr, -sr) / noise.floor_tilt_std_rad;
+      if (!jacobian->allFinite()) return false;
     }
     return residual.allFinite();
   };
@@ -1043,14 +1106,19 @@ inline RobotPoseEstimate MultiTagPoseSolver::Solve(
     // (2 pixel_std_px^2)]: never below nominal, and at most the per-coordinate
     // variance ratio of a fit at the reprojection reject threshold.
     const int dof = rows - 6;
+    const double weighted_sq = weighted_residual.squaredNorm();
+    if (!std::isfinite(weighted_sq)) {
+      est.validity = {false, PoseInvalidReason::kInvalidCovariance,
+                      "Joint pose residual variance is non-finite"};
+      return est;
+    }
     const double threshold_ratio =
         options.max_reprojection_error_px / noise.pixel_std_px;
+    const double max_scale = 0.5 * threshold_ratio * threshold_ratio;
     const double variance_scale =
-        dof > 0
-            ? std::max(1.0, std::min(weighted_residual.squaredNorm() /
-                                         static_cast<double>(dof),
-                                     0.5 * threshold_ratio * threshold_ratio))
-            : 1.0;
+        dof > 0 ? std::max(1.0, std::min(weighted_sq / static_cast<double>(dof),
+                                         max_scale))
+                : 1.0;
     const detail::PoseNormalMatrix information = normal / variance_scale;
     if (!detail::SetCovarianceStdDevs(information, noise, &est)) return est;
     if (!std::isfinite(est.reprojection_error_px) ||

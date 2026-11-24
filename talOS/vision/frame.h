@@ -108,10 +108,14 @@ inline std::optional<uint64_t> CaptureMidpoint(uint64_t stamp_ns,
     if (geometry > UINT64_MAX - earlier) return std::nullopt;
     earlier += geometry;
   }
-  if (stamp_ns > UINT64_MAX - later) return std::nullopt;
-  const uint64_t shifted = stamp_ns + later;
-  if (shifted < earlier) return std::nullopt;
-  return shifted - earlier;
+  if (later >= earlier) {
+    const uint64_t net_later = later - earlier;
+    if (stamp_ns > UINT64_MAX - net_later) return std::nullopt;
+    return stamp_ns + net_later;
+  }
+  const uint64_t net_earlier = earlier - later;
+  if (stamp_ns < net_earlier) return std::nullopt;
+  return stamp_ns - net_earlier;
 }
 
 // Carries camera identification, capture timing, dimensions, format,
@@ -150,7 +154,7 @@ class Frame {
       : owned_storage_{std::move(other.owned_storage_)},
         shared_storage_{std::move(other.shared_storage_)},
         was_shared_{
-            other.was_shared_.exchange(false, std::memory_order_relaxed)},
+            other.was_shared_.exchange(false, std::memory_order_acquire)},
         data_offset_{std::exchange(other.data_offset_, 0)},
         borrowed_{std::exchange(other.borrowed_, nullptr)},
         borrowed_size_{std::exchange(other.borrowed_size_, 0)} {
@@ -163,7 +167,7 @@ class Frame {
     owned_storage_ = std::move(other.owned_storage_);
     shared_storage_ = std::move(other.shared_storage_);
     was_shared_.store(
-        other.was_shared_.exchange(false, std::memory_order_relaxed),
+        other.was_shared_.exchange(false, std::memory_order_acquire),
         std::memory_order_relaxed);
     data_offset_ = std::exchange(other.data_offset_, 0);
     borrowed_ = std::exchange(other.borrowed_, nullptr);
@@ -178,7 +182,9 @@ class Frame {
         uint32_t stride = 0)
       : Frame(NoStorage{}, camera_id, session_id, sequence_number, capture_time,
               width, height, ResolveStride(width, format, stride), format) {
-    AllocateAlignedOwned(static_cast<size_t>(stride_) * height_);
+    if (const auto total = CheckedMul(stride_, height_)) {
+      AllocateAlignedOwned(*total);
+    }
   }
 
   // Constructs a Frame moving an owned buffer.
@@ -321,7 +327,7 @@ class Frame {
   // storage size only while stride or height is zero); see holds_image().
   size_t size() const {
     if (stride_ > 0 && height_ > 0) {
-      return static_cast<size_t>(stride_) * height_;
+      return CheckedMul(stride_, height_).value_or(0);
     }
     return stored_size();
   }
@@ -332,11 +338,18 @@ class Frame {
   // holds: nonzero width and height, a stride covering one row, and at least
   // stride * height stored bytes. Read pixels only from such a frame.
   bool holds_image() const {
-    if (width_ == 0 || height_ == 0 ||
-        stride_ < static_cast<size_t>(width_) * bytes_per_pixel()) {
+    if (width_ == 0 || height_ == 0) {
       return false;
     }
-    return stored_size() >= size();
+    const auto min_stride = CheckedMul(width_, bytes_per_pixel());
+    if (!min_stride || stride_ < *min_stride) {
+      return false;
+    }
+    const auto required = CheckedMul(stride_, height_);
+    if (!required) {
+      return false;
+    }
+    return stored_size() >= *required;
   }
 
   // Returns true if buffer storage is shared with other handles.
@@ -353,9 +366,9 @@ class Frame {
   Frame Clone() const {
     Frame cloned;
     cloned.CopyMetadataFrom(*this);
-    const size_t bytes = static_cast<size_t>(stride_) * height_;
+    const auto bytes = CheckedMul(stride_, height_);
     // Never read past the bytes actually stored in the source frame.
-    const size_t copied = std::min(bytes, stored_size());
+    const size_t copied = bytes ? std::min(*bytes, stored_size()) : 0;
     if (copied > 0 && data() != nullptr) {
       cloned.CopyIntoAlignedOwned(data(), copied);
     }
@@ -383,15 +396,24 @@ class Frame {
 
  private:
   static constexpr size_t kPageAlignment = 4096;
+  static_assert((kPageAlignment & (kPageAlignment - 1)) == 0,
+                "kPageAlignment must be a power of two");
+
+  static constexpr std::optional<size_t> CheckedMul(size_t a, size_t b) {
+    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
+      return std::nullopt;
+    }
+    return a * b;
+  }
 
   static constexpr uint32_t ResolveStride(uint32_t width, PixelFormat format,
                                           uint32_t stride) {
     if (stride > 0) return stride;
-    const size_t row_bytes = static_cast<size_t>(width) * BytesPerPixel(format);
-    if (row_bytes > std::numeric_limits<uint32_t>::max()) {
+    const auto row_bytes = CheckedMul(width, BytesPerPixel(format));
+    if (!row_bytes || *row_bytes > std::numeric_limits<uint32_t>::max()) {
       return 0;
     }
-    return static_cast<uint32_t>(row_bytes);
+    return static_cast<uint32_t>(*row_bytes);
   }
 
   // Selects the constructor that sets the metadata and dimensions only; the
@@ -429,22 +451,31 @@ class Frame {
 
   static size_t AlignmentOffset(const uint8_t* ptr) {
     const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-    return (kPageAlignment - (addr % kPageAlignment)) % kPageAlignment;
+    return (kPageAlignment - (addr & (kPageAlignment - 1))) &
+           (kPageAlignment - 1);
   }
 
   void AllocateAlignedOwned(size_t bytes) {
     was_shared_.store(false, std::memory_order_relaxed);
-    if (bytes == 0) {
+    constexpr size_t kMaxAllocBytes =
+        static_cast<size_t>(std::numeric_limits<std::ptrdiff_t>::max()) -
+        kPageAlignment;
+    if (bytes == 0 || bytes > kMaxAllocBytes) {
       owned_storage_.reset();
       data_offset_ = 0;
       return;
     }
     auto storage =
         std::make_shared<std::vector<uint8_t>>(bytes + kPageAlignment);
-    data_offset_ = AlignmentOffset(storage->data());
-    // Shrinking within capacity never reallocates, keeping data() page-aligned
-    // while making (storage->size() - data_offset_) == bytes exact.
-    storage->resize(data_offset_ + bytes);
+    const size_t offset = AlignmentOffset(storage->data());
+    data_offset_ = offset;
+    // Erasing the tail shrinks within capacity without reallocating, keeping
+    // data() page-aligned while making (storage->size() - data_offset_) ==
+    // bytes exact (and avoiding std::vector::resize's dead append path that
+    // triggers GCC 16 -Warray-bounds).
+    storage->erase(
+        storage->begin() + static_cast<std::ptrdiff_t>(offset + bytes),
+        storage->end());
     owned_storage_ = std::move(storage);
   }
 

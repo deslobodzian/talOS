@@ -55,6 +55,11 @@ class AprilTagPipeline {
  public:
   explicit AprilTagPipeline(const PipelineConfig& config,
                             std::shared_ptr<ComputeBackend> backend = nullptr);
+  ~AprilTagPipeline();
+  AprilTagPipeline(const AprilTagPipeline&) = delete;
+  AprilTagPipeline& operator=(const AprilTagPipeline&) = delete;
+  AprilTagPipeline(AprilTagPipeline&&) noexcept;
+  AprilTagPipeline& operator=(AprilTagPipeline&&) noexcept;
 
   // Not thread-safe: call from one thread at a time.
   PipelineResult ProcessFrame(const Frame& frame);

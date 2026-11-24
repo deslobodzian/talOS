@@ -809,6 +809,54 @@ TEST(SingleProcess, ReadNextEmptyInvalidAndInactiveCases) {
             ReadResult::INACTIVE);
 }
 
+// REQ-CONTRACT-36: out-of-range reader_sequence() queries and operations on a
+// moved-from RTMSQueue must fail safely without out-of-bounds or null
+// dereferences.
+TEST(SingleProcess, ReaderSequenceAndMovedFromQueueGuardInvalidAccess) {
+  const std::string path = make_test_path("rn_bounds");
+  RTMSQueue queue{
+      path,
+      sizeof(Message::TestMessage),
+      alignof(Message::TestMessage),
+      kSchema,
+      8,
+      overwrite_sequence_options(),
+  };
+
+  const auto reader_id = queue.register_reader();
+  ASSERT_TRUE(reader_id.has_value());
+  const std::size_t id = *reader_id;
+
+  const Message::TestMessage message{3, 3.0F};
+  ASSERT_EQ(queue.write(BytesOf(message)).result, WriteResult::SUCCESS);
+  std::array<std::byte, sizeof(Message::TestMessage)> buffer{};
+  MessageInfo info{};
+  ASSERT_EQ(queue.read_next(id, std::span<std::byte>(buffer), info),
+            ReadResult::OK);
+  EXPECT_EQ(queue.reader_sequence(id), 1u);
+  EXPECT_EQ(queue.reader_sequence(MAX_READERS), 0u);
+  EXPECT_EQ(queue.reader_sequence(MAX_READERS + 100), 0u);
+
+  const auto check_moved_from = [&](RTMSQueue& moved_from) {
+    // NOLINTBEGIN(clang-analyzer-cplusplus.Move)
+    EXPECT_EQ(moved_from.reader_sequence(id), 0u);
+    EXPECT_EQ(moved_from.read_next(id, std::span<std::byte>(buffer), info),
+              ReadResult::INVALID);
+    EXPECT_EQ(moved_from.write(BytesOf(message)).result, WriteResult::FAILURE);
+    // NOLINTEND(clang-analyzer-cplusplus.Move)
+  };
+  RTMSQueue* moved_from_ptr = &queue;
+  RTMSQueue moved = std::move(queue);
+  check_moved_from(*moved_from_ptr);
+
+  ASSERT_EQ(moved.write(BytesOf(Message::TestMessage{4, 4.0F})).result,
+            WriteResult::SUCCESS);
+  EXPECT_EQ(moved.read_next(id, std::span<std::byte>(buffer), info),
+            ReadResult::OK);
+  EXPECT_EQ(moved.reader_sequence(id), 2u);
+  moved.release_reader(id);
+}
+
 TEST(SingleProcess, ReadNextLapsUsingDocumentedFormula) {
   const std::string path = make_test_path("rn_lap");
 
