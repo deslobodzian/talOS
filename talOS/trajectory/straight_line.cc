@@ -59,8 +59,8 @@ struct Profile {
 // axis's MinimumTime) at full acceleration and the lowest cruise speed that
 // does it. The axis that sets total_s cruises at its limit, or peaks at
 // sqrt(accel distance) (a triangle). The other solves cruise^2 - accel
-// total cruise + accel distance = 0 for the smaller root, written to avoid
-// cancellation.
+// total cruise + accel distance = 0 for the smaller root, factored by
+// accel * total_s to avoid both cancellation and intermediate overflow.
 Profile Fit(double distance, double speed, double accel, double total_s) {
   Profile p{distance, accel, 0, 0, total_s};
   if (distance <= 0 || total_s <= 0) return p;
@@ -69,10 +69,13 @@ Profile Fit(double distance, double speed, double accel, double total_s) {
                    ? std::sqrt(distance) * std::sqrt(accel)
                    : speed;
   } else {
+    const double avg = distance / total_s;
     const double at = accel * total_s;
-    const double discriminant = std::max(0.0, at * at - 4 * accel * distance);
-    p.cruise =
-        std::min(speed, 2 * accel * distance / (at + std::sqrt(discriminant)));
+    const double ratio = (std::isfinite(at) && at > 0.0)
+                             ? 4.0 * (avg / at)
+                             : 4.0 * ((avg / accel) / total_s);
+    const double root = std::sqrt(std::max(0.0, 1.0 - ratio));
+    p.cruise = std::min(speed, avg / (0.5 * (1.0 + root)));
   }
   p.ramp_s = std::min(p.cruise / accel, total_s / 2);
   return p;
