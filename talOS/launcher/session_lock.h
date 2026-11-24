@@ -199,6 +199,21 @@ inline bool FlockUnsupported(int code) {
          code == ENOSYS;
 }
 
+// Calls `lock(fd, operation)`, retrying EINTR up to 100 times and reporting
+// the final errno in `code` (0 on success).
+inline int FlockRetryEintr(const FlockFunction& lock, int fd, int operation,
+                           int& code) {
+  int result = -1;
+  code = 0;
+  for (int attempt = 0; attempt < 100; ++attempt) {
+    errno = 0;
+    result = lock(fd, operation);
+    code = errno;
+    if (result == 0 || code != EINTR) break;
+  }
+  return result;
+}
+
 // The file in a log root that ProbeLogRootLocks locks. Not a directory, so
 // retention never takes it for a session.
 inline constexpr std::string_view kLockProbeFile = ".talos-lock-probe";
@@ -502,16 +517,28 @@ class SessionDirectoryLock {
   }
 
   // The file path_ names, opened (created when absent, never its directory)
-  // and exclusively locked; -1 when it cannot be.
+  // and exclusively locked; -1 when it cannot be. Retries briefly on
+  // EWOULDBLOCK or a replaced inode so a concurrent SessionDirectoryLock::Held
+  // shared-lock probe landing between open and flock does not look like a lost
+  // lock while staying well inside a supervision pass.
   int TakeCurrent(const FlockFunction& lock) const {
-    const int fd = introspect::OpenLockFile(path_, O_RDWR);
-    if (fd < 0) return -1;
-    if (lock(fd, LOCK_EX | LOCK_NB) != 0 ||
-        !introspect::LockFileIsCurrent(fd, path_)) {
+    constexpr int kAttempts = 10;
+    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+      const int fd = introspect::OpenLockFile(path_, O_RDWR);
+      if (fd < 0) return -1;
+      int code = 0;
+      if (FlockRetryEintr(lock, fd, LOCK_EX | LOCK_NB, code) == 0) {
+        if (introspect::LockFileIsCurrent(fd, path_)) return fd;
+        ::close(fd);
+        continue;
+      }
       ::close(fd);
-      return -1;
+      if (code != EWOULDBLOCK) return -1;
+      if (attempt + 1 < kAttempts) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+      }
     }
-    return fd;
+    return -1;
   }
 
   int fd_{-1};
