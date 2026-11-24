@@ -23,6 +23,7 @@ past the 3 s button-press edge, proving that the launcher holds sim_gateway's
 schedule start until every non-observer member's loop has started so each
 mechanism still receives its full button window."""
 
+import contextlib
 import json
 import os
 import shlex
@@ -196,6 +197,24 @@ def delay_teleop_startup(work, delay_s):
     os.chmod(wrapper, 0o755)
 
 
+@contextlib.contextmanager
+def preserve_artifacts_on_failure(tmp, subdir):
+    """Preserves launch.log and sessions/ under TEST_UNDECLARED_OUTPUTS_DIR on
+    any test failure (docs/TESTING.md §8.2)."""
+    failed = True
+    try:
+        yield
+        failed = False
+    finally:
+        if failed:
+            kept = sim_check.preserve_failure_artifacts(
+                os.path.join(tmp, "launch.log"),
+                os.path.join(tmp, "sessions"),
+                subdir=subdir)
+            if kept:
+                print(f"failure artifacts preserved: {kept}", file=sys.stderr)
+
+
 class ScaffoldSimTest(unittest.TestCase):
     def launch(self, tmp, work, launcher, env, config, gateway_extra,
                duration_s):
@@ -262,7 +281,9 @@ class ScaffoldSimTest(unittest.TestCase):
         # reports a configured link with no alert, reject or fault.
         r = runfiles.Create()
         log_dump = r.Rlocation("_main/talOS/launcher/log_dump")
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, \
+                preserve_artifacts_on_failure(
+                    tmp, "scaffold_sim_no_mechanism_failure"):
             work, launcher, env = harness.workspace(tmp)
             harness.generate(work, None, None)
             session, diagnostics = self.launch(
@@ -354,7 +375,9 @@ class ScaffoldSimTest(unittest.TestCase):
     def test_next_steps_move_each_mechanism_to_its_goal(self):
         r = runfiles.Create()
         log_dump = r.Rlocation("_main/talOS/launcher/log_dump")
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, \
+                preserve_artifacts_on_failure(
+                    tmp, "scaffold_sim_next_steps_failure"):
             work, launcher, env = harness.workspace(tmp)
             buttons = scaffold(work)
             # Two mechanisms on one press is what teleop_button prevents.
@@ -384,7 +407,9 @@ class ScaffoldSimTest(unittest.TestCase):
         # session.
         r = runfiles.Create()
         log_dump = r.Rlocation("_main/talOS/launcher/log_dump")
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, \
+                preserve_artifacts_on_failure(
+                    tmp, "scaffold_sim_late_member_failure"):
             work, launcher, env = harness.workspace(tmp)
             buttons = scaffold(work)
             config = follow_next(work, buttons)
@@ -398,6 +423,7 @@ class ScaffoldSimTest(unittest.TestCase):
             self.addCleanup(unlink_registry, namespace)
             output = os.path.join(tmp, "sessions")
             os.makedirs(output)
+            log = os.path.join(tmp, "launch.log")
             args = [
                 launcher, "--config", config, "--sim",
                 "--duration-s", str(new_subsystem.SIM_DURATION_S),
@@ -412,10 +438,18 @@ class ScaffoldSimTest(unittest.TestCase):
                 "--local-port", str(bridge_port),
                 "--output-dir", output,
             ]
-            run = subprocess.run(
-                args, cwd=work, env=env, capture_output=True, text=True,
-                timeout=new_subsystem.SIM_DURATION_S + 20)
+            try:
+                run = subprocess.run(
+                    args, cwd=work, env=env, capture_output=True, text=True,
+                    timeout=new_subsystem.SIM_DURATION_S + 20)
+            except subprocess.TimeoutExpired as exc:
+                partial = (exc.stdout or "") + (exc.stderr or "")
+                with open(log, "w", encoding="utf-8", errors="replace") as f:
+                    f.write(partial)
+                raise
             diagnostics = run.stdout + run.stderr
+            with open(log, "w", encoding="utf-8", errors="replace") as f:
+                f.write(diagnostics)
             self.assertEqual(run.returncode, 0, diagnostics)
             sessions = [d for d in os.listdir(output)
                         if os.path.isdir(os.path.join(output, d))]

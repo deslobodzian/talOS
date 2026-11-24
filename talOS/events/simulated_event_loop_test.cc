@@ -70,28 +70,36 @@ TEST(SimulatedEventLoop, TimerChangeFromAHandlerlessThreadDuringRunIsRejected) {
   SimulationEnvironment environment;
   SimulatedEventLoop<> loop{environment};
 
-  std::optional<std::logic_error> caught;
+  std::optional<std::logic_error> caught_arm;
+  std::optional<std::logic_error> caught_disarm;
+  std::uint16_t id = 0;
   auto handler = [&](const Context&) {
     std::thread other{[&] {
       try {
-        loop.arm_timer(0, loop.monotonic_now() + 1ms, 1ms);
+        loop.arm_timer(id, loop.monotonic_now() + 1ms, 1ms);
       } catch (const std::logic_error& error) {
-        caught.emplace(error);
+        caught_arm.emplace(error);
+      }
+      try {
+        loop.disarm_timer(id);
+      } catch (const std::logic_error& error) {
+        caught_disarm.emplace(error);
       }
     }};
     other.join();
     loop.exit();
   };
 
-  const auto id = loop.register_timer("tick", make_thunk(&handler));
+  id = loop.register_timer("tick", make_thunk(&handler));
   loop.arm_timer(id, MonotonicTime::from_nanos(1'000'000), 1ms);
   loop.run_for(5ms);
 
-  if (!caught.has_value()) {
-    FAIL() << "no logic_error caught";
-  }
+  EXPECT_TRUE(caught_arm.has_value()) << "arm_timer did not throw logic_error";
+  EXPECT_TRUE(caught_disarm.has_value())
+      << "disarm_timer did not throw logic_error";
 }
 
+// REQ-RT-02
 TEST(SimulatedEventLoop, LatestSkipsBacklogButCallbacksKeepCappedSequence) {
   SimulationEnvironment environment;
   SimulatedEventLoop<> loop{environment};
@@ -604,6 +612,7 @@ TEST(SimulatedEventLoop, ExitStopsTheLoop) {
 // drained completely before the timer callback runs, matching
 // RealtimeEventLoop.
 // REQ-SAFE-01
+// REQ-RT-01
 // REQ-RT-04
 TEST(SimulatedEventLoop, TimerDrainsFullSequenceBacklogBeforeDispatching) {
   constexpr int kQueued = 80;  // over max_messages_per_tick (64), under ring
@@ -901,6 +910,34 @@ TEST(SimulatedEventLoop,
     loop.run_until(MonotonicTime::max());
     EXPECT_EQ(quiet_count, 40u);
     EXPECT_EQ(loop.drains(), 3u);
+  }
+
+  // A periodic timer armed within one period of MonotonicTime::max() must fire
+  // once and terminate cleanly rather than overflowing signed int64_t and
+  // spinning forever.
+  {
+    SimulationEnvironment environment;
+    SimulatedEventLoop<> loop{environment};
+    loop.set_delivery(Delivery::BEFORE_TIMERS);
+    std::vector<Context> firings;
+    auto on_timer = [&](const Context& context) {
+      firings.push_back(context);
+      if (firings.size() > 5u) {
+        ADD_FAILURE() << "periodic timer near max() wrapped and spun";
+        loop.exit();
+      }
+    };
+    const auto timer_id =
+        loop.register_timer("near_max", make_thunk(&on_timer));
+    const MonotonicTime deadline = MonotonicTime::max() - 5ms;
+    loop.arm_timer(timer_id, deadline, 10ms);
+
+    loop.run_until(MonotonicTime::max());
+    ASSERT_EQ(firings.size(), 1u);
+    EXPECT_EQ(firings[0].event_time, deadline);
+    EXPECT_EQ(firings[0].now, deadline);
+    EXPECT_EQ(firings[0].sequence, 1u);
+    EXPECT_EQ(loop.monotonic_now(), MonotonicTime::max());
   }
 }
 

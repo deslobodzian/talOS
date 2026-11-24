@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <typeinfo>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -52,8 +53,18 @@ std::function<void()> Callback(TalosCallback fn, void* user, const char* what) {
   return [fn, user, what] { Check(fn(user), what); };
 }
 
-HardwareLink& Link(TalosNode* node) {
+HardwareLink& EnsureLink(TalosNode* node) {
   return AsNode(node).extension<HardwareLink>();
+}
+
+HardwareLink& FindLink(TalosNode* node, std::size_t index) {
+  auto* link = static_cast<HardwareLink*>(
+      NodeAccess::find_extension(AsNode(node), typeid(HardwareLink)));
+  if (link == nullptr) {
+    throw std::out_of_range("no device handle at index " +
+                            std::to_string(index));
+  }
+  return *link;
 }
 
 detail::DeviceKind DeviceKindOf(std::int32_t kind) {
@@ -337,6 +348,27 @@ std::optional<detail::ParamValue> FindParam(const Node& node,
 void SetError(std::string message) { g_last_error = std::move(message); }
 void ClearError() { g_last_error.clear(); }
 const std::string& LastError() { return g_last_error; }
+
+namespace {
+void ForwardHostError(const char* message) noexcept {
+  try {
+    if (message == nullptr || message[0] == '\0') {
+      ClearError();
+    } else {
+      SetError(message);
+    }
+  } catch (...) {
+    ClearError();
+  }
+}
+
+struct HostErrorRegistrar {
+  HostErrorRegistrar() {
+    NodeAccess::set_host_error_callback(&ForwardHostError);
+  }
+};
+const HostErrorRegistrar kHostErrorRegistrar{};
+}  // namespace
 
 }  // namespace talos::node_api
 
@@ -658,7 +690,7 @@ int32_t talos_state_machine_just_entered(const TalosNode* node, int64_t index) {
 int64_t talos_device(TalosNode* node, int32_t kind, const char* name) {
   return Guard<int64_t>(-1, [&] {
     return static_cast<int64_t>(HardwareAccess::add_device(
-        Link(node), DeviceKindOf(kind), NonNull(name, "device name")));
+        EnsureLink(node), DeviceKindOf(kind), NonNull(name, "device name")));
   });
 }
 
@@ -677,7 +709,7 @@ int32_t talos_allow_untargeted_outputs(TalosNode* node) {
 int32_t talos_hardware_sample_time(TalosNode* node, int64_t* out_ns) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     if (out_ns == nullptr) throw std::invalid_argument("null out_ns");
-    const std::optional<talos::Time> sampled = Link(node).sample_time();
+    const std::optional<talos::Time> sampled = EnsureLink(node).sample_time();
     if (!sampled) return 0;
     *out_ns = sampled->nanos();
     return 1;
@@ -686,7 +718,7 @@ int32_t talos_hardware_sample_time(TalosNode* node, int64_t* out_ns) {
 
 int32_t talos_hardware_fresh(TalosNode* node, int64_t max_age_ns) {
   return Guard<int32_t>(TALOS_ERR, [&] {
-    const talos::HardwareLink& link = Link(node);
+    const talos::HardwareLink& link = EnsureLink(node);
     return static_cast<int32_t>(max_age_ns < 0
                                     ? link.fresh()
                                     : link.fresh(talos::Duration{max_age_ns}));
@@ -696,7 +728,7 @@ int32_t talos_hardware_fresh(TalosNode* node, int64_t max_age_ns) {
 int32_t talos_hardware_age(TalosNode* node, int64_t* out_ns) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     if (out_ns == nullptr) throw std::invalid_argument("null out_ns");
-    const talos::Duration age = Link(node).age();
+    const talos::Duration age = EnsureLink(node).age();
     if (age == talos::Duration::max()) return 0;
     *out_ns = age.count();
     return 1;
@@ -706,7 +738,8 @@ int32_t talos_hardware_age(TalosNode* node, int64_t* out_ns) {
 int32_t talos_motor_set(TalosNode* node, int64_t index, int32_t mode,
                         double demand, double ff_volts, int32_t slot) {
   return Guard<int32_t>(TALOS_ERR, [&] {
-    HardwareAccess::motor_set(Link(node), Index(index), MotorMode(mode), demand,
+    const std::size_t idx = Index(index);
+    HardwareAccess::motor_set(FindLink(node, idx), idx, MotorMode(mode), demand,
                               ff_volts, slot);
     return TALOS_OK;
   });
@@ -715,29 +748,33 @@ int32_t talos_motor_set(TalosNode* node, int64_t index, int32_t mode,
 int32_t talos_motor_rezero(TalosNode* node, int64_t index,
                            double position_rot) {
   return Guard<int32_t>(TALOS_ERR, [&] {
-    HardwareAccess::motor_rezero(Link(node), Index(index), position_rot);
+    const std::size_t idx = Index(index);
+    HardwareAccess::motor_rezero(FindLink(node, idx), idx, position_rot);
     return TALOS_OK;
   });
 }
 
 int32_t talos_gyro_rezero(TalosNode* node, int64_t index, double yaw_rot) {
   return Guard<int32_t>(TALOS_ERR, [&] {
-    HardwareAccess::gyro_rezero(Link(node), Index(index), yaw_rot);
+    const std::size_t idx = Index(index);
+    HardwareAccess::gyro_rezero(FindLink(node, idx), idx, yaw_rot);
     return TALOS_OK;
   });
 }
 
 int32_t talos_motor_zeroed(TalosNode* node, int64_t index) {
   return Guard<int32_t>(TALOS_ERR, [&] {
+    const std::size_t idx = Index(index);
     return static_cast<int32_t>(
-        HardwareAccess::motor_zeroed(Link(node), Index(index)));
+        HardwareAccess::motor_zeroed(FindLink(node, idx), idx));
   });
 }
 
 int32_t talos_gyro_zeroed(TalosNode* node, int64_t index) {
   return Guard<int32_t>(TALOS_ERR, [&] {
+    const std::size_t idx = Index(index);
     return static_cast<int32_t>(
-        HardwareAccess::gyro_zeroed(Link(node), Index(index)));
+        HardwareAccess::gyro_zeroed(FindLink(node, idx), idx));
   });
 }
 
@@ -745,7 +782,8 @@ int32_t talos_motor_clamped_count(TalosNode* node, int64_t index,
                                   uint64_t* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     if (out == nullptr) throw std::invalid_argument("null out");
-    *out = HardwareAccess::motor_clamped_count(Link(node), Index(index));
+    const std::size_t idx = Index(index);
+    *out = HardwareAccess::motor_clamped_count(FindLink(node, idx), idx);
     return TALOS_OK;
   });
 }
@@ -753,21 +791,24 @@ int32_t talos_motor_clamped_count(TalosNode* node, int64_t index,
 int32_t talos_digital_output_set(TalosNode* node, int64_t index,
                                  int32_t value) {
   return Guard<int32_t>(TALOS_ERR, [&] {
-    HardwareAccess::digital_output_set(Link(node), Index(index), value != 0);
+    const std::size_t idx = Index(index);
+    HardwareAccess::digital_output_set(FindLink(node, idx), idx, value != 0);
     return TALOS_OK;
   });
 }
 
 int32_t talos_pwm_set(TalosNode* node, int64_t index, double output) {
   return Guard<int32_t>(TALOS_ERR, [&] {
-    HardwareAccess::pwm_set(Link(node), Index(index), output);
+    const std::size_t idx = Index(index);
+    HardwareAccess::pwm_set(FindLink(node, idx), idx, output);
     return TALOS_OK;
   });
 }
 
 int32_t talos_pwm_stop(TalosNode* node, int64_t index) {
   return Guard<int32_t>(TALOS_ERR, [&] {
-    HardwareAccess::pwm_stop(Link(node), Index(index));
+    const std::size_t idx = Index(index);
+    HardwareAccess::pwm_stop(FindLink(node, idx), idx);
     return TALOS_OK;
   });
 }
@@ -775,7 +816,8 @@ int32_t talos_pwm_stop(TalosNode* node, int64_t index) {
 int32_t talos_motor_sample(TalosNode* node, int64_t index, TalosSample* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     TalosSample& o = *Out(out);
-    const auto s = HardwareAccess::motor_sample(Link(node), Index(index));
+    const std::size_t idx = Index(index);
+    const auto s = HardwareAccess::motor_sample(FindLink(node, idx), idx);
     o.valid = s.valid;
     o.position = s.position_rot;
     o.velocity = s.velocity_rps;
@@ -792,7 +834,8 @@ int32_t talos_motor_sample(TalosNode* node, int64_t index, TalosSample* out) {
 int32_t talos_sensor_sample(TalosNode* node, int64_t index, TalosSample* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     TalosSample& o = *Out(out);
-    const auto s = HardwareAccess::sensor_sample(Link(node), Index(index));
+    const std::size_t idx = Index(index);
+    const auto s = HardwareAccess::sensor_sample(FindLink(node, idx), idx);
     o.valid = s.valid;
     o.position = s.position_rot;
     o.velocity = s.velocity_rps;
@@ -804,8 +847,9 @@ int32_t talos_motor_time(TalosNode* node, int64_t index, int32_t velocity,
                          int64_t* out_ns) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     if (out_ns == nullptr) throw std::invalid_argument("null out_ns");
+    const std::size_t idx = Index(index);
     const auto time =
-        HardwareAccess::motor_time(Link(node), Index(index), velocity != 0);
+        HardwareAccess::motor_time(FindLink(node, idx), idx, velocity != 0);
     if (!time) return 0;
     *out_ns = time->nanos();
     return 1;
@@ -816,8 +860,9 @@ int32_t talos_sensor_time(TalosNode* node, int64_t index, int32_t velocity,
                           int64_t* out_ns) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     if (out_ns == nullptr) throw std::invalid_argument("null out_ns");
+    const std::size_t idx = Index(index);
     const auto time =
-        HardwareAccess::sensor_time(Link(node), Index(index), velocity != 0);
+        HardwareAccess::sensor_time(FindLink(node, idx), idx, velocity != 0);
     if (!time) return 0;
     *out_ns = time->nanos();
     return 1;
@@ -828,8 +873,9 @@ int32_t talos_motor_age(TalosNode* node, int64_t index, int32_t velocity,
                         int64_t* out_ns) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     if (out_ns == nullptr) throw std::invalid_argument("null out_ns");
+    const std::size_t idx = Index(index);
     const auto age =
-        HardwareAccess::motor_age(Link(node), Index(index), velocity != 0);
+        HardwareAccess::motor_age(FindLink(node, idx), idx, velocity != 0);
     if (!age) return 0;
     *out_ns = age->count();
     return 1;
@@ -840,8 +886,9 @@ int32_t talos_sensor_age(TalosNode* node, int64_t index, int32_t velocity,
                          int64_t* out_ns) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     if (out_ns == nullptr) throw std::invalid_argument("null out_ns");
+    const std::size_t idx = Index(index);
     const auto age =
-        HardwareAccess::sensor_age(Link(node), Index(index), velocity != 0);
+        HardwareAccess::sensor_age(FindLink(node, idx), idx, velocity != 0);
     if (!age) return 0;
     *out_ns = age->count();
     return 1;
@@ -852,8 +899,9 @@ int32_t talos_digital_input_sample(TalosNode* node, int64_t index,
                                    TalosSample* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     TalosSample& o = *Out(out);
+    const std::size_t idx = Index(index);
     const auto s =
-        HardwareAccess::digital_input_sample(Link(node), Index(index));
+        HardwareAccess::digital_input_sample(FindLink(node, idx), idx);
     o.valid = s.valid;
     o.value = s.value;
     return TALOS_OK;
@@ -864,8 +912,9 @@ int32_t talos_analog_input_sample(TalosNode* node, int64_t index,
                                   TalosSample* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     TalosSample& o = *Out(out);
+    const std::size_t idx = Index(index);
     const auto s =
-        HardwareAccess::analog_input_sample(Link(node), Index(index));
+        HardwareAccess::analog_input_sample(FindLink(node, idx), idx);
     o.valid = s.valid;
     o.voltage = s.voltage;
     return TALOS_OK;
@@ -875,7 +924,8 @@ int32_t talos_analog_input_sample(TalosNode* node, int64_t index,
 int32_t talos_encoder_sample(TalosNode* node, int64_t index, TalosSample* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     TalosSample& o = *Out(out);
-    const auto s = HardwareAccess::encoder_sample(Link(node), Index(index));
+    const std::size_t idx = Index(index);
+    const auto s = HardwareAccess::encoder_sample(FindLink(node, idx), idx);
     o.valid = s.valid;
     o.position = s.position_rot;
     o.velocity = s.velocity_rps;

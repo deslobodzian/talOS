@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -520,6 +521,236 @@ TEST(FieldPath, HardensAlignmentBoundsTypesAndDagExpansion) {
     ASSERT_NE(schema, nullptr);
     const auto paths = ScalarPaths(*schema, *schema->objects()->Get(0));
     EXPECT_LE(paths.size(), 4096u);
+  }
+}
+
+// REQ-CONTRACT-07: ULong enum enumerators with bit 63 set (stored as negative
+// int64_t in FlatBuffers reflection) encode their exact uint64_t bits, while
+// non-integer scalars with a non-negative enum index are rejected.
+TEST(FieldPath, EncodeFieldHandlesULongEnumsAndRejectsNonIntegerEnumIndices) {
+  flatbuffers::FlatBufferBuilder builder;
+  const auto enum_name = builder.CreateString("test.Flags");
+  const auto low_name = builder.CreateString("LOW");
+  const auto high_bit_name = builder.CreateString("HIGH_BIT");
+  const auto max_name = builder.CreateString("MAX_VAL");
+
+  reflection::EnumValBuilder ev0(builder);
+  ev0.add_name(low_name);
+  ev0.add_value(1);
+  const auto v0 = ev0.Finish();
+
+  reflection::EnumValBuilder ev1(builder);
+  ev1.add_name(high_bit_name);
+  ev1.add_value(static_cast<std::int64_t>(std::uint64_t{1} << 63));
+  const auto v1 = ev1.Finish();
+
+  reflection::EnumValBuilder ev2(builder);
+  ev2.add_name(max_name);
+  ev2.add_value(
+      static_cast<std::int64_t>(std::numeric_limits<std::uint64_t>::max()));
+  const auto v2 = ev2.Finish();
+
+  const std::vector<flatbuffers::Offset<reflection::EnumVal>> evs = {v0, v1,
+                                                                     v2};
+  const auto values = builder.CreateVector(evs);
+  reflection::TypeBuilder utb(builder);
+  utb.add_base_type(reflection::BaseType::ULong);
+  const auto underlying = utb.Finish();
+  reflection::EnumBuilder eb(builder);
+  eb.add_name(enum_name);
+  eb.add_values(values);
+  eb.add_underlying_type(underlying);
+  const auto enum_off = eb.Finish();
+  const auto enums = builder.CreateVector(&enum_off, 1);
+
+  const auto obj_name = builder.CreateString("test.Holder");
+  auto add_field = [&](const char* fname, reflection::BaseType base,
+                       std::int32_t idx, std::uint16_t id,
+                       std::uint16_t offset) {
+    const auto fn = builder.CreateString(fname);
+    reflection::TypeBuilder tb(builder);
+    tb.add_base_type(base);
+    tb.add_index(idx);
+    const auto ft = tb.Finish();
+    reflection::FieldBuilder fb(builder);
+    fb.add_name(fn);
+    fb.add_type(ft);
+    fb.add_id(id);
+    fb.add_offset(offset);
+    return fb.Finish();
+  };
+  const std::vector<flatbuffers::Offset<reflection::Field>> fields = {
+      add_field("flags", reflection::BaseType::ULong, 0, 0, 0),
+      add_field("bad_bool", reflection::BaseType::Bool, 0, 1, 8),
+      add_field("bad_float", reflection::BaseType::Float, 0, 2, 12),
+      add_field("bad_double", reflection::BaseType::Double, 0, 3, 16),
+      add_field("bad_oob_enum", reflection::BaseType::UByte, 5, 4, 24),
+  };
+  const auto fields_vec = builder.CreateVector(fields);
+  reflection::ObjectBuilder ob(builder);
+  ob.add_name(obj_name);
+  ob.add_fields(fields_vec);
+  ob.add_is_struct(true);
+  ob.add_minalign(8);
+  ob.add_bytesize(32);
+  const auto obj = ob.Finish();
+  const auto objects = builder.CreateVector(&obj, 1);
+  reflection::SchemaBuilder sb(builder);
+  sb.add_objects(objects);
+  sb.add_enums(enums);
+  reflection::FinishSchemaBuffer(builder, sb.Finish());
+
+  const auto* schema =
+      VerifySchema({reinterpret_cast<const char*>(builder.GetBufferPointer()),
+                    builder.GetSize()});
+  ASSERT_NE(schema, nullptr);
+  const auto& holder = *schema->objects()->Get(0);
+
+  const ResolvedField flags = ResolveField(*schema, holder, "flags", "test");
+  ASSERT_NE(flags.enum_def, nullptr);
+  std::array<std::byte, 32> buf{};
+
+  for (const auto& [label, expected] :
+       {std::pair{"LOW", std::uint64_t{1}},
+        std::pair{"HIGH_BIT", std::uint64_t{1} << 63},
+        std::pair{"MAX_VAL", std::numeric_limits<std::uint64_t>::max()}}) {
+    EncodeField(buf.data(), flags, FieldValue{std::string{label}}, "test");
+    std::uint64_t got = 0;
+    std::memcpy(&got, buf.data() + flags.offset, sizeof(got));
+    EXPECT_EQ(got, expected) << label;
+  }
+  EXPECT_THROW(
+      EncodeField(buf.data(), flags, FieldValue{std::string{"NOPE"}}, "test"),
+      std::invalid_argument);
+
+  // Crafted schemas with an enum index on non-integer scalars or out-of-bounds
+  // enum index are rejected at ResolveField.
+  for (const char* bad_path :
+       {"bad_bool", "bad_float", "bad_double", "bad_oob_enum"}) {
+    EXPECT_THROW(ResolveField(*schema, holder, bad_path, "test"),
+                 std::invalid_argument)
+        << bad_path;
+  }
+}
+
+// REQ-CONTRACT-07: EncodeField and EncodeNumber refuse out-of-range floats,
+// NaN/Inf, negative unsigned values, fractional integers, and variant-type
+// mismatches.
+TEST(FieldPath, EncodeFieldAndEncodeNumberRefuseBoundariesAndMismatches) {
+  std::array<std::byte, 8> buf{};
+  auto scalar_field = [](reflection::BaseType base, std::size_t size) {
+    return ResolvedField{
+        .offset = 0,
+        .base_type = base,
+        .size = size,
+        .enum_def = nullptr,
+        .leaf_name = "f",
+        .enclosing_name = "Test",
+    };
+  };
+
+  // Float range limits, NaN, and Inf.
+  const double past_flt_max =
+      static_cast<double>(std::numeric_limits<float>::max()) * 2.0;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  for (const double bad : {past_flt_max, -past_flt_max, nan, inf, -inf}) {
+    EXPECT_THROW(
+        EncodeNumber(buf.data(), reflection::BaseType::Float, bad, "test"),
+        std::invalid_argument);
+    EXPECT_THROW(
+        EncodeField(buf.data(), scalar_field(reflection::BaseType::Float, 4),
+                    FieldValue{bad}, "test"),
+        std::invalid_argument);
+  }
+  for (const double bad : {nan, inf, -inf}) {
+    EXPECT_THROW(
+        EncodeNumber(buf.data(), reflection::BaseType::Double, bad, "test"),
+        std::invalid_argument);
+    EXPECT_THROW(
+        EncodeNumber(buf.data(), reflection::BaseType::Int, bad, "test"),
+        std::invalid_argument);
+    EXPECT_THROW(
+        EncodeNumber(buf.data(), reflection::BaseType::ULong, bad, "test"),
+        std::invalid_argument);
+  }
+
+  // Negative values for unsigned integer fields (both int64_t and double).
+  for (const auto& [base, size] :
+       {std::pair{reflection::BaseType::UType, std::size_t{1}},
+        std::pair{reflection::BaseType::UByte, std::size_t{1}},
+        std::pair{reflection::BaseType::UShort, std::size_t{2}},
+        std::pair{reflection::BaseType::UInt, std::size_t{4}},
+        std::pair{reflection::BaseType::ULong, std::size_t{8}}}) {
+    EXPECT_THROW(EncodeField(buf.data(), scalar_field(base, size),
+                             FieldValue{std::int64_t{-1}}, "test"),
+                 std::invalid_argument);
+    EXPECT_THROW(EncodeField(buf.data(), scalar_field(base, size),
+                             FieldValue{-1.0}, "test"),
+                 std::invalid_argument);
+  }
+
+  // Fractional values for integer fields.
+  for (const reflection::BaseType base :
+       {reflection::BaseType::Int, reflection::BaseType::Long,
+        reflection::BaseType::ULong}) {
+    EXPECT_THROW(EncodeNumber(buf.data(), base, 1.5, "test"),
+                 std::invalid_argument);
+    EXPECT_THROW(EncodeNumber(buf.data(), base, -0.5, "test"),
+                 std::invalid_argument);
+  }
+
+  // Integer range overflow via int64_t and double.
+  EXPECT_THROW(
+      EncodeField(buf.data(), scalar_field(reflection::BaseType::Byte, 1),
+                  FieldValue{std::int64_t{128}}, "test"),
+      std::invalid_argument);
+  EXPECT_THROW(
+      EncodeField(buf.data(), scalar_field(reflection::BaseType::Byte, 1),
+                  FieldValue{std::int64_t{-129}}, "test"),
+      std::invalid_argument);
+  EXPECT_THROW(
+      EncodeField(buf.data(), scalar_field(reflection::BaseType::UShort, 2),
+                  FieldValue{std::int64_t{65536}}, "test"),
+      std::invalid_argument);
+  EXPECT_THROW(EncodeNumber(buf.data(), reflection::BaseType::Long,
+                            std::ldexp(1.0, 63), "test"),
+               std::invalid_argument);
+  EXPECT_THROW(EncodeNumber(buf.data(), reflection::BaseType::ULong,
+                            std::ldexp(1.0, 64), "test"),
+               std::invalid_argument);
+
+  // Type-variant mismatches: bool, enum, and numeric fields.
+  const ResolvedField bool_field = scalar_field(reflection::BaseType::Bool, 1);
+  for (const FieldValue& bad : {FieldValue{std::int64_t{1}}, FieldValue{1.0},
+                                FieldValue{std::string{"true"}}}) {
+    EXPECT_THROW(EncodeField(buf.data(), bool_field, bad, "test"),
+                 std::invalid_argument);
+  }
+
+  const Identity mixed_id = Of<schema_test::Mixed>();
+  const reflection::Schema* schema = VerifySchema(mixed_id.bfbs);
+  ASSERT_NE(schema, nullptr);
+  const reflection::Object* mixed =
+      schema->objects()->LookupByKey(mixed_id.name.c_str());
+  ASSERT_NE(mixed, nullptr);
+  const ResolvedField enum_field =
+      ResolveField(*schema, *mixed, "level", "test");
+  for (const FieldValue& bad :
+       {FieldValue{true}, FieldValue{std::int64_t{0}}, FieldValue{0.0}}) {
+    EXPECT_THROW(EncodeField(buf.data(), enum_field, bad, "test"),
+                 std::invalid_argument);
+  }
+
+  const ResolvedField double_field =
+      scalar_field(reflection::BaseType::Double, 8);
+  const ResolvedField int_field = scalar_field(reflection::BaseType::Int, 4);
+  for (const ResolvedField& num_field : {double_field, int_field}) {
+    for (const FieldValue& bad :
+         {FieldValue{true}, FieldValue{std::string{"1"}}}) {
+      EXPECT_THROW(EncodeField(buf.data(), num_field, bad, "test"),
+                   std::invalid_argument);
+    }
   }
 }
 

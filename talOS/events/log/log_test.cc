@@ -3242,6 +3242,236 @@ TEST(LogCapture, BudgetTooSmallForHeaderDoesNotGrowOrStopTheNode) {
   }
 }
 
+// Sends buffered before start() (allowed during Node construction) must not
+// trip failed() (EBADF on fd_ == -1) when start() discovers prefix_bytes >
+// max_bytes.
+// REQ-RT-11
+// REQ-OPS-12
+TEST(LogCapture, PreStartSendsUnderTinyCapDoNotFailWriter) {
+  constexpr std::size_t kRecord = sizeof(RecordHeader) + 16;
+  const std::uint64_t tiny_cap = RecordsOffset() - 1;
+  ASSERT_GT(tiny_cap, 2 * kRecord);
+
+  for (const bool background : {false, true}) {
+    for (const std::size_t chunk_bytes :
+         {std::size_t{256}, std::size_t{kRecord}}) {
+      SCOPED_TRACE(::testing::Message() << "background=" << background
+                                        << " chunk_bytes=" << chunk_bytes);
+      const auto path = TempPath(std::string{"prestart_tiny_"} +
+                                 (background ? "bg_" : "sync_") +
+                                 std::to_string(chunk_bytes));
+      const std::string marker = CappedMarkerPath(path);
+      ::unlink(path.c_str());
+      ::unlink(marker.c_str());
+      {
+        LogWriter::Options options{};
+        options.chunk_bytes = chunk_bytes;
+        options.chunk_count = 4;
+        options.background = background;
+        options.max_bytes = tiny_cap;
+        LogWriter writer{path, "prestart_tiny", options};
+        // Buffered before start(); with chunk_bytes == kRecord the second send
+        // also hands off a full chunk before start().
+        writer.send({}, 2, MakePayload(16, 1), 0, 1);
+        writer.send({}, 2, MakePayload(16, 2), 0, 2);
+        writer.start(MakeManifest(), {});
+        writer.send({}, 2, MakePayload(16, 3), 0, 3);
+        writer.flush();
+        EXPECT_TRUE(writer.capped());
+        EXPECT_TRUE(writer.capture_stopped());
+        EXPECT_FALSE(writer.failed()) << writer.error();
+      }
+      EXPECT_FALSE(std::ifstream{path}.good());
+      EXPECT_TRUE(std::ifstream{marker}.good());
+      EXPECT_EQ(FileSize(marker), 0u);
+      ::unlink(path.c_str());
+      ::unlink(marker.c_str());
+    }
+  }
+}
+
+// Synchronous (background = false) sends before start() that fill chunk_bytes
+// or see an elapsed sync_interval must not flush record bytes to offset 0
+// before start() writes FileHeader.
+// REQ-RT-11
+// REQ-OPS-12
+TEST(LogCapture, PreStartSynchronousSendsWaitForFileHeader) {
+  constexpr std::size_t kRecord = sizeof(RecordHeader) + 16;
+  struct Case {
+    const char* name;
+    std::size_t chunk_bytes;
+    std::chrono::nanoseconds sync_interval;
+  };
+  const Case cases[] = {
+      {"chunk_full", kRecord, std::chrono::seconds{1}},
+      {"sync_due", 4096, std::chrono::nanoseconds{0}},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    const auto path = TempPath(std::string{"prestart_sync_"} + c.name);
+    ::unlink(path.c_str());
+    {
+      LogWriter::Options options{};
+      options.chunk_bytes = c.chunk_bytes;
+      options.chunk_count = 1;
+      options.background = false;
+      options.sync_interval = c.sync_interval;
+      LogWriter writer{path, "prestart_sync", options};
+      writer.send({}, 2, MakePayload(16, 1), 0, 1);
+      writer.send({}, 2, MakePayload(16, 2), 0, 2);
+      writer.send({}, 2, MakePayload(16, 3), 0, 3);
+      writer.start(MakeManifest(), {});
+      writer.send({}, 2, MakePayload(16, 4), 0, 4);
+      writer.send({}, 2, MakePayload(16, 5), 0, 5);
+      writer.flush();
+      EXPECT_FALSE(writer.failed()) << writer.error();
+    }
+    const ReadBack back = ReadAll(path, false);
+    EXPECT_TRUE(back.damage.clean());
+    ASSERT_EQ(back.records.size(), 5u);
+    for (std::size_t i = 0; i < 5u; ++i) {
+      EXPECT_EQ(back.records[i].header.kind,
+                static_cast<std::uint16_t>(EventKind::SEND));
+      EXPECT_EQ(back.records[i].header.sequence, i + 1);
+      EXPECT_EQ(back.records[i].payload,
+                MakePayload(16, static_cast<int>(i + 1)));
+    }
+    ::unlink(path.c_str());
+  }
+}
+
+// Pre-start() buffered bytes count toward segment_used so a capped log never
+// overshoots max_bytes (non-rotating) or segment_bytes (rotating), even when
+// pre-start() sends alone plus the prefix exceed the cap.
+// REQ-RT-11
+// REQ-OPS-12
+TEST(LogCapture, PreStartSendsCountTowardByteCapAndSegmentBudget) {
+  constexpr std::size_t kRecord = sizeof(RecordHeader) + 16;
+  for (const bool background : {false, true}) {
+    SCOPED_TRACE(background ? "background" : "sync");
+    const std::string mode = background ? "bg" : "sync";
+
+    // Non-rotating cap: prefix + 3 records. 2 pre-start + 5 post-start must
+    // keep exactly 3 records and stay <= cap.
+    {
+      const auto path = TempPath("prestart_cap_nonrot_" + mode);
+      const std::string marker = CappedMarkerPath(path);
+      ::unlink(path.c_str());
+      ::unlink(marker.c_str());
+      const std::uint64_t cap = RecordsOffset() + 3 * kRecord;
+      {
+        LogWriter::Options options{};
+        options.chunk_bytes = 256;
+        options.chunk_count = 4;
+        options.background = background;
+        options.max_bytes = cap;
+        LogWriter writer{path, "cap_nonrot", options};
+        writer.send({}, 2, MakePayload(16, 1), 0, 1);
+        writer.send({}, 2, MakePayload(16, 2), 0, 2);
+        writer.start(MakeManifest(), {});
+        for (int i = 3; i <= 7; ++i) {
+          writer.send({}, 2, MakePayload(16, i), 0,
+                      static_cast<std::uint64_t>(i));
+        }
+        writer.flush();
+        EXPECT_TRUE(writer.capped());
+        EXPECT_TRUE(writer.capture_stopped());
+        EXPECT_FALSE(writer.failed()) << writer.error();
+      }
+      EXPECT_LE(FileSize(path), cap);
+      EXPECT_TRUE(std::ifstream{marker}.good());
+      const ReadBack back = ReadAll(path, false);
+      EXPECT_TRUE(back.damage.clean());
+      ASSERT_EQ(back.records.size(), 3u);
+      for (std::size_t i = 0; i < 3u; ++i) {
+        EXPECT_EQ(back.records[i].header.sequence, i + 1);
+      }
+      ::unlink(path.c_str());
+      ::unlink(marker.c_str());
+    }
+
+    // Non-rotating cap where pre-start() sends alone + prefix exceed cap.
+    {
+      const auto path = TempPath("prestart_cap_over_" + mode);
+      const std::string marker = CappedMarkerPath(path);
+      ::unlink(path.c_str());
+      ::unlink(marker.c_str());
+      const std::uint64_t cap = RecordsOffset() + 2 * kRecord;
+      {
+        LogWriter::Options options{};
+        options.chunk_bytes = 256;
+        options.chunk_count = 4;
+        options.background = background;
+        options.max_bytes = cap;
+        LogWriter writer{path, "cap_over", options};
+        for (int i = 1; i <= 4; ++i) {
+          writer.send({}, 2, MakePayload(16, i), 0,
+                      static_cast<std::uint64_t>(i));
+        }
+        writer.start(MakeManifest(), {});
+        writer.flush();
+        EXPECT_TRUE(writer.capped());
+        EXPECT_TRUE(writer.capture_stopped());
+        EXPECT_FALSE(writer.failed()) << writer.error();
+      }
+      EXPECT_LE(FileSize(path), cap);
+      EXPECT_TRUE(std::ifstream{marker}.good());
+      const ReadBack back = ReadAll(path, false);
+      EXPECT_TRUE(back.damage.clean());
+      ASSERT_EQ(back.records.size(), 2u);
+      EXPECT_EQ(back.records[0].header.sequence, 1u);
+      EXPECT_EQ(back.records[1].header.sequence, 2u);
+      ::unlink(path.c_str());
+      ::unlink(marker.c_str());
+    }
+
+    // Rotating cap: 4 segments of `segment_cap` bytes each. Pre-start records
+    // in segment 0 must be accounted so segment 0 never overshoots segment_cap.
+    {
+      const auto path = TempPath("prestart_cap_rot_" + mode);
+      const std::string marker = CappedMarkerPath(path);
+      for (const auto& file : LogSegmentFiles(path)) ::unlink(file.c_str());
+      ::unlink(marker.c_str());
+      const std::uint64_t segment_cap =
+          RecordsOffset() + sizeof(RecordHeader) + 128;
+      const std::uint64_t cap = 4 * segment_cap;
+      {
+        LogWriter::Options options{};
+        options.chunk_bytes = 256;
+        options.chunk_count = 16;
+        options.background = background;
+        options.max_bytes = cap;
+        LogWriter writer{path, "cap_rot", options};
+        writer.send({}, 2, MakePayload(16, 1), 0, 1);
+        writer.send({}, 2, MakePayload(16, 2), 0, 2);
+        writer.start(MakeManifest(), {});
+        for (int i = 3; i <= 6; ++i) {
+          writer.send({}, 2, MakePayload(16, i), 0,
+                      static_cast<std::uint64_t>(i));
+        }
+        writer.flush();
+        EXPECT_FALSE(writer.failed()) << writer.error();
+      }
+      const std::vector<std::string> files = LogSegmentFiles(path);
+      ASSERT_GE(files.size(), 2u);
+      std::uint64_t total = 0;
+      for (const auto& file : files) {
+        const std::uint64_t sz = FileSize(file);
+        EXPECT_LE(sz, segment_cap) << file;
+        total += sz;
+        LogReader reader{file};
+        LogReader::Record record;
+        while (reader.next(record)) {
+        }
+        EXPECT_FALSE(reader.truncated()) << file;
+      }
+      EXPECT_LE(total, cap);
+      for (const auto& file : files) ::unlink(file.c_str());
+      ::unlink(marker.c_str());
+    }
+  }
+}
+
 // A capped log written with `options`, one 16-byte record at each of
 // `times_ns` (its record time, Context::now). Returns the kept files.
 std::vector<std::string> WriteTimedLog(const std::string& path,

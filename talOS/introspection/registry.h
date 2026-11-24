@@ -456,6 +456,7 @@ struct RegistryTestHooks {
   void (*mapped)(RegistryHeader*){nullptr};
   void (*claiming)(NodeRecord*){nullptr};
   void (*lock_file_opened)(){nullptr};
+  void (*releasing)(NodeRecord*){nullptr};
 };
 
 // Serializes the writers: segment creation, sizing and initialization
@@ -623,10 +624,17 @@ class NodeRegistration {
   void publish(const event::Manifest& manifest, const Attributes& attributes,
                std::span<const std::uint32_t> source_flags = {}) {
     write_sources(manifest, [&attributes, source_flags](std::size_t index,
+                                                        std::uint16_t id,
                                                         std::string_view name) {
       std::uint32_t flags =
           index < source_flags.size() ? source_flags[index] : 0u;
       for (const auto& attribute : attributes) {
+        if constexpr (requires { attribute.source_id; }) {
+          if (attribute.source_id.has_value()) {
+            if (*attribute.source_id == id) flags |= attribute.flags;
+            continue;
+          }
+        }
         if (attribute.topic == name) {
           flags |= attribute.flags;
         }
@@ -832,7 +840,7 @@ class NodeRegistration {
       source.kind = static_cast<std::uint16_t>(registration.kind);
       source.message_bytes = registration.message_bytes;
       source.alignment = registration.alignment;
-      source.flags = flags_for(i, registration.name);
+      source.flags = flags_for(i, registration.id, registration.name);
       source.period_ns = registration.period_ns;
       copy_name(source.name, kMaxNameBytes, registration.name);
       source.events.store(0, std::memory_order_relaxed);
@@ -868,6 +876,7 @@ class NodeRegistration {
   std::uint64_t generation_{0};
   std::uint64_t pid_{0};
   bool names_checked_{false};
+  void (*releasing_hook_)(NodeRecord*){nullptr};
 };
 
 // --- reading ---------------------------------------------------------------

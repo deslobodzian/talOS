@@ -301,12 +301,20 @@ struct AlertPrefixedField {
   bool is_bool{false};  // a bool scalar (not an array, not a struct)
 };
 
+struct AlertFieldsResult {
+  std::vector<AlertPrefixedField> fields;
+  // Non-empty when `bfbs` failed reflection verification or did not contain
+  // `root`: LintGraph emits Severity::ERROR so corrupt or mismatched schema
+  // bytes cannot silently bypass alert checks (REQ-CONTRACT-09).
+  std::string error;
+};
+
 // Every field whose name starts with kAlertPrefix in struct `root` of
 // `bfbs` (a reflection.Schema), nested structs and arrays of structs
-// included, each struct type visited once. Empty when `bfbs` does not
+// included, each struct type visited once. Sets `error` when `bfbs` does not
 // verify or does not hold `root`. In names.cc: it reads reflection.
-std::vector<AlertPrefixedField> AlertPrefixedFields(std::string_view bfbs,
-                                                    std::string_view root);
+AlertFieldsResult AlertPrefixedFields(std::string_view bfbs,
+                                      std::string_view root);
 }  // namespace detail
 
 // The node name must match the target's package leaf
@@ -319,7 +327,10 @@ inline std::optional<std::string> CheckNodeTarget(std::string_view name,
                               "' for node '" + std::string{name} + "'";
   std::string_view repo;
   std::string_view rest = target;
-  if (rest.starts_with("@")) {
+  if (rest.starts_with("@@//")) {
+    // Bazel 8 canonical label for the main repository (`@@//package:rule`).
+    rest.remove_prefix(2);
+  } else if (rest.starts_with("@")) {
     const std::size_t at_count = rest.starts_with("@@") ? 2 : 1;
     const std::size_t slashes = rest.find("//", at_count);
     if (slashes == std::string_view::npos)
@@ -327,8 +338,15 @@ inline std::optional<std::string> CheckNodeTarget(std::string_view name,
              " must be an absolute Bazel label (//package:rule or "
              "@repo//package:rule)";
     repo = rest.substr(at_count, slashes - at_count);
-    while (!repo.empty() && repo.back() == '+') repo.remove_suffix(1);
-    if (repo.empty() || repo.find_first_of("@/:") != std::string_view::npos)
+    if (repo.find_first_of("@/:") != std::string_view::npos)
+      return context +
+             " must be an absolute Bazel label (//package:rule or "
+             "@repo//package:rule)";
+    if (const std::size_t suffix = repo.find_first_of("+~");
+        suffix != std::string_view::npos) {
+      repo = repo.substr(0, suffix);
+    }
+    if (repo.empty())
       return context +
              " must be an absolute Bazel label (//package:rule or "
              "@repo//package:rule)";
@@ -648,27 +666,36 @@ inline std::vector<Diagnostic> LintGraph(
             add(Severity::ERROR, source.name, *problem);
         }
         // Alert fields, from the writer's schema (a shape without one, a
-        // registry snapshot, has no fields to check).
+        // registry snapshot, has no fields to check). A non-empty bfbs that
+        // fails verification or lacks `source.schema` is an error so corrupt
+        // schema bytes cannot silently bypass alert checks (REQ-CONTRACT-09).
         if (!source.bfbs.empty()) {
-          for (const auto& field :
-               detail::AlertPrefixedFields(source.bfbs, source.schema)) {
-            const auto alert = ParseAlertField(field.name);
-            if (!alert) {
-              add(Severity::ERROR, source.name,
-                  "field '" + field.path + "' (written by " + node.name +
-                      ") starts with 'alert_' but is not "
-                      "alert_<error|warning|info>_<name>");
-            } else if (!field.is_bool) {
-              add(Severity::ERROR, source.name,
-                  "alert field '" + field.path + "' (written by " + node.name +
-                      ") is not a bool; an alert is active "
-                      "while true");
-            } else if (role != "status") {
-              add(Severity::ERROR, source.name,
-                  "alert field '" + field.path + "' (written by " + node.name +
-                      ") is in a '" + role +
-                      "' topic; an alert belongs to its node's 'status' "
-                      "topic, the health it reports");
+          const auto alerts =
+              detail::AlertPrefixedFields(source.bfbs, source.schema);
+          if (!alerts.error.empty()) {
+            add(Severity::ERROR, source.name,
+                alerts.error + " (written by " + node.name + ")");
+          } else {
+            for (const auto& field : alerts.fields) {
+              const auto alert = ParseAlertField(field.name);
+              if (!alert) {
+                add(Severity::ERROR, source.name,
+                    "field '" + field.path + "' (written by " + node.name +
+                        ") starts with 'alert_' but is not "
+                        "alert_<error|warning|info>_<name>");
+              } else if (!field.is_bool) {
+                add(Severity::ERROR, source.name,
+                    "alert field '" + field.path + "' (written by " +
+                        node.name +
+                        ") is not a bool; an alert is active "
+                        "while true");
+              } else if (role != "status") {
+                add(Severity::ERROR, source.name,
+                    "alert field '" + field.path + "' (written by " +
+                        node.name + ") is in a '" + role +
+                        "' topic; an alert belongs to its node's 'status' "
+                        "topic, the health it reports");
+              }
             }
           }
         }

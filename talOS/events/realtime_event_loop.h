@@ -238,7 +238,7 @@ class RealtimeEventLoop
       Expiration expiration{};
       while (keep_running()) {
         now = Poller::now();
-        if (!scheduler_.pop_expired(now, expiration)) break;
+        if (!scheduler_.pop_expired(std::min(now, end), expiration)) break;
         if (expiration.id == INTERNAL_POLL_TIMER_ID) {
           drain_messages(expiration.deadline, now);
           continue;

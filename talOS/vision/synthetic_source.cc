@@ -7,6 +7,7 @@
 #include <cstring>
 #include <format>
 #include <iterator>
+#include <limits>
 #include <opencv2/imgproc.hpp>
 #include <utility>
 #include <vector>
@@ -14,6 +15,18 @@
 namespace talos::vision {
 
 namespace {
+
+std::chrono::nanoseconds FramePeriodForFps(double fps) {
+  constexpr double kDefaultFps = 30.0;
+  constexpr double kMinFps = 1.0 / 3600.0;  // 1 hour max period
+  constexpr double kMaxFps = 1'000'000.0;   // 1 us min period
+  if (!std::isfinite(fps) || fps <= 0.0) {
+    fps = kDefaultFps;
+  }
+  const double clamped_fps = std::clamp(fps, kMinFps, kMaxFps);
+  return std::chrono::nanoseconds(
+      static_cast<int64_t>(std::llround(1e9 / clamped_fps)));
+}
 
 // Tag36h11 codebook for first 10 IDs (0..9)
 constexpr uint64_t kTag36h11Codes[10] = {
@@ -51,6 +64,17 @@ SyntheticCameraSource::SyntheticCameraSource(uint32_t camera_id,
 
 SyntheticCameraSource::~SyntheticCameraSource() {
   SyntheticCameraSource::Stop();
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto self = std::this_thread::get_id();
+  for (auto& t : retired_threads_) {
+    if (!t.joinable()) continue;
+    if (t.get_id() == self) {
+      t.detach();
+    } else {
+      t.join();
+    }
+  }
+  retired_threads_.clear();
 }
 
 uint32_t SyntheticCameraSource::camera_id() const { return camera_id_; }
@@ -81,6 +105,10 @@ CameraMode SyntheticCameraSource::CurrentMode() const {
 }
 
 bool SyntheticCameraSource::SetMode(const CameraMode& mode) {
+  if (mode.width == 0 || mode.height == 0 || !std::isfinite(mode.fps) ||
+      mode.fps < 0.0) {
+    return false;
+  }
   std::lock_guard<std::mutex> lock(mutex_);
   mode_ = mode;
   return true;
@@ -107,28 +135,61 @@ void SyntheticCameraSource::SetConnectionCallback(ConnectionCallback callback) {
   connection_callback_ = std::move(callback);
 }
 
-bool SyntheticCameraSource::Start() {
-  if (is_running_.exchange(true)) {
+void SyntheticCameraSource::ReapRetiredLocked(
+    std::vector<std::thread>& to_join) {
+  const auto self = std::this_thread::get_id();
+  std::erase_if(retired_threads_, [&](std::thread& t) {
+    if (!t.joinable()) return true;
+    if (t.get_id() == self) return false;
+    to_join.push_back(std::move(t));
     return true;
-  }
+  });
+}
 
+bool SyntheticCameraSource::Start() {
+  std::vector<std::thread> to_join;
+  bool started = true;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (mode_.fps > 0.0) {
-      delivery_thread_ = std::thread(&SyntheticCameraSource::WorkerLoop, this);
+    ReapRetiredLocked(to_join);
+    if (!is_running_.load(std::memory_order_relaxed)) {
+      if (!std::isfinite(mode_.fps) || mode_.fps < 0.0) {
+        started = false;
+      } else {
+        const uint64_t generation = ++run_generation_;
+        is_running_.store(true, std::memory_order_release);
+        if (mode_.fps > 0.0) {
+          delivery_thread_ =
+              std::thread(&SyntheticCameraSource::WorkerLoop, this, generation);
+        }
+      }
     }
   }
-  return true;
+  for (auto& t : to_join) {
+    if (t.joinable()) t.join();
+  }
+  return started;
 }
 
 void SyntheticCameraSource::Stop() {
-  if (!is_running_.exchange(false)) {
-    return;
+  std::vector<std::thread> to_join;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    is_running_.store(false, std::memory_order_release);
+    ++run_generation_;
+    const auto self = std::this_thread::get_id();
+    if (delivery_thread_.joinable()) {
+      if (delivery_thread_.get_id() == self) {
+        retired_threads_.push_back(std::move(delivery_thread_));
+      } else {
+        to_join.push_back(std::move(delivery_thread_));
+      }
+    }
+    ReapRetiredLocked(to_join);
+    cv_.notify_all();
   }
-
-  cv_.notify_all();
-  if (delivery_thread_.joinable()) {
-    delivery_thread_.join();
+  for (auto& t : to_join) {
+    if (t.joinable()) t.join();
   }
 }
 
@@ -232,26 +293,32 @@ bool SyntheticCameraSource::TriggerFrame() {
   return true;
 }
 
-void SyntheticCameraSource::WorkerLoop() {
-  while (is_running_.load()) {
+void SyntheticCameraSource::WorkerLoop(uint64_t generation) {
+  while (true) {
     double fps = 30.0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      if (!is_running_.load(std::memory_order_relaxed) ||
+          run_generation_ != generation) {
+        break;
+      }
       fps = mode_.fps;
     }
-    if (fps <= 0.0) {
-      fps = 30.0;
-    }
 
-    auto period = std::chrono::duration<double>(1.0 / fps);
-    auto next_time =
-        std::chrono::steady_clock::now() +
-        std::chrono::duration_cast<std::chrono::nanoseconds>(period);
+    const auto period = FramePeriodForFps(fps);
+    const auto next_time = std::chrono::steady_clock::now() + period;
 
     TriggerFrame();
 
     std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait_until(lock, next_time, [this]() { return !is_running_.load(); });
+    cv_.wait_until(lock, next_time, [this, generation]() {
+      return !is_running_.load(std::memory_order_relaxed) ||
+             run_generation_ != generation;
+    });
+    if (!is_running_.load(std::memory_order_relaxed) ||
+        run_generation_ != generation) {
+      break;
+    }
   }
 }
 
@@ -261,7 +328,12 @@ void SyntheticCameraSource::RenderScene(Frame& frame) {
   const uint32_t stride = frame.stride();
   const PixelFormat format = frame.format();
   uint8_t* buf = frame.mutable_data();
-  if (buf == nullptr || width == 0 || height == 0) return;
+  constexpr auto kMaxInt =
+      static_cast<uint32_t>(std::numeric_limits<int>::max());
+  if (buf == nullptr || width == 0 || height == 0 || width > kMaxInt ||
+      height > kMaxInt) {
+    return;
+  }
 
   // Background color: white (255)
   std::memset(buf, 255, frame.size());
@@ -300,11 +372,17 @@ void SyntheticCameraSource::RenderScene(Frame& frame) {
               stride);
 
   // Rasterize each synthetic tag
+  constexpr double kMaxCoord = 1e6;
   for (const auto& tag : tags_) {
     const double cx = tag.center_x;
     const double cy = tag.center_y;
     const double size = tag.size_pixels;
-    if (size <= 0.0) continue;
+    if (!std::isfinite(cx) || !std::isfinite(cy) || !std::isfinite(size) ||
+        !std::isfinite(tag.rotation_rad) || size <= 0.0 ||
+        std::abs(cx) > kMaxCoord || std::abs(cy) > kMaxCoord ||
+        size > kMaxCoord) {
+      continue;
+    }
 
     // Tag codeword: lookup in table or fallback to deterministic hash
     constexpr size_t kCodebookSize = std::size(kTag36h11Codes);

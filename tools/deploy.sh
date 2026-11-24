@@ -41,11 +41,11 @@ validate_prefix() {
   if (
     LC_ALL=C
     case "$p" in
-      *[[:space:][:cntrl:]]*|*[\<\>\&\"\'\\]*) exit 0 ;;
+      *[[:space:][:cntrl:]]*|*[\<\>\&\"\'\\]*|*'%'*|*'$'*) exit 0 ;;
       *) exit 1 ;;
     esac
   ); then
-    die "invalid --prefix: must not contain whitespace, control, quote, backslash, or XML-special characters"
+    die "invalid --prefix: must not contain whitespace, control, quote, backslash, XML-special, or systemd-expansion (% or \$) characters"
   fi
 }
 
@@ -759,7 +759,9 @@ sys.exit(os.path.commonpath([test, prefix]) != test)
 # `#!/usr/bin/env` interpreter the boot service cannot run is refused before
 # anything is written (check_interpreters).
 cmd_install() {
-  local bundle="${1:?usage: deploy.sh install <bundle> [--prefix DIR]}"
+  [ $# -eq 1 ] && [ -n "$1" ] ||
+    die "usage: deploy.sh install <bundle> [--prefix DIR] [--no-warm-up] [--dry-run]"
+  local bundle="$1"
   [ -x "$bundle/run.sh" ] || die "not a bundle (no executable run.sh): $bundle"
   refuse_testonly "$bundle"
   check_interpreters "$bundle"
@@ -882,7 +884,7 @@ cmd_enable_boot() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --user) [ $# -ge 2 ] || die "--user requires a user name (usage: deploy.sh enable-boot [--prefix DIR] [--user NAME] [--dry-run])"; user="$2"; shift 2 ;;
-      *) break ;;
+      *) die "unknown argument: $1 (usage: deploy.sh enable-boot [--prefix DIR] [--user NAME] [--dry-run])" ;;
     esac
   done
   validate_prefix "$PREFIX"
@@ -1302,19 +1304,31 @@ EOF
 # a bundle its launcher refuses, such as one installed by a deploy.sh
 # without the check. A stop selects nothing.
 cmd_rollback() {
+  [ $# -eq 0 ] || die "usage: deploy.sh rollback [--prefix DIR] [--no-warm-up] [--dry-run]"
   [ -L "$PREFIX/current" ] || die "no current bundle at $PREFIX/current"
-  [ -L "$PREFIX/previous" ] && [ -x "$PREFIX/previous/run.sh" ] ||
+  [ -L "$PREFIX/previous" ] ||
     die "no previous bundle to roll back to ($PREFIX/previous missing or not a bundle)"
-  local cur previous
+  local cur prev_target previous
   cur="$(readlink "$PREFIX/current")"
-  previous="$(cd "$PREFIX/previous" && pwd -P)"
+  prev_target="$(readlink "$PREFIX/previous")"
+  case "$prev_target" in
+    /*) previous="$prev_target" ;;
+    *) previous="$PREFIX/$prev_target" ;;
+  esac
+  [ -x "$previous/run.sh" ] ||
+    die "no previous bundle to roll back to ($PREFIX/previous missing or not a bundle)"
+  previous="$(cd "$previous" && pwd -P)"
   warm_up "$previous"
   check_graph "$previous" ||
     die "not rolled back: the launcher refuses $previous; $(kept_selection)"
   release_stops
-  select_bundle "$(readlink "$PREFIX/previous")" "$PREFIX/current"
+  select_bundle "$prev_target" "$PREFIX/current"
   select_bundle "$cur" "$PREFIX/previous"
-  say "rolled back: current -> $(readlink "$PREFIX/current"); restart the service to activate"
+  if [ "$DRY_RUN" = "1" ]; then
+    say "would roll back: current -> $prev_target; restart the service to activate"
+  else
+    say "rolled back: current -> $prev_target; restart the service to activate"
+  fi
 }
 
 # --- prune ------------------------------------------------------------------

@@ -543,5 +543,85 @@ from = "autonomous.routines"
   std::filesystem::remove_all(dir);
 }
 
+// REQ-OPS-22, REQ-CONTRACT-28: LintTelemetryConfig refuses a dictionary whose
+// combined dictionary + value pages exceed the 64-slot `/talos/telemetry` ring
+// (matching Telemetry construction).
+TEST(DescribeGraphUnitTest,
+     LintTelemetryConfigRefusesCombinedPagesOverSlotCount) {
+  const schema::Identity alerts_id = schema::Of<schema_test::Alerts>();
+  NodeDescription producer{
+      .roster_name = "bank", .target = "//example/bank:node", .answered = true};
+  producer.declared.name = "bank";
+  producer.declared.target = "//example/bank:node";
+
+  // 64 status topics each carrying routine_index labelled with 100 x 110-byte
+  // labels (~12 KiB per channel -> 1 channel per dictionary page): 64
+  // dictionary pages + value pages > 64 slots, while total channels (321) stay
+  // far below kMaxChannels (2048).
+  std::string big_labels = "[";
+  for (int i = 0; i < 100; ++i) {
+    if (i > 0) big_labels += ", ";
+    big_labels +=
+        "\"lbl_" + std::to_string(i) + "_" + std::string(100, 'x') + "\"";
+  }
+  big_labels += "]";
+
+  std::string toml =
+      "[robot]\nperiod_us = 10000\n"
+      "[subsystems.bank]\nnode = \"//example/bank:node\"\n"
+      "names = " +
+      big_labels +
+      "\n"
+      "[subsystems.telemetry]\nnode = \"//talOS/telemetry:node\"\n";
+  for (int i = 0; i < 64; ++i) {
+    naming::SourceShape source;
+    source.kind = event::SourceKind::SENDER;
+    source.name = "/bank/status/ch" + std::to_string(i);
+    source.message_bytes = sizeof(schema_test::Alerts);
+    source.alignment = alignof(schema_test::Alerts);
+    source.schema = alerts_id.name;
+    source.schema_hash = alerts_id.hash;
+    source.bfbs.assign(alerts_id.bfbs.begin(), alerts_id.bfbs.end());
+    producer.declared.sources.push_back(std::move(source));
+
+    toml +=
+        "[[subsystems.telemetry.labels]]\n"
+        "channel = \"bank/status/ch" +
+        std::to_string(i) +
+        "/routine_index\"\n"
+        "from = \"bank.names\"\n";
+  }
+  const auto cfg = config::ParseRobotConfigString(toml);
+  const auto findings = LintTelemetryConfig(cfg, {producer});
+  ASSERT_EQ(findings.size(), 1u);
+  EXPECT_EQ(findings[0].severity, naming::Severity::ERROR);
+  EXPECT_EQ(findings[0].subject, "telemetry");
+  EXPECT_NE(findings[0].message.find("64-slot"), std::string::npos)
+      << findings[0].message;
+}
+
+// REQ-OPS-38, REQ-CONTRACT-10: LintParameterKeys accepts an explicit empty
+// `labels = []` when telemetry reports reading `"labels"`.
+TEST(DescribeGraphUnitTest, LintParameterKeysAcceptsEmptyTelemetryLabels) {
+  const auto cfg = config::ParseRobotConfigString(R"(
+[robot]
+period_us = 10000
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+labels = []
+)");
+  NodeDescription telemetry{.roster_name = "telemetry",
+                            .target = "//talOS/telemetry:node",
+                            .answered = true};
+  telemetry.declared.name = "telemetry";
+  telemetry.declared.target = "//talOS/telemetry:node";
+  telemetry.declared.params = std::vector<introspect::ParamRead>{
+      {"telemetry", "stale_timeout_us"},  {"telemetry", "include"},
+      {"telemetry", "exclude"},           {"telemetry", "labels"},
+      {"telemetry", "labels[0].channel"}, {"telemetry", "labels[0].from"},
+  };
+  EXPECT_TRUE(LintParameterKeys(cfg, {telemetry}, "").empty());
+}
+
 }  // namespace
 }  // namespace talos::launcher

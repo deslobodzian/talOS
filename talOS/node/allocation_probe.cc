@@ -50,7 +50,7 @@ std::atomic<std::uint64_t> g_count{0};
 bool g_in_hook = false;
 
 [[maybe_unused]] void Count() {
-  if (!g_counting.load(std::memory_order_relaxed)) return;
+  if (!g_counting.load(std::memory_order_acquire)) return;
   if (pthread_equal(pthread_self(), g_thread.load(std::memory_order_relaxed)) ==
       0) {
     return;
@@ -168,16 +168,21 @@ void AllocationProbe::start() {
   if (const std::string_view why = Unsupported(); !why.empty()) {
     throw std::logic_error(std::string{why});
   }
-  if (counting_ || g_counting.load()) {
+  if (counting_ || g_counting.load(std::memory_order_acquire)) {
     throw std::logic_error("another AllocationProbe is counting");
   }
   // glibc's first backtrace() loads libgcc_s, which allocates.
   void* prime[1];
   ::backtrace(prime, 1);
-  g_count = 0;
-  g_thread = pthread_self();
+  g_count.store(0, std::memory_order_relaxed);
+  g_thread.store(pthread_self(), std::memory_order_relaxed);
+  bool expected = false;
+  if (!g_counting.compare_exchange_strong(expected, true,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_relaxed)) {
+    throw std::logic_error("another AllocationProbe is counting");
+  }
   counting_ = true;
-  g_counting = true;
 #if defined(TALOS_PROBE_MALLOC_LOGGER)
   malloc_logger = LogAllocation;
 #endif
@@ -188,9 +193,9 @@ std::uint64_t AllocationProbe::stop() {
 #if defined(TALOS_PROBE_MALLOC_LOGGER)
   malloc_logger = nullptr;
 #endif
-  g_counting = false;
+  g_counting.store(false, std::memory_order_release);
   counting_ = false;
-  return g_count.load();
+  return g_count.load(std::memory_order_relaxed);
 }
 
 std::string AllocationProbe::sites() const {

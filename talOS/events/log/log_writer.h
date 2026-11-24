@@ -349,6 +349,7 @@ class LogWriter {
     void submit_active() noexcept;
     bool acquire_chunk() noexcept;
     void write_chunk(Chunk& chunk) noexcept;
+    void discard_buffered() noexcept;
     void sync(bool durable) noexcept;
     void drain() noexcept;
     void start_writer();
@@ -370,6 +371,12 @@ class LogWriter {
     std::uint64_t segment_span_ns{0};
     // Producer only: the now_ns of the segment's first record.
     std::int64_t segment_first_ns{0};
+    // Producer only: true once start() has configured the log (and, in
+    // synchronous mode, written the prefix to offset 0).
+    bool started{false};
+    // Synchronous mode only: chunks submitted before start() are held here
+    // until start() writes the prefix, never flushed to offset 0 ahead of it.
+    std::vector<std::byte> pre_start_sync;
 
     std::deque<Chunk> pool;
     // Writer only: when it last wrote (see Options::write_interval); empty

@@ -273,6 +273,7 @@ def _cpp_test_names(text):
 
 def _python_test_names(text):
     """Active (non-skipped, non-docstring) Python `test_*` functions/methods."""
+    text = text.removeprefix("\ufeff")
     try:
         tree = ast.parse(text)
     except SyntaxError as error:
@@ -305,6 +306,7 @@ def _python_test_names(text):
 
 def infer_role(sources):
     """The role of a node package from the text of its non-test sources."""
+    sources = [text.removeprefix("\ufeff") for text in sources]
     if any(p.search(text) for p in ACTUATOR for text in sources):
         return "actuator"
     for text in sources:
@@ -386,7 +388,7 @@ def scenario_steps(text):
     scenario is no such literal (built from another, say), whose steps
     cannot be read."""
     try:
-        tree = ast.parse(text)
+        tree = ast.parse(text.removeprefix("\ufeff"))
     except SyntaxError as error:
         raise MatrixError(f"cannot parse the file: {error}")
     parents = {child: node for node in ast.walk(tree)
@@ -489,6 +491,7 @@ def check(text, lang, role, sibling=lambda name: None):
     the parity claim. `sibling(name)` reads a file beside the test (None
     when there is none), for a parity claim's C++ test. Raises MatrixError
     for a role override or a parity claim the rules refuse."""
+    text = text.removeprefix("\ufeff")
     names = _python_test_names(text) if lang == "py" else _cpp_test_names(text)
     for match in ROLE.finditer(text):
         override, why = match.group(1), reason(match.group(2))
@@ -530,7 +533,7 @@ def check(text, lang, role, sibling=lambda name: None):
 
 
 def read(path):
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:
         return f.read()
 
 
@@ -660,6 +663,7 @@ def targets(workspace, paths):
 
 def read_baseline(text):
     """{(path, case)} from baseline lines `<path> <case> [<case>...]`."""
+    text = text.removeprefix("\ufeff")
     entries = set()
     for number, line in enumerate(text.splitlines(), 1):
         fields = line.split("#", 1)[0].split()
