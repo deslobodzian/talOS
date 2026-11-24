@@ -1,6 +1,8 @@
 """Unit tests for tools/lint_test_time.py on in-memory files."""
 
 import io
+import os
+import tempfile
 import unittest
 
 from tools import lint_test_time
@@ -639,6 +641,46 @@ class LintTestTimeTest(unittest.TestCase):
         failures, out = lint({path: SLEEP + SLEEP}, dup_allowlist)
         self.assertGreaterEqual(failures, 1, out)
         self.assertIn("duplicate", out.lower())
+
+    # REQ-RT-06, REQ-RT-17: leading UTF-8 BOM must not bypass line-1 Python
+    # node imports or BUILD parsing, and any `*.bazelrc` must be scanned for
+    # retry flags (RULES.md 3, RULES.md 12).
+    def test_utf8_bom_and_named_bazelrc_files_are_caught(self):
+        py_extra = {"examples/arm/BUILD.bazel": "\ufeff" + PY_NODE_BUILD}
+        for name, text, kind in (
+            ("bom_import_subprocess", "\ufeff" + PY_IMPORT_SUBPROCESS, "io"),
+            ("bom_from_time_import",
+             "\ufefffrom " + "time import sleep as s\n", "clock"),
+            ("bom_import_random", "\ufeff" + PY_IMPORT_RANDOM, "random"),
+            ("bom_from_threading_lock",
+             "\ufeff" + PY_FROM_THREADING_LOCK, "lock"),
+        ):
+            with self.subTest(name=name):
+                failures, out = lint({"examples/arm/arm.py": text, **py_extra})
+                self.assertEqual(failures, 1, out)
+                self.assertIn(f"examples/arm/arm.py:1: {kind}", out)
+
+        # Disk read via read_file strips raw UTF-8 BOM bytes.
+        with tempfile.TemporaryDirectory(
+                dir=os.environ.get("TEST_TMPDIR")) as root:
+            py_path = os.path.join(root, "arm.py")
+            with open(py_path, "wb") as f:
+                f.write(b"\xef\xbb\xbf" + PY_IMPORT_SUBPROCESS.encode("utf-8"))
+            text = lint_test_time.read_file(py_path)
+            self.assertFalse(text.startswith("\ufeff"))
+            failures, out = lint({"examples/arm/arm.py": text, **py_extra})
+            self.assertEqual(failures, 1, out)
+            self.assertIn("examples/arm/arm.py:1: io", out)
+
+        # Named `*.bazelrc` files (such as `talos.bazelrc`) are retry configs.
+        retry_line = "test --flaky" + "_test_attempts=3\n"
+        for rc_path in ("talos.bazelrc", "ci.bazelrc",
+                        "examples/robot_repo/.bazelrc"):
+            with self.subTest(rc=rc_path):
+                self.assertTrue(lint_test_time.is_retry_config(rc_path))
+                failures, out = lint({rc_path: retry_line})
+                self.assertEqual(failures, 1, out)
+                self.assertIn(f"{rc_path}:1: retry", out)
 
 
 if __name__ == "__main__":

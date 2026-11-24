@@ -161,14 +161,53 @@ class SlowTestsTest(unittest.TestCase):
                     slow_tests.query_lanes()
                 self.assertNotEqual(raised.exception.code, 0)
 
-    # REQ-DEV-25: query_lanes assigns the same lane precedence as lane_of
-    # (heavy > integration > e2e > perf) for targets carrying multiple lane tags.
-    def test_lane_query_matches_lane_of_precedence(self):
+    # REQ-DEV-25: targets carrying multiple lane tags must fail closed rather
+    # than picking a looser budget or dodging `--enforce`.
+    def test_multiple_lane_tags_fail_closed(self):
+        for tags in (
+                ["heavy", "integration"],
+                ["heavy", "e2e", "perf"],
+                ["integration", "perf"],
+                ["e2e", "perf"]):
+            with self.subTest(tags=tags):
+                with self.assertRaisesRegex(ValueError, "multiple lane tags"):
+                    slow_tests.lane_of(tags)
+
+        # BEP events carrying multiple lane tags fail closed in from_bep and
+        # in main(--check --enforce integration).
+        bep_events = [
+            json.dumps({"id": {"targetCompleted": {"label": "//a:dual_test"}},
+                        "completed": {"success": True,
+                                      "tag": ["heavy", "integration"]}}),
+            json.dumps({"id": {"testResult": {"label": "//a:dual_test"}},
+                        "testResult": {"testAttemptDurationMillis": "45000"}}),
+        ]
+        with self.assertRaisesRegex(ValueError, "//a:dual_test"):
+            slow_tests.from_bep(bep_events)
+
+        with tempfile.TemporaryDirectory(
+                dir=os.environ.get("TEST_TMPDIR")) as root:
+            bep = os.path.join(root, "events.json")
+            with open(bep, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(bep_events) + "\n")
+            with self.assertRaises(SystemExit) as raised, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                slow_tests.main(["--check", "--bep", bep,
+                                 "--enforce", "integration"])
+            self.assertNotEqual(raised.exception.code, 0)
+
+        # Conflicting duplicate entries in --lanes fail closed.
+        with self.assertRaisesRegex(ValueError, "multiple lanes"):
+            slow_tests.read_lanes(io.StringIO(
+                "//a:dual_test heavy\n//a:dual_test integration\n"))
+
+        # query_lanes fails closed when bazel query returns a target in more
+        # than one lane.
         per_lane = {
-            "heavy": "//a:heavy_and_int\n//a:all_lanes\n",
-            "integration": "//a:heavy_and_int\n//a:int_and_perf\n",
-            "e2e": "//a:all_lanes\n//a:e2e_and_perf\n",
-            "perf": "//a:all_lanes\n//a:int_and_perf\n//a:e2e_and_perf\n",
+            "heavy": "//a:heavy_and_int\n",
+            "integration": "//a:heavy_and_int\n",
+            "e2e": "",
+            "perf": "",
         }
 
         def fake_run(cmd, **_kwargs):
@@ -180,16 +219,12 @@ class SlowTestsTest(unittest.TestCase):
             raise AssertionError(f"unexpected query: {expr}")
 
         with mock.patch.object(slow_tests.subprocess, "run",
-                               side_effect=fake_run):
-            lanes = slow_tests.query_lanes()
-        self.assertEqual(lanes["//a:heavy_and_int"],
-                         slow_tests.lane_of(["heavy", "integration"]))
-        self.assertEqual(lanes["//a:all_lanes"],
-                         slow_tests.lane_of(["heavy", "e2e", "perf"]))
-        self.assertEqual(lanes["//a:int_and_perf"],
-                         slow_tests.lane_of(["integration", "perf"]))
-        self.assertEqual(lanes["//a:e2e_and_perf"],
-                         slow_tests.lane_of(["e2e", "perf"]))
+                               side_effect=fake_run), \
+                self.assertRaises(SystemExit) as raised:
+            slow_tests.query_lanes()
+        self.assertIn("//a:heavy_and_int", str(raised.exception))
+        self.assertIn("heavy", str(raised.exception))
+        self.assertIn("integration", str(raised.exception))
 
     # REQ-DEV-25: exit code 3 from bazel query fails closed whenever stderr
     # reports any non-external (workspace) package failure or no external error.
@@ -201,10 +236,14 @@ class SlowTestsTest(unittest.TestCase):
             'ERROR: Evaluation of query "tests(//...)" failed: '
             "errors were encountered while computing transitive closure\n"
         )
-        ok_proc = subprocess.CompletedProcess(
-            [], 3, stdout="//a:sim_test\n", stderr=external_stderr)
+
+        def ok_run(cmd, **_kwargs):
+            stdout = "//a:sim_test\n" if "heavy" in cmd[-1] else ""
+            return subprocess.CompletedProcess(
+                cmd, 3, stdout=stdout, stderr=external_stderr)
+
         with mock.patch.object(slow_tests.subprocess, "run",
-                               return_value=ok_proc):
+                               side_effect=ok_run):
             self.assertEqual(slow_tests.query_lanes(),
                              {"//a:sim_test": "heavy"})
 

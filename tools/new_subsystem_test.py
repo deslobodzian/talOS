@@ -839,6 +839,50 @@ class NewSubsystemTest(unittest.TestCase):
                 new_subsystem.plan_standalone(os.path.join(top, "arm"),
                                               "arm", "py", talos)
 
+    # REQ-DEV-02
+    def test_standalone_refuses_symlinks_non_dirs_and_paths_inside_talos(self):
+        with tempfile.TemporaryDirectory() as top:
+            talos = os.path.join(top, "talos")
+            os.makedirs(talos)
+            for name, text in (("MODULE.bazel", 'module(name = "talos")\n'),
+                               ("talos.bazelrc", "# talos\n"),
+                               (".bazelversion", "8.4.2\n")):
+                with open(os.path.join(talos, name), "w",
+                          encoding="utf-8") as f:
+                    f.write(text)
+
+            regular_file = os.path.join(top, "regular_file")
+            with open(regular_file, "w", encoding="utf-8") as f:
+                f.write("not a dir\n")
+            dangling = os.path.join(top, "dangling")
+            os.symlink(os.path.join(top, "missing"), dangling)
+            empty_dir = os.path.join(top, "empty_dir")
+            os.makedirs(empty_dir)
+            dir_link = os.path.join(top, "dir_link")
+            os.symlink(empty_dir, dir_link)
+            inside = os.path.join(talos, "sub", "arm")
+
+            for label, target in (
+                ("regular_file", regular_file),
+                ("dangling_symlink", dangling),
+                ("dir_symlink", dir_link),
+                ("dir_symlink_slash", dir_link + os.sep),
+                ("talos_root", talos),
+                ("inside_talos", inside),
+            ):
+                with self.subTest(case=label):
+                    with self.assertRaises(new_subsystem.Refused):
+                        new_subsystem.plan_standalone(target, "arm", "py", talos)
+
+            # An existing empty real directory and a new target inside a
+            # symlinked parent (like macOS /tmp) are still accepted.
+            writes_empty = new_subsystem.plan_standalone(
+                empty_dir, "arm", "py", talos)
+            self.assertTrue(writes_empty)
+            writes_via_parent = new_subsystem.plan_standalone(
+                os.path.join(dir_link, "arm"), "arm", "py", talos)
+            self.assertTrue(writes_via_parent)
+
     # REQ-DEV-01
     def test_talos_checkout_flag_is_held_to_the_checkout_check(self):
         # --talos-checkout DIR (relative to the robot repository's root)
