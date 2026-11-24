@@ -120,8 +120,8 @@ CANcoder and Pigeon2 accept `type`, `bus`, `can_id`, `inverted`, and `offset_rot
 QuadratureEncoder accepts `type`, `dio_a`, `dio_b`, and `counts_per_rev`;
 DutyCycleEncoder accepts `type`, `dio`, and `offset_rot`; `digital_outputs`
 accepts only `dio`, `digital_inputs` accepts `dio` plus the optional
-`sim_motor`, `sim_closed_at_rot`, `sim_closed_above`, and `sim_closed_reads`
-keys, and analog inputs and PWM outputs accept only `channel`.
+`sim_motor`, `sim_closed_at_rot`, `sim_closed_above`, `sim_closed_reads` and
+`sim_sensor` keys, and analog inputs and PWM outputs accept only `channel`.
 
 Motor tables may specify `follow = "master_motor"` and optional
 `oppose_master = true` (default false). The master must be a motor owned by
@@ -238,17 +238,28 @@ A digital input may carry a simulated home switch:
 `sim_motor = "<motor>"` (a motor of the same subsystem) and
 `sim_closed_at_rot` (finite, required with `sim_motor`), with
 `sim_closed_above` and `sim_closed_reads` (both default false). Config load
-refuses a `sim_closed_*` key without `sim_motor`, a `sim_motor` that names no
-motor of the input's subsystem, and a non-finite `sim_closed_at_rot`, naming
+refuses `sim_closed_at_rot` or `sim_closed_above` without `sim_motor`, a
+`sim_motor` that names no motor of the input's subsystem, and a non-finite
+`sim_closed_at_rot`, naming
 the key and the input. Like `motor_type`, every config load accepts them but
 only the physics simulator reads them; they are not in the wire format or the
 configuration fingerprint. `sim_gateway --physics` binds them from its own
 parse of `--config` (`PhysicsSimBackend::SetHomeSwitches`; the backend table
 below gives the switch's behaviour).
 
+A digital input may instead name a sensor of the MuJoCo model
+(`[simulation.mujoco]` below): `sim_sensor = "<sensor>"` (a non-empty
+string), with `sim_closed_reads` (default false), the value the input reads
+while that sensor detects. Config load refuses `sim_sensor` with
+`sim_motor`; `sim_closed_at_rot` or `sim_closed_above` with `sim_sensor`;
+and `sim_closed_reads` with neither `sim_motor` nor `sim_sensor`, naming
+the key and the input. Like `sim_motor`, it is not in the wire format or the
+configuration fingerprint. Config load does not open the model, so a
+`sim_sensor` naming a sensor the model lacks is not refused at load.
+
 An optional top-level `[simulation]` table configures physics chassis geometry,
-end-of-travel hard stops, battery sag, chassis dynamics, and per-mechanism
-inertia/friction:
+end-of-travel hard stops, battery sag, chassis dynamics, per-mechanism
+inertia/friction and the MuJoCo model:
 - `wheel_radius_m` (positive finite double, default `0.0508` m),
 - `[[simulation.swerve_modules]]` entries (`drive`, `steer`, `x_m`, `y_m`, where
   `drive` and `steer` name distinct configured motors, no motor appears twice,
@@ -266,7 +277,24 @@ inertia/friction:
 - `[[simulation.mechanisms]]` entries (`motor` naming a configured master motor
   with no duplicates; `inertia_kg_m2` required positive finite at the mechanism
   shaft; optional `load`, `"roller"` (default) or `"flywheel"`; optional
-  non-negative finite `viscous_damping_nm_per_radps` and `static_friction_nm`).
+  non-negative finite `viscous_damping_nm_per_radps` and `static_friction_nm`),
+- `[simulation.mujoco]`, the MuJoCo model: `robot_model` (required, the
+  robot's MJCF file), `robot_model_files` (optional array: every other file
+  the model reads, such as meshes) and `field` (optional field model name,
+  today `"rebuilt_2026"`; absent or `""` is flat carpet). The file that sets
+  `robot_model` sets the whole model: `robot_model_files` comes only from
+  that file (absent there, none), so a file that includes another and sets
+  `robot_model` discards the included file's list, while `field` overrides
+  on its own. Each path is relative to the file that sets it and never
+  absolute; each file must exist, and the build lists it in the config's
+  `CONFIG_FILES`, so `talos_sim` and `talos_bundle` carry it, as
+  `[trajectories]` files are. Config load refuses an unknown key, a
+  non-string or empty path, a non-array `robot_model_files`,
+  `robot_model_files` in a file that does not set `robot_model`, and an
+  unknown `field`, naming the key and the file that sets it. It checks only
+  that the files exist and the field name is known: it does not open the
+  model, so a file the model reads but the list omits is not refused at
+  load.
 
 Like `motor_type` and `sim_motor`, `[simulation]` stays off the wire and out of
 `ConfigurationId`; `sim_gateway --physics` passes `wheel_radius_m` in

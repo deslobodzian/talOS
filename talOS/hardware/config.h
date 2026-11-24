@@ -474,6 +474,15 @@ struct LocalHomeSwitch {
   bool operator==(const LocalHomeSwitch&) const { return true; }
 };
 
+// A digital input bound to a sensor of the MuJoCo model
+// (`[simulation.mujoco]`): it reads `closed_reads` while that sensor detects.
+// Like LocalHomeSwitch, not on the config wire and equal whatever its value.
+struct LocalWorldSensor {
+  std::string sensor;  // Empty: not bound to the model.
+  bool closed_reads{false};
+  bool operator==(const LocalWorldSensor&) const { return true; }
+};
+
 struct DigitalInputConfig {
   uint16_t id{};
   ConfigString name;
@@ -484,6 +493,11 @@ struct DigitalInputConfig {
   // from its own parse of the robot config
   // (sim::PhysicsSimBackend::SetHomeSwitches).
   LocalHomeSwitch sim_home_switch{};
+  // [digital_inputs.*] sim_sensor and, with it, sim_closed_reads; exclusive
+  // with sim_motor. Off the wire and out of ConfigurationId like
+  // sim_home_switch; a simulator reads it from its own parse of the robot
+  // config.
+  LocalWorldSensor sim_sensor{};
   bool operator==(const DigitalInputConfig&) const = default;
 };
 
