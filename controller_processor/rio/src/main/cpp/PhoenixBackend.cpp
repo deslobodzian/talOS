@@ -905,10 +905,14 @@ void PhoenixBackend::SyncUnlicensedAndPruneUnavailable() {
 bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
   const PhaseTimer timer{*log_, talos::rio::TickPhase::kDevices};
   // HasResetOccurred reports (and clears) one device's reset latch.
+  const auto has_reset = [this](ph::hardware::ParentDevice& device) {
+    return poll_device_reset_ ? poll_device_reset_(device)
+                              : device.HasResetOccurred();
+  };
   reset_ids.clear();
   for (std::size_t i = 0; i < motors_.size() && i < config_.motors.size();
        ++i) {
-    if (motors_[i]->HasResetOccurred()) {
+    if (has_reset(*motors_[i])) {
       const auto& motor = config_.motors[i];
       reset_ids.push_back(motor.id);
       talos::rio::LogEvent event;
@@ -923,9 +927,8 @@ bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
   }
   for (std::size_t i = 0; i < sensors_.size() && i < config_.sensors.size();
        ++i) {
-    const bool reset = sensors_[i].encoder
-                           ? sensors_[i].encoder->HasResetOccurred()
-                           : sensors_[i].imu->HasResetOccurred();
+    const bool reset = sensors_[i].encoder ? has_reset(*sensors_[i].encoder)
+                                           : has_reset(*sensors_[i].imu);
     if (reset) {
       const auto& sensor = config_.sensors[i];
       reset_ids.push_back(sensor.id);
