@@ -949,6 +949,8 @@ dio = 2
         self.assertFalse(lift.connected)
         self.assertFalse(lift.reverse_limit)
 
+    # REQ-CONTRACT-14, REQ-OPS-20: Motor.hardware_index returns the motor's slot
+    # in configured motor order matching /hw/status motor_fault_mask.
     def test_motor_hardware_index_matches_configured_order(self):
         toml = """
 [robot]

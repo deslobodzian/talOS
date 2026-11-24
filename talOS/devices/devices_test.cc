@@ -2795,8 +2795,9 @@ TEST(Devices, LateOutputDeviceFailsAtomicallyWithoutLeakingRequestTopic) {
   }
 }
 
-// Motor::hardware_index returns the motor's slot in configured motor order
-// (config.hardware.motors / /hw/status motor_fault_mask), independent of the
+// REQ-OPS-20: Motor::hardware_index returns the motor's slot in configured
+// motor order (config.hardware.motors / /hw/status motor_fault_mask),
+// independent of the
 // order handles are opened on a node or non-motor handles opened before them.
 TEST(Devices, MotorHardwareIndexMatchesConfiguredMotorOrder) {
   constexpr const char* kMultiMotorToml = R"(
