@@ -462,13 +462,13 @@ bool RefreshSessionLocks(const SessionLock* session_lock,
   const Refreshed directory =
       session_directory ? session_directory->Refresh(lock_session_directory)
                         : Refreshed::kHeld;
-  if (directory == Refreshed::kTaken) {
+  if (session_directory && directory == Refreshed::kTaken) {
     // Once: a lock taken stays held.
     ConsoleLine(std::cerr)
         << "[launcher] locked " << session_directory->path()
         << ", which could not be locked when the session started; "
            "retention passes over this session from now on\n";
-  } else if (directory == Refreshed::kRetaken &&
+  } else if (session_directory && directory == Refreshed::kRetaken &&
              !state.directory_lock_retaken_reported) {
     state.directory_lock_retaken_reported = true;
     if (manifest != nullptr) manifest->directory_lock_retaken = true;
@@ -481,7 +481,7 @@ bool RefreshSessionLocks(const SessionLock* session_lock,
         << " was removed while this session held it; locked it "
            "again on a new file, so retention passes over this "
            "session again\n";
-  } else if (directory == Refreshed::kLost &&
+  } else if (session_directory && directory == Refreshed::kLost &&
              !state.directory_lock_lost_reported) {
     state.directory_lock_lost_reported = true;
     if (manifest != nullptr) manifest->directory_lock_lost = true;

@@ -682,8 +682,8 @@ TEST(LogFuzzTest, OversizedHeaderManifestAndSchemaRejectedByBothReaders) {
       } catch (const IncompleteLogHeader& e) {
         ADD_FAILURE() << "expected non-IncompleteLogHeader runtime_error, got: "
                       << e.what();
-      } catch (const std::runtime_error&) {
-        // Expected.
+      } catch (const std::runtime_error& e) {
+        EXPECT_NE(e.what(), nullptr);
       }
     };
     check([&] { (void)LogReader{path}; });
