@@ -2,11 +2,16 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <iterator>
 #include <limits>
+#include <random>
+#include <vector>
 
 namespace talos::hardware {
 namespace {
@@ -371,6 +376,528 @@ TEST(ClockOffset, ExtremeTimestampsDoNotOverflowSignedArithmetic) {
   EXPECT_EQ(clock.round_trip_us(), 1000u);
   EXPECT_EQ(clock.uncertainty_us(), 503u);
   EXPECT_EQ(clock.bounded_offset_us(), 1511);
+}
+
+// Guards RT-29: a corrupt or spoofed far-future sample_time_us within a boot
+// (including UINT64_MAX) must be ignored rather than advancing
+// last_sample_time_us_ and permanently locking out subsequent valid States or
+// poisoning the one-way offset estimate.
+// REQ-RT-27
+TEST(ClockOffset, FarFutureSampleJumpIsIgnoredWithoutLockingOutLaterSamples) {
+  Estimator clock;
+  for (std::uint64_t i = 0; i < Estimator::kConvergedSamples; ++i) {
+    ASSERT_TRUE(clock.Observe(11, 1'000 + 5'000 * i, 1'000'000 + 5'000 * i));
+  }
+  const std::uint64_t last_sample =
+      1'000 + 5'000 * (Estimator::kConvergedSamples - 1);
+  const std::uint64_t last_receipt =
+      1'000'000 + 5'000 * (Estimator::kConvergedSamples - 1);
+  const std::int64_t offset_before = clock.offset_us();
+  const std::size_t window_before = clock.window_count();
+
+  // Far-future jumps (+1 hour, UINT64_MAX, and 1 us past the 1 s margin at
+  // zero elapsed bridge time), duplicate UINT64_MAX, and inconsistent jump
+  // pairs (+1 h then +5 h, or a frozen corrupt pair separated by >1 s) are all
+  // ignored without disturbing state.
+  EXPECT_FALSE(
+      clock.Observe(11, last_sample + 3'600'000'000ULL, last_receipt + 5'000));
+  EXPECT_FALSE(clock.Observe(11, last_sample + 18'000'000'000ULL,
+                             last_receipt + 10'000));
+  EXPECT_FALSE(clock.Observe(11, std::numeric_limits<std::uint64_t>::max(),
+                             last_receipt + 15'000));
+  EXPECT_FALSE(clock.Observe(11, std::numeric_limits<std::uint64_t>::max(),
+                             last_receipt + 20'000));
+  EXPECT_FALSE(clock.Observe(11, last_sample + 1'000'001ULL, last_receipt));
+  // A frozen corrupt timestamp pair separated by >1 s of bridge time fails the
+  // symmetric physical-rate check and must not re-sync.
+  EXPECT_FALSE(
+      clock.Observe(11, last_sample + 7'200'000'000ULL, last_receipt + 5'000));
+  EXPECT_FALSE(clock.Observe(11, last_sample + 7'200'000'001ULL,
+                             last_receipt + 2'005'000));
+  EXPECT_EQ(clock.ignored_count(), 7u);
+  EXPECT_EQ(clock.window_count(), window_before);
+  EXPECT_EQ(clock.offset_us(), offset_before);
+  EXPECT_EQ(clock.spread_us(), 0u);
+
+  // Subsequent normal samples clear any pending jump candidate and continue to
+  // be accepted cleanly; a later corrupt frame matching the old candidate's
+  // trajectory is therefore still ignored.
+  EXPECT_TRUE(clock.Observe(11, last_sample + 5'000, last_receipt + 5'000));
+  EXPECT_FALSE(clock.Observe(11, last_sample + 7'200'005'001ULL,
+                             last_receipt + 2'010'000));
+  EXPECT_TRUE(clock.Observe(11, last_sample + 10'000, last_receipt + 10'000));
+  EXPECT_EQ(clock.ignored_count(), 8u);
+  EXPECT_EQ(clock.window_count(), window_before + 2);
+  EXPECT_EQ(clock.offset_us(), offset_before);
+}
+
+// Guards RT-29 against delayed buffered frames after a long (>500 s) outage:
+// a packet delayed past the 1 s jump margin must never pull the prompt anchor
+// backward and lock out the live frame immediately behind it, while sustained
+// bridge-fast oscillator drift refreshes the anchor over normal streaming so
+// the drift allowance never grows unboundedly.
+// REQ-RT-27
+TEST(ClockOffset, DelayedFrameAfterLongOutageDoesNotLockOutLiveSamples) {
+  // 1. 1000 s outage + 1.5 s delayed buffered packet + live frame 5 ms later.
+  // Because 1000 s / 500 (2 s) > 1.5 s, a naive anchor-retreat check would
+  // pull the anchor back to the delayed packet and reject live frames for
+  // ~250 s. Instead, the live frame is accepted on frame 1 (zero frames lost).
+  {
+    Estimator clock;
+    ASSERT_TRUE(clock.Observe(1, 1'000'000, 1'000'000));
+    ASSERT_TRUE(clock.Observe(1, 1'000'000 + 999'500'000ULL,
+                              1'000'000 + 1'001'000'000ULL));
+    EXPECT_TRUE(clock.Observe(1, 1'000'000 + 1'001'005'000ULL,
+                              1'000'000 + 1'001'005'000ULL));
+    EXPECT_EQ(clock.ignored_count(), 0u);
+    // Anchor advanced to the live frame, so 1 us past the 1 s margin is
+    // rejected immediately.
+    EXPECT_FALSE(clock.Observe(1, 1'000'000 + 1'002'005'001ULL,
+                               1'000'000 + 1'001'005'000ULL));
+    EXPECT_EQ(clock.ignored_count(), 1u);
+  }
+
+  // 2. One hour of steady 200 Hz streaming with bridge 1000 ppm fast (every
+  // frame slower than the first by increasing drift): every valid frame is
+  // accepted, and the anchor refreshes periodically so a corrupt +1.5 s jump
+  // after an hour is still rejected rather than accepted inside a huge drift
+  // cone.
+  {
+    Estimator clock;
+    constexpr std::uint64_t kSteps = 720'000;  // 1 hour at 5 ms
+    for (std::uint64_t i = 0; i <= kSteps; ++i) {
+      ASSERT_TRUE(
+          clock.Observe(2, 1'000'000 + 5'000 * i, 10'000'000 + 5'005 * i));
+    }
+    const std::uint64_t last_sample = 1'000'000 + 5'000 * kSteps;
+    const std::uint64_t last_receipt = 10'000'000 + 5'005 * kSteps;
+    EXPECT_FALSE(
+        clock.Observe(2, last_sample + 1'500'000, last_receipt + 5'005));
+    EXPECT_TRUE(clock.Observe(2, last_sample + 5'000, last_receipt + 5'005));
+    EXPECT_EQ(clock.ignored_count(), 1u);
+  }
+}
+
+// Guards RT-29 against SIGSTOP / startup stall + SO_RCVBUF tail-drop on an
+// unseen boot (e.g. a mid-boot bridge restart): draining stale buffered frames
+// leaves the initial anchor behind live time, so the first live frame is held
+// as a jump candidate and the second live frame (5 ms later, consistent at
+// physical clock rate) immediately re-syncs the anchor and resumes acceptance.
+// REQ-RT-27
+TEST(ClockOffset, UnseenBootStallTailDropRecoversOnTwoConsistentLiveFrames) {
+  {
+    Estimator clock;
+    // Unseen boot: bridge stalled 3 s while SO_RCVBUF buffered 10.000 s ..
+    // 11.000 s and tail-dropped 11.005 s .. 12.995 s.
+    ASSERT_TRUE(clock.Observe(9, 10'000'000, 13'000'000));
+    for (std::uint64_t i = 1; i <= Estimator::kWindowSamples; ++i) {
+      ASSERT_TRUE(clock.Observe(9, 10'000'000 + 5'000 * i, 13'001'000));
+    }
+    ASSERT_TRUE(clock.converged());
+    const std::int64_t stale_offset = clock.offset_us();
+    ASSERT_EQ(stale_offset, 2'001'000);
+
+    // Live frame 1 (2.005 s ahead of the stale anchor): held as jump candidate
+    // without disturbing the window or offset.
+    EXPECT_FALSE(clock.Observe(9, 13'005'000, 13'005'000));
+    EXPECT_EQ(clock.ignored_count(), 1u);
+    EXPECT_EQ(clock.offset_us(), stale_offset);
+
+    // A reordered stale duplicate does not disturb the pending candidate.
+    EXPECT_FALSE(clock.Observe(9, 10'995'000, 13'006'000));
+    EXPECT_EQ(clock.ignored_count(), 2u);
+
+    // Live frame 2 (5 ms later, consistent with live frame 1 at physical clock
+    // rate): re-syncs the anchor and is accepted immediately, snapping
+    // offset_us_ to 0 while stale delays age out of spread_us_.
+    EXPECT_TRUE(clock.Observe(9, 13'010'000, 13'010'000));
+    EXPECT_EQ(clock.ignored_count(), 2u);
+    EXPECT_TRUE(clock.converged());
+    EXPECT_EQ(clock.offset_us(), 0);
+    EXPECT_GT(clock.spread_us(), 2'000'000u);
+
+    // After a full window of live frames, stale buffered delays age out cleanly
+    // and a single corrupt jump is still rejected without locking out live
+    // time.
+    for (std::uint64_t i = 1; i <= Estimator::kWindowSamples; ++i) {
+      ASSERT_TRUE(
+          clock.Observe(9, 13'010'000 + 5'000 * i, 13'010'000 + 5'000 * i));
+    }
+    EXPECT_EQ(clock.offset_us(), 0);
+    EXPECT_EQ(clock.spread_us(), 0u);
+    const std::uint64_t live = 13'010'000 + 5'000 * Estimator::kWindowSamples;
+    EXPECT_FALSE(clock.Observe(9, live + 1'000'001, live));
+    EXPECT_TRUE(clock.Observe(9, live + 5'000, live + 5'000));
+    EXPECT_EQ(clock.ignored_count(), 3u);
+  }
+
+  // A backward bridge receipt must not confirm a pending jump candidate.
+  {
+    Estimator clock;
+    ASSERT_TRUE(clock.Observe(10, 10'000'000, 13'000'000));
+    ASSERT_TRUE(clock.Observe(10, 11'000'000, 13'001'000));
+    EXPECT_FALSE(clock.Observe(10, 13'005'000, 13'005'000));
+    EXPECT_FALSE(clock.Observe(10, 13'010'000, 13'004'000));
+    EXPECT_TRUE(clock.Observe(10, 13'015'000, 13'015'000));
+    EXPECT_EQ(clock.ignored_count(), 2u);
+  }
+}
+
+// Guards RT-29 boundary cases: exact 1 s jitter margin, burst catch-up after
+// delayed buffered frames (including UDP tail-drop after a multi-second pause),
+// long outages with up to 1000 ppm relative oscillator drift in either
+// direction, backward bridge clock without underflow, and arbitrary starting
+// sample_time_us on a new boot.
+// REQ-RT-27
+TEST(ClockOffset, JumpGuardAcceptsOutagesJitterAndNewBootWhileEnforcingBound) {
+  // 1. Exact boundary at receipt_delta == 0 and burst jitter catch-up.
+  {
+    Estimator clock;
+    // Frame 0 delayed by 400 ms; Frame 1 arrives promptly in the same Tick.
+    ASSERT_TRUE(clock.Observe(1, 1'000'000, 2'400'000));
+    EXPECT_TRUE(clock.Observe(1, 1'400'000, 2'400'000));
+    // Exact 1 s margin above the prompt anchor is accepted; 1 us past is not.
+    EXPECT_FALSE(clock.Observe(1, 2'400'001, 2'400'000));
+    EXPECT_TRUE(clock.Observe(1, 2'400'000, 2'400'000));
+    EXPECT_EQ(clock.ignored_count(), 1u);
+  }
+
+  // 2. Multi-second pause with 200 buffered stale frames followed by a live
+  // frame (UDP tail-drop): delayed frames must not pull the anchor back and
+  // lock out the live frame behind them.
+  {
+    Estimator clock;
+    ASSERT_TRUE(clock.Observe(2, 1'000'000, 1'000'000));
+    // 200 delayed frames drained at t = 3.5 s carrying s = 1.005 s .. 2.000 s.
+    for (std::uint64_t i = 1; i <= Estimator::kWindowSamples; ++i) {
+      ASSERT_TRUE(clock.Observe(2, 1'000'000 + 5'000 * i, 3'500'000));
+    }
+    // Live frame arrives at t = 3.505 s with s = 3.505 s (+1.505 s ahead of
+    // the last buffered frame, but matching the pre-pause anchor).
+    EXPECT_TRUE(clock.Observe(2, 3'505'000, 3'505'000));
+    // Once back at live time, 1 us past the 1 s margin is still rejected.
+    EXPECT_FALSE(clock.Observe(2, 3'505'000 + 1'000'001, 3'505'000));
+    EXPECT_EQ(clock.ignored_count(), 1u);
+  }
+
+  // 3. Long link outages (10 s and 1 hour) with 1000 ppm relative oscillator
+  // drift in either direction, plus exact bound check at 10 s (drift = 20 ms).
+  {
+    Estimator clock;
+    ASSERT_TRUE(clock.Observe(3, 1'000'000, 10'000'000));
+    // 10 s outage: max allowed = 10 s + 20 ms (2000 ppm) + 1 s = 11.020 s.
+    EXPECT_FALSE(clock.Observe(3, 1'000'000 + 11'020'001, 20'000'000));
+    // Gateway 1000 ppm fast across 10 s (+10 ms): accepted.
+    EXPECT_TRUE(clock.Observe(3, 1'000'000 + 10'010'000, 20'000'000));
+    // 1-hour outage with gateway 1000 ppm fast (+3.6 s): accepted.
+    EXPECT_TRUE(clock.Observe(3, 11'010'000 + 3'603'600'000ULL,
+                              20'000'000 + 3'600'000'000ULL));
+    // 1-hour outage with bridge 1000 ppm fast (-3.6 s): accepted without
+    // retreating the anchor on one frame (a far-future jump outside the 1-hour
+    // drift cone is still rejected immediately, and once 1 s of live frames
+    // refreshes the anchor a +1.5 s jump is rejected again).
+    const std::uint64_t s2 = 11'010'000 + 3'603'600'000ULL + 3'596'400'000ULL;
+    const std::uint64_t r2 = 20'000'000 + 7'200'000'000ULL;
+    EXPECT_TRUE(clock.Observe(3, s2, r2));
+    EXPECT_FALSE(clock.Observe(3, s2 + 15'000'000, r2 + 5'000));
+    constexpr std::uint64_t kRefreshSteps = 201;
+    for (std::uint64_t i = 1; i <= kRefreshSteps; ++i) {
+      ASSERT_TRUE(clock.Observe(3, s2 + 5'000 * i, r2 + 5'005 * i));
+    }
+    const std::uint64_t s3 = s2 + 5'000 * kRefreshSteps;
+    const std::uint64_t r3 = r2 + 5'005 * kRefreshSteps;
+    EXPECT_FALSE(clock.Observe(3, s3 + 1'500'000, r3 + 5'005));
+    EXPECT_EQ(clock.ignored_count(), 3u);
+  }
+
+  // 4. Backward bridge receipt_us must not underflow into a huge allowance,
+  // and a new boot resets the baseline for arbitrary starting sample_time_us.
+  {
+    Estimator clock;
+    ASSERT_TRUE(clock.Observe(4, 5'000, 10'000'000));
+    EXPECT_FALSE(clock.Observe(4, 5'000 + 1'000'001, 1'000'000));
+    EXPECT_TRUE(clock.Observe(4, 10'000, 1'000'000));
+    // New boot may jump far higher or far lower than the previous boot.
+    EXPECT_TRUE(clock.Observe(5, 900'000'000'000ULL, 10'005'000));
+    EXPECT_TRUE(clock.Observe(6, 0, 10'010'000));
+    EXPECT_FALSE(clock.Observe(6, 1'000'001, 10'010'000));
+    EXPECT_TRUE(clock.Observe(6, 5'000, 10'015'000));
+  }
+}
+
+// Seeded property test for RT-29 (AGENTS.md verification #2): drives
+// ClockOffsetEstimator::Observe through a randomized physical model (5/10/20 ms
+// gateway periods, +-1000 ppm relative clock drift, FIFO socket buffers of
+// 64..4000 frames with tail-drop, unseen-boot stalls, bridge stalls, link
+// outages from 10 ms to ~3 h, held bursts, stall-then-dead-link, overloaded
+// bridge reading slower than arrival, and single corrupt frames across all 6
+// fault shapes).
+// Property A (no corruption): never refuses two legitimate frames in a row.
+// Property B (single corrupt frame during streaming): every injection recovers
+// and worst lockout stays within the derived bound (~1.032 s).
+// REQ-RT-27
+TEST(
+    ClockOffset,
+    RandomizedPhysicalModelNeverRefusesTwoLegitFramesInARowAndBoundsCorruptLockout) {
+  constexpr std::array<std::uint64_t, 4> kPeriods = {5'000, 5'000, 10'000,
+                                                     20'000};
+  constexpr std::uint64_t kMaxPeriodUs = kPeriods.back();
+  constexpr std::uint64_t kMinDeliveryJitterUs = 50;
+  constexpr std::uint64_t kMaxDeliveryJitterUs = 2'000;
+  constexpr std::uint64_t kMaxModelDriftPpm = 1'000;
+  // Derived Property B lockout ceiling for a single corrupt frame injected
+  // during steady streaming:
+  //   - kMaxSampleJumpMarginUs (1,000,000 us): maximum jump accepted directly
+  //     above the prompt anchor before the gate rejects it.
+  //   - kMaxPeriodUs (20,000 us): up to one gateway tick after real gateway
+  //     time catches up before the next legitimate sample strictly exceeds the
+  //     accepted corrupt timestamp.
+  //   - 2 * kMaxDeliveryJitterUs (4,000 us): corrupt-frame delivery jitter
+  //     widening receipt_delta plus recovering-frame delivery jitter widening
+  //     measured lockout.
+  //   - Drift overhead (<= 8,120 us): under steady -1000 ppm (bridge fast),
+  //     the prompt anchor refreshes every kAnchorRefreshUs (1 s), so at
+  //     injection receipt_delta is at most 2 * kAnchorRefreshUs +
+  //     2 * kMaxPeriodUs (~2.04 s); the gate's 2000 ppm drift allowance
+  //     (~4.08 ms), the gateway's 1000 ppm lag since the anchor (~2.04 ms),
+  //     and its 1000 ppm lag while catching up across the 1 s margin (~1.0 ms
+  //     plus 1 ms for integer rounding and 1/(1 - 1e-3)) sum to 8.12 ms.
+  // Theoretical ceiling is ~1.032 s (single-margin + period + jitter + 1 s
+  // drift is ~1.025 s; measured worst across the 40-boot suite is ~1.021 s).
+  constexpr std::uint64_t kMaxAnchorAgeUs =
+      2 * Estimator::kAnchorRefreshUs + 2 * kMaxPeriodUs;
+  constexpr std::uint64_t kMaxDriftOverheadUs =
+      kMaxAnchorAgeUs / Estimator::kMaxClockDriftDivisor +
+      (kMaxAnchorAgeUs + Estimator::kMaxSampleJumpMarginUs) *
+          kMaxModelDriftPpm / 1'000'000 +
+      1'000;
+  constexpr std::uint64_t kMaxCorruptLockoutUs =
+      Estimator::kMaxSampleJumpMarginUs + kMaxPeriodUs +
+      2 * kMaxDeliveryJitterUs + kMaxDriftOverheadUs;
+
+  struct Frame {
+    std::uint64_t sample_us;
+    bool corrupt;
+  };
+  struct RunStats {
+    std::uint64_t legit = 0;
+    std::uint64_t max_refused_run = 0;
+    std::uint64_t worst_lockout_us = 0;
+    std::uint64_t unrecovered = 0;
+    std::array<std::uint64_t, 6> corrupt_shapes{};
+  };
+
+  const auto run_boot = [&](std::uint64_t seed, bool inject_corrupt,
+                            int events) -> RunStats {
+    RunStats stats;
+    Estimator est;
+    std::mt19937_64 rng{seed};
+    const auto uniform = [&](std::uint64_t lo, std::uint64_t hi) {
+      return std::uniform_int_distribution<std::uint64_t>{lo, hi}(rng);
+    };
+
+    const std::uint64_t boot =
+        uniform(1, std::numeric_limits<std::uint64_t>::max() - 1);
+    const double drift =
+        (static_cast<double>(uniform(0, 2 * kMaxModelDriftPpm)) -
+         static_cast<double>(kMaxModelDriftPpm)) *
+        1e-6;
+    const std::uint64_t g0 = uniform(0, 1) != 0
+                                 ? uniform(0, 5'000'000)
+                                 : uniform(0, 4'000'000'000'000ULL);
+    constexpr std::array<std::size_t, 4> kCaps = {64, 200, 1000, 4000};
+    const std::uint64_t period =
+        kPeriods[static_cast<std::size_t>(uniform(0, kPeriods.size() - 1))];
+    const std::size_t cap =
+        kCaps[static_cast<std::size_t>(uniform(0, kCaps.size() - 1))];
+    const auto gclock = [&](std::uint64_t bridge_t) {
+      const auto drift_us =
+          static_cast<std::int64_t>(static_cast<double>(bridge_t) * drift);
+      return drift_us >= 0
+                 ? g0 + bridge_t + static_cast<std::uint64_t>(drift_us)
+                 : g0 + bridge_t - static_cast<std::uint64_t>(-drift_us);
+    };
+
+    std::uint64_t t = uniform(1'000'000, 50'000'000);
+    std::uint64_t refused_run = 0;
+    std::uint64_t last_receipt_us = 0;
+    bool lockout_active = false;
+    std::uint64_t lockout_from_us = 0;
+
+    const auto deliver = [&](const Frame& frame, std::uint64_t receipt_us) {
+      receipt_us = std::max(receipt_us, last_receipt_us + 1);
+      last_receipt_us = receipt_us;
+      const bool accepted = est.Observe(boot, frame.sample_us, receipt_us);
+      if (frame.corrupt) return;
+      ++stats.legit;
+      if (!inject_corrupt) {
+        if (!accepted) {
+          ++refused_run;
+          stats.max_refused_run = std::max(stats.max_refused_run, refused_run);
+        } else {
+          refused_run = 0;
+        }
+      } else if (lockout_active && accepted) {
+        const std::uint64_t lockout_us =
+            receipt_us > lockout_from_us ? receipt_us - lockout_from_us : 0;
+        stats.worst_lockout_us = std::max(stats.worst_lockout_us, lockout_us);
+        lockout_active = false;
+      }
+    };
+
+    const auto stream = [&](std::uint64_t dur_us) {
+      const std::uint64_t end = t + dur_us;
+      for (; t < end; t += period) {
+        deliver({gclock(t), false},
+                t + uniform(kMinDeliveryJitterUs, kMaxDeliveryJitterUs));
+      }
+    };
+
+    // Models a FIFO socket buffer of capacity `cap` filling during a stall and
+    // tail-dropping subsequent frames without iterating over dropped ticks.
+    const auto buffer_stall = [&](std::uint64_t dur_us) {
+      std::deque<Frame> queue;
+      const std::uint64_t ticks = (dur_us + period - 1) / period;
+      const std::uint64_t buffered =
+          std::min<std::uint64_t>(ticks, static_cast<std::uint64_t>(cap));
+      for (std::uint64_t i = 0; i < buffered; ++i) {
+        queue.push_back({gclock(t + i * period), false});
+      }
+      t += ticks * period;
+      return queue;
+    };
+
+    const auto drain = [&](const auto& frames) {
+      std::uint64_t r = t;
+      for (const Frame& frame : frames) {
+        r += uniform(5, 40);
+        deliver(frame, r);
+      }
+    };
+
+    if (uniform(0, 2) == 0) {
+      // Unseen-boot stall: first frames drained late, tail dropped.
+      drain(buffer_stall(uniform(10'000, 30'000'000)));
+    }
+    stream(uniform(100'000, 3'000'000));
+
+    for (int e = 0; e < events; ++e) {
+      std::uint64_t kind = uniform(0, inject_corrupt ? 5 : 4);
+      if (!inject_corrupt && kind == 4) kind = 5;
+      // Log-uniform durations from 10 ms to ~2.8 h (~10,000 s).
+      const auto dur = static_cast<std::uint64_t>(
+          10'000.0 * std::pow(1'000'000.0,
+                              static_cast<double>(uniform(0, 1000)) / 1000.0));
+      if (kind == 0) {
+        // Bridge stall: buffer fills, tail-drop, drain at once.
+        drain(buffer_stall(dur));
+      } else if (kind == 1) {
+        // Link outage: frames lost.
+        t += dur - dur % period;
+      } else if (kind == 2) {
+        // Held burst: path holds every frame, then delivers at once.
+        std::vector<Frame> held;
+        const std::uint64_t end = t + std::min<std::uint64_t>(dur, 30'000'000);
+        for (; t < end; t += period) held.push_back({gclock(t), false});
+        drain(held);
+      } else if (kind == 3) {
+        // Stall followed by a dead link before the buffered frames drain.
+        const std::deque<Frame> queue =
+            buffer_stall(std::min<std::uint64_t>(dur, 20'000'000));
+        t += uniform(0, 5'000'000);
+        drain(queue);
+      } else if (kind == 5) {
+        // Overloaded bridge: reads slower than frames arrive while buffer stays
+        // full, then load ends and remaining frames drain at once.
+        std::deque<Frame> queue = buffer_stall(uniform(1'000'000, 8'000'000));
+        const std::uint64_t gap = period + uniform(0, 2 * period);
+        const std::uint64_t end = t + std::min<std::uint64_t>(dur, 60'000'000);
+        std::uint64_t next_read = t;
+        for (; t < end; t += period) {
+          if (queue.size() < cap) queue.push_back({gclock(t), false});
+          while (!queue.empty() && next_read <= t) {
+            deliver(queue.front(), next_read);
+            queue.pop_front();
+            next_read += gap;
+          }
+        }
+        drain(queue);
+      } else {
+        // Single corrupt frame covering all 6 fault shapes.
+        const std::uint64_t now_s = gclock(t);
+        const std::uint64_t shape = uniform(0, 5);
+        ++stats.corrupt_shapes[static_cast<std::size_t>(shape)];
+        std::uint64_t corrupt_s = 0;
+        switch (shape) {
+          case 0:
+            corrupt_s = now_s + uniform(1, 900'000);
+            break;
+          case 1:
+            corrupt_s = now_s + uniform(900'000, 1'100'000);
+            break;
+          case 2:
+            corrupt_s = now_s + uniform(1'100'000, 3'600'000'000ULL);
+            break;
+          case 3:
+            corrupt_s = std::numeric_limits<std::uint64_t>::max();
+            break;
+          case 4:
+            corrupt_s = now_s | (std::uint64_t{1} << uniform(20, 63));
+            break;
+          default:
+            corrupt_s = now_s > 5'000'000 ? now_s - uniform(1, 5'000'000) : 0;
+            break;
+        }
+        lockout_active = true;
+        lockout_from_us = t;
+        deliver({corrupt_s, true},
+                t + uniform(kMinDeliveryJitterUs, kMaxDeliveryJitterUs));
+        t += period;
+      }
+
+      stream(inject_corrupt ? uniform(5'000'000, 20'000'000)
+                            : uniform(20'000, 5'000'000));
+      if (inject_corrupt && lockout_active) {
+        ++stats.unrecovered;
+        lockout_active = false;
+      }
+    }
+    return stats;
+  };
+
+  constexpr std::uint64_t kBoots = 40;
+  constexpr int kEventsPerBoot = 15;
+  std::uint64_t total_legit_a = 0;
+  std::uint64_t worst_refused_run = 0;
+  std::uint64_t worst_lockout_us = 0;
+  std::uint64_t total_unrecovered = 0;
+  std::array<std::uint64_t, 6> shape_counts{};
+
+  for (std::uint64_t seed = 1; seed <= kBoots; ++seed) {
+    const RunStats prop_a =
+        run_boot(seed, /*inject_corrupt=*/false, kEventsPerBoot);
+    total_legit_a += prop_a.legit;
+    worst_refused_run = std::max(worst_refused_run, prop_a.max_refused_run);
+    EXPECT_LE(prop_a.max_refused_run, 1u) << "seed " << seed;
+
+    const RunStats prop_b =
+        run_boot(seed + 1'000'000, /*inject_corrupt=*/true, kEventsPerBoot);
+    worst_lockout_us = std::max(worst_lockout_us, prop_b.worst_lockout_us);
+    total_unrecovered += prop_b.unrecovered;
+    for (std::size_t i = 0; i < shape_counts.size(); ++i) {
+      shape_counts[i] += prop_b.corrupt_shapes[i];
+    }
+    EXPECT_EQ(prop_b.unrecovered, 0u) << "seed " << seed;
+    EXPECT_LE(prop_b.worst_lockout_us, kMaxCorruptLockoutUs) << "seed " << seed;
+  }
+
+  EXPECT_GT(total_legit_a, 0u);
+  EXPECT_LE(worst_refused_run, 1u);
+  EXPECT_EQ(total_unrecovered, 0u);
+  EXPECT_LE(worst_lockout_us, kMaxCorruptLockoutUs);
+  for (std::size_t i = 0; i < shape_counts.size(); ++i) {
+    EXPECT_GT(shape_counts[i], 0u) << "corrupt fault shape " << i;
+  }
 }
 
 }  // namespace
