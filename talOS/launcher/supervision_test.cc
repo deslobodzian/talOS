@@ -6276,11 +6276,13 @@ TEST(Supervision, QuiescedBridgeDecouplesActuatorStopFromLogFlushTimeout) {
     const auto all_events = ReadLines(events);
     ASSERT_EQ(all_events.size(), 5u);
     EXPECT_EQ(all_events[0], "hw_int");
-    EXPECT_EQ(all_events[1], "hw_quiesced");
-    std::vector<std::string> owners(all_events.begin() + 2,
+    // quiesce_bridge marks kFlagQuiesced before writing "hw_quiesced", so
+    // signaled owners can log their SIGINT lines concurrently with it.
+    std::vector<std::string> middle(all_events.begin() + 1,
                                     all_events.begin() + 4);
-    std::sort(owners.begin(), owners.end());
-    EXPECT_EQ(owners, (std::vector<std::string>{"alpha_int", "beta_int"}));
+    std::sort(middle.begin(), middle.end());
+    EXPECT_EQ(middle, (std::vector<std::string>{"alpha_int", "beta_int",
+                                                "hw_quiesced"}));
     EXPECT_EQ(all_events[4], "hw_exit");
 
     const std::string manifest =

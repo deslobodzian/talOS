@@ -2052,6 +2052,8 @@ eject_us = 100000
   talos_sim_destroy(sim);
 }
 
+// REQ-CONTRACT-13, REQ-OPS-20: talos_motor_hardware_index exposes the
+// configured motor slot index and rejects invalid nodes or non-motor indices.
 TEST(NodeApiStandalone, MotorHardwareIndexReturnsSlotAndRejectsInvalid) {
   constexpr const char* kMultiToml = R"(
 [robot]

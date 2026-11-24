@@ -471,7 +471,7 @@ TEST_F(MotorTest, FutureClockMappedAcquisitionClampsAgeToZero) {
   EXPECT_EQ(s.velocity_age_us(), 0u);
 }
 
-// REQ-CONTRACT-08, REQ-DEV-04: /motor/state.fault masks /hw/status
+// REQ-OPS-20, REQ-CONTRACT-14: /motor/state.fault masks /hw/status
 // motor_fault_mask to kraken's own Motor::hardware_index() bit so another
 // motor's fault never raises kraken's fault, even when kraken is not at slot 0.
 TEST(MotorFaultMask, ReportsOnlyKrakenHardwareIndexBit) {
