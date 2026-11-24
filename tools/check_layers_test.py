@@ -1857,6 +1857,176 @@ class CheckNodeSourcesTest(unittest.TestCase):
                 self.assertGreaterEqual(failures, 1, f"{name}: {out}")
                 self.assertIn("bench/arm/macros.bzl:", out)
 
+    # REQ-SAFE-27, REQ-CONTRACT-16: helper calls mutating containers via
+    # keyword/splat args, `getattr`/Call.func mutation, and complex container
+    # expressions (BoolOp, BinOp, comprehensions, Lambda) must fail closed.
+    def test_starlark_helper_kwargs_getattr_and_expr_bypasses_fail_closed(self):
+        bad_builds = (
+            ("helper_includes_kwarg_mutation",
+             'INC = []\n'
+             'hide(includes = INC)\n'
+             'cc_library(name = "arm", srcs = ["arm.cc"], includes = INC)\n'),
+            ("helper_splat_opts_mutation",
+             'OPTS = {"includes": []}\n'
+             'hide(**OPTS)\n'
+             'cc_library(name = "arm", srcs = ["arm.cc"], **OPTS)\n'),
+            ("shadowed_cc_library_includes_mutation",
+             'load(":evil.bzl", "cc_library")\n'
+             'INC = []\n'
+             'cc_library(includes = INC)\n'
+             'native.cc_library(name = "arm", srcs = ["arm.cc"], includes = INC)\n'),
+            ("struct_ro_method_name_arg_mutation",
+             'INC = []\n'
+             'evil.get(INC)\n'
+             'cc_library(name = "arm", srcs = ["arm.cc"], includes = INC)\n'),
+            ("getattr_direct_call_includes",
+             'INC = []\n'
+             'getattr(INC, "append")(".")\n'
+             'cc_library(name = "arm", srcs = ["arm.cc"], includes = INC)\n'),
+            ("getattr_bound_method_includes",
+             'INC = []\n'
+             'fn = getattr(INC, "append")\n'
+             'fn(".")\n'
+             'cc_library(name = "arm", srcs = ["arm.cc"], includes = INC)\n'),
+            ("sorted_key_callback_includes",
+             'INC = []\n'
+             'sorted([INC], key = mutate)\n'
+             'cc_library(name = "arm", srcs = ["arm.cc"], includes = INC)\n'),
+            ("shadowed_ro_builtin_includes",
+             'load(":m.bzl", len = "mutate")\n'
+             'INC = []\n'
+             'len(INC)\n'
+             'cc_library(name = "arm", srcs = ["arm.cc"], includes = INC)\n'),
+            ("boolop_or_subscript_kwargs",
+             'OPTS = {}\n'
+             '(OPTS or {})["includes"] = ["."]\n'
+             'cc_library(name = "arm", srcs = ["arm.cc"], **OPTS)\n'),
+            ("binop_dict_merge_append_includes",
+             'INC = []\n'
+             '({"k": INC} | {})["k"].append(".")\n'
+             'cc_library(name = "arm", srcs = ["arm.cc"], includes = INC)\n'),
+            ("binop_list_concat_subscript_kwargs",
+             'OPTS = {}\n'
+             '([OPTS] + [])[0]["includes"] = ["."]\n'
+             'cc_library(name = "arm", srcs = ["arm.cc"], **OPTS)\n'),
+            ("listcomp_alias_subscript_kwargs",
+             'OPTS = {}\n'
+             'xs = [OPTS for _ in [1]]\n'
+             'xs[0]["includes"] = ["."]\n'
+             'cc_library(name = "arm", srcs = ["arm.cc"], **OPTS)\n'),
+            ("lambda_alias_append_includes",
+             'INC = []\n'
+             'f = lambda: INC\n'
+             'f().append(".")\n'
+             'cc_library(name = "arm", srcs = ["arm.cc"], includes = INC)\n'),
+        )
+        for name, build in bad_builds:
+            with self.subTest(bad_build=name):
+                files = {
+                    "bench/arm/BUILD": build,
+                    "bench/arm/arm.cc": "int ok = 1;\n",
+                }
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn("bench/arm/BUILD:", out)
+
+        bad_macros = (
+            ("macro_helper_splat_before_native",
+             "def robot_lib(name, srcs, **kwargs):\n"
+             "    hide(**kwargs)\n"
+             "    native.cc_library(name = name, srcs = srcs, **kwargs)\n"),
+            ("macro_helper_splat_in_loop",
+             "def robot_lib(name, srcs, **kwargs):\n"
+             "    for _ in range(2):\n"
+             "        hide(**kwargs)\n"),
+            ("macro_struct_ro_method_arg_mutation",
+             "def robot_lib(name, srcs, **kwargs):\n"
+             "    evil.get(kwargs)\n"
+             "    native.cc_library(name = name, srcs = srcs, **kwargs)\n"),
+            ("macro_getattr_direct_update",
+             "def robot_lib(name, srcs, **kwargs):\n"
+             '    getattr(kwargs, "update")({"includes": ["."]})\n'
+             "    native.cc_library(name = name, srcs = srcs, **kwargs)\n"),
+            ("macro_getattr_bound_update",
+             "def robot_lib(name, srcs, **kwargs):\n"
+             '    fn = getattr(kwargs, "update")\n'
+             '    fn({"includes": ["."]})\n'
+             "    native.cc_library(name = name, srcs = srcs, **kwargs)\n"),
+            ("macro_boolop_or_subscript_kwargs",
+             "def robot_lib(name, srcs, **kwargs):\n"
+             '    (kwargs or {})["includes"] = ["."]\n'
+             "    native.cc_library(name = name, srcs = srcs, **kwargs)\n"),
+            ("macro_listcomp_subscript_kwargs",
+             "def robot_lib(name, srcs, **kwargs):\n"
+             '    [kwargs for _ in [1]][0]["includes"] = ["."]\n'
+             "    native.cc_library(name = name, srcs = srcs, **kwargs)\n"),
+            ("macro_lambda_subscript_kwargs",
+             "def robot_lib(name, srcs, **kwargs):\n"
+             "    f = lambda: kwargs\n"
+             '    f()["includes"] = ["."]\n'
+             "    native.cc_library(name = name, srcs = srcs, **kwargs)\n"),
+        )
+        for name, macro_src in bad_macros:
+            with self.subTest(bad_macro=name):
+                files = {
+                    "bench/arm/macros.bzl": macro_src,
+                    "bench/arm/BUILD": (
+                        'load(":macros.bzl", "robot_lib")\n'
+                        'robot_lib(name = "arm", srcs = ["arm.cc"])\n'
+                    ),
+                    "bench/arm/arm.cc": "int ok = 1;\n",
+                }
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn("bench/arm/macros.bzl:", out)
+
+        # Legitimate patterns stay allowed: single-forwarding wrapper macros,
+        # multiple native.* calls, and standard loaded cc_library with **OPTS.
+        ok_cases = (
+            ("single_forwarding_wrapper_macro", {
+                "bench/arm/macros.bzl": (
+                    'load("//talOS/build:contract.bzl", "talos_cc_node")\n'
+                    "def my_wrapper(name, srcs, **kwargs):\n"
+                    '    linkopts = kwargs.pop("linkopts", [])\n'
+                    "    talos_cc_node(\n"
+                    "        name = name,\n"
+                    "        srcs = srcs,\n"
+                    "        linkopts = linkopts,\n"
+                    "        **kwargs\n"
+                    "    )\n"
+                ),
+                "bench/arm/BUILD": (
+                    'load(":macros.bzl", "my_wrapper")\n'
+                    'my_wrapper(name = "arm", srcs = ["arm.cc"])\n'
+                ),
+                "bench/arm/arm.cc": "int ok = 1;\n",
+            }),
+            ("multiple_native_rule_calls_with_kwargs", {
+                "bench/arm/macros.bzl": (
+                    "def dual_lib(name, srcs, **kwargs):\n"
+                    '    native.cc_library(name = name + "_a", srcs = srcs, **kwargs)\n'
+                    '    native.cc_library(name = name + "_b", srcs = srcs, **kwargs)\n'
+                ),
+                "bench/arm/BUILD": (
+                    'load(":macros.bzl", "dual_lib")\n'
+                    'dual_lib(name = "arm", srcs = ["arm.cc"])\n'
+                ),
+                "bench/arm/arm.cc": "int ok = 1;\n",
+            }),
+            ("standard_loaded_cc_library_with_static_opts", {
+                "bench/arm/BUILD": (
+                    'load("@rules_cc//cc:cc_library.bzl", "cc_library")\n'
+                    'OPTS = {"copts": ["-Wall"]}\n'
+                    'cc_library(name = "arm", srcs = ["arm.cc"], **OPTS)\n'
+                ),
+                "bench/arm/arm.cc": "int ok = 1;\n",
+            }),
+        )
+        for name, files in ok_cases:
+            with self.subTest(ok=name):
+                failures, out = run_sources(files)
+                self.assertEqual(failures, 0, f"{name}: {out}")
+
 
 if __name__ == "__main__":
     unittest.main()

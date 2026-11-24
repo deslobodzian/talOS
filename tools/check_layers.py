@@ -1170,7 +1170,9 @@ _STARLARK_READONLY_METHODS = frozenset({
 _STARLARK_KWARG_PASSTHROUGH_METHODS = _STARLARK_READONLY_METHODS | frozenset({
     "pop",
 })
-# Built-in functions that do not mutate list/dict arguments passed to them.
+# Built-in functions that do not mutate list/dict arguments passed to them
+# (`getattr` is intentionally excluded: `getattr(obj, "append")` returns a
+# mutating bound method).
 _STARLARK_READONLY_BUILTINS = frozenset({
     "all",
     "any",
@@ -1178,7 +1180,6 @@ _STARLARK_READONLY_BUILTINS = frozenset({
     "dict",
     "dir",
     "enumerate",
-    "getattr",
     "hasattr",
     "hash",
     "len",
@@ -1194,40 +1195,64 @@ _STARLARK_READONLY_BUILTINS = frozenset({
     "type",
     "zip",
 })
+# Standard Bazel rules that cannot mutate Starlark list/dict containers passed
+# to them via keyword or `**kwargs` arguments (when unshadowed or loaded from
+# a standard Bazel ruleset).
+_STARLARK_NON_MUTATING_RULES = frozenset({
+    "alias",
+    "cc_binary",
+    "cc_import",
+    "cc_library",
+    "cc_proto_library",
+    "cc_shared_library",
+    "cc_test",
+    "config_setting",
+    "exports_files",
+    "filegroup",
+    "genrule",
+    "glob",
+    "package",
+    "package_group",
+    "platform",
+    "py_binary",
+    "py_library",
+    "py_runtime",
+    "py_test",
+    "select",
+    "sh_binary",
+    "sh_library",
+    "sh_test",
+    "test_suite",
+})
+_STANDARD_BAZEL_RULE_LOAD_PREFIXES = (
+    "@rules_cc//",
+    "@rules_python//",
+    "@rules_shell//",
+    "@bazel_tools//",
+)
 
 
 def _container_root_names(node, skip_popped=False):
-    """Yields variable names whose container may be referenced by `node`.
+    """Yields every variable name referenced by `node` (fail closed).
 
     When `skip_popped=True`, omits the receiver of `.pop(...)` because the
-    returned value has been detached from that container (shallow copies such
-    as `list(...)`, `dict(...)`, and `.copy()` still alias nested elements and
+    returned value has been detached from that container (arguments to `.pop`
+    such as its default value are still traversed, and shallow copies such as
+    `list(...)`, `dict(...)`, and `.copy()` still alias nested elements and
     are never skipped).
     """
     if isinstance(node, ast.Name):
         yield node.id
-    elif isinstance(node, (ast.Subscript, ast.Attribute)):
-        yield from _container_root_names(node.value, skip_popped=skip_popped)
-    elif isinstance(node, ast.IfExp):
-        yield from _container_root_names(node.body, skip_popped=skip_popped)
-        yield from _container_root_names(node.orelse, skip_popped=skip_popped)
-    elif isinstance(node, ast.Call):
-        if isinstance(node.func, ast.Attribute):
-            if not (skip_popped and node.func.attr == "pop"):
-                yield from _container_root_names(
-                    node.func.value, skip_popped=skip_popped)
+        return
+    if (skip_popped and isinstance(node, ast.Call) and
+            isinstance(node.func, ast.Attribute) and node.func.attr == "pop"):
         for a in node.args:
             yield from _container_root_names(a, skip_popped=skip_popped)
         for kw in node.keywords:
             yield from _container_root_names(kw.value, skip_popped=skip_popped)
-    elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
-        for elt in node.elts:
-            yield from _container_root_names(elt, skip_popped=skip_popped)
-    elif isinstance(node, ast.Dict):
-        for v in node.values:
-            yield from _container_root_names(v, skip_popped=skip_popped)
-    elif isinstance(node, ast.Starred):
-        yield from _container_root_names(node.value, skip_popped=skip_popped)
+        return
+    for child in ast.iter_child_nodes(node):
+        yield from _container_root_names(child, skip_popped=skip_popped)
 
 
 def _iter_assigned_names(target):
@@ -1238,6 +1263,93 @@ def _iter_assigned_names(target):
             yield from _iter_assigned_names(elt)
     elif isinstance(target, ast.Starred):
         yield from _iter_assigned_names(target.value)
+
+
+def _collect_shadowed_names(tree):
+    """Returns `(shadowed_builtins, shadowed_rules)` for names bound or loaded
+    from non-standard modules anywhere in `tree`."""
+    assigned_or_param = set()
+    shadowed_builtins = set()
+    shadowed_rules = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                assigned_or_param.update(_iter_assigned_names(target))
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr,
+                               ast.For, ast.comprehension)):
+            assigned_or_param.update(_iter_assigned_names(node.target))
+        elif isinstance(node, ast.FunctionDef):
+            assigned_or_param.add(node.name)
+            for arg in (list(node.args.posonlyargs) + list(node.args.args) +
+                        list(node.args.kwonlyargs)):
+                assigned_or_param.add(arg.arg)
+            if node.args.vararg:
+                assigned_or_param.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                assigned_or_param.add(node.args.kwarg.arg)
+        elif isinstance(node, ast.Lambda):
+            for arg in (list(node.args.posonlyargs) + list(node.args.args) +
+                        list(node.args.kwonlyargs)):
+                assigned_or_param.add(arg.arg)
+            if node.args.vararg:
+                assigned_or_param.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                assigned_or_param.add(node.args.kwarg.arg)
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and
+              node.func.id == "load"):
+            mod = (node.args[0].value
+                   if (node.args and isinstance(node.args[0], ast.Constant) and
+                       isinstance(node.args[0].value, str))
+                   else None)
+            is_std_rule_mod = (
+                mod is not None and
+                mod.startswith(_STANDARD_BAZEL_RULE_LOAD_PREFIXES))
+            for a in node.args[1:]:
+                if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                    shadowed_builtins.add(a.value)
+                    if not (is_std_rule_mod and
+                            a.value in _STARLARK_NON_MUTATING_RULES):
+                        shadowed_rules.add(a.value)
+            for kw in node.keywords:
+                if kw.arg:
+                    shadowed_builtins.add(kw.arg)
+                    orig = (kw.value.value
+                            if (isinstance(kw.value, ast.Constant) and
+                                isinstance(kw.value.value, str))
+                            else None)
+                    if not (is_std_rule_mod and
+                            orig in _STARLARK_NON_MUTATING_RULES and
+                            kw.arg in _STARLARK_NON_MUTATING_RULES):
+                        shadowed_rules.add(kw.arg)
+    shadowed_builtins |= assigned_or_param
+    shadowed_rules |= assigned_or_param
+    return frozenset(shadowed_builtins), frozenset(shadowed_rules)
+
+
+def _is_ro_builtin_call(node, shadowed_builtins):
+    if not (isinstance(node.func, ast.Name) and
+            node.func.id in _STARLARK_READONLY_BUILTINS and
+            node.func.id not in shadowed_builtins):
+        return False
+    # `sorted`/`max`/`min` can invoke a caller-supplied `key` callback that
+    # mutates container elements in place.
+    if (node.func.id in ("sorted", "max", "min") and
+            any(kw.arg in ("key", None) for kw in node.keywords)):
+        return False
+    return True
+
+
+def _is_non_mutating_bazel_rule_call(node, shadowed_builtins, shadowed_rules):
+    if (isinstance(node.func, ast.Attribute) and
+            isinstance(node.func.value, ast.Name) and
+            node.func.value.id == "native" and
+            "native" not in shadowed_builtins):
+        return True
+    if (isinstance(node.func, ast.Name) and
+            node.func.id in _STARLARK_NON_MUTATING_RULES and
+            node.func.id not in shadowed_rules):
+        return True
+    return False
 
 
 def _record_target_mutations(target, assign_counts, mutated,
@@ -1269,16 +1381,24 @@ def _propagate_aliases(mutated, alias_refs):
                     changed = True
 
 
-def _collect_starlark_bindings(tree, *, container_safe=False):
+def _collect_starlark_bindings(tree, *, container_safe=False,
+                               shadowed_names=None):
     """Returns single-assigned, unmutated top-level Starlark bindings.
 
     Any variable reassigned more than once, targeted by `AugAssign`,
     subscript/attribute assignment, loop/parameter binding, or a non-read-only
-    method/attribute access (including through aliases) is excluded (fail
-    closed). With `container_safe=True`, variables passed as arguments to
-    non-read-only calls (other than `includes = ...` or `**var` splats) are
-    also excluded so a helper call cannot mutate a list/dict in place.
+    method/attribute access (including through aliases when
+    `container_safe=True`) is excluded (fail closed). With
+    `container_safe=True`, variables passed to any call (including via
+    `Call.func`, positional args, or keyword/splat args — exempting only
+    `includes = ...` and `**var` on known non-mutating native/standard Bazel
+    rules) are also excluded so helper calls cannot mutate containers in place.
     """
+    if shadowed_names is None:
+        shadowed_builtins, shadowed_rules = _collect_shadowed_names(tree)
+    else:
+        shadowed_builtins, shadowed_rules = shadowed_names
+
     top_level = {}
     for stmt in tree.body:
         if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and
@@ -1287,6 +1407,7 @@ def _collect_starlark_bindings(tree, *, container_safe=False):
 
     assign_counts = {}
     mutated = set()
+    def_names = set()
     alias_refs = {}
 
     for node in ast.walk(tree):
@@ -1298,9 +1419,22 @@ def _collect_starlark_bindings(tree, *, container_safe=False):
                 for name in _iter_assigned_names(target):
                     alias_refs.setdefault(name, set()).update(
                         _container_root_names(node.value, skip_popped=True))
-        elif isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+        elif isinstance(node, ast.AugAssign):
             _record_target_mutations(node.target, assign_counts, mutated,
                                      count_simple_name=False)
+        elif isinstance(node, ast.AnnAssign):
+            _record_target_mutations(node.target, assign_counts, mutated,
+                                     count_simple_name=False)
+            if node.value is not None:
+                for name in _iter_assigned_names(node.target):
+                    alias_refs.setdefault(name, set()).update(
+                        _container_root_names(node.value, skip_popped=True))
+        elif isinstance(node, ast.NamedExpr):
+            _record_target_mutations(node.target, assign_counts, mutated,
+                                     count_simple_name=False)
+            for name in _iter_assigned_names(node.target):
+                alias_refs.setdefault(name, set()).update(
+                    _container_root_names(node.value, skip_popped=True))
         elif isinstance(node, ast.Delete):
             for target in node.targets:
                 _record_target_mutations(target, assign_counts, mutated,
@@ -1312,7 +1446,9 @@ def _collect_starlark_bindings(tree, *, container_safe=False):
                 alias_refs.setdefault(name, set()).update(
                     _container_root_names(node.iter, skip_popped=True))
         elif isinstance(node, ast.FunctionDef):
-            mutated.add(node.name)
+            def_names.add(node.name)
+            alias_refs.setdefault(node.name, set()).update(
+                _container_root_names(node, skip_popped=True))
             for arg in (list(node.args.posonlyargs) + list(node.args.args) +
                         list(node.args.kwonlyargs)):
                 mutated.add(arg.arg)
@@ -1341,18 +1477,22 @@ def _collect_starlark_bindings(tree, *, container_safe=False):
                         mutated.add(kw.arg)
                 continue
             if container_safe:
-                is_ro_builtin = (
-                    isinstance(node.func, ast.Name) and
-                    node.func.id in _STARLARK_READONLY_BUILTINS)
+                is_ro_builtin = _is_ro_builtin_call(node, shadowed_builtins)
                 is_ro_method = (
                     isinstance(node.func, ast.Attribute) and
                     node.func.attr in _STARLARK_READONLY_METHODS)
-                if not is_ro_builtin and not is_ro_method:
+                is_non_mutating_rule = _is_non_mutating_bazel_rule_call(
+                    node, shadowed_builtins, shadowed_rules)
+                if not is_ro_builtin:
+                    if not is_ro_method:
+                        mutated.update(
+                            _container_root_names(node.func, skip_popped=True))
                     for a in node.args:
                         mutated.update(
                             _container_root_names(a, skip_popped=True))
                     for kw in node.keywords:
-                        if kw.arg not in ("includes", None):
+                        if not (is_non_mutating_rule and
+                                kw.arg in ("includes", None)):
                             mutated.update(
                                 _container_root_names(
                                     kw.value, skip_popped=True))
@@ -1361,19 +1501,26 @@ def _collect_starlark_bindings(tree, *, container_safe=False):
         if count > 1:
             mutated.add(name)
 
-    _propagate_aliases(mutated, alias_refs)
-    return {k: v for k, v in top_level.items() if k not in mutated}
+    if container_safe:
+        _propagate_aliases(mutated, alias_refs)
+    return {k: v for k, v in top_level.items()
+            if k not in mutated and k not in def_names}
 
 
-def _function_mutates_kwarg(func_node, kw_name):
-    """True when `func_node`'s `**kw_name` parameter may be mutated or rebound
-    inside `func_node` (fail closed)."""
+def _function_mutates_kwarg(func_node, kw_name, shadowed_builtins=frozenset(),
+                            shadowed_rules=frozenset()):
+    """True when `func_node`'s `**kw_name` parameter may be mutated, rebound,
+    or forwarded to a non-builtin helper alongside another `**kw_name` call
+    (or inside a loop/nested function) (fail closed)."""
     mutated = set()
     alias_refs = {}
+    total_kw_splats = 0
+    non_builtin_kw_splats = 0
+    non_builtin_kw_splat_in_loop_or_nested = False
 
-    for node in ast.walk(func_node):
-        if node is func_node:
-            continue
+    def walk(node, in_loop_or_nested):
+        nonlocal total_kw_splats, non_builtin_kw_splats
+        nonlocal non_builtin_kw_splat_in_loop_or_nested
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name):
@@ -1385,9 +1532,22 @@ def _function_mutates_kwarg(func_node, kw_name):
                 for name in _iter_assigned_names(target):
                     alias_refs.setdefault(name, set()).update(
                         _container_root_names(node.value, skip_popped=True))
-        elif isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+        elif isinstance(node, ast.AugAssign):
             _record_target_mutations(node.target, {}, mutated,
                                      count_simple_name=False)
+        elif isinstance(node, ast.AnnAssign):
+            _record_target_mutations(node.target, {}, mutated,
+                                     count_simple_name=False)
+            if node.value is not None:
+                for name in _iter_assigned_names(node.target):
+                    alias_refs.setdefault(name, set()).update(
+                        _container_root_names(node.value, skip_popped=True))
+        elif isinstance(node, ast.NamedExpr):
+            _record_target_mutations(node.target, {}, mutated,
+                                     count_simple_name=False)
+            for name in _iter_assigned_names(node.target):
+                alias_refs.setdefault(name, set()).update(
+                    _container_root_names(node.value, skip_popped=True))
         elif isinstance(node, ast.Delete):
             for target in node.targets:
                 _record_target_mutations(target, {}, mutated,
@@ -1398,23 +1558,51 @@ def _function_mutates_kwarg(func_node, kw_name):
             for name in _iter_assigned_names(node.target):
                 alias_refs.setdefault(name, set()).update(
                     _container_root_names(node.iter, skip_popped=True))
+        elif isinstance(node, ast.FunctionDef):
+            alias_refs.setdefault(node.name, set()).update(
+                _container_root_names(node, skip_popped=True))
         elif isinstance(node, ast.Attribute):
             if node.attr not in _STARLARK_KWARG_PASSTHROUGH_METHODS:
                 mutated.update(_container_root_names(node.value,
                                                      skip_popped=True))
         elif isinstance(node, ast.Call):
-            is_ro_builtin = (isinstance(node.func, ast.Name) and
-                             node.func.id in _STARLARK_READONLY_BUILTINS)
+            is_ro_builtin = _is_ro_builtin_call(node, shadowed_builtins)
             is_safe_method = (
                 isinstance(node.func, ast.Attribute) and
                 node.func.attr in _STARLARK_KWARG_PASSTHROUGH_METHODS)
-            if not is_ro_builtin and not is_safe_method:
+            is_non_mutating_rule = _is_non_mutating_bazel_rule_call(
+                node, shadowed_builtins, shadowed_rules)
+            if not is_ro_builtin:
+                if not is_safe_method:
+                    mutated.update(
+                        _container_root_names(node.func, skip_popped=True))
                 for a in node.args:
                     mutated.update(_container_root_names(a, skip_popped=True))
                 for kw in node.keywords:
-                    if kw.arg is not None:
+                    if (kw.arg is None and isinstance(kw.value, ast.Name) and
+                            kw.value.id == kw_name):
+                        total_kw_splats += 1
+                        if not is_non_mutating_rule:
+                            non_builtin_kw_splats += 1
+                            if in_loop_or_nested:
+                                non_builtin_kw_splat_in_loop_or_nested = True
+                    else:
                         mutated.update(
                             _container_root_names(kw.value, skip_popped=True))
+
+        child_in_loop_or_nested = in_loop_or_nested or isinstance(
+            node, (ast.For, ast.While, ast.comprehension,
+                   ast.Lambda, ast.FunctionDef))
+        for child in ast.iter_child_nodes(node):
+            walk(child, child_in_loop_or_nested)
+
+    for stmt in func_node.body:
+        walk(stmt, False)
+
+    if non_builtin_kw_splat_in_loop_or_nested:
+        mutated.add(kw_name)
+    if non_builtin_kw_splats > 0 and total_kw_splats > 1:
+        mutated.add(kw_name)
 
     _propagate_aliases(mutated, alias_refs)
     return kw_name in mutated
@@ -1569,8 +1757,11 @@ def scan_starlark_ast(path, tree):
     `-include`/`-imacros`/`-trigraphs`/`-ftrigraphs`/include-path compiler
     flags, as well as non-empty (or dynamic/mutated) `includes` keyword
     arguments and dynamic/mutated `**kwargs` splats."""
-    bindings = _collect_starlark_bindings(tree)
-    safe_bindings = _collect_starlark_bindings(tree, container_safe=True)
+    shadowed_names = _collect_shadowed_names(tree)
+    shadowed_builtins, shadowed_rules = shadowed_names
+    bindings = _collect_starlark_bindings(tree, shadowed_names=shadowed_names)
+    safe_bindings = _collect_starlark_bindings(
+        tree, container_safe=True, shadowed_names=shadowed_names)
     violations = []
     seen_keys = set()
     reported_flag_nodes = set()
@@ -1600,8 +1791,9 @@ def scan_starlark_ast(path, tree):
             if node.args.kwarg:
                 shadowed.add(node.args.kwarg.arg)
             inner_kwargs = set(passthrough_kwargs) - shadowed
-            if (node.args.kwarg and
-                    not _function_mutates_kwarg(node, node.args.kwarg.arg)):
+            if (node.args.kwarg and not _function_mutates_kwarg(
+                    node, node.args.kwarg.arg,
+                    shadowed_builtins, shadowed_rules)):
                 inner_kwargs.add(node.args.kwarg.arg)
             for default in node.args.defaults:
                 check_calls(default, passthrough_kwargs)
