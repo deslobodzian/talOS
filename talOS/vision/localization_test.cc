@@ -1319,5 +1319,121 @@ TEST(LocalizationTest,
   }
 }
 
+TEST(LocalizationTest,
+     OrderPoseCandidatesAndReprojectionRejectNegativeAndNonFinite) {
+  using Pose = talos::geometry::SE3<double>;
+  const Pose pose_a(talos::geometry::SO3<double>::Identity(), {1, 0, 3});
+  const Pose pose_b(talos::geometry::SO3<double>::Identity(), {0, 0, 3});
+
+  // Negative secondary error must not beat a valid primary or look unambiguous.
+  {
+    Pose p1 = pose_a, p2 = pose_b;
+    double e1 = 0.5, e2 = -1.0;
+    EXPECT_DOUBLE_EQ(detail::OrderPoseCandidates(p1, p2, e1, e2), 1.0);
+    EXPECT_TRUE(p1.matrix().isApprox(pose_a.matrix()));
+    EXPECT_DOUBLE_EQ(e1, 0.5);
+  }
+  // Negative primary must be demoted behind a valid secondary and fail closed.
+  {
+    Pose p1 = pose_a, p2 = pose_b;
+    double e1 = -std::numeric_limits<double>::infinity(), e2 = 0.5;
+    EXPECT_DOUBLE_EQ(detail::OrderPoseCandidates(p1, p2, e1, e2), 1.0);
+    EXPECT_TRUE(p1.matrix().isApprox(pose_b.matrix()));
+    EXPECT_DOUBLE_EQ(e1, 0.5);
+  }
+
+  // Non-finite observed corners must not produce NaN reprojection error.
+  CameraIntrinsics intr;
+  intr.fx = intr.fy = 600.0;
+  intr.cx = 320.0;
+  intr.cy = 240.0;
+  std::array<float, 8> bad_corners{};
+  bad_corners[0] = std::numeric_limits<float>::quiet_NaN();
+  const double err = ComputeReprojectionError(
+      bad_corners, Pose(talos::geometry::SO3<double>::Identity(), {0, 0, 2}),
+      intr, 0.2);
+  EXPECT_TRUE(std::isfinite(err));
+  EXPECT_GE(err, 1e9);
+}
+
+TEST(LocalizationTest,
+     ComputeRobotFieldPoseAndCovarianceFailClosedOnNaNAndOverflow) {
+  using Pose = talos::geometry::SE3<double>;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+
+  FieldLayout layout;
+  layout.SetTagPose(1,
+                    Pose(talos::geometry::SO3<double>::Identity(), {4, 0, 1}));
+  const auto mount = CameraMounting::Identity();
+  const Pose valid_cam_tag(talos::geometry::SO3<double>::Identity(), {0, 0, 2});
+
+  // NaN in PoseValidationOptions must fail closed, never bypass checks.
+  {
+    PoseValidationOptions bad_opts;
+    bad_opts.max_reprojection_error_px = nan;
+    EXPECT_FALSE(ComputeRobotFieldPose(1, 0, valid_cam_tag, mount, layout, 0.1,
+                                       0.05, bad_opts)
+                     .validity.valid);
+  }
+  {
+    PoseValidationOptions bad_opts;
+    bad_opts.max_distance_m = nan;
+    EXPECT_FALSE(ComputeRobotFieldPose(1, 0, valid_cam_tag, mount, layout, 0.1,
+                                       0.05, bad_opts)
+                     .validity.valid);
+  }
+  // Negative reprojection error or ambiguity must fail closed.
+  EXPECT_EQ(ComputeRobotFieldPose(1, 0, valid_cam_tag, mount, layout, -0.1, 0.0)
+                .validity.reason,
+            PoseInvalidReason::kHighReprojectionError);
+  EXPECT_EQ(ComputeRobotFieldPose(1, 0, valid_cam_tag, mount, layout, 0.1, -0.1)
+                .validity.reason,
+            PoseInvalidReason::kHighAmbiguity);
+
+  // SetCovarianceStdDevs must reject non-finite/negative options, overflow, and
+  // asymmetric matrices whose upper triangle makes the symmetric part non-PD.
+  RobotPoseEstimate estimate;
+  estimate.T_field_robot = Pose::Identity();
+  estimate.average_distance_m = 2.0;
+  const detail::PoseNormalMatrix identity =
+      detail::PoseNormalMatrix::Identity();
+
+  PoseSolverOptions bad_mount;
+  bad_mount.mount_angle_std_rad = nan;
+  EXPECT_FALSE(detail::SetCovarianceStdDevs(identity, bad_mount, &estimate));
+
+  bad_mount.mount_angle_std_rad = inf;
+  EXPECT_FALSE(detail::SetCovarianceStdDevs(identity, bad_mount, &estimate));
+
+  bad_mount.mount_angle_std_rad = 1e200;
+  estimate.average_distance_m = 1e200;
+  EXPECT_FALSE(detail::SetCovarianceStdDevs(identity, bad_mount, &estimate));
+
+  estimate.average_distance_m = 2.0;
+  detail::PoseNormalMatrix asymmetric = identity;
+  asymmetric(0, 1) = 100.0;  // Lower triangle still looks PD; sym part is not.
+  EXPECT_FALSE(detail::SetCovarianceStdDevs(asymmetric, {}, &estimate));
+
+  // MultiTagPoseSolver rejects NaN validation options and filters out a
+  // detection with NaN corners without poisoning a valid sibling tag.
+  JointFixture fixture(3.0, 2);
+  PoseValidationOptions bad_validation;
+  bad_validation.max_reprojection_error_px = nan;
+  const auto rejected =
+      SolveMultiTagRobotPose(fixture.tags, 1, fixture.mount, fixture.layout,
+                             fixture.intr, bad_validation);
+  EXPECT_FALSE(rejected.validity.valid);
+  EXPECT_EQ(rejected.validity.reason, PoseInvalidReason::kInvalidCovariance);
+
+  fixture.tags[1].corners[0] = std::numeric_limits<float>::quiet_NaN();
+  const auto survived = fixture.Solve();
+  ASSERT_TRUE(survived.validity.valid) << survived.validity.message;
+  EXPECT_EQ(survived.tag_count, 1);
+  EXPECT_TRUE(survived.T_field_robot.matrix().allFinite());
+  EXPECT_TRUE(std::isfinite(survived.std_devs.x_std_m));
+  EXPECT_FALSE(std::isinf(survived.std_devs.x_std_m));
+}
+
 }  // namespace
 }  // namespace talos::vision
