@@ -74,6 +74,7 @@ let socket: WebSocket|null = null, demo = false, sequence = 0n,
 let nextDemo = 0, lastTick = performance.now();
 let retry: ReturnType<typeof setTimeout>|undefined;
 let generation = 0;
+let openGeneration = 0;
 let connection: Connection = 'idle';
 let lastPlayback: PlaybackState|null = null;
 let lastPlaybackPost = 0;
@@ -202,13 +203,13 @@ function postPlayback(now: number) {
 // failure is equally quiet, because the connection status already says the
 // bridge is unreachable. A document that arrives and does not parse is the one
 // case worth a sentence on screen.
-async function fetchDeclared(url: string, gen: number, signal?: AbortSignal) {
+async function fetchDeclared(url: string, openGen: number, signal?: AbortSignal) {
   const target = declaredUrl(url);
   if (!target) return;
   let text: string;
   try {
     const response = await fetch(target, {cache: 'no-store', signal});
-    if (gen !== generation) return;
+    if (openGen !== openGeneration) return;
     if (response.status === 404) return;
     if (!response.ok) {
       declaredError = `Declared graph unavailable: HTTP ${response.status}`;
@@ -228,7 +229,7 @@ async function fetchDeclared(url: string, gen: number, signal?: AbortSignal) {
   } catch {
     return;
   }
-  if (gen !== generation) return;
+  if (openGen !== openGeneration) return;
   ingestDeclared(text);
   postSystem();
 }
@@ -250,14 +251,14 @@ function ingestDeclared(text: string) {
 // is null and nothing is reported. A network failure is quiet, for the same
 // reason the declared graph's is. A malformed document keeps the last good
 // manifest and says why this one was refused.
-async function fetchManifest(url: string, gen: number, signal?: AbortSignal) {
+async function fetchManifest(url: string, openGen: number, signal?: AbortSignal) {
   const target = manifestUrl(url);
   if (!target || manifestInFlight) return;
   manifestInFlight = true;
   let text: string;
   try {
     const response = await fetch(target, {cache: 'no-store', signal});
-    if (gen !== generation) return;
+    if (openGen !== openGeneration) return;
     if (response.status === 404) {
       // "Not offered" is not a fault; it clears whatever the previous bridge
       // was serving.
@@ -284,9 +285,9 @@ async function fetchManifest(url: string, gen: number, signal?: AbortSignal) {
   } catch {
     return;
   } finally {
-    if (gen === generation) manifestInFlight = false;
+    if (openGen === openGeneration) manifestInFlight = false;
   }
-  if (gen !== generation) return;
+  if (openGen !== openGeneration) return;
   const previousError = manifestError;
   manifestError = '';
   if (text === lastManifestRaw) {
@@ -366,6 +367,7 @@ function reset() {
 }
 function close() {
   generation++;
+  openGeneration++;
   clearTimeout(retry);
   fetchAbort?.abort();
   fetchAbort = null;
@@ -414,6 +416,7 @@ function connect(url: string, gen: number) {
     nextManifestPoll = performance.now();
     socket.onopen = () => {
       if (gen !== generation) return;
+      const openGen = ++openGeneration;
       status = 'WebSocket connected';
       connection = 'live';
       decoder.reset();
@@ -429,8 +432,8 @@ function connect(url: string, gen: number) {
       fetchAbort = typeof AbortController === 'function' ? new AbortController() : null;
       manifestInFlight = false;
       nextManifestPoll = performance.now() + 1000;
-      void fetchDeclared(url, gen, fetchAbort?.signal);
-      void fetchManifest(url, gen, fetchAbort?.signal);
+      void fetchDeclared(url, openGen, fetchAbort?.signal);
+      void fetchManifest(url, openGen, fetchAbort?.signal);
     };
     socket.onmessage = e => {
       if (gen !== generation) return;
@@ -592,7 +595,7 @@ setInterval(() => {
   // live document, and the launcher replaces it atomically as nodes restart.
   if (manifestBase !== null && connection === 'live' && now >= nextManifestPoll) {
     nextManifestPoll = now + 1000;
-    void fetchManifest(manifestBase, generation, fetchAbort?.signal);
+    void fetchManifest(manifestBase, openGeneration, fetchAbort?.signal);
   }
   const tickDt = Number.isFinite(now - lastTick) ?
       Math.max(0, Math.round((now - lastTick) * 1e6)) : 0;

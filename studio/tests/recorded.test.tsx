@@ -60,6 +60,7 @@ import {visionPanel} from '../src/panels/vision';
 import {Header} from '../src/shell/Header';
 import {RecordedTransport} from '../src/shell/RecordedTransport';
 import {ReviewPicker} from '../src/shell/ReviewPicker';
+import {StatusStrip} from '../src/shell/StatusStrip';
 import {WorkspaceArea, type WorkspaceCallbacks} from '../src/shell/WorkspaceArea';
 import {parseDeclaredGraph, parseSystemGraph} from '../src/system';
 
@@ -1555,5 +1556,81 @@ test('HardwarePanel and VisionPanel never request absent channels on recorded se
   for (const chName of visRequested) {
     assert.ok(present.has(chName), `VisionPanel requested absent channel ${chName}`);
   }
+  studio.closeRecorded();
+});
+
+// REQ-OPS-41, REQ-OPS-20: useRobotStatus() and RobotPanel must gate on
+// useRecorded() so live system.graph (node counts and target selections) and
+// live system.declared.can_buses never leak into StatusStrip or RobotPanel
+// during recorded playback.
+test('StatusStrip and RobotPanel ignore live system state during recorded playback', async () => {
+  const at = START + 5_000_000_000n;
+  const channels: ChannelInfo[] = [
+    'hw/status/battery_v',
+    'hw/status/can_bus_count',
+    'hw/status/can_buses/0/read_state',
+    'hw/status/can_buses/0/utilization_frac',
+    'hw/status/can_buses/1/read_state',
+    'hw/status/can_buses/1/utilization_frac',
+    'shooter/state/enabled',
+  ].map(info);
+  const s = (value: number) => ({value, sample_ns: at.toString()});
+  const server = fakeServer(url => {
+    if (url.pathname.endsWith('/snapshot')) {
+      return json({
+        t_ns: at.toString(),
+        channels: {
+          'hw/status/battery_v': s(12.4),
+          'hw/status/can_bus_count': s(2),
+          'hw/status/can_buses/0/read_state': s(1),
+          'hw/status/can_buses/0/utilization_frac': s(0.2),
+          'hw/status/can_buses/1/read_state': s(1),
+          'hw/status/can_buses/1/utilization_frac': s(0.5),
+          'shooter/state/enabled': s(1),
+        }
+      });
+    }
+    return undefined;
+  });
+
+  const recDeclared = {
+    version: 1, nodes: [], diagnostics: [], can_buses: ['rio', 'RecBus']
+  };
+  const rec = new RecordedSource(
+      SERVER, 's1', channels, BOUNDS, server.fetchFn, fakeClock().clock,
+      EMPTY_TIMELINE, recDeclared);
+  rec.seek(at.toString());
+  await settle();
+
+  const liveGraph = parseSystemGraph(demoSystemGraph(50n));
+  for (const node of liveGraph.nodes) {
+    if (node.name === 'shooter') {
+      node.selections = [{sources: ['teleop', 'auto'], selected: 'teleop'}];
+    }
+  }
+  const studio = createStaticStudio({
+    system: {
+      graph: liveGraph,
+      stale: false,
+      declared: {version: 1, nodes: [], diagnostics: [], can_buses: ['rio', 'LiveBus']}
+    }
+  });
+  studio.openRecorded(rec);
+
+  const stripHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}><StatusStrip/></StudioProvider>);
+  assert.match(stripHtml, /<small>Nodes<\/small><b>—<\/b>/, stripHtml);
+  assert.doesNotMatch(stripHtml, /<small>Nodes<\/small><b>[^<]*\//, stripHtml);
+
+  const robotHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <robotPanel.component config={robotPanel.defaultConfig}
+                              setConfig={() => {}} instanceId="robot"/>
+      </StudioProvider>);
+  assert.match(robotHtml, /← none/, robotHtml);
+  assert.doesNotMatch(robotHtml, /← teleop/, robotHtml);
+  assert.match(robotHtml, /CAN RecBus/, robotHtml);
+  assert.doesNotMatch(robotHtml, /LiveBus/, robotHtml);
+
   studio.closeRecorded();
 });
