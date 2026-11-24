@@ -10,6 +10,7 @@ repository by hand.
 
 import os
 import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -252,6 +253,41 @@ class CheckRobotRepositoryTest(unittest.TestCase):
         result = self.run_script(self.robot)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(os.path.exists(lock))
+        self.assertFalse(os.path.exists(lock + ".retake"))
+
+    # REQ-DEV-32: if $lock/pid disappears or reads empty between `[ -f ]` and
+    # `cat`, take_copy_lock must fail closed immediately instead of matching
+    # empty `holder` against a concurrent holder's freshly mkdir'd lock and
+    # `rm -rf`-ing it.
+    def test_empty_holder_fails_closed_without_removing_concurrent_lock(self):
+        lock = os.path.join(
+            self.tmpdir, f"talos-robot-check-{os.getuid()}.lock")
+        put(os.path.join(lock, "pid"), "999999\n")
+        marker = os.path.join(lock, "concurrent_holder")
+        real_cat = shutil.which("cat")
+        wrap_dir = os.path.join(self.tmp, "wrap_cat")
+        state = os.path.join(self.tmp, "cat_tripped")
+        # First read of $lock/pid simulates the old holder releasing $lock and
+        # a concurrent check immediately taking $lock (before writing pid).
+        put(os.path.join(wrap_dir, "cat"),
+            "#!/bin/sh\n"
+            f'if [ "$1" = {shlex.quote(os.path.join(lock, "pid"))} ] && '
+            f'[ ! -e {shlex.quote(state)} ]; then\n'
+            f'  : > {shlex.quote(state)}\n'
+            f'  rm -rf {shlex.quote(lock)}\n'
+            f'  mkdir -p {shlex.quote(lock)}\n'
+            f'  : > {shlex.quote(marker)}\n'
+            '  exit 1\n'
+            'fi\n'
+            f'exec {shlex.quote(real_cat)} "$@"\n',
+            0o755)
+        result = self.run_script(
+            self.robot,
+            PATH=wrap_dir + os.pathsep + self.env["PATH"])
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertTrue(os.path.exists(marker),
+                        "concurrent holder's live lock was removed")
         self.assertFalse(os.path.exists(lock + ".retake"))
 
 
