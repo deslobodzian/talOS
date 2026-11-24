@@ -19,13 +19,16 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -329,50 +332,136 @@ TEST(PositionMechanism, NonFiniteDemandGoesNeutral) {
   arm.ExpectNeutral();
 }
 
-// A request outside update() (here a message callback, which would act on
-// a goal no Target selected) is refused for set_goal(), hold() and
-// clear_fault(), naming the mechanism.
+// Requests, clear_fault(), and update() are refused outside update() (the
+// constructor, an every() timer, a message callback, and off the loop thread
+// while update() is running), throwing std::logic_error naming the mechanism.
 // REQ-SAFE-36
 TEST(PositionMechanism, RequestOutsideUpdateThrows) {
-  enum class Action { kSetGoal, kHold, kClearFault };
-  for (const Action action :
-       {Action::kSetGoal, Action::kHold, Action::kClearFault}) {
-    SCOPED_TRACE(static_cast<int>(action));
+  struct Case {
+    const char* name;
+    void (*call)(PositionMechanism&);
+  };
+  static constexpr std::array<Case, 6> kCases{{
+      {"set_goal", [](PositionMechanism& m) { m.set_goal(0.2); }},
+      {"set_goal_units", [](PositionMechanism& m) { m.set_goal_units(0.2); }},
+      {"hold", [](PositionMechanism& m) { m.hold(); }},
+      {"stop", [](PositionMechanism& m) { m.stop(); }},
+      {"clear_fault", [](PositionMechanism& m) { m.clear_fault(); }},
+      {"update", [](PositionMechanism& m) { m.update(); }},
+  }};
+  constexpr std::string_view kExpectedName = "PositionMechanism 'arm'";
+
+  // Constructor (before the event loop runs update()).
+  {
+    struct CtorNode {
+      explicit CtorNode(Node& node) : mech{node, "arm"} {
+        for (std::size_t i = 0; i < kCases.size(); ++i) {
+          try {
+            kCases[i].call(mech);
+            errors[i] = "accepted";
+          } catch (const std::logic_error& e) {
+            errors[i] = e.what();
+          }
+        }
+      }
+      void update() { mech.update(); }
+      PositionMechanism mech;
+      std::array<std::string, kCases.size()> errors{};
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    const auto& node = sim.add<CtorNode>("arm");
+    for (std::size_t i = 0; i < kCases.size(); ++i) {
+      SCOPED_TRACE(std::string{"constructor: "} + kCases[i].name);
+      EXPECT_NE(node.errors[i].find(kExpectedName), std::string::npos)
+          << node.errors[i];
+    }
+  }
+
+  // every() timer callback.
+  for (const Case& c : kCases) {
+    SCOPED_TRACE(std::string{"every: "} + c.name);
+    struct TimerNode {
+      explicit TimerNode(Node& node) : mech{node, "arm"} {
+        node.every(20ms, [this] { call(mech); });
+      }
+      void update() { mech.update(); }
+      PositionMechanism mech;
+      void (*call)(PositionMechanism&) = nullptr;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    sim.add<TimerNode>("arm").call = c.call;
+    try {
+      sim.step(50ms);
+      ADD_FAILURE() << c.name << " from every() was accepted";
+    } catch (const std::logic_error& e) {
+      EXPECT_NE(std::string{e.what()}.find(kExpectedName), std::string::npos)
+          << e.what();
+    }
+  }
+
+  // Subscription callback (which would act on a goal no Target selected).
+  for (const Case& c : kCases) {
+    SCOPED_TRACE(std::string{"callback: "} + c.name);
     struct CallbackNode {
       explicit CallbackNode(Node& node)
           : mech{node, "arm"},
             goal{node.subscribe<control::PositionTarget>(
-                "/test/goal", [this](const control::PositionTarget& t) {
-                  switch (action) {
-                    case Action::kSetGoal:
-                      mech.set_goal(t.position_rot());
-                      break;
-                    case Action::kHold:
-                      mech.hold(t.feedforward_v());
-                      break;
-                    case Action::kClearFault:
-                      mech.clear_fault();
-                      break;
-                  }
-                })} {}
+                "/test/goal",
+                [this](const control::PositionTarget&) { call(mech); })} {}
       void update() { mech.update(); }
       PositionMechanism mech;
-      Action action = Action::kSetGoal;
+      void (*call)(PositionMechanism&) = nullptr;
       Subscription<control::PositionTarget> goal;
     };
     auto sim = Sim::FromToml(kRobotToml);
-    sim.add<CallbackNode>("arm").action = action;
+    sim.add<CallbackNode>("arm").call = c.call;
     SimHardware hw{sim};
     hw.enable();
     sim.step(10ms);
     sim.publish("/test/goal", control::PositionTarget{0.2, 0.0});
     try {
       sim.step(10ms);
-      ADD_FAILURE() << "request from a callback was accepted";
+      ADD_FAILURE() << c.name << " from a callback was accepted";
     } catch (const std::logic_error& e) {
-      EXPECT_NE(std::string{e.what()}.find("PositionMechanism 'arm'"),
-                std::string::npos)
+      EXPECT_NE(std::string{e.what()}.find(kExpectedName), std::string::npos)
           << e.what();
+    }
+  }
+
+  // Off the loop thread while update() is running (joined before update()
+  // returns so there is no concurrent access to node or mechanism state).
+  {
+    struct ThreadedNode {
+      explicit ThreadedNode(Node& node) : mech{node, "arm"} {}
+      void update() {
+        if (!ran) {
+          ran = true;
+          std::thread other{[this] {
+            for (std::size_t i = 0; i < kCases.size(); ++i) {
+              try {
+                kCases[i].call(mech);
+                errors[i] = "accepted";
+              } catch (const std::logic_error& e) {
+                errors[i] = e.what();
+              }
+            }
+          }};
+          other.join();
+        }
+        mech.update();
+      }
+      PositionMechanism mech;
+      bool ran = false;
+      std::array<std::string, kCases.size()> errors{};
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    const auto& node = sim.add<ThreadedNode>("arm");
+    sim.step(10ms);
+    ASSERT_TRUE(node.ran);
+    for (std::size_t i = 0; i < kCases.size(); ++i) {
+      SCOPED_TRACE(std::string{"off-thread: "} + kCases[i].name);
+      EXPECT_NE(node.errors[i].find(kExpectedName), std::string::npos)
+          << node.errors[i];
     }
   }
 }
@@ -564,8 +653,52 @@ can_id = 2
                                   "min_rot = 1.2e308\nmax_rot = 1.7e308\n"
                                   "absolute_rot_per_sensor_rot = 1.0e308\n"
                                   "absolute_offset_rot = 1.5e308\n"},
+      // home_margin_rot >= travel from home_rot to far limit makes stuck-switch
+      // detection unreachable inside [min_rot, max_rot].
+      {"home_margin_rot",
+       "tolerance_rot = 0.1\nhoming = \"limit_switch\"\n"
+       "limit_switch = \"bottom\"\nmin_rot = 0.0\nmax_rot = 1.0\n"
+       "homing_v = -1.0\nhoming_timeout_us = 500000\n"
+       "homing_stall_rps = 0.1\nhoming_stall_us = 50000\n"
+       "home_margin_rot = 1.0\n"},
+      {"home_margin_rot",
+       "tolerance_rot = 0.1\nhoming = \"limit_switch\"\n"
+       "limit_switch = \"bottom\"\nmin_rot = 0.0\nmax_rot = 1.0\n"
+       "homing_v = -1.0\nhoming_timeout_us = 500000\n"
+       "homing_stall_rps = 0.1\nhoming_stall_us = 50000\n"
+       "home_margin_rot = 1.5\n"},
+      {"home_margin_rot",
+       "tolerance_rot = 0.1\nhoming = \"limit_switch\"\n"
+       "limit_switch = \"bottom\"\nmin_rot = 0.0\nmax_rot = 1.0\n"
+       "homing_v = 1.0\nhome_rot = 1.0\nhoming_timeout_us = 500000\n"
+       "homing_stall_rps = 0.1\nhoming_stall_us = 50000\n"
+       "home_margin_rot = 1.0\n"},
+      {"home_margin_rot",
+       "tolerance_rot = 0.1\nhoming = \"limit_switch\"\n"
+       "limit_switch = \"bottom\"\nmin_rot = 0.0\nmax_rot = 1.0\n"
+       "homing_v = 1.0\nhome_rot = 1.0\nhoming_timeout_us = 500000\n"
+       "homing_stall_rps = 0.1\nhoming_stall_us = 50000\n"
+       "home_margin_rot = 1.5\n"},
   };
   for (const auto& [key, table] : bad) expect_refused(key, toml(table));
+  {  // home_margin_rot strictly below travel is accepted in either direction
+    auto sim = Sim::FromToml(
+        toml("tolerance_rot = 0.1\nhoming = \"limit_switch\"\n"
+             "limit_switch = \"bottom\"\nmin_rot = 0.0\nmax_rot = 1.0\n"
+             "homing_v = -1.0\nhoming_timeout_us = 500000\n"
+             "homing_stall_rps = 0.1\nhoming_stall_us = 50000\n"
+             "home_margin_rot = 0.9\n"));
+    EXPECT_NO_THROW(sim.add<PositionNode>("m"));
+  }
+  {
+    auto sim = Sim::FromToml(
+        toml("tolerance_rot = 0.1\nhoming = \"limit_switch\"\n"
+             "limit_switch = \"bottom\"\nmin_rot = 0.0\nmax_rot = 1.0\n"
+             "homing_v = 1.0\nhome_rot = 1.0\nhoming_timeout_us = 500000\n"
+             "homing_stall_rps = 0.1\nhoming_stall_us = 50000\n"
+             "home_margin_rot = 0.9\n"));
+    EXPECT_NO_THROW(sim.add<PositionNode>("m"));
+  }
   {  // a negative ratio with the margin inside its window is accepted
     auto sim = Sim::FromToml(toml(absolute + "min_rot = -0.4\nmax_rot = 0.4\n"
                                              "absolute_rot_per_sensor_rot = "
@@ -1833,6 +1966,258 @@ max_rot = 1.6e308
     }
     EXPECT_TRUE(node.mech.driving());
     EXPECT_DOUBLE_EQ(node.mech.goal_rot(), 1.2e308);
+  }
+}
+
+// A stuck limit switch latched in kFaulted must never rezero the motor after a
+// device reset drops motor.zeroed(): otherwise a subsequent clear_fault() or
+// Driver Station disable/re-enable would enter kReady with a false zero
+// mid-travel instead of re-homing.
+// REQ-SAFE-36
+TEST(PositionMechanism,
+     SwitchStuckFaultDoesNotRezeroMidTravelAfterDeviceReset) {
+  struct InspectNode {
+    explicit InspectNode(Node& node)
+        : mech{node, node.name()}, motor{node, node.name()}, target{node} {}
+    void update() {
+      if (clear_next) {
+        mech.clear_fault();
+        clear_next = false;
+      }
+      if (const control::PositionTarget* t = target.get()) {
+        mech.set_goal(t->position_rot(), t->feedforward_v());
+      } else {
+        mech.stop();
+      }
+      mech.update();
+    }
+    PositionMechanism mech;
+    Motor motor;
+    Target<control::PositionTarget> target;
+    bool clear_next = false;
+  };
+  for (const bool use_ds_disable : {false, true}) {
+    SCOPED_TRACE(use_ds_disable ? "ds_disable" : "clear_fault");
+    Rig<InspectNode> carriage{"carriage"};
+    carriage.SetMotor(1.0, 0.0);
+    carriage.hw.set_digital_input("carriage", "carriage_home",
+                                  false);  // closed
+    carriage.Start();
+    carriage.Drive(1.0, 20ms);  // home at raw 1.0 -> position_rot == 0.0
+    ASSERT_TRUE(carriage.mech().homed());
+    ASSERT_TRUE(carriage.node.motor.zeroed());
+
+    // Move mid-travel (1.0 rot > home_margin_rot 0.2) with switch open.
+    carriage.hw.set_digital_input("carriage", "carriage_home", true);
+    carriage.SetMotor(2.0, 0.0);
+    carriage.Drive(1.0, 20ms);
+    ASSERT_EQ(carriage.mech().phase(), PositionPhase::kAtGoal);
+    ASSERT_EQ(carriage.mech().fault(), PositionFault::kNone);
+
+    // Switch shorts closed mid-travel -> latches kSwitchStuck.
+    carriage.hw.set_digital_input("carriage", "carriage_home", false);
+    carriage.Drive(1.0, 20ms);
+    ASSERT_EQ(carriage.mech().phase(), PositionPhase::kFaulted);
+    ASSERT_EQ(carriage.mech().fault(), PositionFault::kSwitchStuck);
+    carriage.ExpectNeutral();
+
+    // Motor resets while kSwitchStuck is latched and switch remains closed.
+    carriage.hw.reset_device("carriage", "carriage");
+    carriage.SetMotor(0.0, 0.0);
+    // Step past restore (2 ticks) + home_samples (2 ticks) with extra margin.
+    carriage.Drive(1.0, 50ms);
+    EXPECT_EQ(carriage.mech().phase(), PositionPhase::kFaulted);
+    EXPECT_EQ(carriage.mech().fault(), PositionFault::kSwitchStuck);
+    EXPECT_FALSE(carriage.mech().homed());
+    EXPECT_FALSE(carriage.node.motor.zeroed());
+    carriage.ExpectNeutral();
+
+    // Once the stuck switch is cleared and the fault is cleared (either via
+    // clear_fault() or DS disable/re-enable), the mechanism must re-home
+    // rather than skipping homing into kReady.
+    carriage.hw.set_digital_input("carriage", "carriage_home", true);
+    carriage.Drive(1.0, 10ms);  // let the open switch sample arrive
+    if (use_ds_disable) {
+      carriage.hw.set_driver_station(DsPacket(ds::kTeleop));
+      carriage.sim.step(20ms);
+      EXPECT_EQ(carriage.mech().fault(), PositionFault::kNone);
+      EXPECT_EQ(carriage.mech().phase(), PositionPhase::kUnhomed);
+      EXPECT_FALSE(carriage.mech().homed());
+      EXPECT_FALSE(carriage.node.motor.zeroed());
+      carriage.Start();
+    } else {
+      carriage.node.clear_next = true;
+    }
+    carriage.Drive(1.0, 20ms);
+    EXPECT_EQ(carriage.mech().fault(), PositionFault::kNone);
+    EXPECT_FALSE(carriage.node.motor.zeroed());
+    carriage.ExpectHoming(-1.0);
+  }
+}
+
+// clear_fault() inside update() while enabled restarts homing after
+// kHomingTimeout (push and settle) and kHomingStall instead of immediately
+// re-faulting on tick 1.
+// REQ-SAFE-36
+TEST(PositionMechanism, ClearFaultInsideUpdateRestartsHomingAfterHomingFaults) {
+  struct ClearableNode {
+    explicit ClearableNode(Node& node)
+        : mech{node, node.name()}, target{node} {}
+    void update() {
+      if (clear_next) {
+        mech.clear_fault();
+        clear_next = false;
+      }
+      if (const control::PositionTarget* t = target.get()) {
+        mech.set_goal(t->position_rot(), t->feedforward_v());
+      } else {
+        mech.stop();
+      }
+      mech.update();
+    }
+    PositionMechanism mech;
+    Target<control::PositionTarget> target;
+    bool clear_next = false;
+  };
+  {
+    SCOPED_TRACE("kHomingTimeout during push");
+    Rig<ClearableNode> hood{"hood"};
+    hood.SetMotor(2.3, -0.5, 5.0);
+    hood.Start();
+    hood.Drive(0.5, 550ms);  // past homing_timeout_us (500 ms)
+    ASSERT_EQ(hood.mech().phase(), PositionPhase::kFaulted);
+    ASSERT_EQ(hood.mech().fault(), PositionFault::kHomingTimeout);
+    hood.ExpectNeutral();
+
+    hood.node.clear_next = true;
+    hood.Drive(0.5, 20ms);  // stays enabled: fresh homing push, no re-fault
+    EXPECT_FALSE(hood.node.clear_next);
+    EXPECT_EQ(hood.mech().fault(), PositionFault::kNone);
+    hood.ExpectHoming(-1.0);
+
+    hood.SetMotor(2.0, 0.0, 30.0);  // reaches stop and stalls under load
+    hood.Drive(0.5, 80ms);
+    EXPECT_TRUE(hood.mech().homed());
+    EXPECT_EQ(hood.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(hood.Applied().mode, Mode::kPosition);
+  }
+  {
+    SCOPED_TRACE("kHomingTimeout during settle");
+    Rig<ClearableNode> carriage{"carriage"};
+    carriage.SetMotor(1.0, -0.5);
+    carriage.hw.set_digital_input("carriage", "carriage_home", true);
+    carriage.Start();
+    carriage.Drive(0.5, 30ms);
+    carriage.hw.set_digital_input("carriage", "carriage_home", false);
+    carriage.Drive(0.5, 550ms);  // switch sets frame; never comes to rest
+    ASSERT_EQ(carriage.mech().phase(), PositionPhase::kFaulted);
+    ASSERT_EQ(carriage.mech().fault(), PositionFault::kHomingTimeout);
+    carriage.ExpectNeutral();
+
+    // Still moving when clear_fault() runs while enabled: gets a fresh settle
+    // timeout window instead of immediately re-faulting on tick 1.
+    carriage.node.clear_next = true;
+    carriage.Drive(0.5, 50ms);
+    EXPECT_FALSE(carriage.node.clear_next);
+    EXPECT_EQ(carriage.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(carriage.mech().phase(), PositionPhase::kHoming);
+    EXPECT_FALSE(carriage.mech().homed());
+    carriage.ExpectNeutral();
+
+    carriage.SetMotor(1.0, 0.0);  // comes to rest -> settles and drives goal
+    carriage.Drive(0.5, 30ms);
+    EXPECT_TRUE(carriage.mech().homed());
+    EXPECT_EQ(carriage.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(carriage.Applied().mode, Mode::kMotionMagic);
+  }
+  {
+    SCOPED_TRACE("kHomingStall during limit-switch push");
+    Rig<ClearableNode> carriage{"carriage"};
+    carriage.SetMotor(1.0, 0.0);  // still while switch is open
+    carriage.hw.set_digital_input("carriage", "carriage_home", true);
+    carriage.Start();
+    carriage.Drive(0.5, 250ms);  // past homing_stall_us (200 ms)
+    ASSERT_EQ(carriage.mech().phase(), PositionPhase::kFaulted);
+    ASSERT_EQ(carriage.mech().fault(), PositionFault::kHomingStall);
+    carriage.ExpectNeutral();
+
+    // Still at rest on tick 1 when clear_fault() runs while enabled: must
+    // drive homing_v rather than re-faulting kHomingStall immediately.
+    carriage.node.clear_next = true;
+    carriage.Drive(0.5, 10ms);
+    EXPECT_FALSE(carriage.node.clear_next);
+    EXPECT_EQ(carriage.mech().fault(), PositionFault::kNone);
+    carriage.ExpectHoming(-1.0);
+
+    carriage.SetMotor(0.8, -0.5);  // frees up and moves to the switch
+    carriage.Drive(0.5, 20ms);
+    carriage.hw.set_digital_input("carriage", "carriage_home", false);
+    carriage.SetMotor(0.5, 0.0);
+    carriage.Drive(0.5, 30ms);
+    EXPECT_TRUE(carriage.mech().homed());
+    EXPECT_EQ(carriage.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(carriage.Applied().mode, Mode::kMotionMagic);
+  }
+}
+
+// 1-frame CAN/UDP latency jitter during a stall-homing push at 0.6 *
+// max_velocity_rps (10 ms of real motion in a 5 ms node tick = 0.6 rot) must
+// not trip the frame-jump check, reset push_since_, or cause a spurious
+// kHomingTimeout.
+// REQ-SAFE-36
+TEST(PositionMechanism, StallHomingToleratesOneFrameLatencyJitterDuringPush) {
+  {
+    SCOPED_TRACE("1-frame State/UDP jitter at 0.6 * max_velocity_rps");
+    Rig hood{"hood"};  // max_velocity_rps=100, timeout=500ms, min_push=200ms
+    double pos = 25.0;
+    hood.SetMotor(pos, -60.0, 5.0);
+    hood.Start();
+    // Push smoothly at 60 rps (0.3 rot / 5 ms) for 340 ms.
+    for (int i = 0; i < 68; ++i) {
+      pos -= 0.3;
+      hood.SetMotor(pos, -60.0, 5.0);
+      hood.Drive(0.5, 5ms);
+    }
+    ASSERT_EQ(hood.mech().phase(), PositionPhase::kHoming);
+
+    // 1-frame UDP drop: the motor advances 2 periods (-0.6 rot in 10 ms at
+    // 60 rps) before the next State arrives at the stop, stalled under load.
+    // A false frame-jump reset here (at t ~ 350 ms) would wipe push_since_ and
+    // travel, making homing wait homing_min_push_us (200 ms) past the 500 ms
+    // timeout and spuriously fault kHomingTimeout.
+    hood.hw.lose_states(1);
+    pos -= 0.3;
+    hood.SetMotor(pos, -60.0, 5.0);
+    hood.Drive(0.5, 5ms);  // lost State: node sees previous position
+    pos -= 0.3;
+    hood.SetMotor(pos, 0.0, 30.0);  // arrives with 0.6 rot delta, at stop
+    hood.Drive(0.5, 160ms);  // past homing_stall_us (50 ms) and past 500 ms
+                             // total if push_since_ had been falsely reset
+    EXPECT_TRUE(hood.mech().homed())
+        << "phase " << static_cast<int>(hood.mech().phase()) << " fault "
+        << static_cast<int>(hood.mech().fault());
+    EXPECT_EQ(hood.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(hood.Applied().mode, Mode::kPosition);
+  }
+  {
+    SCOPED_TRACE("CAN sample-age drop at 0.6 * max_velocity_rps");
+    Rig hood{"hood"};
+    hood.hw.set_motor("hood", "hood", 5.0, -60.0, 15'000, 0, 0, 0, 5.0);
+    hood.Start();
+    hood.Drive(0.5, 20ms);
+    ASSERT_EQ(hood.mech().phase(), PositionPhase::kHoming);
+
+    // Next tick delivers a fresh sample (age 0 us) 20 ms of real motion after
+    // the 15 ms-aged sample (-1.2 rot at 60 rps), hitting the stop under load.
+    // 1.2 rot exceeds frame_jump_slack_ alone (100 rps * (5 ms + 5 ms) = 1.0
+    // rot), so homing succeeds in 70 ms (< homing_min_push_us = 200 ms) only
+    // because push_last_age_ credits the 15 ms sample-age drop and preserves
+    // push_since_ and push_start_rot_.
+    hood.hw.set_motor("hood", "hood", 3.8, 0.0, 0, 0, 0, 0, 30.0);
+    hood.Drive(0.5, 70ms);
+    EXPECT_TRUE(hood.mech().homed());
+    EXPECT_EQ(hood.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(hood.Applied().mode, Mode::kPosition);
   }
 }
 

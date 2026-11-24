@@ -868,7 +868,12 @@ def _talos_bundle_impl(ctx):
             n_rf = default_info.default_runfiles
             n_target = _bundle_label(node.label)
             if node.label.name == "node":
-                n_name = node.label.package.split("/")[-1]
+                if node.label.package:
+                    n_name = node.label.package.split("/")[-1]
+                elif node.label.repo_name:
+                    n_name = node.label.repo_name.split("+")[0].split("~")[0]
+                else:
+                    n_name = node.label.name
             else:
                 n_name = node.label.name
             n_lang = "cpp"
@@ -1186,11 +1191,12 @@ def talos_bundle(name, config, **kwargs):
 _LAUNCHER = Label("//talOS/launcher:launcher")
 _LAUNCHER_RUNNER = Label("//talOS/build:launcher_runner.py")
 
-def _launcher_runner_data(config, nodes, data):
+def _launcher_runner_data(config, nodes, data, hardware_node = None):
     """The runner's runfiles: config, launcher, hardware node, nodes, data."""
+    hw = hardware_node if hardware_node != None else _HARDWARE_NODE
     seen = {}
     labels = []
-    for item in [config, _LAUNCHER, _HARDWARE_NODE] + list(nodes) + list(data):
+    for item in [config, _LAUNCHER, hw] + list(nodes) + list(data):
         lbl = native.package_relative_label(item)
         if lbl not in seen:
             seen[lbl] = True
@@ -1214,6 +1220,7 @@ def talos_graph_test(
         config,
         nodes,
         data = [],
+        hardware_node = None,
         **kwargs):
     """Probes every node in `config` with `launcher --describe-only` and lints the graph.
 
@@ -1226,15 +1233,20 @@ def talos_graph_test(
       config: the robot.toml file or label.
       nodes: the node binaries `config` names: the NODES of its generated manifest.
       data: every file `config` reads besides itself: the manifest's CONFIG_FILES.
+      hardware_node: optional label of the `[robot] hardware_node` binary
+        (defaults to `//talOS/bridge:hardware_node`). Pass this when the config
+        overrides `[robot] hardware_node` so `expected_nodes` and runfiles stay
+        accurate.
       **kwargs: passed to py_test.
     """
 
     # The roster is the hardware node and one node per NODES entry: a binary
     # registers under one name and the launcher refuses two nodes of one name,
     # so no two subsystems of a passing graph share an entry.
+    hw = hardware_node if hardware_node != None else _HARDWARE_NODE
     expected_nodes = len({
         native.package_relative_label(item): True
-        for item in [_HARDWARE_NODE] + list(nodes)
+        for item in [hw] + list(nodes)
     })
     size = kwargs.pop("size", "small")
     py_test(
@@ -1243,7 +1255,7 @@ def talos_graph_test(
         srcs = [_LAUNCHER_RUNNER],
         main = _LAUNCHER_RUNNER,
         args = _launcher_runner_args(config) + ["--graph-nodes", str(expected_nodes)],
-        data = _launcher_runner_data(config, nodes, data),
+        data = _launcher_runner_data(config, nodes, data, hardware_node = hw),
         legacy_create_init = False,
         deps = [Label("@rules_python//python/runfiles")],
         **kwargs
@@ -1254,6 +1266,7 @@ def talos_sim(
         config,
         nodes,
         data = [],
+        hardware_node = None,
         **kwargs):
     """Runs `config` in simulation: `bazel run :<name> -- [launcher args]`.
 
@@ -1271,6 +1284,8 @@ def talos_sim(
       nodes: the node binaries `config` names: the NODES of its generated manifest.
       data: every other file the session reads: the manifest's CONFIG_FILES
         and the simulator the config's [robot] sim_gateway names.
+      hardware_node: optional label of the `[robot] hardware_node` binary
+        (defaults to `//talOS/bridge:hardware_node`).
       **kwargs: passed to py_binary.
     """
 
@@ -1302,7 +1317,7 @@ def talos_sim(
         name = name,
         srcs = [main_py],
         main = main_py,
-        data = _launcher_runner_data(config, nodes, data) + [_LAUNCHER_RUNNER],
+        data = _launcher_runner_data(config, nodes, data, hardware_node = hardware_node) + [_LAUNCHER_RUNNER],
         legacy_create_init = False,
         deps = [Label("@rules_python//python/runfiles")],
         **kwargs

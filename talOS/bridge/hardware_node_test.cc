@@ -27,6 +27,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -1778,23 +1779,74 @@ int HoldPort(uint16_t port) {
   return fd;
 }
 
+struct ReceivedCommandFrame {
+  uint64_t sequence{0};
+  uint64_t sent_us{0};
+  Command command{};
+};
+
+// The next hardware command frame the gateway receives, with its frame header
+// sequence and send timestamp, skipping other frame types; nullopt after
+// kReceiveHangBound (a bound on a hang only).
+std::optional<ReceivedCommandFrame> NextCommandFrame(
+    protocol::RuntimeUdpPeer& gateway) {
+  protocol::DecodedFrame frame{};
+  while (protocol::testing::ReceiveFrame(gateway, &frame) ==
+         protocol::UdpStatus::kOk) {
+    if (frame.header.type != protocol::FrameType::kHardwareCommand) continue;
+    ReceivedCommandFrame received{
+        frame.header.sequence, frame.header.monotonic_time_us, {}};
+    if (!Decode(std::span<const uint8_t>{frame.payload, frame.payload_size},
+                received.command)) {
+      return std::nullopt;
+    }
+    return received;
+  }
+  return std::nullopt;
+}
+
 // A socket that can no longer send (shut down for writing: EPIPE, as from a
 // macOS socket the kernel marked defunct around sleep and wake) is closed by
 // the send that finds it and replaced on the same ports: the first attempt
 // on the next Tick, any later one kReopenRetryUs after the last. Nothing is
-// sent while it is closed, and the duty that could not be sent goes out on the
-// new socket. On macOS without SO_NOSIGPIPE that first send kills the test
+// sent while it is closed, the duty that could not be sent goes out on the
+// new socket, and outbound frame sequences increase strictly monotonically
+// across the reopen (never resetting to 1, which would fail the gateway's
+// replay gate). On macOS without SO_NOSIGPIPE that first send kills the test
 // with SIGPIPE instead.
 // REQ-RT-22
 TEST(HardwareNodeTest, ASocketThatCannotSendIsReplacedAndFramesFlowAgain) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint16_t roller = cfg.subsystems.at("intake").motors[0];
   Link link;
   ASSERT_TRUE(link.Open(cfg));
   HardwareNode& node = link.node.value();
   protocol::RuntimeUdpPeer& gateway = link.gateway;
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+
   constexpr uint64_t kStartUs = 1'000'000;
   node.Tick(kStartUs);
   ASSERT_EQ(NextProbeUs(gateway), kStartUs);
+
+  // Establish a live gateway state and send outbound commands before the
+  // socket breaks so header.sequence advances well past 1 prior to reopen.
+  ASSERT_TRUE(InjectState(node, gateway, TrustState(config_id, 11, 1, 1'000),
+                          kStartUs + 1'000));
+  ASSERT_GT(ReceiveConfigs(gateway), 0u);
+  PublishCommand(intake_pub, IntakeRequest(cfg, 4.0));
+  node.Tick(kStartUs + 2'000);
+  const auto cmd_before_1 = NextCommandFrame(gateway);
+  ASSERT_TRUE(cmd_before_1.has_value());
+  EXPECT_GT(cmd_before_1->sequence, 1u);
+  EXPECT_DOUBLE_EQ(MotorOf(cmd_before_1->command, roller).demand, 4.0);
+
+  PublishCommand(intake_pub, IntakeRequest(cfg, 5.0));
+  node.Tick(kStartUs + 3'000);
+  const auto cmd_before_2 = NextCommandFrame(gateway);
+  ASSERT_TRUE(cmd_before_2.has_value());
+  EXPECT_GT(cmd_before_2->sequence, cmd_before_1->sequence);
+  EXPECT_DOUBLE_EQ(MotorOf(cmd_before_2->command, roller).demand, 5.0);
 
   // The unanswered probe's retry, 100001 us on, finds the socket broken.
   ASSERT_EQ(shutdown(node.udp_fd(), SHUT_WR), 0);
@@ -1822,7 +1874,50 @@ TEST(HardwareNodeTest, ASocketThatCannotSendIsReplacedAndFramesFlowAgain) {
   node.Tick(retry_us);
   EXPECT_GE(node.udp_fd(), 0);
   EXPECT_EQ(node.socket_counters().reopens, 1u);
-  EXPECT_EQ(NextProbeUs(gateway), retry_us);
+
+  // Both the retried probe and the pending neutral command go out on the
+  // replacement socket with header.sequence strictly above cmd_before_2.
+  std::optional<uint64_t> probe_after_us;
+  std::optional<uint64_t> probe_after_seq;
+  std::optional<ReceivedCommandFrame> neutral_after;
+  protocol::DecodedFrame frame{};
+  while ((!probe_after_us || !neutral_after) &&
+         protocol::testing::ReceiveFrame(gateway, &frame) ==
+             protocol::UdpStatus::kOk) {
+    if (frame.header.type == protocol::FrameType::kClockProbe) {
+      probe_after_us = frame.header.monotonic_time_us;
+      probe_after_seq = frame.header.sequence;
+    } else if (frame.header.type == protocol::FrameType::kHardwareCommand) {
+      ReceivedCommandFrame received{
+          frame.header.sequence, frame.header.monotonic_time_us, {}};
+      ASSERT_TRUE(
+          Decode(std::span<const uint8_t>{frame.payload, frame.payload_size},
+                 received.command));
+      neutral_after = received;
+    }
+  }
+  ASSERT_TRUE(probe_after_us.has_value());
+  EXPECT_EQ(*probe_after_us, retry_us);
+  EXPECT_GT(*probe_after_seq, cmd_before_2->sequence);
+  ASSERT_TRUE(neutral_after.has_value());
+  EXPECT_GT(neutral_after->sequence, cmd_before_2->sequence);
+  EXPECT_GT(neutral_after->sequence, *probe_after_seq);
+  EXPECT_EQ(MotorOf(neutral_after->command, roller).mode, Mode::kNeutral);
+
+  // A fresh driving command after socket replacement keeps increasing the
+  // sequence monotonically as well.
+  const uint64_t fresh_sample_us = 202'001;
+  ASSERT_TRUE(InjectState(node, gateway,
+                          TrustState(config_id, 11, 1, fresh_sample_us),
+                          retry_us + 1'000));
+  Command after_req = IntakeRequest(cfg, 6.0);
+  after_req.observed_time_us = fresh_sample_us;
+  PublishCommand(intake_pub, after_req);
+  node.Tick(retry_us + 2'000);
+  const auto cmd_after = NextCommandFrame(gateway);
+  ASSERT_TRUE(cmd_after.has_value());
+  EXPECT_GT(cmd_after->sequence, neutral_after->sequence);
+  EXPECT_DOUBLE_EQ(MotorOf(cmd_after->command, roller).demand, 6.0);
 }
 
 int pending_send_error = 0;
@@ -2733,6 +2828,375 @@ TEST(HardwareNodeTest, PushConfigDuringTickDoesNotAllocate) {
   node.PushConfig(now_us + 1'000);
   const uint64_t allocations = probe.stop();
   EXPECT_EQ(allocations, 0u) << probe.sites();
+}
+
+// REQ-OPS-20: /hw/status publishes on the first tick and then at 50 Hz
+// (kStatusPeriodUs = 20 ms — neither suppressed to a slower cadence nor
+// published on intermediate <20 ms ticks), and carries non-zero, accurate
+// clock_offset_us and clock_offset_uncertainty_us once converged.
+TEST(HardwareNodeTest, PublishesStatusAt50HzWithConvergedClockOffset) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
+  ipc::Subscriber<bridge::BridgeStatus> status_sub{
+      bridge::topics::kStatus,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::SEQUENCE}};
+
+  constexpr uint64_t kStartUs = 2'000'000;
+  constexpr uint64_t kStatusPeriodUs = 20'000;
+  constexpr int64_t kTrueOffsetUs = 1'500'000;
+  constexpr uint64_t kBootId = 11;
+
+  // Initial tick publishes /hw/status #0 (not yet converged) and sends probe 1.
+  node.Tick(kStartUs);
+  const auto initial = status_sub.read();
+  ASSERT_TRUE(initial.has_value());
+  EXPECT_FALSE(status_sub.read().has_value());
+  EXPECT_FALSE(initial->clock_offset_valid());
+  EXPECT_EQ(initial->clock_offset_us(), 0);
+  EXPECT_EQ(initial->clock_offset_uncertainty_us(), 0u);
+
+  auto pending_probe = NextProbeUs(gateway);
+  ASSERT_TRUE(pending_probe.has_value());
+  ASSERT_EQ(*pending_probe, kStartUs);
+
+  State state = TrustState(config_id, kBootId, 1, 0);
+  state.flags = kConfigured;
+  std::vector<bridge::BridgeStatus> published;
+
+  // Drive 6 consecutive 20 ms intervals (120 ms total) with intermediate 5 ms
+  // ticks and a 1 us pre-boundary tick in each interval.
+  for (uint64_t k = 1; k <= 6; ++k) {
+    SCOPED_TRACE(k);
+    const uint64_t interval_start = kStartUs + (k - 1) * kStatusPeriodUs;
+    const uint64_t interval_end = kStartUs + k * kStatusPeriodUs;
+
+    // +5 ms: echo the interval's clock probe (t1 = interval_start,
+    // t2 = interval_start + 5 ms - kTrueOffsetUs); no status published yet.
+    const uint64_t t_echo = interval_start + 5'000;
+    state.sample_time_us = t_echo - static_cast<uint64_t>(kTrueOffsetUs);
+    state.clock_probe_time_us = *pending_probe;
+    ASSERT_TRUE(InjectState(node, gateway, state, t_echo));
+    EXPECT_FALSE(status_sub.read().has_value())
+        << "early /hw/status at " << t_echo;
+
+    // +6 ms: complete the causal two-way exchange (t4 = interval_start + 6 ms,
+    // RTT = 6 ms -> midpoint offset = 1'498'000 us, half-RTT = 3'000 us).
+    const uint64_t t_complete = interval_start + 6'000;
+    node.Tick(t_complete);
+    EXPECT_FALSE(status_sub.read().has_value())
+        << "early /hw/status at " << t_complete;
+
+    // +10 ms and +15 ms: intermediate hardware ticks inject States without
+    // publishing /hw/status.
+    for (const uint64_t offset_us : {10'000u, 15'000u}) {
+      const uint64_t t = interval_start + offset_us;
+      state.sample_time_us = t - static_cast<uint64_t>(kTrueOffsetUs);
+      state.clock_probe_time_us = 0;
+      ASSERT_TRUE(InjectState(node, gateway, state, t));
+      EXPECT_FALSE(status_sub.read().has_value())
+          << "early /hw/status at " << t;
+    }
+
+    // 1 us before the 20 ms cadence boundary: still no status publication.
+    node.Tick(interval_end - 1);
+    EXPECT_FALSE(status_sub.read().has_value())
+        << "1 us early /hw/status at " << (interval_end - 1);
+
+    // At exactly +20 ms: publishes exactly one /hw/status and the next probe.
+    node.Tick(interval_end);
+    const auto status = status_sub.read();
+    ASSERT_TRUE(status.has_value())
+        << "missing 50 Hz /hw/status at " << interval_end;
+    EXPECT_FALSE(status_sub.read().has_value())
+        << "duplicate /hw/status at " << interval_end;
+    published.push_back(*status);
+
+    pending_probe = NextProbeUs(gateway);
+    ASSERT_TRUE(pending_probe.has_value());
+    EXPECT_EQ(*pending_probe, interval_end);
+  }
+
+  ASSERT_EQ(published.size(), 6u);
+  // Intervals 1 and 2 have 3 and 6 States (< kConvergedSamples = 8).
+  EXPECT_FALSE(published[0].clock_offset_valid());
+  EXPECT_FALSE(published[1].clock_offset_valid());
+  // Intervals 3..6 have >= 8 States and fresh 6 ms two-way exchanges.
+  for (std::size_t i = 2; i < published.size(); ++i) {
+    SCOPED_TRACE(i);
+    const bridge::BridgeStatus& s = published[i];
+    EXPECT_TRUE(s.clock_offset_valid());
+    EXPECT_EQ(s.clock_boot_id(), kBootId);
+    EXPECT_EQ(s.clock_offset_us(), 1'498'000);
+    EXPECT_EQ(s.clock_min_round_trip_us(), 6'000u);
+    EXPECT_GE(s.clock_offset_uncertainty_us(), 3'000u);
+    EXPECT_LE(s.clock_offset_uncertainty_us(), 4'000u);
+    EXPECT_LE(std::abs(s.clock_offset_us() - kTrueOffsetUs),
+              static_cast<int64_t>(s.clock_offset_uncertainty_us()));
+  }
+}
+
+// Guards RT-29: a corrupt or spoofed far-future State sample_time_us within an
+// active boot (including UINT64_MAX) is dropped at the ordering gate (counted
+// in /hw/status clock_ignored_count) without advancing last_sample_time_us_,
+// publishing on /hw/state, refreshing state_age_us, or invalidating active
+// subsystem demands, so subsequent valid States keep the link alive. Long
+// legitimate outages, burst jitter within the margin, and new gateway boots
+// remain accepted.
+// REQ-RT-27, REQ-OPS-20
+TEST(HardwareNodeTest, FarFutureStateSampleTimeIsIgnoredWithoutLockingOutBoot) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint16_t roller = cfg.subsystems.at("intake").motors[0];
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  ipc::Subscriber<Packet> state_sub{
+      kStateTopic,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+
+  // Acknowledge config and establish active driving on boot 11.
+  constexpr uint64_t kStartUs = 1'000'000;
+  ConfigAckPayload ack{};
+  ack.config_id = config_id;
+  ack.status = ConfigAckStatus::kOk;
+  std::array<uint8_t, sizeof(ConfigAckPayload)> ack_bytes{};
+  ASSERT_EQ(EncodeConfigAck(ack, ack_bytes), sizeof(ConfigAckPayload));
+  ASSERT_EQ(link.gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 1,
+                                   kStartUs - 500, ack_bytes.data(),
+                                   ack_bytes.size()),
+            protocol::UdpStatus::kOk);
+  while (!node.is_configured()) {
+    ASSERT_TRUE(DatagramQueued(node)) << "no config ACK configured the bridge";
+    node.Tick(kStartUs - 500);
+  }
+
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 1'000), kStartUs));
+  ASSERT_TRUE(state_sub.read().has_value());
+  PublishCommand(intake_pub, IntakeRequest(cfg, 4.0));
+  node.Tick(kStartUs + 1'000);
+  ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
+  ASSERT_DOUBLE_EQ(MotorOf(node.current_command(), roller).demand, 4.0);
+  const uint64_t ignored_before =
+      node.Status(kStartUs + 1'000).clock_ignored_count();
+
+  // 1. Corrupt far-future States (+60 s and UINT64_MAX, even carrying a new
+  // epoch and disabled flags) are dropped whole: nothing published on
+  // /hw/state, active demands stay intact, freshness is NOT refreshed, and
+  // clock_ignored_count increments for each.
+  State future_60s = TrustState(config_id, 11, 9, 60'001'000);
+  future_60s.flags = kConfigured;  // disabled
+  ASSERT_TRUE(InjectState(node, link.gateway, future_60s, kStartUs + 5'000));
+  EXPECT_FALSE(state_sub.read().has_value());
+  EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
+  EXPECT_DOUBLE_EQ(MotorOf(node.current_command(), roller).demand, 4.0);
+
+  State future_max =
+      TrustState(config_id, 11, 10, std::numeric_limits<uint64_t>::max());
+  ASSERT_TRUE(InjectState(node, link.gateway, future_max, kStartUs + 10'000));
+  EXPECT_FALSE(state_sub.read().has_value());
+  EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
+  EXPECT_DOUBLE_EQ(MotorOf(node.current_command(), roller).demand, 4.0);
+
+  const bridge::BridgeStatus after_corrupt = node.Status(kStartUs + 10'000);
+  EXPECT_EQ(after_corrupt.clock_ignored_count(), ignored_before + 2);
+  EXPECT_EQ(after_corrupt.state_age_us(), 10'000u)
+      << "dropped far-future States must not refresh freshness";
+
+  // 2. Subsequent valid States of boot 11 are accepted, published, and admit
+  // fresh subsystem requests.
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 16'000),
+                          kStartUs + 15'000));
+  const auto valid_pkt = state_sub.read();
+  ASSERT_TRUE(valid_pkt.has_value());
+  State decoded{};
+  ASSERT_TRUE(Decode(valid_pkt->bytes(), decoded));
+  EXPECT_EQ(decoded.boot_id, 11u);
+  EXPECT_EQ(decoded.sample_time_us, 16'000u);
+  EXPECT_EQ(node.Status(kStartUs + 15'000).state_age_us(), 0u);
+
+  Command next_req = IntakeRequest(cfg, 6.0);
+  next_req.observed_time_us = 16'000;
+  PublishCommand(intake_pub, next_req);
+  node.Tick(kStartUs + 16'000);
+  EXPECT_EQ(node.identity_rejected(), 0u);
+  EXPECT_DOUBLE_EQ(MotorOf(node.current_command(), roller).demand, 6.0);
+
+  // 3. Burst jitter: a delayed frame followed by a prompt frame at the same
+  // bridge timestamp (within the 1 s margin) is accepted.
+  const uint64_t burst_now = kStartUs + 220'000;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 21'000), burst_now));
+  ASSERT_TRUE(state_sub.read().has_value());
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 221'000), burst_now));
+  ASSERT_TRUE(state_sub.read().has_value());
+
+  // 4. Legitimate 10 s link outage (both clocks advance 10 s, gateway 1000 ppm
+  // fast = +10 ms) recovers cleanly on the same boot.
+  const uint64_t after_outage_now = burst_now + 10'000'000;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 221'000 + 10'010'000),
+                          after_outage_now));
+  const auto recovered = state_sub.read();
+  ASSERT_TRUE(recovered.has_value());
+  ASSERT_TRUE(Decode(recovered->bytes(), decoded));
+  EXPECT_EQ(decoded.sample_time_us, 221'000u + 10'010'000u);
+  EXPECT_FALSE(node.Status(after_outage_now).alert_error_link_lost());
+
+  // 5. A new boot resets the baseline and accepts an arbitrary starting
+  // sample_time_us (far above the prior boot).
+  const uint64_t reboot_now = after_outage_now + 5'000;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 12, 1, 900'000'000'000ULL),
+                          reboot_now));
+  const auto rebooted = state_sub.read();
+  ASSERT_TRUE(rebooted.has_value());
+  ASSERT_TRUE(Decode(rebooted->bytes(), decoded));
+  EXPECT_EQ(decoded.boot_id, 12u);
+  EXPECT_EQ(decoded.sample_time_us, 900'000'000'000ULL);
+}
+
+// Guards RT-29 hardening over loopback UDP:
+// 1. A delayed buffered State after a >500 s outage never pulls the prompt
+//    anchor backward or locks out the live State immediately behind it.
+// 2. An unseen boot whose initial SO_RCVBUF drain carries only stale frames
+//    after a 3 s stall recovers on two consecutive physically-consistent live
+//    States instead of locking out the boot, while still ignoring an isolated
+//    corrupt jump afterward.
+// REQ-RT-27, REQ-OPS-20
+TEST(HardwareNodeTest,
+     StateOrderingRecoversFromLongOutageDelayedFrameAndUnseenBootStall) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint16_t roller = cfg.subsystems.at("intake").motors[0];
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  ipc::Subscriber<Packet> state_sub{
+      kStateTopic,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+
+  // Configure bridge and establish boot 11.
+  constexpr uint64_t kStartUs = 1'000'000;
+  ConfigAckPayload ack{};
+  ack.config_id = config_id;
+  ack.status = ConfigAckStatus::kOk;
+  std::array<uint8_t, sizeof(ConfigAckPayload)> ack_bytes{};
+  ASSERT_EQ(EncodeConfigAck(ack, ack_bytes), sizeof(ConfigAckPayload));
+  ASSERT_EQ(link.gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 1,
+                                   kStartUs - 500, ack_bytes.data(),
+                                   ack_bytes.size()),
+            protocol::UdpStatus::kOk);
+  while (!node.is_configured()) {
+    ASSERT_TRUE(DatagramQueued(node)) << "no config ACK configured the bridge";
+    node.Tick(kStartUs - 500);
+  }
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 1'000'000), kStartUs));
+  ASSERT_TRUE(state_sub.read().has_value());
+
+  // 1. 1000 s outage + 1.5 s delayed buffered State + live State 5 ms later.
+  const uint64_t delayed_now = kStartUs + 1'001'000'000ULL;
+  const uint64_t delayed_sample = 1'000'000 + 999'500'000ULL;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, delayed_sample),
+                          delayed_now));
+  ASSERT_TRUE(state_sub.read().has_value());
+
+  const uint64_t live_now = delayed_now + 5'000;
+  const uint64_t live_sample = 1'000'000 + 1'001'005'000ULL;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, live_sample), live_now));
+  const auto live_pkt = state_sub.read();
+  ASSERT_TRUE(live_pkt.has_value())
+      << "live State after long-outage delayed packet must not be locked out";
+  State decoded{};
+  ASSERT_TRUE(Decode(live_pkt->bytes(), decoded));
+  EXPECT_EQ(decoded.sample_time_us, live_sample);
+  const bridge::BridgeStatus after_outage = node.Status(live_now);
+  EXPECT_EQ(after_outage.clock_ignored_count(), 0u);
+  EXPECT_FALSE(after_outage.alert_error_link_lost());
+
+  Command live_req = IntakeRequest(cfg, 5.0);
+  live_req.observed_time_us = live_sample;
+  PublishCommand(intake_pub, live_req);
+  node.Tick(live_now + 1'000);
+  EXPECT_EQ(node.identity_rejected(), 0u);
+  EXPECT_DOUBLE_EQ(MotorOf(node.current_command(), roller).demand, 5.0);
+
+  // 2. Unseen boot 12 starting with a 3 s stall + SO_RCVBUF tail-drop (stale
+  // frames 10.000 s .. 11.000 s drained at receipt 13.000 s .. 13.001 s).
+  const uint64_t boot12_receipt_base = live_now + 10'000'000ULL;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 12, 1, 10'000'000),
+                          boot12_receipt_base));
+  ASSERT_TRUE(state_sub.read().has_value());
+  // Re-ACK config for the new boot so the bridge is configured on boot 12.
+  ASSERT_EQ(link.gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 2,
+                                   boot12_receipt_base + 100, ack_bytes.data(),
+                                   ack_bytes.size()),
+            protocol::UdpStatus::kOk);
+  while (!node.is_configured()) {
+    ASSERT_TRUE(DatagramQueued(node));
+    node.Tick(boot12_receipt_base + 100);
+  }
+  for (uint64_t i = 1; i <= 20; ++i) {
+    ASSERT_TRUE(
+        InjectState(node, link.gateway,
+                    TrustState(config_id, 12, 1, 10'000'000 + 50'000 * i),
+                    boot12_receipt_base + 1'000));
+    ASSERT_TRUE(state_sub.read().has_value());
+  }
+
+  // Live State 1 (2.005 s ahead of the stale anchor): held as jump candidate
+  // and ignored without publishing.
+  const uint64_t live1_now = boot12_receipt_base + 5'000;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 12, 1, 13'005'000), live1_now));
+  EXPECT_FALSE(state_sub.read().has_value());
+  EXPECT_EQ(node.Status(live1_now).clock_ignored_count(), 1u);
+
+  // Live State 2 (5 ms later, consistent with Live State 1): re-syncs anchor,
+  // publishes on /hw/state, and admits fresh subsystem requests.
+  const uint64_t live2_now = boot12_receipt_base + 10'000;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 12, 1, 13'010'000), live2_now));
+  const auto resynced_pkt = state_sub.read();
+  ASSERT_TRUE(resynced_pkt.has_value())
+      << "second consistent live State must re-sync unseen-boot stale anchor";
+  ASSERT_TRUE(Decode(resynced_pkt->bytes(), decoded));
+  EXPECT_EQ(decoded.boot_id, 12u);
+  EXPECT_EQ(decoded.sample_time_us, 13'010'000u);
+  EXPECT_EQ(node.Status(live2_now).state_age_us(), 0u);
+  EXPECT_FALSE(node.Status(live2_now).alert_error_link_lost());
+
+  Command boot12_req = IntakeRequest(cfg, 7.0);
+  boot12_req.boot_id = 12;
+  boot12_req.observed_time_us = 13'010'000;
+  PublishCommand(intake_pub, boot12_req);
+  node.Tick(live2_now + 1'000);
+  EXPECT_EQ(node.identity_rejected(), 0u);
+  EXPECT_DOUBLE_EQ(MotorOf(node.current_command(), roller).demand, 7.0);
+
+  // After re-sync, an isolated corrupt +60 s State is still ignored without
+  // locking out live State 3.
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 12, 9, 73'010'000),
+                          live2_now + 5'000));
+  EXPECT_FALSE(state_sub.read().has_value());
+  EXPECT_EQ(node.Status(live2_now + 5'000).clock_ignored_count(), 2u);
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 12, 1, 13'020'000),
+                          live2_now + 10'000));
+  EXPECT_TRUE(state_sub.read().has_value());
 }
 
 }  // namespace

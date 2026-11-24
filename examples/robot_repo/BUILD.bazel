@@ -71,12 +71,17 @@ py_test(
 )
 
 # Runs every node with --describe and lints the graph, as
-# `launcher --describe-only` does.
+# `launcher --describe-only` does. Launches the Python node //gate:node,
+# which cannot load sanitizer runtimes through ctypes.
 talos_graph_test(
     name = "graph_test",
     config = "robot.toml",
     data = CONFIG_FILES,
     nodes = NODES,
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
 )
 
 talos_bundle(
@@ -127,11 +132,16 @@ talos_sim(
 # has settled, then 1 s more: every member runs once and exits 0, Studio's
 # bridge records a bound http_port, and the bridge receives State from the
 # simulator (talos_sim_test, talOS/build/contract.bzl). Takes its startup
-# plus ~2 s of real time.
+# plus ~2 s of real time. Launches the Python node //gate:node, which cannot
+# load sanitizer runtimes through ctypes.
 talos_sim_test(
     name = "sim_smoke_test",
     sim = ":sim",
     studio = True,
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
 )
 
 # e2e: //:sim with --start-studio-bridge until the bridge is up; /drive
@@ -141,7 +151,8 @@ talos_sim_test(
 # over HTTP to verify //:studio_webroot wiring. no-sandbox: the
 # sandbox stages each file of //:studio_webroot as a link out of it, which
 # the bridge does not serve; outside it the webroot is linked whole, as
-# `bazel run //:sim` sees it.
+# `bazel run //:sim` sees it. Launches the Python node //gate:node, which
+# cannot load sanitizer runtimes through ctypes.
 py_test(
     name = "studio_test",
     size = "small",
@@ -151,6 +162,8 @@ py_test(
         "e2e",
         "exclusive",
         "no-sandbox",
+        "no_asan",
+        "no_tsan",
     ],
     deps = ["@rules_python//python/runfiles"],
 )

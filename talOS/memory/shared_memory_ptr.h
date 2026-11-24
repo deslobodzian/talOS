@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -138,7 +139,15 @@ class SharedMemoryPtr {
  private:
   // Bounded so a real mismatch is still reported promptly: 200 x 250us.
   static constexpr int kAttachAttempts = 200;
-  static constexpr useconds_t kAttachRetryUs = 250;
+  static constexpr long kAttachRetryNs = 250L * 1000L;
+
+  static void sleep_attach_retry() noexcept {
+    timespec req{0, kAttachRetryNs};
+    timespec rem{};
+    while (::nanosleep(&req, &rem) == -1 && errno == EINTR) {
+      req = rem;
+    }
+  }
 
   static off_t to_off_t(std::size_t size) {
     if (size == 0) {
@@ -176,10 +185,12 @@ class SharedMemoryPtr {
 
   int map_ptr() {
     const off_t file_size = to_off_t(size_);
-    const int shm_fd = create_or_attach();
+    int shm_fd = -1;
+    int attempts_remaining = kAttachAttempts;
 
-    switch (mode_) {
-      case SharedMemoryMode::CREATE:
+    for (;;) {
+      shm_fd = create_or_attach();
+      if (mode_ == SharedMemoryMode::CREATE) {
         if (shm_fd == -1) {
           const int err = errno;
           std::fprintf(stderr, "shm_open failed on create for %s: %s\n",
@@ -196,55 +207,83 @@ class SharedMemoryPtr {
           shm_unlink(shm_name_.c_str());
           return -1;
         }
-
         break;
-      case SharedMemoryMode::ATTACH: {
-        if (shm_fd == -1) {
-          const int err = errno;
-          std::fprintf(stderr, "shm_open failed on attach for %s: %s\n",
-                       shm_name_.c_str(), std::strerror(err));
-          return -1;
-        }
+      }
 
-        // Mapping more than the creator allocated faults on access,
-        // so refuse instead of handing back a landmine.
-        //
-        // shm_open publishes the name before the creator can call
-        // ftruncate, so a peer starting at the same moment can arrive
-        // between the two and measure a segment that is still empty.
-        // That window is microseconds wide; a genuinely wrong segment
-        // stays wrong, so waiting briefly separates the two without
-        // masking either.
-        struct stat st;
-        bool sized = false;
-        for (int attempt = 0; attempt < kAttachAttempts; ++attempt) {
-          if (fstat(shm_fd, &st) < 0) {
-            std::perror("fstat failed");
-            close(shm_fd);
-            return -1;
-          }
-          if (st.st_size >= 0 &&
-              static_cast<std::size_t>(st.st_size) >= size_) {
-            sized = true;
-            break;
-          }
-          usleep(kAttachRetryUs);
-        }
+      if (mode_ != SharedMemoryMode::ATTACH) {
+        return -1;
+      }
+      if (shm_fd == -1) {
+        const int err = errno;
+        std::fprintf(stderr, "shm_open failed on attach for %s: %s\n",
+                     shm_name_.c_str(), std::strerror(err));
+        return -1;
+      }
 
-        if (!sized) {
-          std::fprintf(stderr,
-                       "shared memory %s is %lld bytes, need %zu; it was "
-                       "created by a process built against a different "
-                       "message layout\n",
-                       shm_name_.c_str(), static_cast<long long>(st.st_size),
-                       size_);
+      // Mapping more than the creator allocated faults on access,
+      // so refuse instead of handing back a landmine.
+      //
+      // shm_open publishes the name before the creator can call
+      // ftruncate, so a peer starting at the same moment can arrive
+      // between the two and measure a segment that is still empty.
+      // That window is microseconds wide; a genuinely wrong segment
+      // stays wrong, so waiting briefly separates the two without
+      // masking either. If the creator fails ftruncate and unlinks
+      // the 0-byte segment, drop the dead inode and re-open so we
+      // can create a fresh segment or attach to a replacement creator.
+      struct stat st {};
+      bool sized = false;
+      bool reopen = false;
+      while (attempts_remaining > 0) {
+        --attempts_remaining;
+        int fstat_rc = -1;
+        do {
+          fstat_rc = fstat(shm_fd, &st);
+        } while (fstat_rc < 0 && errno == EINTR);
+        if (fstat_rc < 0) {
+          std::perror("fstat failed");
           close(shm_fd);
           return -1;
         }
+        if (st.st_size >= 0 && static_cast<std::size_t>(st.st_size) >= size_) {
+          sized = true;
+          break;
+        }
+#if defined(__linux__)
+        if (st.st_size == 0 && st.st_nlink == 0) {
+          reopen = true;
+          break;
+        }
+        if (attempts_remaining > 0) {
+          sleep_attach_retry();
+        }
+#else
+        if (attempts_remaining > 0) {
+          sleep_attach_retry();
+          if (st.st_size == 0) {
+            reopen = true;
+            break;
+          }
+        }
+#endif
+      }
+
+      if (sized) {
         break;
       }
-      default:
-        return -1;
+      if (reopen && attempts_remaining > 0) {
+        close(shm_fd);
+        continue;
+      }
+
+      std::fprintf(stderr,
+                   "shared memory %s is %lld bytes, need %zu; it was "
+                   "created by a process built against a different "
+                   "message layout\n",
+                   shm_name_.c_str(), static_cast<long long>(st.st_size),
+                   size_);
+      close(shm_fd);
+      return -1;
     }
 
     const auto unlink_created = [&] {

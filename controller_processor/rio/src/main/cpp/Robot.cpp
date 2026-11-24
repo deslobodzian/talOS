@@ -20,6 +20,7 @@
 #include "PhoenixBackend.h"
 #include "RioBuild.h"
 #include "RobotSafety.h"
+#include "SocketLinkTick.h"
 #include "SocketRetry.h"
 
 #ifdef __linux__
@@ -60,22 +61,11 @@ constexpr const char* kConfigPath = "/home/lvuser/talos_config.bin";
 constexpr const char* kConfigPath = "talos_config.bin";
 #endif
 
-// RioLog kMessage indices (rate-limit keys) of this file's reports; 0, 7, 8
-// and 16 to 31 are PhoenixBackend's (configure failure, CAN bus status, CAN
-// bus reader, licence refusals), 9 to 12 LoopConsole's.
-constexpr uint16_t kSocketMessage = 1;
+// RioLog kMessage index (rate-limit key) of this file's persistence report;
+// 1, 3 to 6 and 14 are SocketLinkTick.h's, 0, 7, 8, 13 and 16 to 31 are
+// PhoenixBackend's (configure failure, CAN bus status, CAN bus reader, restore
+// failure, licence refusals), and 9 to 12 are LoopConsole's.
 constexpr uint16_t kPersistMessage = 2;
-constexpr uint16_t kSocketOpenMessage = 3;
-constexpr uint16_t kSocketLostMessage = 4;
-constexpr uint16_t kSocketReplacedMessage = 5;
-constexpr uint16_t kSocketSendMessage = 6;
-
-void Report(talos::rio::RioLog& log, uint16_t index, std::string_view text) {
-  talos::rio::LogEvent event;
-  event.index = index;
-  event.SetText(text);
-  log.Post(event);
-}
 
 // The loop watchdog's SCHED_FIFO priority: above the loop thread's, so it
 // preempts a loop that never sleeps. It is also above the kernel's interrupt
@@ -417,200 +407,27 @@ void Robot::StartCompetition() {
     const uint64_t now_us = NowUs();
     const talos::driver_station::DriverStationData& driver_station_view =
         driver_station.Read(now_us, gateway_->config().command_timeout_us);
-    const uint32_t mode_flags = driver_station_view.fms.flags;
-    ds_sampler.Observe(mode_flags, now_us);
-    log_->ClosePhase(TickPhase::kDriverStation, NowNs());
-    auto open_status = talos::protocol::UdpStatus::kOk;
-    int open_errno = 0;
-    const auto socket_event = socket_retry.Poll(now_us, [&] {
-      // The failing call's errno (Open's close of the half-made socket
-      // leaves it): ENETUNREACH while the network has no route yet. A lost
-      // socket is replaced on the same ports, its frame sequence carried on.
-      errno = 0;
-      open_status =
-          socket_retry.replacing()
-              ? endpoint_->Reopen()
-              : endpoint_->Open(IsSimulation() ? "127.0.0.1" : "0.0.0.0", 5802,
-                                companion_address, 5803);
-      open_errno = errno;
-      return open_status == talos::protocol::UdpStatus::kOk;
-    });
-    if (socket_event == talos::rio::SocketRetry::Event::kFailed) {
-      // RioLog coalesces these to one line a second with their count. The
-      // errno is printed as a number (101 is ENETUNREACH): strerror may take
-      // a locale lock on this thread.
-      char text[128];
-      std::snprintf(text, sizeof(text),
-                    "hardware gateway socket failed: %s (errno %d)",
-                    talos::protocol::UdpStatusName(open_status), open_errno);
-      Report(*log_, kSocketMessage, text);
-    } else if (socket_event == talos::rio::SocketRetry::Event::kOpened &&
-               socket_retry.failures() > 0) {
-      char text[128];
-      std::snprintf(
-          text, sizeof(text),
-          "hardware gateway socket open after %u failed attempts, %.3f s "
-          "after the first",
-          static_cast<unsigned>(socket_retry.failures()),
-          static_cast<double>(now_us > socket_retry.first_failure_us()
-                                  ? now_us - socket_retry.first_failure_us()
-                                  : 0) /
-              1e6);
-      Report(*log_, kSocketOpenMessage, text);
-    } else if (socket_event == talos::rio::SocketRetry::Event::kReplaced) {
-      char text[128];
-      std::snprintf(
-          text, sizeof(text),
-          "hardware gateway socket replaced after %u failed attempts, %.3f s "
-          "after it was lost",
-          static_cast<unsigned>(socket_retry.failures()),
-          static_cast<double>(now_us > socket_retry.lost_us()
-                                  ? now_us - socket_retry.lost_us()
-                                  : 0) /
-              1e6);
-      Report(*log_, kSocketReplacedMessage, text);
-    }
-    // A send that finds the socket unable to send again loses it
-    // (SocketRetry::SendFailed): nothing more is sent this tick, and the next
-    // due Poll replaces it, usually on the next tick, which then runs as
-    // usual; a tick with no socket open ticks the gateway disabled and sends
-    // nothing, as before the first open. Any other send error keeps it, and
-    // a spell of them prints a line when it starts and one once sends have
-    // gone a second without failing (one key, so RioLog prints at most one
-    // a second).
-    const auto sent = [&](talos::protocol::UdpStatus status) {
-      using SendEvent = talos::rio::SocketRetry::SendEvent;
-      const SendEvent event = socket_retry.ObserveSend(
-          now_us, status, endpoint_->udp_stats().last_send_error);
-      char text[160];
-      switch (event) {
-        case SendEvent::kNone:
-          return;
-        case SendEvent::kWouldBlock:
-          loop_console.ObserveSendWouldBlock(
-              endpoint_->udp_stats().send_would_block);
-          return;
-        case SendEvent::kLost:
-          endpoint_->Close();
-          std::snprintf(text, sizeof(text),
-                        "hardware gateway socket cannot send (errno %d); "
-                        "replacing it, nothing is sent until then",
-                        socket_retry.last_send_error());
-          Report(*log_, kSocketLostMessage, text);
-          return;
-        case SendEvent::kFailing:
-          std::snprintf(text, sizeof(text),
-                        "hardware gateway socket send failed (errno %d); "
-                        "keeping the socket",
-                        socket_retry.spell_error());
-          Report(*log_, kSocketSendMessage, text);
-          return;
-        case SendEvent::kRecovered: {
-          // The last errno only when the spell's changed.
-          char last[32] = "";
-          if (socket_retry.last_send_error() != socket_retry.spell_error()) {
-            std::snprintf(last, sizeof(last), ", last errno %d",
-                          socket_retry.last_send_error());
-          }
-          // From the spell's first failure to its last: the line comes
-          // SocketRetry::kSpellQuietUs after that.
-          std::snprintf(
-              text, sizeof(text),
-              "hardware gateway socket sending again: %u sends failed over "
-              "%.3f s (errno %d%s)",
-              static_cast<unsigned>(socket_retry.spell_failures()),
-              static_cast<double>(socket_retry.spell_last_failure_us() >
-                                          socket_retry.spell_start_us()
-                                      ? socket_retry.spell_last_failure_us() -
-                                            socket_retry.spell_start_us()
-                                      : 0) /
-                  1e6,
-              socket_retry.spell_error(), last);
-          Report(*log_, kSocketSendMessage, text);
-          return;
-        }
-      }
+    talos::rio::SocketLinkTickContext link_ctx{
+        .now_us = now_us,
+        .boot_id = boot_id,
+        .period_us = period_us,
+        .ds_refreshed_us = driver_station.refreshed_us(),
+        .driver_station_view = driver_station_view,
+        .socket_retry = socket_retry,
+        .ds_sampler = ds_sampler,
+        .log = *log_,
+        .loop_console = loop_console,
+        .ds_buffer = ds_buffer,
+        .ds_packet = ds_packet,
     };
-    if (socket_retry.open()) {
-      const bool enabled =
-          (mode_flags & talos::driver_station::kEnabled) != 0 &&
-          (mode_flags & talos::driver_station::kEStop) == 0;
-      // Pre-arm the watchdog before Endpoint::Tick() when enabled with no
-      // active command so a stall inside the first Apply()/ApplyOutputs()
-      // after enable, disable or recovery is still neutralized (REQ-SAFE-25).
-      if (const uint64_t pre_arm_us = talos::rio::WatchdogPreArmDeadlineUs(
-              now_us, enabled, gateway_->command_expiry_us(),
-              gateway_->config().command_timeout_us, period_us);
-          pre_arm_us != 0) {
-        watchdog_->Beat(now_us, pre_arm_us);
-      }
-      // Endpoint handles clock probes even disabled/uncommissioned, echoing
-      // only on a subsequent tick so its sample stamp follows probe receipt.
-      const auto tick_status = endpoint_->Tick(now_us, enabled);
-      // Permanent receive errors close the socket and schedule a 100 ms
-      // SocketRetry reopen; transient errors (ECONNREFUSED) keep it open.
-      socket_retry.ObserveReceive(now_us, endpoint_->last_receive_status(),
-                                  endpoint_->last_receive_error());
-      if (!socket_retry.open()) {
-        endpoint_->Close();
-        char text[160];
-        std::snprintf(text, sizeof(text),
-                      "hardware gateway socket cannot receive (errno %d); "
-                      "replacing it, nothing is sent until then",
-                      socket_retry.last_recv_error());
-        Report(*log_, kSocketLostMessage, text);
-      }
-      sent(tick_status);
-      // The socket retry and the endpoint's tick.
-      const uint64_t ticked_ns = NowNs();
-      log_->ClosePhase(TickPhase::kLink, ticked_ns);
-      // The age of the drained command's observation at the end of the tick
-      // that drained it, on this clock: observed_time_us is the
-      // sample_time_us of a State this gateway sent (REQ-RT-25). RioLog drops
-      // a difference that wrapped (an observation in this clock's future).
-      if (const auto& drained = endpoint_->drained(); drained.present) {
-        log_->RecordCommandAge(ticked_ns / 1000 - drained.observed_time_us,
-                               drained.accepted);
-      }
-
-      // The Driver Station only produces new data at 50 Hz, so sampling it on
-      // every hardware tick would put three duplicate packets on the link, and
-      // in the dispatch log downstream, for every real one. A new mode goes
-      // out on the tick that observes it: an enabled switch (autonomous to
-      // teleop) leaves the State unchanged, so until its generation arrives
-      // the old mode's target lanes still drive. Not on a socket the State
-      // send just lost: the replacement sends it.
-      if (ds_sampler.Sample(driver_station_view, now_us, boot_id,
-                            socket_retry.open(), ds_packet)) {
-        // Encode() returns 0 if the payload will not fit; send nothing rather
-        // than an empty frame the receiver would forward as a decode failure.
-        const auto ds_size =
-            talos::driver_station::Encode(ds_packet, ds_buffer);
-        log_->ClosePhase(TickPhase::kDriverStation, NowNs());
-        if (ds_size) {
-          const auto ds_status =
-              endpoint_->SendFrame(talos::protocol::FrameType::kDriverStation,
-                                   now_us, ds_buffer.data(), ds_size);
-          sent(ds_status);
-          const uint64_t ds_sent_ns = NowNs();
-          log_->ClosePhase(TickPhase::kLink, ds_sent_ns);
-          if (ds_status != talos::protocol::UdpStatus::kOk) {
-            ds_sampler.RevertSample();
-          } else if (driver_station.refreshed_us() != 0) {
-            // The sent snapshot's refresh age at its send (REQ-RT-25); none
-            // for the neutral snapshot, which no refresh made.
-            log_->RecordDriverStationAge(ds_sent_ns / 1000 -
-                                         driver_station.refreshed_us());
-          }
-        } else {
-          ds_sampler.RevertSample();
-        }
-      }
-    } else {
-      gateway_->Tick(now_us, false);
-      // The socket retry and the gateway's tick.
-      log_->ClosePhase(TickPhase::kLink, NowNs());
-    }
+    talos::rio::TickSocketLink(
+        link_ctx, *endpoint_, *gateway_,
+        [&] {
+          return endpoint_->Open(IsSimulation() ? "127.0.0.1" : "0.0.0.0", 5802,
+                                 companion_address, 5803);
+        },
+        [&](uint64_t pre_arm_us) { watchdog_->Beat(now_us, pre_arm_us); },
+        NowNs);
 
     // A console line for each command expiry this tick found (no State
     // reaches the main processor when its loss caused the expiry), each
@@ -648,7 +465,8 @@ void Robot::StartCompetition() {
 
     if (persister.Tick(
             !(gateway_->snapshot().flags & talos::hardware::kEnabled)) > 0) {
-      Report(*log_, kPersistMessage, "cannot persist hardware configuration");
+      talos::rio::ReportRioMessage(*log_, kPersistMessage,
+                                   "cannot persist hardware configuration");
     }
 
     const uint64_t end_ns = NowNs();
@@ -691,7 +509,8 @@ void Robot::StartCompetition() {
   // still waiting for a disabled tick is saved too: the loop has stopped.
   persister.Stop();
   if (persister.Tick(false) > 0) {
-    Report(*log_, kPersistMessage, "cannot persist hardware configuration");
+    talos::rio::ReportRioMessage(*log_, kPersistMessage,
+                                 "cannot persist hardware configuration");
   }
 
 #ifndef __FRC_ROBORIO__

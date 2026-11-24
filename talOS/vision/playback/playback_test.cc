@@ -212,10 +212,101 @@ TEST(RecordedCameraSourceTest, RecordingOfAnotherSizeFailsStartWithItsSize) {
       });
   EXPECT_FALSE(source.Start());
   EXPECT_FALSE(source.IsConnected());
+  EXPECT_FALSE(source.IsRunning());
+  EXPECT_EQ(source.frame_count(), 0u);
   ASSERT_EQ(reports.size(), 1u);
   EXPECT_EQ(reports[0].first, ConnectionState::kError);
   EXPECT_NE(reports[0].second.find("640x480"), std::string::npos)
       << reports[0].second;
+}
+
+TEST(RecordedCameraSourceTest,
+     FailedStartOnCorruptFirstFrameLeavesFrameCountZero) {
+  const auto dir = NewDirectory("corrupt_first");
+  std::ofstream(dir / "0.png") << "not a valid png";
+  CameraSourceConfig config;
+  config.device_path = dir.string();
+  config.fps = 30.0;
+  RecordedCameraSource source(config, RecordedCameraSource::Pacing::kManual);
+  EXPECT_FALSE(source.Start());
+  EXPECT_FALSE(source.IsRunning());
+  EXPECT_FALSE(source.IsConnected());
+  EXPECT_EQ(source.frame_count(), 0u);
+}
+
+TEST(RecordedCameraSourceTest,
+     FinishClearsRunningAndAllowsStopOrRestartFromDisconnectCallback) {
+  const auto dir = NewDirectory("eof_disconnect");
+  RenderFrame(dir, "0.png", 2.0);
+  WriteTimeline(dir, "0.png,0\n");
+
+  CameraSourceConfig config;
+  config.device_path = dir.string();
+  config.width = kWidth;
+  config.height = kHeight;
+  config.fps = 1000.0;  // 1 ms end period for fast deterministic EOF.
+
+  // Calling Stop() from the worker's disconnect callback must not self-join,
+  // and Finish() must clear IsRunning().
+  {
+    RecordedCameraSource source(config,
+                                RecordedCameraSource::Pacing::kRealtime);
+    std::mutex mu;
+    std::condition_variable cv;
+    bool disconnected = false;
+    bool running_in_callback = true;
+    source.SetConnectionCallback([&](ConnectionState state, std::string_view) {
+      if (state != ConnectionState::kDisconnected) return;
+      running_in_callback = source.IsRunning();
+      source.Stop();
+      {
+        std::lock_guard lock(mu);
+        disconnected = true;
+      }
+      cv.notify_one();
+    });
+    ASSERT_TRUE(source.Start());
+    {
+      std::unique_lock lock(mu);
+      ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds{10},
+                              [&] { return disconnected; }));
+    }
+    EXPECT_FALSE(running_in_callback);
+    EXPECT_FALSE(source.IsRunning());
+    EXPECT_FALSE(source.IsConnected());
+    source.Stop();
+  }
+
+  // Calling Start() from the disconnect callback reopens without self-join.
+  {
+    RecordedCameraSource source(config,
+                                RecordedCameraSource::Pacing::kRealtime);
+    std::mutex mu;
+    std::condition_variable cv;
+    int disconnects = 0;
+    bool restarted = false;
+    source.SetConnectionCallback([&](ConnectionState state, std::string_view) {
+      if (state != ConnectionState::kDisconnected) return;
+      {
+        std::lock_guard lock(mu);
+        ++disconnects;
+        if (disconnects == 1) {
+          restarted = source.Start();
+        }
+      }
+      cv.notify_one();
+    });
+    ASSERT_TRUE(source.Start());
+    {
+      std::unique_lock lock(mu);
+      ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds{10},
+                              [&] { return disconnects >= 2; }));
+    }
+    EXPECT_TRUE(restarted);
+    source.Stop();
+    EXPECT_FALSE(source.IsRunning());
+    EXPECT_FALSE(source.IsConnected());
+  }
 }
 
 TEST(ImageSequenceTest, RejectsNegativeAndOverflowingTimestamps) {
@@ -386,6 +477,40 @@ TEST(RecordedCameraSourceTest, LargeTimestampsDoNotOverflowInt64) {
   EXPECT_EQ(source.DeliverUntil(std::numeric_limits<std::int64_t>::max()), 0u);
   EXPECT_EQ(delivered, 3u);
   source.Stop();
+
+  // WaitSliceNs caps each condition_variable::wait_for slice so INT64_MAX
+  // never overflows steady_clock::now() + rel_time and spins.
+  EXPECT_EQ(WaitSliceNs(100, 100), 0);
+  EXPECT_EQ(WaitSliceNs(200, 100), 0);
+  EXPECT_EQ(WaitSliceNs(100, 250), 150);
+  EXPECT_EQ(
+      WaitSliceNs(1'000'000'000LL, std::numeric_limits<std::int64_t>::max()),
+      kMaxWaitSliceNs);
+  EXPECT_EQ(WaitSliceNs(-10, std::numeric_limits<std::int64_t>::max()),
+            kMaxWaitSliceNs);
+
+  // Realtime playback with an INT64_MAX second frame delivers frame 0, sleeps
+  // cleanly without overflow, and stops immediately when Stop() is called.
+  RecordedCameraSource rt_source(config,
+                                 RecordedCameraSource::Pacing::kRealtime);
+  std::mutex mu;
+  std::condition_variable cv;
+  bool got_first = false;
+  rt_source.SetFrameCallback([&](const Frame&) {
+    {
+      std::lock_guard lock(mu);
+      got_first = true;
+    }
+    cv.notify_one();
+  });
+  ASSERT_TRUE(rt_source.Start());
+  {
+    std::unique_lock lock(mu);
+    ASSERT_TRUE(
+        cv.wait_for(lock, std::chrono::seconds{10}, [&] { return got_first; }));
+  }
+  rt_source.Stop();
+  EXPECT_FALSE(rt_source.IsRunning());
 }
 
 }  // namespace

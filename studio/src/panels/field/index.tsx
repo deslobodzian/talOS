@@ -23,6 +23,7 @@ import {
   useChassis,
   useDictionary,
   usePlayback,
+  useRecorded,
   useSeries,
   useSnapshot
 } from '../../data/hooks';
@@ -112,9 +113,12 @@ function FieldPanel({config, setConfig}: PanelProps<FieldConfig>) {
   const dictionary = useDictionary();
   const playback = usePlayback();
   const actions = useActions();
+  const recorded = useRecorded();
   const cursorNs = playback.cursor_ns;
 
-  const estimate = useMemo(() => discoverEstimate(dictionary), [dictionary]);
+  const poseTopic = recorded?.bounds.pose_topic;
+  const estimate = useMemo(
+      () => discoverEstimate(dictionary, poseTopic), [dictionary, poseTopic]);
   const cameras = useMemo(() => discoverCameras(dictionary), [dictionary]);
 
   const trailChannels = useMemo(

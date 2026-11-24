@@ -427,6 +427,30 @@ class CheckNodeMatrixTest(unittest.TestCase):
             with self.subTest(src=src):
                 self.assertEqual(check_node_matrix.infer_role([src]), "actuator")
 
+    # REQ-SAFE-38: a leading UTF-8 BOM in a Python node source must not
+    # downgrade an actuator to observer or break file reads.
+    def test_utf8_bom_does_not_bypass_actuator_role_inference(self):
+        for src in (
+            "\ufefffrom talos import Motor\n",
+            "\ufeffimport talos as t\nm = t.Motor(node, 'm')\n",
+            "\ufefffrom talos.devices import (\n    PwmOutput,\n)\n",
+        ):
+            with self.subTest(src=src):
+                self.assertEqual(check_node_matrix.infer_role([src]), "actuator")
+
+        # Disk read via read() / targets() strips raw UTF-8 BOM bytes.
+        with tempfile.TemporaryDirectory(
+                dir=os.environ.get("TEST_TMPDIR")) as root:
+            pkg = os.path.join(root, "bot", "arm")
+            os.makedirs(pkg)
+            with open(os.path.join(pkg, "BUILD"), "wb") as f:
+                f.write(b'\xef\xbb\xbftalos_py_node(name = "node")\n')
+            with open(os.path.join(pkg, "arm.py"), "wb") as f:
+                f.write(b"\xef\xbb\xbffrom talos import Motor\n")
+            self.assertEqual(
+                check_node_matrix.targets(root, ["bot"]),
+                [(pkg, "actuator")])
+
 
 if __name__ == "__main__":
     unittest.main()

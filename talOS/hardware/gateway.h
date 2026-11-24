@@ -133,11 +133,12 @@ class Gateway {
   // Phoenix 6 reports Position as fixed point in [-16384, 16384) of its own
   // units, so a long spin can wrap it; steps are compared modulo this span.
   static constexpr double kPositionSpanRot = 32768;
-  // The clock Tick's `now` comes from. Read again after Backend::Read, it
-  // ends the position-jump window when the feedback was read rather than when
-  // the tick began, so a loop preempted in between does not see more motion
-  // than its window allows. Without one (explicit simulated time) the window
-  // ends at `now`.
+  // The clock Tick's `now` comes from. Read again after Backend::Read, it ends
+  // the position-jump window when the feedback was read rather than when the
+  // tick began (so a loop preempted in between does not see more motion than
+  // its window allows), re-checks active command expiry after a stalled Read,
+  // and ages Accept() observations against the current clock. Without one
+  // (explicit simulated time) each check uses `now`.
   void SetClock(uint64_t (*clock)()) { clock_ = clock; }
   Gateway(Config config, Backend& backend, uint64_t boot_id);
   Gateway(Backend& backend, uint64_t boot_id);
@@ -232,6 +233,7 @@ class Gateway {
 
  private:
   void Invalidate();
+  void ExpireCommand(uint64_t at_us);
   void RecordEnabledRefusal(const Config& refused);
   // This tick's CAN bus slot: index `sequence % count` of the applied
   // configuration's buses (state_.health.can_bus_count, set only where a
@@ -266,6 +268,7 @@ class Gateway {
   bool healthy_{false};
   bool restoring_{false};
   bool restore_waiting_{false};
+  bool unattempted_restore_{false};
   uint64_t restore_retry_at_{};
   bool configuring_{false};
   Config pending_config_;

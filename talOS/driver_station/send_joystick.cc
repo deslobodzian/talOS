@@ -3,11 +3,15 @@
 // ChassisTarget to swerve motor requests -- can be driven and watched without a
 // Driver Station or a controller processor attached. The payload is the same
 // wire encoding the Rio sends, so nodes downstream cannot tell the difference.
+#include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include "talOS/driver_station/driver_station.h"
@@ -19,11 +23,70 @@
 namespace {
 
 float AxisValue(const std::string& text) {
-  const double value = std::stod(text);
-  if (!std::isfinite(value) || value < -1.0 || value > 1.0) {
-    throw std::invalid_argument("axis values must be within [-1, 1]");
+  if (text.empty() || std::isspace(static_cast<unsigned char>(text.front()))) {
+    throw std::invalid_argument("axis values must be within [-1, 1]: '" + text +
+                                "'");
+  }
+  std::string_view digits{text};
+  if (digits.front() == '+' || digits.front() == '-') {
+    digits.remove_prefix(1);
+  }
+  if (digits.size() >= 2 && digits[0] == '0' &&
+      (digits[1] == 'x' || digits[1] == 'X')) {
+    throw std::invalid_argument("axis values must be within [-1, 1]: '" + text +
+                                "'");
+  }
+  std::size_t used = 0;
+  double value = 0;
+  try {
+    value = std::stod(text, &used);
+  } catch (const std::exception&) {
+    used = 0;
+  }
+  if (used == 0 || used != text.size() || !std::isfinite(value) ||
+      value < -1.0 || value > 1.0) {
+    throw std::invalid_argument("axis values must be within [-1, 1]: '" + text +
+                                "'");
   }
   return static_cast<float>(value);
+}
+
+uint32_t ButtonMask(const std::string& text) {
+  if (text.empty() || text.front() < '0' || text.front() > '9') {
+    throw std::invalid_argument("buttons must be a nonnegative uint32 mask: '" +
+                                text + "'");
+  }
+  std::size_t used = 0;
+  unsigned long long mask = 0;
+  try {
+    mask = std::stoull(text, &used, 10);
+  } catch (const std::exception&) {
+    used = 0;
+  }
+  if (used == 0 || used != text.size() || mask > UINT32_MAX) {
+    throw std::invalid_argument("buttons must be a nonnegative uint32 mask: '" +
+                                text + "'");
+  }
+  return static_cast<uint32_t>(mask);
+}
+
+int PositiveSeconds(const std::string& text) {
+  if (text.empty() || std::isspace(static_cast<unsigned char>(text.front()))) {
+    throw std::invalid_argument("duration must be a positive integer: '" +
+                                text + "'");
+  }
+  std::size_t used = 0;
+  int value = 0;
+  try {
+    value = std::stoi(text, &used, 10);
+  } catch (const std::exception&) {
+    used = 0;
+  }
+  if (used == 0 || used != text.size() || value <= 0) {
+    throw std::invalid_argument("duration must be a positive integer: '" +
+                                text + "'");
+  }
+  return value;
 }
 
 }  // namespace
@@ -43,9 +106,9 @@ int main(int argc, char** argv) {
       } else if (arg == "--rot" && i + 1 < argc) {
         axis2 = -AxisValue(argv[++i]);
       } else if (arg == "--buttons" && i + 1 < argc) {
-        buttons = static_cast<uint32_t>(std::stoul(argv[++i]));
+        buttons = ButtonMask(argv[++i]);
       } else if (arg == "--duration-s" && i + 1 < argc) {
-        duration_s = std::stoi(argv[++i]);
+        duration_s = PositiveSeconds(argv[++i]);
       } else if (arg == "--disabled") {
         disabled = true;
       } else {
@@ -53,9 +116,6 @@ int main(int argc, char** argv) {
             "usage: send_joystick [--x -1..1] [--y -1..1] [--rot -1..1] "
             "[--buttons MASK] [--duration-s N] [--disabled]");
       }
-    }
-    if (duration_s <= 0) {
-      throw std::invalid_argument("duration must be positive");
     }
 
     talos::process::InstallStopHandlers();

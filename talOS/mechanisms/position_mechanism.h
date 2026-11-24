@@ -187,8 +187,9 @@ class PositionMechanism {
   double homing_stall_current_a_{0};
   Duration homing_min_push_{};
   double homing_min_travel_rot_{0};
-  double max_velocity_rps_{0};  // the motor's, for frame-jump detection
-  Duration rezero_skew_{};      // RezeroAgeBound: CANcoder vs motor sample
+  double max_velocity_rps_{0};   // the motor's, for frame-jump detection
+  Duration rezero_skew_{};       // RezeroAgeBound: CANcoder vs motor sample
+  Duration frame_jump_slack_{};  // 1 status/gateway period for CAN/UDP jitter
   bool switch_closed_reads_{false};
   int home_samples_{1};
   double home_margin_rot_{0};
@@ -221,6 +222,7 @@ class PositionMechanism {
   double push_start_rot_{0};          // position where that push began
   double push_last_rot_{0};           // position at the last push tick
   Time push_last_at_{};
+  std::optional<Duration> push_last_age_;
   std::optional<Time> homing_still_since_;
   // A limit switch has set the frame and the mechanism has not yet come to
   // rest: home_samples consecutive valid readings below homing_stall_rps.

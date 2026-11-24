@@ -68,7 +68,20 @@ RecordedCameraSource::RecordedCameraSource(const CameraSourceConfig& config,
   config_.device_path = RecordingPath(config.device_path);
 }
 
-RecordedCameraSource::~RecordedCameraSource() { Stop(); }
+RecordedCameraSource::~RecordedCameraSource() {
+  Stop();
+  std::lock_guard lock(stop_mutex_);
+  const auto self = std::this_thread::get_id();
+  for (auto& t : retired_threads_) {
+    if (!t.joinable()) continue;
+    if (t.get_id() == self) {
+      t.detach();
+    } else {
+      t.join();
+    }
+  }
+  retired_threads_.clear();
+}
 
 std::vector<CameraMode> RecordedCameraSource::SupportedModes() const {
   return {CurrentMode()};
@@ -108,15 +121,21 @@ std::size_t RecordedCameraSource::frame_count() const {
 
 bool RecordedCameraSource::Start() {
   Stop();
+  sequence_.reset();
   std::string error;
-  sequence_ = ImageSequence::Open(config_.device_path, config_.fps, &error);
-  if (!sequence_) {
+  auto sequence = ImageSequence::Open(config_.device_path, config_.fps, &error);
+  if (!sequence) {
     Report(ConnectionState::kError, "recording: " + error);
     return false;
   }
   int width = 0, height = 0;
-  if (!sequence_->LoadGray(0, &pixels_, &width, &height, &error)) {
+  std::vector<std::uint8_t> pixels;
+  if (!sequence->LoadGray(0, &pixels, &width, &height, &error)) {
     Report(ConnectionState::kError, "recording: " + error);
+    return false;
+  }
+  if (width <= 0 || height <= 0) {
+    Report(ConnectionState::kError, "recording: invalid frame dimensions");
     return false;
   }
   if ((config_.width != 0 && static_cast<uint32_t>(width) != config_.width) ||
@@ -129,6 +148,8 @@ bool RecordedCameraSource::Start() {
                std::to_string(config_.height));
     return false;
   }
+  sequence_ = std::move(sequence);
+  pixels_ = std::move(pixels);
   config_.width = static_cast<uint32_t>(width);
   config_.height = static_cast<uint32_t>(height);
   // The recording ends one frame period after its last frame, so the
@@ -154,28 +175,44 @@ bool RecordedCameraSource::Start() {
   running_.store(true);
   connected_.store(true);
   if (pacing_ == Pacing::kRealtime) {
-    {
-      std::lock_guard lock(stop_mutex_);
-      stop_ = false;
-    }
     const auto start_ns = HostNowNs();
+    std::lock_guard lock(stop_mutex_);
+    stop_ = false;
     thread_ = std::thread([this, start_ns] { Play(start_ns); });
   }
   return true;
 }
 
 void RecordedCameraSource::Stop() {
+  std::vector<std::thread> to_join;
   {
     std::lock_guard lock(stop_mutex_);
     stop_ = true;
+    const auto self = std::this_thread::get_id();
+    if (thread_.joinable()) {
+      if (thread_.get_id() == self) {
+        retired_threads_.push_back(std::move(thread_));
+      } else {
+        to_join.push_back(std::move(thread_));
+      }
+    }
+    std::erase_if(retired_threads_, [&](std::thread& t) {
+      if (!t.joinable()) return true;
+      if (t.get_id() == self) return false;
+      to_join.push_back(std::move(t));
+      return true;
+    });
+    stop_cv_.notify_all();
   }
-  stop_cv_.notify_all();
-  if (thread_.joinable()) thread_.join();
+  for (auto& t : to_join) {
+    if (t.joinable()) t.join();
+  }
   running_.store(false);
   connected_.store(false);
 }
 
 void RecordedCameraSource::Finish() {
+  running_.store(false);
   connected_.store(false);
   Report(ConnectionState::kDisconnected, "end of recording");
 }
@@ -234,7 +271,8 @@ bool RecordedCameraSource::WaitUntil(std::int64_t due_ns) {
   std::unique_lock lock(stop_mutex_);
   for (auto now_ns = HostNowNs(); !stop_ && now_ns < due_ns;
        now_ns = HostNowNs()) {
-    stop_cv_.wait_for(lock, std::chrono::nanoseconds(due_ns - now_ns));
+    stop_cv_.wait_for(lock,
+                      std::chrono::nanoseconds(WaitSliceNs(now_ns, due_ns)));
   }
   return !stop_;
 }

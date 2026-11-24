@@ -9,7 +9,9 @@
 #include <fstream>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "events_test/events_test_message_generated.h"
@@ -1225,6 +1227,67 @@ TEST(Replay, MultiPassPreTimerBacklogRecordedOnRealtimeLoopReplaysCleanly) {
 
   std::remove(original_path.c_str());
   std::remove(replayed_path.c_str());
+}
+
+// ReplayEventLoop enforces the same single-threaded RunScope invariants as the
+// live and simulated loops: re-entrant run() from inside a callback throws
+// without disturbing now_ or in_run_, and cross-thread arm_timer/disarm_timer
+// calls during run() throw std::logic_error.
+// REQ-RT-04
+TEST(Replay, ReentrantRunAndCrossThreadTimerChangesAreRejected) {
+  const std::string path = temp_path("rt04_replay");
+  {
+    SimulationEnvironment environment;
+    SimulatedEventLoop<log::LogWriter> loop{environment,
+                                            log::LogWriter{path, "rt04"}};
+    const auto id = loop.register_timer("tick", Thunk{});
+    loop.arm_timer(id, MonotonicTime::from_nanos(1'000'000), 1ms);
+    loop.run_for(2ms);
+    loop.finish();
+    ASSERT_FALSE(loop.recorder().failed()) << loop.recorder().error();
+  }
+
+  log::LogReader reader{path};
+  ReplayEventLoop<> loop{reader};
+
+  int calls = 0;
+  bool arm_rejected = false;
+  bool disarm_rejected = false;
+  std::uint16_t timer_id = 0;
+  auto handler = [&](const Context& context) {
+    ++calls;
+    if (calls != 1) return;
+    EXPECT_THROW(loop.run(), std::logic_error);
+    EXPECT_EQ(calls, 1) << "re-entrant run dispatched a nested callback";
+    EXPECT_EQ(loop.now_impl(), context.now)
+        << "rejected re-entrant run overwrote now_";
+
+    std::thread other{[&] {
+      try {
+        loop.arm_timer(timer_id, context.now + 1ms, 1ms);
+      } catch (const std::logic_error&) {
+        arm_rejected = true;
+      }
+      try {
+        loop.disarm_timer(timer_id);
+      } catch (const std::logic_error&) {
+        disarm_rejected = true;
+      }
+    }};
+    other.join();
+  };
+
+  timer_id = loop.register_timer("tick", make_thunk(&handler));
+  loop.arm_timer(timer_id, MonotonicTime::from_nanos(1'000'000), 1ms);
+
+  loop.run();
+  EXPECT_FALSE(loop.diverged());
+  EXPECT_TRUE(loop.reached_exit());
+  EXPECT_EQ(calls, 2);
+  EXPECT_TRUE(arm_rejected) << "cross-thread arm_timer was not rejected";
+  EXPECT_TRUE(disarm_rejected) << "cross-thread disarm_timer was not rejected";
+
+  std::remove(path.c_str());
 }
 
 }  // namespace

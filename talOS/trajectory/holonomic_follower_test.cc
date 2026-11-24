@@ -641,5 +641,59 @@ TEST(HolonomicFollowerTest, DeterministicAndResettable) {
   }
 }
 
+// Guards: step_pose() matches step() for any pose type exposing x_m(), y_m(),
+// and yaw_rad(), and ChassisSpeeds::as<M>() converts to a target struct.
+// REQ-DEV-15
+TEST(HolonomicFollowerTest, StepPoseAndChassisSpeedsAsMatchStep) {
+  struct PoseLike {
+    double x = 0;
+    double y = 0;
+    double yaw = 0;
+    double x_m() const { return x; }
+    double y_m() const { return y; }
+    double yaw_rad() const { return yaw; }
+  };
+  struct TargetLike {
+    double vx_mps = 0;
+    double vy_mps = 0;
+    double omega_radps = 0;
+  };
+
+  FollowerConfig config;
+  config.translation = {.kp = 2.0, .ki = 0.4, .kd = 0.1, .integral_limit = 1.0};
+  config.heading = {.kp = 3.0, .ki = 0.2, .kd = 0.05, .integral_limit = 1.0};
+  const Trajectory trajectory = Curve();
+
+  for (const SpeedsFrame frame : {SpeedsFrame::kField, SpeedsFrame::kRobot}) {
+    SCOPED_TRACE(frame == SpeedsFrame::kField ? "field" : "robot");
+    HolonomicFollower via_se2(config);
+    HolonomicFollower via_pose(config);
+    for (int tick = 0; tick < 20; ++tick) {
+      const double t_s = 0.02 * tick;
+      const double x = 8.0 + 0.03 * tick;
+      const double y = 2.0 - 0.02 * tick;
+      const double yaw = 1.5 + 0.05 * tick;
+      const FollowerOutput expected =
+          via_se2.step(trajectory, t_s, Pose(yaw, Pose::Vector2(x, y)),
+                       tick > 0 ? 0.02 : 0.0, frame);
+      const FollowerOutput actual = via_pose.step_pose(
+          trajectory, t_s, PoseLike{x, y, yaw}, tick > 0 ? 0.02 : 0.0, frame);
+      EXPECT_EQ(actual.valid, expected.valid);
+      EXPECT_EQ(actual.finished, expected.finished);
+      EXPECT_DOUBLE_EQ(actual.x_error_m, expected.x_error_m);
+      EXPECT_DOUBLE_EQ(actual.y_error_m, expected.y_error_m);
+      EXPECT_DOUBLE_EQ(actual.heading_error_rad, expected.heading_error_rad);
+      EXPECT_DOUBLE_EQ(actual.speeds.vx_mps, expected.speeds.vx_mps);
+      EXPECT_DOUBLE_EQ(actual.speeds.vy_mps, expected.speeds.vy_mps);
+      EXPECT_DOUBLE_EQ(actual.speeds.omega_radps, expected.speeds.omega_radps);
+
+      const TargetLike target = actual.speeds.as<TargetLike>();
+      EXPECT_DOUBLE_EQ(target.vx_mps, actual.speeds.vx_mps);
+      EXPECT_DOUBLE_EQ(target.vy_mps, actual.speeds.vy_mps);
+      EXPECT_DOUBLE_EQ(target.omega_radps, actual.speeds.omega_radps);
+    }
+  }
+}
+
 }  // namespace
 }  // namespace talos::trajectory

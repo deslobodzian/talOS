@@ -248,5 +248,91 @@ TEST_F(ReplayTest, MissingOrNonDirectoryFramesPathReturnsError) {
   EXPECT_FALSE(error.empty());
 }
 
+TEST_F(ReplayTest,
+       ReplaysMultipleFramesReusingAndRebuildingPipelineAcrossContexts) {
+  constexpr int kOddWidth = 643;
+  constexpr int kOddHeight = 480;
+  const auto layout = MakeLayout();
+  auto camera = MakeCamera();
+  camera.intrinsics.image_width = kOddWidth;
+  camera.intrinsics.image_height = kOddHeight;
+  const auto pose = field_sim::RobotPoseOnField(2.0, 2.0, 0.0);
+
+  std::vector<std::uint8_t> gray(static_cast<std::size_t>(kOddWidth) *
+                                 kOddHeight);
+  field_sim::RenderScratch scratch;
+  const int painted = field_sim::RenderInstantaneousFieldView(
+      layout.layout, patterns_, camera, pose, kTagSize,
+      field_sim::SimRenderOptions{}, &gray, &scratch.detections);
+  ASSERT_GT(painted, 0);
+
+  const Frame frame{0,
+                    0,
+                    0,
+                    MonotonicTime::from_nanos(0),
+                    kOddWidth,
+                    kOddHeight,
+                    kOddWidth,
+                    PixelFormat::kGray8,
+                    std::move(gray)};
+
+  auto make_opts = [&](double min_margin) {
+    FrameRecorder::Options opts;
+    opts.output_dir = dir_;
+    opts.sample_hz = 1e12;
+    opts.rejected_hz = 1e12;
+    opts.context.camera = "test_camera";
+    opts.context.width = kOddWidth;
+    opts.context.height = kOddHeight;
+    opts.context.intrinsics = camera.intrinsics;
+    opts.context.mounting = {0.0, 0.0, 0.5, 0.0, 0.0, 0.0};
+    opts.context.detector = {.backend = "cpu",
+                             .decimate = 1.0,
+                             .threads = 1,
+                             .sigma = 0.0,
+                             .refine_edges = true,
+                             .hamming_threshold = 1,
+                             .min_decision_margin = min_margin};
+    return opts;
+  };
+
+  auto make_rec = [&](std::uint64_t ts) {
+    FrameRecord r;
+    r.capture_ns = ts;
+    r.reason = "sampled";
+    r.observation.valid = true;
+    r.observation.x_m = 2.0;
+    r.observation.y_m = 2.0;
+    r.observation.yaw_rad = 0.0;
+    r.truth = TruthRecord{2.0, 2.0, 0.0};
+    return r;
+  };
+
+  // Two frames with identical context (exercise cached pipeline reuse).
+  {
+    FrameRecorder recorder{make_opts(30.0)};
+    ASSERT_TRUE(recorder.Record(frame, make_rec(1'000'000)));
+  }
+  {
+    FrameRecorder recorder{make_opts(30.0)};
+    ASSERT_TRUE(recorder.Record(frame, make_rec(2'000'000)));
+  }
+  // Third frame with higher min_decision_margin (exercise pipeline rebuild).
+  {
+    FrameRecorder recorder{make_opts(1000.0)};
+    ASSERT_TRUE(recorder.Record(frame, make_rec(3'000'000)));
+  }
+
+  ReplayStats stats;
+  std::string error;
+  ASSERT_TRUE(
+      ReplayFrames(dir_.string(), layout, DetectorOverrides{}, &stats, &error))
+      << error;
+  EXPECT_EQ(stats.frames, 3u);
+  EXPECT_EQ(stats.valid_after, 2u);
+  EXPECT_EQ(stats.rejections_after["(valid)"], 2u);
+  EXPECT_EQ(stats.rejections_after["decision_margin"], 1u);
+}
+
 }  // namespace
 }  // namespace talos::vision::recording

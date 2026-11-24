@@ -1312,5 +1312,156 @@ TEST(Endpoint, RefusalAcksCarryTransferConfigId) {
     EXPECT_EQ(ack->config_id, base_id);
   }
 }
+
+// REQ-RT-13: Endpoint::Tick emits exactly one kHardwareState frame per gateway
+// tick across unconfigured-disabled, configured-disabled, enabled, and
+// disabled-again operation.
+TEST(Endpoint, EmitsExactlyOneStatePerTickWhileDisabledAndEnabled) {
+  SimBackend backend;
+  Gateway gateway{backend, 3018};
+  Endpoint endpoint{gateway};
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+
+  constexpr uint64_t kPeriodUs = 5'000;
+  uint64_t now_us = 10'000;
+  uint64_t next_expected_seq = 0;
+
+  const auto check_phase = [&](const char* label, std::size_t count,
+                               bool enabled, bool configured) {
+    SCOPED_TRACE(label);
+    const uint64_t sent_before = endpoint.udp_stats().sent_frames;
+    std::vector<uint64_t> expected_times;
+    expected_times.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      now_us += kPeriodUs;
+      expected_times.push_back(now_us);
+      ASSERT_EQ(endpoint.Tick(now_us, enabled), protocol::UdpStatus::kOk);
+    }
+    EXPECT_EQ(endpoint.udp_stats().sent_frames - sent_before, count);
+
+    // Trailing DriverStation sentinel bounds the batch in loopback order so a
+    // dropped State fails immediately instead of waiting on a hang deadline.
+    const uint64_t sentinel_us = now_us + 1;
+    const std::array<uint8_t, 1> sentinel{0x5A};
+    ASSERT_EQ(endpoint.SendFrame(protocol::FrameType::kDriverStation,
+                                 sentinel_us, sentinel.data(), sentinel.size()),
+              protocol::UdpStatus::kOk);
+
+    std::vector<State> states;
+    std::vector<uint64_t> sequences;
+    uint64_t sentinel_seq = 0;
+    protocol::DecodedFrame frame;
+    while (companion.Receive(&frame) == protocol::UdpStatus::kOk) {
+      if (frame.header.type == protocol::FrameType::kDriverStation &&
+          frame.header.monotonic_time_us == sentinel_us) {
+        sentinel_seq = frame.header.sequence;
+        break;
+      }
+      ASSERT_EQ(frame.header.type, protocol::FrameType::kHardwareState);
+      State state{};
+      ASSERT_TRUE(Decode({frame.payload, frame.payload_size}, state));
+      states.push_back(state);
+      sequences.push_back(frame.header.sequence);
+    }
+    ASSERT_NE(sentinel_seq, 0u);
+    ASSERT_EQ(states.size(), count);
+    for (std::size_t i = 0; i < count; ++i) {
+      SCOPED_TRACE(i);
+      EXPECT_EQ(states[i].sample_time_us, expected_times[i]);
+      EXPECT_EQ((states[i].flags & kEnabled) != 0, enabled);
+      EXPECT_EQ((states[i].flags & kConfigured) != 0, configured);
+      if (next_expected_seq != 0) {
+        EXPECT_EQ(sequences[i], next_expected_seq + i);
+      } else if (i > 0) {
+        EXPECT_EQ(sequences[i], sequences[i - 1] + 1);
+      }
+    }
+    next_expected_seq = sentinel_seq + 1;
+  };
+
+  check_phase("unconfigured disabled", 4, /*enabled=*/false,
+              /*configured=*/false);
+  ASSERT_TRUE(gateway.Reconfigure(SwerveConfig(true)));
+  check_phase("configured disabled", 8, /*enabled=*/false, /*configured=*/true);
+  check_phase("configured enabled", 8, /*enabled=*/true, /*configured=*/true);
+  check_phase("disabled again", 4, /*enabled=*/false, /*configured=*/true);
+}
+
+int g_ack_send_error = 0;
+int g_state_send_error = 0;
+int g_state_send_attempts = 0;
+int EndpointSendErrorSeam(protocol::FrameType type) {
+  if (type == protocol::FrameType::kHardwareConfigAck) {
+    return g_ack_send_error;
+  }
+  if (type == protocol::FrameType::kHardwareState) {
+    ++g_state_send_attempts;
+    return g_state_send_error;
+  }
+  return 0;
+}
+
+// A kSocketError from SendAck must never be masked behind a later kWouldBlock
+// State send, and a permanent SendAck error (SendErrorNeedsNewSocket, e.g.
+// ENETUNREACH) must skip sending State so its fatal status and errno reach
+// SocketRetry intact.
+// REQ-CONTRACT-04, REQ-RT-22
+TEST(Endpoint,
+     AckSocketErrorIsNotMaskedByStateWouldBlockAndFatalAckSkipsState) {
+  FakeBackend backend;
+  Gateway gateway{backend, 3018};
+  Endpoint endpoint{gateway};
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+
+  // Push a valid config so Endpoint queues an ACK and tries to send it.
+  const auto cfg = SwerveConfig(true);
+  for (const auto& chunk : CreateConfigChunks(cfg)) {
+    ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig,
+                                  protocol::kFlagNone, 1000, chunk.data(),
+                                  chunk.size()),
+              protocol::UdpStatus::kOk);
+  }
+
+  // 1. Transient SendAck kSocketError (ECONNREFUSED) + State kWouldBlock:
+  // State send still runs, but Worse() prioritizes kSocketError over
+  // kWouldBlock.
+  g_ack_send_error = ECONNREFUSED;
+  g_state_send_error = EAGAIN;
+  g_state_send_attempts = 0;
+  endpoint.SetSendErrorSeam(&EndpointSendErrorSeam);
+  uint64_t now_us = 2000;
+  ASSERT_TRUE(Eventually([&] {
+    const auto status = endpoint.Tick(now_us, false);
+    now_us += 1000;
+    if (!gateway.configured()) return false;
+    EXPECT_EQ(status, protocol::UdpStatus::kSocketError);
+    return true;
+  }));
+  EXPECT_GT(g_state_send_attempts, 0);
+
+  // 2. Permanent SendAck kSocketError (ENETUNREACH, SendErrorNeedsNewSocket)
+  // on the queued ACK retry at the start of Tick: skips State send entirely
+  // and returns kSocketError (cannot be masked by EAGAIN or overwritten by a
+  // transient State send error).
+  g_ack_send_error = ENETUNREACH;
+  g_state_send_error = EAGAIN;
+  g_state_send_attempts = 0;
+  EXPECT_EQ(endpoint.Tick(now_us, false), protocol::UdpStatus::kSocketError);
+  EXPECT_EQ(g_state_send_attempts, 0);
+  now_us += 1000;
+
+  // 3. Once the error clears, the still-queued ACK and State both go out.
+  endpoint.SetSendErrorSeam(nullptr);
+  ASSERT_EQ(endpoint.Tick(now_us, false), protocol::UdpStatus::kOk);
+  protocol::DecodedFrame frame;
+  ASSERT_TRUE(
+      companion.Receive(protocol::FrameType::kHardwareConfigAck, &frame));
+  ConfigAckPayload ack{};
+  ASSERT_TRUE(DecodeConfigAck({frame.payload, frame.payload_size}, ack));
+  EXPECT_EQ(ack.status, ConfigAckStatus::kOk);
+  EXPECT_EQ(ack.config_id, ConfigurationId(cfg));
+}
 }  // namespace
 }  // namespace talos::hardware

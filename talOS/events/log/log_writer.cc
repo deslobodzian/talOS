@@ -183,6 +183,22 @@ void LogWriter::State::write_chunk(Chunk& chunk) noexcept {
       sink.write_bytes(chunk.data.data() + chunk.written, size - chunk.written);
 }
 
+void LogWriter::State::discard_buffered() noexcept {
+  pre_start_sync.clear();
+  for (Chunk& chunk : pool) {
+    chunk.used = 0;
+    chunk.committed.store(0, std::memory_order_relaxed);
+    chunk.written = 0;
+    chunk.segment = 0;
+  }
+  submitted.store(0, std::memory_order_relaxed);
+  completed.store(0, std::memory_order_relaxed);
+  active = &pool.front();
+  segment = 0;
+  segment_used = 0;
+  segment_first_ns = 0;
+}
+
 void LogWriter::State::sync(bool durable) noexcept {
   sink.sync(durable, capture_error.load() == CaptureError::BYTE_CAP);
 }
@@ -196,6 +212,17 @@ void LogWriter::State::submit_active() noexcept {
   active = nullptr;
 
   if (!options.background) {
+    if (!started) {
+      // Defer synchronous flushes until start() has written FileHeader at
+      // offset 0 so pre-start() sends never corrupt the file head.
+      pre_start_sync.insert(
+          pre_start_sync.end(), chunk->data.begin(),
+          chunk->data.begin() + static_cast<std::ptrdiff_t>(chunk->used));
+      chunk->used = 0;
+      chunk->written = 0;
+      active = chunk;
+      return;
+    }
     write_chunk(*chunk);
     chunk->used = 0;
     chunk->written = 0;
@@ -293,8 +320,8 @@ LogWriter::State::Take LogWriter::State::take(
         writer_idle.exchange(false, std::memory_order_seq_cst)) {
       wake.post();
     }
-  } else if (std::chrono::steady_clock::now() - sink.last_sync() >=
-             options.sync_interval) {
+  } else if (started && std::chrono::steady_clock::now() - sink.last_sync() >=
+                            options.sync_interval) {
     submit_active();
     sync(/*durable=*/false);
   }
@@ -504,7 +531,7 @@ void LogWriter::State::drain() noexcept {
   settle();
 
   if (!options.background) {
-    sync(/*durable=*/true);
+    if (started) sync(/*durable=*/true);
     return;
   }
 
@@ -722,11 +749,15 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
   const auto prefix_bytes =
       sizeof(header) + manifest_bytes.size() + schemas.size();
   if (state.options.max_bytes != 0 && prefix_bytes > state.options.max_bytes) {
-    // No valid log fits. Do not spend the budget on an unreadable prefix,
-    // and do not let a policy limit stop the node itself. The thread that
-    // would have created the file creates the marker instead: this one when
-    // synchronous, else the writer thread (open_file, with no prefix).
+    // No valid log fits. Discard any records buffered before start() so the
+    // writer never attempts to write them to an unopened descriptor, do not
+    // spend the budget on an unreadable prefix, and do not let a policy limit
+    // stop the node itself. The thread that would have created the file creates
+    // the marker instead: this one when synchronous, else the writer thread
+    // (open_file, with no prefix).
+    state.discard_buffered();
     state.capture_error.store(State::CaptureError::BYTE_CAP);
+    state.started = true;
     if (state.options.background) {
       state.start_writer();
       return;
@@ -743,8 +774,8 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
   prefix.insert(prefix.end(), manifest_bytes.begin(), manifest_bytes.end());
   prefix.insert(prefix.end(), schemas.begin(), schemas.end());
 
+  const std::uint64_t pre_start_bytes = state.segment_used;
   std::uint64_t segment_count = 1;
-  state.segment_used = prefix_bytes;
   if (state.options.max_bytes != 0) {
     // Segments that each hold the prefix and the largest record.
     const std::uint64_t smallest = prefix_bytes + largest_record;
@@ -766,7 +797,69 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
   }
   state.sink.configure_segments(std::move(prefix), segment_count);
 
+  const std::uint64_t limit =
+      state.segment_bytes != 0 ? state.segment_bytes : state.options.max_bytes;
+  if (pre_start_bytes > 0 && limit != 0 &&
+      prefix_bytes + pre_start_bytes > limit) {
+    // Pre-start() records plus the now-known prefix exceed the segment/file
+    // cap: re-ingest them in order under the real cap so rotation or BYTE_CAP
+    // stops cleanly without overshooting max_bytes/segment_bytes.
+    std::vector<std::byte> buffered;
+    buffered.reserve(static_cast<std::size_t>(pre_start_bytes));
+    if (!state.options.background) {
+      buffered.insert(buffered.end(), state.pre_start_sync.begin(),
+                      state.pre_start_sync.end());
+    } else {
+      const std::uint64_t done =
+          state.completed.load(std::memory_order_relaxed);
+      const std::uint64_t sent =
+          state.submitted.load(std::memory_order_relaxed);
+      for (std::uint64_t i = done; i < sent; ++i) {
+        const Chunk& chunk = state.pool[i % state.pool.size()];
+        buffered.insert(
+            buffered.end(), chunk.data.begin(),
+            chunk.data.begin() + static_cast<std::ptrdiff_t>(chunk.used));
+      }
+    }
+    if (state.active != nullptr && state.active->used > 0) {
+      buffered.insert(buffered.end(), state.active->data.begin(),
+                      state.active->data.begin() +
+                          static_cast<std::ptrdiff_t>(state.active->used));
+    }
+
+    state.discard_buffered();
+    state.segment_used = prefix_bytes;
+    if (!state.options.background) {
+      state.sink.write_prefix_sync();
+      state.started = true;
+    } else {
+      state.started = true;
+      state.start_writer();
+    }
+
+    std::size_t offset = 0;
+    while (offset + sizeof(RecordHeader) <= buffered.size()) {
+      RecordHeader rec_header{};
+      std::memcpy(&rec_header, buffered.data() + offset, sizeof(rec_header));
+      const std::size_t total = sizeof(RecordHeader) + rec_header.stored_bytes;
+      if (offset + total > buffered.size()) break;
+      const std::span<const std::byte> stored{
+          buffered.data() + offset + sizeof(RecordHeader),
+          rec_header.stored_bytes};
+      State::Take taken = state.take(rec_header, stored);
+      if (taken == State::Take::kPoolFull && state.options.background) {
+        state.wait_written();
+        taken = state.take(rec_header, stored);
+      }
+      if (taken == State::Take::kStopped) break;
+      offset += total;
+    }
+    return;
+  }
+
+  state.segment_used = prefix_bytes + pre_start_bytes;
   if (state.options.background) {
+    state.started = true;
     // The writer thread opens the file and writes the prefix: this thread
     // runs the loop and must not wait on the disk.
     state.start_writer();
@@ -774,6 +867,12 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
   }
   // Synchronous: the constructor opened the file, and the prefix leads it.
   state.sink.write_prefix_sync();
+  state.started = true;
+  if (!state.pre_start_sync.empty()) {
+    state.sink.write_bytes(state.pre_start_sync.data(),
+                           state.pre_start_sync.size());
+    state.pre_start_sync.clear();
+  }
 }
 
 void LogWriter::dispatch(const Context& context,

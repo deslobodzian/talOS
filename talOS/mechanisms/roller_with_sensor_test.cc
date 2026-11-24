@@ -14,10 +14,13 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -573,29 +576,135 @@ TEST(RollerWithSensor, ReleaseThenPressRunsAgain) {
   EXPECT_DOUBLE_EQ(intake.Applied().demand, -8.0);
 }
 
-// A request is refused outside update() (here every()), naming the roller,
-// and lasts only the update() it was made in.
+// Requests and update() are refused outside update() (the constructor, an
+// every() timer, a message callback, and off the loop thread while update()
+// is running), throwing std::logic_error naming the roller, and a request
+// lasts only the update() it was made in.
 // REQ-SAFE-38
 TEST(RollerWithSensor, RequestIsTiedToItsUpdate) {
-  struct TimerNode {
-    explicit TimerNode(Node& node) : roller{node, "roller"} {
-      node.every(20ms, [this] { roller.set_goal(RollerCommand::kIntake); });
-    }
-    void update() { roller.update(); }
-    RollerWithSensor roller;
+  struct Case {
+    const char* name;
+    void (*call)(RollerWithSensor&);
   };
+  static constexpr std::array<Case, 3> kCases{{
+      {"set_goal",
+       [](RollerWithSensor& m) { m.set_goal(RollerCommand::kIntake); }},
+      {"stop", [](RollerWithSensor& m) { m.stop(); }},
+      {"update", [](RollerWithSensor& m) { m.update(); }},
+  }};
+  constexpr std::string_view kExpectedName = "RollerWithSensor 'roller'";
+
+  // Constructor (before the event loop runs update()).
   {
+    struct CtorNode {
+      explicit CtorNode(Node& node) : roller{node, "roller"} {
+        for (std::size_t i = 0; i < kCases.size(); ++i) {
+          try {
+            kCases[i].call(roller);
+            errors[i] = "accepted";
+          } catch (const std::logic_error& e) {
+            errors[i] = e.what();
+          }
+        }
+      }
+      void update() { roller.update(); }
+      RollerWithSensor roller;
+      std::array<std::string, kCases.size()> errors{};
+    };
     auto sim = Sim::FromToml(kRobotToml);
-    sim.add<TimerNode>("intake");
+    const auto& node = sim.add<CtorNode>("intake");
+    for (std::size_t i = 0; i < kCases.size(); ++i) {
+      SCOPED_TRACE(std::string{"constructor: "} + kCases[i].name);
+      EXPECT_NE(node.errors[i].find(kExpectedName), std::string::npos)
+          << node.errors[i];
+    }
+  }
+
+  // every() timer callback.
+  for (const Case& c : kCases) {
+    SCOPED_TRACE(std::string{"every: "} + c.name);
+    struct TimerNode {
+      explicit TimerNode(Node& node) : roller{node, "roller"} {
+        node.every(20ms, [this] { call(roller); });
+      }
+      void update() { roller.update(); }
+      RollerWithSensor roller;
+      void (*call)(RollerWithSensor&) = nullptr;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    sim.add<TimerNode>("intake").call = c.call;
     try {
       sim.step(50ms);
-      ADD_FAILURE() << "set_goal() from every() was accepted";
+      ADD_FAILURE() << c.name << " from every() was accepted";
     } catch (const std::logic_error& e) {
-      EXPECT_NE(std::string{e.what()}.find("RollerWithSensor 'roller'"),
-                std::string::npos)
+      EXPECT_NE(std::string{e.what()}.find(kExpectedName), std::string::npos)
           << e.what();
     }
   }
+
+  // Subscription callback.
+  for (const Case& c : kCases) {
+    SCOPED_TRACE(std::string{"callback: "} + c.name);
+    struct CallbackNode {
+      explicit CallbackNode(Node& node)
+          : roller{node, "roller"},
+            goal{node.subscribe<roller_test::Goal>(
+                "/test/goal",
+                [this](const roller_test::Goal&) { call(roller); })} {}
+      void update() { roller.update(); }
+      RollerWithSensor roller;
+      void (*call)(RollerWithSensor&) = nullptr;
+      Subscription<roller_test::Goal> goal;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    sim.add<CallbackNode>("intake").call = c.call;
+    sim.publish("/test/goal", roller_test::Goal{Command::INTAKE});
+    try {
+      sim.step(10ms);
+      ADD_FAILURE() << c.name << " from a callback was accepted";
+    } catch (const std::logic_error& e) {
+      EXPECT_NE(std::string{e.what()}.find(kExpectedName), std::string::npos)
+          << e.what();
+    }
+  }
+
+  // Off the loop thread while update() is running (joined before update()
+  // returns so there is no concurrent access to node or mechanism state).
+  {
+    struct ThreadedNode {
+      explicit ThreadedNode(Node& node) : roller{node, "roller"} {}
+      void update() {
+        if (!ran) {
+          ran = true;
+          std::thread other{[this] {
+            for (std::size_t i = 0; i < kCases.size(); ++i) {
+              try {
+                kCases[i].call(roller);
+                errors[i] = "accepted";
+              } catch (const std::logic_error& e) {
+                errors[i] = e.what();
+              }
+            }
+          }};
+          other.join();
+        }
+        roller.update();
+      }
+      RollerWithSensor roller;
+      bool ran = false;
+      std::array<std::string, kCases.size()> errors{};
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    const auto& node = sim.add<ThreadedNode>("intake");
+    sim.step(10ms);
+    ASSERT_TRUE(node.ran);
+    for (std::size_t i = 0; i < kCases.size(); ++i) {
+      SCOPED_TRACE(std::string{"off-thread: "} + kCases[i].name);
+      EXPECT_NE(node.errors[i].find(kExpectedName), std::string::npos)
+          << node.errors[i];
+    }
+  }
+
   struct SkippingNode {
     explicit SkippingNode(Node& node) : roller{node, "roller"} {}
     void update() {

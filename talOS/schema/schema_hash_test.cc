@@ -454,4 +454,87 @@ TEST(SchemaHash, RejectsDiamondDagAndTwoFieldSelfCycle) {
   }
 }
 
+// REQ-CONTRACT-07: crafted .bfbs with a non-negative enum index on a
+// non-integer scalar (Bool, Float, Double) — directly or as an array element —
+// is rejected even when the schema has an enum at that index.
+TEST(SchemaHash, RejectsEnumIndexOnNonIntegerScalars) {
+  auto build_with_enum = [](reflection::BaseType base,
+                            reflection::BaseType element,
+                            std::uint16_t length) {
+    flatbuffers::FlatBufferBuilder builder;
+    const auto enum_name = builder.CreateString("test.Kind");
+    const auto val_name = builder.CreateString("A");
+    reflection::EnumValBuilder evb(builder);
+    evb.add_name(val_name);
+    evb.add_value(0);
+    const auto ev = evb.Finish();
+    const auto evs = builder.CreateVector(&ev, 1);
+    reflection::TypeBuilder utb(builder);
+    utb.add_base_type(reflection::BaseType::UByte);
+    const auto ut = utb.Finish();
+    reflection::EnumBuilder eb(builder);
+    eb.add_name(enum_name);
+    eb.add_values(evs);
+    eb.add_underlying_type(ut);
+    const auto e = eb.Finish();
+    const auto enums = builder.CreateVector(&e, 1);
+
+    const auto obj_name = builder.CreateString("test.Crafted");
+    const auto field_name = builder.CreateString("field");
+    reflection::TypeBuilder tb(builder);
+    tb.add_base_type(base);
+    tb.add_index(0);
+    tb.add_element(element);
+    tb.add_fixed_length(length);
+    const auto type = tb.Finish();
+    reflection::FieldBuilder fb(builder);
+    fb.add_name(field_name);
+    fb.add_type(type);
+    fb.add_offset(0);
+    const auto field = fb.Finish();
+    const auto fields = builder.CreateVector(&field, 1);
+    reflection::ObjectBuilder ob(builder);
+    ob.add_name(obj_name);
+    ob.add_fields(fields);
+    ob.add_is_struct(true);
+    ob.add_minalign(8);
+    ob.add_bytesize(16);
+    const auto obj = ob.Finish();
+    const auto objects = builder.CreateVector(&obj, 1);
+    reflection::SchemaBuilder sb(builder);
+    sb.add_objects(objects);
+    sb.add_enums(enums);
+    reflection::FinishSchemaBuffer(builder, sb.Finish());
+    return std::vector<std::uint8_t>(
+        builder.GetBufferPointer(),
+        builder.GetBufferPointer() + builder.GetSize());
+  };
+
+  // Sanity: a valid integer scalar with enum index 0 hashes cleanly.
+  const auto valid = build_with_enum(reflection::BaseType::UByte,
+                                     reflection::BaseType::None, 0);
+  EXPECT_TRUE(Hash(valid, "test.Crafted").has_value());
+
+  for (const reflection::BaseType bad_base :
+       {reflection::BaseType::Bool, reflection::BaseType::Float,
+        reflection::BaseType::Double}) {
+    const auto direct =
+        build_with_enum(bad_base, reflection::BaseType::None, 0);
+    flatbuffers::Verifier v1(direct.data(), direct.size());
+    ASSERT_TRUE(reflection::VerifySchemaBuffer(v1));
+    EXPECT_FALSE(Hash(direct, "test.Crafted"))
+        << reflection::EnumNameBaseType(bad_base);
+    const auto* s1 = reflection::GetSchema(direct.data());
+    EXPECT_TRUE(
+        talos::schema::canonical_struct(*s1, *s1->objects()->Get(0)).empty());
+
+    const auto array =
+        build_with_enum(reflection::BaseType::Array, bad_base, 2);
+    flatbuffers::Verifier v2(array.data(), array.size());
+    ASSERT_TRUE(reflection::VerifySchemaBuffer(v2));
+    EXPECT_FALSE(Hash(array, "test.Crafted"))
+        << "Array of " << reflection::EnumNameBaseType(bad_base);
+  }
+}
+
 }  // namespace

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -14,6 +15,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "SocketRetry.h"
+#include "protocol/udp.h"
 
 namespace {
 
@@ -624,6 +628,85 @@ TEST(RioLog, ClosePhaseAndCoalesceGuardBackwardClock) {
   log.Drain(19'000'000);
   EXPECT_EQ(lines.size(), 1u)
       << "backward clock step prematurely emitted coalesced fault line";
+}
+
+// A single-failure send spell recovers SocketRetry::kSpellQuietUs (1.000 s)
+// after its failure. Because RioLog's logger thread drains every 20 ms, the
+// first failing line's 1 s rate-limit window can open up to 20 ms after the
+// failure, so the recovery line arrives while that window is still open. With
+// its own RioLog kMessage key (Robot.cpp's kSocketSendRecoveredMessage = 14,
+// distinct from kSocketSendMessage = 6), recovery emits immediately and intact
+// even when a second failing spell starts right after it; sharing one key
+// coalesces or overwrites and drops the recovery line.
+// REQ-OPS-28
+TEST(RioLog, SocketSendRecoveryOnOwnKeySurvivesDelayedDrainAndNextFailure) {
+  using talos::protocol::UdpStatus;
+  using talos::rio::SocketRetry;
+  constexpr uint16_t kSocketSendMessage = 6;
+  constexpr uint16_t kSocketSendRecoveredMessage = 14;
+  static_assert(kSocketSendRecoveredMessage != kSocketSendMessage);
+
+  std::vector<std::string> lines;
+  RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
+  const auto post_message = [&](uint16_t key, std::string_view text) {
+    LogEvent event;
+    event.kind = LogKind::kMessage;
+    event.index = key;
+    event.SetText(text);
+    ASSERT_TRUE(log.Post(event));
+  };
+
+  SocketRetry retry;
+  ASSERT_EQ(retry.Poll(0, [] { return true; }), SocketRetry::Event::kOpened);
+
+  constexpr uint64_t kFailUs = 1'000'000;
+  ASSERT_EQ(retry.ObserveSend(kFailUs, UdpStatus::kSocketError, ECONNREFUSED),
+            SocketRetry::SendEvent::kFailing);
+  post_message(kSocketSendMessage,
+               "hardware gateway socket send failed (errno 111); keeping the "
+               "socket");
+
+  // Logger thread drains 15 ms later (within its 20 ms cadence), opening
+  // kSocketSendMessage's 1 s window at kFailUs + 15 ms.
+  log.Drain(kFailUs + 15'000);
+  ASSERT_EQ(lines.size(), 1u);
+  EXPECT_NE(lines[0].find("socket send failed"), std::string::npos) << lines[0];
+  EXPECT_EQ(lines[0].find("coalesced"), std::string::npos) << lines[0];
+
+  // Recovery at +1.000 s (kSpellQuietUs), followed immediately by a second
+  // failing spell before the first failing line's delayed 1 s window expires.
+  const uint64_t recover_us = kFailUs + SocketRetry::kSpellQuietUs;
+  ASSERT_EQ(retry.ObserveSend(recover_us, UdpStatus::kOk, 0),
+            SocketRetry::SendEvent::kRecovered);
+  post_message(kSocketSendRecoveredMessage,
+               "hardware gateway socket sending again: 1 sends failed over "
+               "0.000 s (errno 111)");
+
+  const uint64_t second_fail_us = recover_us + 5'000;
+  ASSERT_EQ(
+      retry.ObserveSend(second_fail_us, UdpStatus::kSocketError, ECONNREFUSED),
+      SocketRetry::SendEvent::kFailing);
+  post_message(kSocketSendMessage,
+               "hardware gateway socket send failed (errno 111); keeping the "
+               "socket");
+
+  // Drain while kSocketSendMessage's window is still open (990 ms < 1 s).
+  // Recovery must emit immediately without coalescing or being overwritten by
+  // the immediate second failure.
+  log.Drain(second_fail_us);
+  ASSERT_EQ(lines.size(), 2u);
+  EXPECT_NE(lines[1].find("socket sending again: 1 sends failed"),
+            std::string::npos)
+      << lines[1];
+  EXPECT_EQ(lines[1].find("coalesced"), std::string::npos) << lines[1];
+
+  // Once kSocketSendMessage's 1 s window expires, the second failure emits on
+  // its own key without ever having clobbered recovery.
+  log.Drain(kFailUs + 15'000 + RioLog::kWindowUs);
+  ASSERT_EQ(lines.size(), 3u);
+  EXPECT_NE(lines[2].find("socket send failed"), std::string::npos) << lines[2];
+  EXPECT_NE(lines[2].find("[1 changes coalesced"), std::string::npos)
+      << lines[2];
 }
 
 }  // namespace

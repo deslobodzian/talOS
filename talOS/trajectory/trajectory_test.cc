@@ -446,5 +446,53 @@ TEST(FlipTest, FlippedTrajectoryIsSelfConsistent) {
   }
 }
 
+// Guards: flipped() preserves events and split_starts on a multi-split
+// trajectory with events, and commutes with split().
+// REQ-DEV-14
+TEST(FlipTest, FlippedPreservesEventsAndSplits) {
+  std::vector<TrajectorySample> samples(5);
+  for (std::size_t i = 0; i < samples.size(); ++i) {
+    samples[i].t_s = static_cast<double>(i);
+    samples[i].x_m = 1.0 + 1.5 * static_cast<double>(i);
+    samples[i].y_m = 2.0 + 0.5 * static_cast<double>(i);
+    samples[i].heading_rad = 0.2 * static_cast<double>(i);
+    samples[i].vx_mps = 1.5;
+    samples[i].vy_mps = 0.5;
+    samples[i].omega_radps = 0.2;
+  }
+  const std::vector<EventMarker> events = {
+      {"start", 0.0}, {"first", 1.2}, {"boundary", 2.0}, {"last", 3.5}};
+  const std::vector<std::size_t> splits = {0, 2, 3};
+  const Trajectory trajectory{samples, Interpolation::kHermite, events, splits};
+
+  for (const AllianceFlip flip :
+       {AllianceFlip::kRotate, AllianceFlip::kMirror}) {
+    SCOPED_TRACE(flip == AllianceFlip::kRotate ? "rotate" : "mirror");
+    const Trajectory red = trajectory.flipped(flip, kField);
+    EXPECT_EQ(red.interpolation(), Interpolation::kHermite);
+    ASSERT_EQ(red.split_count(), splits.size());
+    for (std::size_t i = 0; i < splits.size(); ++i) {
+      EXPECT_EQ(red.split_starts()[i], splits[i]);
+    }
+    ASSERT_EQ(red.events().size(), events.size());
+    for (std::size_t i = 0; i < events.size(); ++i) {
+      EXPECT_EQ(red.events()[i].name, events[i].name);
+      EXPECT_DOUBLE_EQ(red.events()[i].t_s, events[i].t_s);
+    }
+    for (std::size_t seg = 0; seg < splits.size(); ++seg) {
+      const Trajectory red_seg = red.split(seg);
+      const Trajectory expected_seg =
+          trajectory.split(seg).flipped(flip, kField);
+      ASSERT_EQ(red_seg.events().size(), expected_seg.events().size());
+      for (std::size_t i = 0; i < red_seg.events().size(); ++i) {
+        EXPECT_EQ(red_seg.events()[i].name, expected_seg.events()[i].name);
+        EXPECT_DOUBLE_EQ(red_seg.events()[i].t_s, expected_seg.events()[i].t_s);
+      }
+      ExpectSameSample(red_seg.sample(0.5 * red_seg.total_time_s()),
+                       expected_seg.sample(0.5 * expected_seg.total_time_s()));
+    }
+  }
+}
+
 }  // namespace
 }  // namespace talos::trajectory

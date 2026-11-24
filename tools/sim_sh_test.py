@@ -12,6 +12,8 @@ import json
 import os
 import shlex
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -369,6 +371,158 @@ class SimShConfigTest(unittest.TestCase):
         self.assertIn("Permission denied", proc.stderr)
         self.assertIn("session lock check failed", proc.stderr)
         self.assertNotIn("another session holds the session lock", proc.stderr)
+
+    # REQ-DEV-05
+    def test_missing_value_for_duration_s_or_http_port_exits_2(self):
+        for flag in ("--duration-s", "--http-port"):
+            with self.subTest(flag=flag):
+                proc = subprocess.run(
+                    ["bash", self.sim, flag],
+                    cwd=self.root, env=dict(self.env, PWD=self.root),
+                    capture_output=True, text=True, timeout=15)
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn(f"{flag} needs an argument", proc.stderr)
+                self.assertNotIn("unbound variable", proc.stderr)
+
+    # REQ-DEV-05, REQ-DEV-23
+    def test_defaults_http_port_from_resolved_studio_config(self):
+        sock_cfg = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock_cfg.bind(("127.0.0.1", 0))
+        sock_cfg.listen(4)
+        self.addCleanup(sock_cfg.close)
+        port_cfg = sock_cfg.getsockname()[1]
+
+        sock_cli = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock_cli.bind(("127.0.0.1", 0))
+        sock_cli.listen(4)
+        self.addCleanup(sock_cli.close)
+        port_cli = sock_cli.getsockname()[1]
+
+        resolved = json.dumps({
+            "nodes": ["//bot:node"],
+            "effective": {
+                "robot": {"sim_gateway": "//talOS/simulation:sim_gateway"},
+                "studio": {"http_port": port_cfg},
+            },
+        })
+        put(os.path.join(self.root, "bazel-bin", "talOS", "configuration",
+                         "resolve"),
+            f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(resolved)}\n",
+            0o755)
+        bin_dir = os.path.join(self.tmp, "bin")
+        put(os.path.join(bin_dir, "bazel"),
+            '#!/bin/sh\n[ "$1" = run ] || [ "$1" = build ] && exit 0\n'
+            'echo "bazel stub: $*" >&2; exit 97\n',
+            0o755)
+        launcher_args = os.path.join(self.tmp, "launcher_args")
+        put(os.path.join(self.root, "bazel-bin", "talOS", "launcher",
+                         "launcher"),
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "$*" > {shlex.quote(launcher_args)}\n'
+            'out_dir=""\n'
+            'session_id=""\n'
+            'while [ $# -gt 0 ]; do\n'
+            '  case "$1" in\n'
+            '    --output-dir) out_dir="$2"; shift ;;\n'
+            '    --session-id) session_id="$2"; shift ;;\n'
+            '  esac\n'
+            '  shift\n'
+            'done\n'
+            'mkdir -p "$out_dir/$session_id"\n'
+            'printf "{}\\n" > "$out_dir/$session_id/graph.json"\n'
+            'exit 0\n',
+            0o755)
+
+        log_root = os.path.join(self.tmp, "sim_logs_studio_port")
+        env = dict(self.env, PWD=self.root, TALOS_SIM_LOG_DIR=log_root)
+
+        # Without --http-port: sim.sh must poll the config's [studio] http_port
+        # (and not override it on the launcher command line).
+        proc = subprocess.run(
+            ["bash", self.sim, "--config", CONFIG, "--sim-gateway",
+             "--no-open"],
+            cwd=self.root, env=env, capture_output=True, text=True, timeout=8)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"Studio on http://localhost:{port_cfg}", proc.stdout)
+        with open(launcher_args, encoding="utf-8") as f:
+            args_default = f.read()
+        self.assertNotIn("--studio-http-port", args_default)
+
+        # With explicit --http-port: sim.sh polls and forwards that port.
+        proc2 = subprocess.run(
+            ["bash", self.sim, "--config", CONFIG, "--sim-gateway",
+             "--no-open", "--http-port", str(port_cli)],
+            cwd=self.root, env=env, capture_output=True, text=True, timeout=8)
+        self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+        self.assertIn(f"Studio on http://localhost:{port_cli}", proc2.stdout)
+        with open(launcher_args, encoding="utf-8") as f:
+            args_cli = f.read()
+        self.assertIn(f"--studio-http-port {port_cli}", args_cli)
+
+    def _assert_signal_during_wpilib_wait_exits(self, sig, expected_rc):
+        resolved = json.dumps({
+            "nodes": ["//bot:node"],
+            "effective": {"robot": {}, "studio": {}},
+        })
+        put(os.path.join(self.root, "bazel-bin", "talOS", "configuration",
+                         "resolve"),
+            f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(resolved)}\n",
+            0o755)
+        bin_dir = os.path.join(self.tmp, "bin")
+        put(os.path.join(bin_dir, "bazel"),
+            '#!/bin/sh\n[ "$1" = run ] || [ "$1" = build ] && exit 0\n'
+            'echo "bazel stub: $*" >&2; exit 97\n',
+            0o755)
+        launcher_marker = os.path.join(self.tmp, f"launcher_started_{sig.name}")
+        put(os.path.join(self.root, "bazel-bin", "talOS", "launcher",
+                         "launcher"),
+            "#!/bin/sh\n"
+            '[ "$1" = "--check-session-lock" ] && exit 0\n'
+            f'echo started > {shlex.quote(launcher_marker)}\n'
+            'exit 0\n',
+            0o755)
+        put(os.path.join(self.root, "controller_processor", "rio", "gradlew"),
+            "#!/bin/sh\nexec sleep 60\n",
+            0o755)
+
+        log_root = os.path.join(self.tmp, f"sim_logs_sig_{sig.name}")
+        env = dict(self.env, PWD=self.root, TALOS_SIM_LOG_DIR=log_root)
+        proc = subprocess.Popen(
+            ["bash", self.sim, "--config", CONFIG, "--headless", "--no-studio"],
+            cwd=self.root, env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True)
+        seen = []
+        try:
+            for line in proc.stdout:
+                seen.append(line)
+                if "waiting for the simulation to come up" in line:
+                    break
+            else:
+                self.fail(f"sim.sh exited before WPILib wait: {''.join(seen)}")
+            proc.send_signal(sig)
+            rest, _ = proc.communicate(timeout=8)
+            out = "".join(seen) + (rest or "")
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            self.fail(
+                f"sim.sh did not exit after {sig.name} during WPILib wait loop")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.assertEqual(proc.returncode, expected_rc, out)
+        self.assertIn("sim.sh: shutting down", out)
+        self.assertFalse(os.path.exists(launcher_marker),
+                         "launcher must not start after signal during WPILib wait")
+
+    # REQ-DEV-05
+    def test_sigterm_during_wpilib_wait_exits_143(self):
+        self._assert_signal_during_wpilib_wait_exits(signal.SIGTERM, 143)
+
+    # REQ-DEV-05
+    def test_sigint_during_wpilib_wait_exits_130(self):
+        self._assert_signal_during_wpilib_wait_exits(signal.SIGINT, 130)
 
 
 if __name__ == "__main__":

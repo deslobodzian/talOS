@@ -94,8 +94,8 @@ affected tests (docs only) skips the test step: rung 2 is then
 Rung 3 is `tools/prepush.sh [--ref <commit>] [--full]`. It checks the commit out in a
 new worktree under `${TMPDIR:-/tmp}`, makes its tracked files read-only with
 CI's own step, runs CI's source lints (`tools/source_lints.sh`: test time,
-links, requirement trace, node test matrix, `bazel_dep` listing,
-`layers-src` (`tools/check_layers.py --source-only`),
+testing rules, links, requirement trace, node test matrix, `bazel_dep`
+listing, `layers-src` (`tools/check_layers.py --source-only`),
 commissioning) and `tools/format.sh --check`
 on the branch's diff against its merge base with `origin/main`, as CI's
 clang-format job, then `bazel build //...`, then `tools/check_host_includes.py`
