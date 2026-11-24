@@ -42,7 +42,7 @@ sensor. It runs the simulator's own program (`RunSimGateway`,
 (`gateway_extension.h`), so it describes and registers as the roster member
 `sim_gateway` with the same `/sim/state` publication and reports the
 `sim_gateway` program in its State; its target label differs, and it also
-publishes `/sim/state/match` (below).
+publishes `/sim/state/match` and `/sim/telemetry/pieces` (below).
 
 **The match.** Before the plant's first step the program adds the world
 rules: the robot model's scripted shooters (below), if it has any, then the
@@ -69,6 +69,25 @@ after the tick) and the scripted shooters' launches as
 The topic is declared whatever the config, so the launcher's `--describe`
 probe and the run agree. The same model, config, seed and tick times give
 the same States and the same `/sim/state/match`.
+
+**The game pieces** (REQ-DEV-43). A field model's contract: every free
+body of it is a game piece, and all are of one radius. The pieces are the
+model's free bodies other than the robot's root (the robot's other bodies
+hang below it), in body order: on `rebuilt_2026` its 504 FUEL, piece *k* being `fuel_k`; on the
+flat carpet none. A field of more than 640, or of pieces whose first geoms'
+bounding radii differ, is refused, naming the count or two of the bodies.
+On the first tick and every round(50 ms / `[robot] period_us`)-th after it
+(every 10th, 20 Hz, at 5 ms; 16.7 to 25 Hz over the gateway's 1 to 20 ms
+periods; `PiecesEveryTicks`), the program writes `/sim/telemetry/pieces`
+(`sim.GamePieces`): `sample_time_ns` as `/sim/state/match`'s, the count,
+the radius, each piece's body position (MuJoCo's `xpos`, as `float`) in the
+field frame, and whether it is in play (`GameRules::InPlay`: the 2026 game
+holds a scored FUEL and a reserve out of play; with no game every piece is
+in play). Only Studio's bridge reads it
+([game pieces](../../../studio/bridge/README.md#game-pieces)); the telemetry
+node observes state and status topics only, so the telemetry feed and its
+recording carry no piece positions. It too is declared whatever the
+config.
 
 A config selects it in `[robot] sim_gateway`
 (`"//talOS/simulation/mujoco:sim_gateway"`, or
@@ -357,6 +376,12 @@ a disabled, AUTO and TELEOP sequence: the periods come in order, the
 launch scores in the step that launched it, each tick's Driver Station
 stamp is that tick's match, the tick TELEOP starts on included, and
 another seed draws the other alliance at TELEOP's tie.
+`pieces_test` (REQ-DEV-43) holds `/sim/telemetry/pieces` to the stepped
+model on the 2026 field, with a robot whose shooter launches a preload that
+the game scores and parks: each FUEL at its body's position exactly, the
+count and radius, a FUEL out of play exactly when the game holds it, the
+10th-tick rule and identical bytes from a second run; and a free-root robot
+that is no piece, and the refusals of 641 pieces and of two radii.
 `gateway_extension_test` holds the chassis-owner refusals, one per key
 and flag, against a welded root that accepts them, and the match input
 each Driver Station state gives. `fields_test` holds
@@ -365,10 +390,12 @@ with its FUEL, and attaches each field's game. `match_state_test`
 (integration, REQ-DEV-40) runs the program on the 2026 field through a mode
 schedule: `/sim/state/match` walks None, AUTO and TELEOP counting down,
 each Driver Station packet carries the time left and game message of its
-own tick's `/sim/state/match`, the first TELEOP packet included, and the live
+own tick's `/sim/state/match`, the first TELEOP packet included,
+`/sim/telemetry/pieces` carries the 504 FUEL on every 10th tick, and the live
 registry row declares what `--describe` declares. `mujoco_gateway_test`
 (integration) runs the program: `--describe` against
-`sim_gateway --physics`'s, `/sim/state/match` aside; refusals from the
+`sim_gateway --physics`'s, `/sim/state/match` and `/sim/telemetry/pieces`
+aside; refusals from the
 extension, from the backend, from the plant's `Bind` and from a scripted
 shooter's broken contract, each named on stderr; a model file
 `robot_model_files` omits, against the same config where the file is; a

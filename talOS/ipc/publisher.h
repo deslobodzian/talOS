@@ -16,12 +16,14 @@ namespace ipc {
 // The writing end of a topic of `schema` (talOS/schema/identity.h).
 class RawPublisher {
  public:
+  // `slots`: the topic's ring, a power of two up to MAX_SLOTS, the one its
+  // describe declares (the launcher creates the segment with it).
   explicit RawPublisher(std::string_view topic, size_t size, size_t alignment,
                         const talos::schema::Identity& schema,
-                        RTMSOptions options = RTMSOptions{})
+                        RTMSOptions options = RTMSOptions{},
+                        size_t slots = MAX_SLOTS)
       : topic_{topic},
-        queue_{topic, size, alignment, schema, MAX_SLOTS, publishing(options)} {
-  }
+        queue_{topic, size, alignment, schema, slots, publishing(options)} {}
   WriteStatus write(std::span<const std::byte> message) {
     return queue_.write(message);
   }
@@ -61,9 +63,14 @@ class Publisher {
           RTMSOptions{
               .overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
               .read_mode = ReadMode::SEQUENCE,
-          })
-      : publisher_{topic, sizeof(Message), alignof(Message),
-                   talos::schema::Of<Message>(), options} {}
+          },
+      size_t slots = MAX_SLOTS)
+      : publisher_{topic,
+                   sizeof(Message),
+                   alignof(Message),
+                   talos::schema::Of<Message>(),
+                   options,
+                   slots} {}
 
   WriteStatus write(const Message& message) {
     return publisher_.write(

@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -23,9 +24,14 @@
 #include <vector>
 
 #include "drive.h"
+#include "pieces.h"
+#include "sim/sim_descriptor.h"
+#include "sim/sim_generated.h"
+#include "sim/topics.h"
 #include "static_files.h"
 #include "system.h"
 #include "talOS/configuration/config_parser.h"
+#include "talOS/hardware/sim_rings.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/process/process.h"
@@ -56,6 +62,9 @@ struct Client {
   // updates carry only what changed.
   studio::ClientFeeds feeds;
   studio::DriveFeed drive_feed;
+  // What this programmer client has been sent of the game pieces; a drive
+  // client, which is sent none, holds none.
+  std::unique_ptr<studio::PiecesFeed> pieces;
 };
 // The manifest is read synchronously on the loop thread that also polls RTMS,
 // so it is capped at Studio's own MAX_MANIFEST_BYTES
@@ -144,6 +153,91 @@ std::optional<std::uint64_t> SegmentId(const std::string& segment) {
   return id;
 }
 using Socket = uWS::WebSocket<false, true, Client>;
+
+// The MuJoCo gateway's game pieces (README.md "Game pieces"): an optional
+// observer read of /sim/telemetry/pieces, latest only. A session without the
+// MuJoCo gateway has no writer, and the topic's segment, when the launcher
+// created one, stays empty.
+struct PiecesTopic {
+  static constexpr std::uint32_t kFlags =
+      talos::introspect::naming::kSourceFlagOptional |
+      talos::introspect::naming::kSourceFlagObserver;
+  std::string segment = ShmObjectName(::sim::topics::kPieces);
+  std::optional<RTMSQueue> queue;
+  std::size_t reader = 0;
+  std::uint64_t segment_id = 0;
+  std::string attach_error;
+  // read_next() copies each message here first.
+  std::vector<std::byte> frame =
+      std::vector<std::byte>(sizeof(::sim::GamePieces));
+  studio::PiecesState state;
+  // Messages taken, and messages refused (torn reads, or a message
+  // IngestPieces would not draw).
+  std::uint64_t events = 0, dropped = 0;
+
+  ~PiecesTopic() { detach(); }
+  void detach() {
+    if (!queue) return;
+    queue->release_reader(reader);
+    queue.reset();
+  }
+
+  // As Bridge::attach, for this topic's layout: its ring is
+  // hardware::sim::kPiecesSlots, as the gateway declares it.
+  void attach(std::uint64_t id,
+              const std::optional<talos::WakeReceiver>& wake) {
+    try {
+      RTMSQueue next(::sim::topics::kPieces, sizeof(::sim::GamePieces),
+                     alignof(::sim::GamePieces),
+                     talos::schema::Of<::sim::GamePieces>(),
+                     talos::hardware::sim::kPiecesSlots,
+                     {OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST});
+      if (SegmentId(segment) != id) return;
+      const auto claimed = next.register_reader();
+      if (!claimed) throw std::runtime_error("RTMS reader slots exhausted");
+      detach();
+      queue.emplace(std::move(next));
+      reader = *claimed;
+      if (wake) queue->set_reader_wake(reader, wake->id());
+      segment_id = id;
+      attach_error.clear();
+    } catch (const std::exception& e) {
+      if (attach_error != e.what()) {
+        attach_error = e.what();
+        std::cerr << "cannot attach to " << ::sim::topics::kPieces << " ("
+                  << e.what() << "); retrying\n";
+      }
+    }
+  }
+
+  void check(const std::optional<talos::WakeReceiver>& wake) {
+    const auto id = SegmentId(segment);
+    if (!id || (queue && *id == segment_id)) return;
+    attach(*id, wake);
+  }
+
+  // Takes the newest message, if one arrived since the last read.
+  void read() {
+    if (!queue) return;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+      MessageInfo info;
+      const auto result = queue->read_next(reader, frame, info);
+      if (result == ReadResult::TORN) {
+        ++dropped;
+        continue;
+      }
+      if (result != ReadResult::OK) return;
+      ::sim::GamePieces message;
+      std::memcpy(&message, frame.data(), sizeof(message));
+      if (studio::IngestPieces(state, message)) {
+        ++events;
+      } else {
+        ++dropped;
+      }
+    }
+  }
+};
+
 struct Bridge {
   std::string topic;
   // The telemetry topic, once its publisher's segment exists. The bridge
@@ -165,6 +259,9 @@ struct Bridge {
   bool backlog = false;
   // Every duty the loop wakes for on its own (next_wake_ns).
   studio::WakeSchedule schedule;
+  // The game pieces, read beside the telemetry and woken by the same
+  // receiver; not read in refusal mode.
+  PiecesTopic pieces;
   std::string attach_error;
   // Every send to a client leaves in one of its passes (pass_clients).
   studio::ClientRotation<Socket*> clients;
@@ -228,6 +325,9 @@ struct Bridge {
     registration->set_source(0, forwarded,
                              lapped + telemetry_state.incomplete_ticks,
                              queue ? queue->writer_sequence() : 0, 0, 0, 0);
+    registration->set_source(1, pieces.events, pieces.dropped,
+                             pieces.queue ? pieces.queue->writer_sequence() : 0,
+                             0, 0, 0);
     registration->end_sample();
   }
 
@@ -297,6 +397,7 @@ struct Bridge {
   void watch(std::int64_t now_ns) {
     if (now_ns < schedule.check_due_ns) return;
     check_segment();
+    pieces.check(wake);
     schedule.check_due_ns =
         now_ns + (queue ? kAttachedCheckNs : kWaitingCheckNs);
   }
@@ -315,9 +416,12 @@ struct Bridge {
   // sees the buckets at one level, so a refill landing between two clients
   // cannot hand the turn of one that could not yet afford a message to a
   // later one with a message of the same size.
+  // `own_room`: what a programmer client's own bucket must hold beyond the
+  // bytes (studio::AffordProgrammerSend).
   bool affordable(
       Socket* client, std::size_t framed_bytes, std::int64_t now,
-      studio::ClientFeeds::Feed feed = studio::ClientFeeds::Feed::kGraph) {
+      studio::ClientFeeds::Feed feed = studio::ClientFeeds::Feed::kGraph,
+      std::size_t own_room = 0) {
     Client* data = client->getUserData();
     EgressBudget* budget = budget_of(client);
     // An evicted drive client holds no slot and is sent nothing more.
@@ -334,24 +438,9 @@ struct Bridge {
       }
       return true;
     }
-    if (!shared_reservation.MaySpend(client, framed_bytes, *budget,
-                                     client_rate(), now)) {
-      return false;
-    }
-    const bool fits_own = budget->available(framed_bytes, client_rate(), now);
-    std::int64_t wait_ns = 0;
-    if (!egress.Affordable(*budget, false, framed_bytes, now, wait_ns)) {
-      schedule.Deferred(now, wait_ns);
-      if (fits_own && client->getBufferedAmount() == 0) {
-        shared_reservation.BlockedOnShared(client, framed_bytes, feed);
-      }
-      return false;
-    }
-    if (client->getBufferedAmount() != 0) {
-      ++held;
-      return false;
-    }
-    return true;
+    return studio::AffordProgrammerSend(
+        shared_reservation, egress, schedule, client, *budget, framed_bytes,
+        own_room, feed, now, client->getBufferedAmount() != 0, held);
   }
 
   // The bucket a client's sends are charged to: a programmer client's own,
@@ -400,11 +489,18 @@ struct Bridge {
           });
       return egress_bytes != charged;
     }
+    // Room the client's telemetry updates leave for an owed pieces message
+    // (studio::PiecesRoom).
+    const std::size_t pieces_room =
+        data->pieces ? studio::PiecesRoom(data->feeds, telemetry_state,
+                                          *data->pieces, pieces.state)
+                     : 0;
     data->feeds.Pump(
         system_graph, telemetry_state, now_ns, client_rate(),
         [this, client, now_ns](std::size_t framed_bytes,
-                               studio::ClientFeeds::Feed feed) {
-          return affordable(client, framed_bytes, now_ns, feed);
+                               studio::ClientFeeds::Feed feed,
+                               std::size_t own_room) {
+          return affordable(client, framed_bytes, now_ns, feed, own_room);
         },
         [this, client](std::string_view text) {
           return send_now(client, text, uWS::OpCode::TEXT);
@@ -412,7 +508,21 @@ struct Bridge {
         [this, client](std::string_view page) {
           return send_now(client, page, uWS::OpCode::BINARY);
         },
-        shared_reservation.PreferTelemetry(client));
+        shared_reservation.PreferTelemetry(client), pieces_room);
+    // The game pieces, from their allowance (studio::PumpPieces).
+    if (!data->pieces) return egress_bytes != charged;
+    studio::PumpPieces(
+        data->feeds, telemetry_state, *data->pieces, pieces.state, now_ns,
+        client_rate(),
+        [this, client, now_ns](std::size_t framed_bytes) {
+          return affordable(client, framed_bytes, now_ns,
+                            studio::ClientFeeds::Feed::kPieces);
+        },
+        [this, client](std::string_view message) {
+          return send_now(client, message, uWS::OpCode::BINARY);
+        });
+    // A message waiting on its allowance is due when the allowance covers it.
+    schedule.Deferred(now_ns, data->pieces->wait_ns());
     return egress_bytes != charged;
   }
 
@@ -531,7 +641,7 @@ struct Bridge {
     node.heartbeat_monotonic_ns = talos::introspect::monotonic_now_ns();
     node.alive = true;
     node.dispatch_count = forwarded;
-    node.declared_source_count = 1;
+    node.declared_source_count = 2;
 
     talos::introspect::SourceSnapshot source;
     // A watcher, not a fetcher: the reader is registered with
@@ -547,6 +657,21 @@ struct Bridge {
     source.dropped = lapped + telemetry_state.incomplete_ticks;
     source.sequence = queue ? queue->writer_sequence() : 0;
     node.sources.push_back(std::move(source));
+
+    // The game pieces: a fetcher of the newest message, read only to show.
+    talos::introspect::SourceSnapshot read_pieces;
+    read_pieces.id = 1;
+    read_pieces.kind = talos::event::SourceKind::FETCHER;
+    read_pieces.name = ::sim::topics::kPieces;
+    read_pieces.message_bytes =
+        static_cast<std::uint32_t>(sizeof(::sim::GamePieces));
+    read_pieces.alignment =
+        static_cast<std::uint32_t>(alignof(::sim::GamePieces));
+    read_pieces.flags = PiecesTopic::kFlags;
+    read_pieces.events = pieces.events;
+    read_pieces.dropped = pieces.dropped;
+    read_pieces.sequence = pieces.queue ? pieces.queue->writer_sequence() : 0;
+    node.sources.push_back(std::move(read_pieces));
     return node;
   }
 
@@ -627,6 +752,19 @@ struct Bridge {
           break;
         }
         read_queue();
+      }
+    }
+    // The pieces share the receiver: read, arm, and read again while an arm
+    // finds a message (three tries, then the fallback cadence).
+    pieces.read();
+    if (pieces.queue && wake) {
+      for (int attempt = 0;; ++attempt) {
+        if (pieces.queue->arm_wake(pieces.reader)) break;
+        if (attempt == 2) {
+          backlog = true;
+          break;
+        }
+        pieces.read();
       }
     }
     // Every pass, not only on a new tick: a pass woken by the budget's refill
@@ -799,6 +937,23 @@ int main(int argc, char** argv) try {
     source.slots =
         static_cast<std::uint32_t>(talos::telemetry_wire::slot_count);
     description.sources.push_back(std::move(source));
+    // The game pieces (README.md "Game pieces"): optional, since only the
+    // MuJoCo gateway writes them, and an observer's read, on the topic's
+    // ring (talOS/hardware/sim_rings.h), as the gateway declares it. After the
+    // telemetry watcher, which stays first.
+    talos::introspect::naming::SourceShape pieces{
+        talos::event::SourceKind::FETCHER, ::sim::topics::kPieces,
+        static_cast<std::uint32_t>(sizeof(::sim::GamePieces)),
+        PiecesTopic::kFlags};
+    const talos::schema::Identity pieces_schema =
+        talos::schema::Of<::sim::GamePieces>();
+    pieces.schema = pieces_schema.name;
+    pieces.schema_hash = pieces_schema.hash;
+    pieces.bfbs = pieces_schema.bfbs;
+    pieces.alignment = static_cast<std::uint32_t>(alignof(::sim::GamePieces));
+    pieces.slots =
+        static_cast<std::uint32_t>(talos::hardware::sim::kPiecesSlots);
+    description.sources.push_back(std::move(pieces));
     std::cout << talos::introspect::DescribeToJson(description);
     return 0;
   }
@@ -1076,6 +1231,7 @@ int main(int argc, char** argv) try {
         request->getHeader("sec-websocket-extensions"), context);
   };
   behavior.open = [&](auto* ws) {
+    ws->getUserData()->pieces = std::make_unique<studio::PiecesFeed>();
     bridge.clients.Add(ws);
     const int fd = static_cast<int>(
         reinterpret_cast<std::uintptr_t>(ws->getNativeHandle()));
@@ -1321,7 +1477,18 @@ int main(int argc, char** argv) try {
           static_cast<std::uint32_t>(talos::telemetry_wire::slot_bytes);
       source.alignment = 8;
       source.schema = talos::schema::Bytes();
-      bridge.registration->publish(talos::event::Manifest{source});
+      talos::event::Registration pieces;
+      pieces.id = 1;
+      pieces.kind = talos::event::SourceKind::FETCHER;
+      pieces.name = ::sim::topics::kPieces;
+      pieces.message_bytes =
+          static_cast<std::uint32_t>(sizeof(::sim::GamePieces));
+      pieces.alignment = static_cast<std::uint32_t>(alignof(::sim::GamePieces));
+      pieces.schema = talos::schema::Of<::sim::GamePieces>();
+      bridge.registration->publish(
+          talos::event::Manifest{source, pieces},
+          std::vector<talos::introspect::EndpointAttribute>{
+              {::sim::topics::kPieces, PiecesTopic::kFlags}});
       bridge.registration->set_realtime(
           {.tier = talos::process::LoopTier::kObserver});
       bridge.report_registration();

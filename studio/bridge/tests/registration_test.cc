@@ -24,6 +24,8 @@
 #include <vector>
 
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include "sim/sim_generated.h"
+#include "sim/topics.h"
 #include "talOS/events/manifest.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/process/realtime_outcome.h"
@@ -177,11 +179,18 @@ TEST(BridgeRegistration, RegistersAdvancesProgressAndDeduplicatesSystemJson) {
   ASSERT_TRUE(first->realtime().has_value());
   EXPECT_EQ(first->realtime()->tier, talos::process::LoopTier::kObserver);
   EXPECT_FALSE(first->realtime()->requested);
-  ASSERT_EQ(first->sources.size(), 1u);
+  // REQ-DEV-43: the telemetry watcher, then the game pieces' optional
+  // observer read, as --describe declares them.
+  ASSERT_EQ(first->sources.size(), 2u);
   EXPECT_EQ(first->sources[0].kind, talos::event::SourceKind::WATCHER);
   EXPECT_EQ(first->sources[0].name, topic);
   EXPECT_EQ(first->sources[0].message_bytes,
             static_cast<std::uint32_t>(talos::telemetry_wire::slot_bytes));
+  EXPECT_EQ(first->sources[1].kind, talos::event::SourceKind::FETCHER);
+  EXPECT_EQ(first->sources[1].name, ::sim::topics::kPieces);
+  EXPECT_EQ(first->sources[1].message_bytes, sizeof(::sim::GamePieces));
+  EXPECT_TRUE(first->sources[1].optional());
+  EXPECT_TRUE(first->sources[1].observer());
 
   // Two HTTP requests ensure at least one post-handler service() pass completes
   // between the first row read and the second.
@@ -218,8 +227,11 @@ TEST(BridgeRegistration, RegistersAdvancesProgressAndDeduplicatesSystemJson) {
   EXPECT_TRUE(reported["alive"].get<bool>()) << body;
   EXPECT_EQ(reported["generation"].get<std::string>(), "0") << body;
   EXPECT_EQ(reported["dispatch_count"].get<std::string>(), "0") << body;
-  EXPECT_EQ(reported["declared_sources"].get<int>(), 1) << body;
-  ASSERT_TRUE(reported.contains("sources") && reported["sources"].size() == 1u)
+  EXPECT_EQ(reported["declared_sources"].get<int>(), 2) << body;
+  ASSERT_TRUE(reported.contains("sources") && reported["sources"].size() == 2u)
+      << body;
+  EXPECT_EQ(reported["sources"][1]["name"].get<std::string>(),
+            ::sim::topics::kPieces)
       << body;
   const auto& source = reported["sources"][0];
   EXPECT_EQ(source["kind"].get<std::string>(), "WATCHER") << body;

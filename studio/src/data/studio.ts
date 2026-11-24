@@ -11,6 +11,7 @@ import type {ReactNode} from 'react';
 
 import type {Snapshot} from '../core';
 import type {SessionManifest} from './manifest';
+import type {PiecesSnapshot} from './pieces';
 import type {RecordedSource} from './recorded';
 import {LiveSource, type DataSource} from './source';
 import {TelemetryStore} from './store';
@@ -32,6 +33,9 @@ export type Studio = {
   system: SystemState;
   manifest: SessionManifest|null;
   manifestError: string;
+  // The live game pieces (data/pieces.ts), null without any; never part of
+  // a recording.
+  pieces: PiecesSnapshot|null;
   actions: StudioActions;
   // The source panels read: `recorded` while one is open, else live.
   readonly source: DataSource;
@@ -100,6 +104,7 @@ class StudioImpl implements Studio {
   system: SystemState;
   manifest: SessionManifest|null;
   manifestError: string;
+  pieces: PiecesSnapshot|null = null;
   actions: StudioActions;
   recorded: RecordedSource|null = null;
   private readonly live: LiveSource;
@@ -274,6 +279,9 @@ export function createWorkerStudio(
       studio.manifest = manifest;
       studio.manifestError = data.error ?? '';
       if (manifest) store.pushManifest(manifest);
+      studio.notify();
+    } else if (data.type === 'pieces') {
+      studio.pieces = data.pieces ?? null;
       studio.notify();
     } else if (data.type === 'export') {
       const href = URL.createObjectURL(new Blob([data.buffer]));

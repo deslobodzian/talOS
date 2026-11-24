@@ -187,6 +187,7 @@ cc_test(
         ":wire",
         "//talOS/driver_station",
         "//talOS/hardware",
+        "//talOS/hardware:sim_messages",
         "//talOS/msgs:geometry",
         "//talOS/node:access",
         "//talOS/node:allocation_probe",

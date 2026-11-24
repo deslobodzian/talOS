@@ -23,6 +23,7 @@
 #include "talOS/hardware/config_wire.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/hardware/sim_rings.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/protocol/frame.h"
 #include "talOS/protocol/types.h"
@@ -146,6 +147,11 @@ int main() {
   PrintMessage<geometry::OdometrySample>("odometry_sample.bytes",
                                          "odometry_sample.slot_bytes");
   PrintMessage<sim::MatchState>("match_state.bytes", "match_state.slot_bytes");
+  PrintMessage<sim::GamePieces>("game_pieces.bytes", "game_pieces.slot_bytes");
+  Print("game_pieces.slot_count", talos::hardware::sim::kPiecesSlots);
+  Print("game_pieces.ring_bytes",
+        rtms_slot_stride(sizeof(sim::GamePieces), alignof(sim::GamePieces)) *
+            talos::hardware::sim::kPiecesSlots);
   const std::size_t telemetry_slot =
       rtms_slot_stride(tw::slot_bytes, kByteTopicAlignment);
   Print("telemetry.slot_stride_bytes", telemetry_slot);
