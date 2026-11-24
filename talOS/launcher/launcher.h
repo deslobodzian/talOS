@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -89,6 +90,46 @@ inline constexpr std::chrono::milliseconds kBridgeStopTimeout{500};
 // `hardware_node` still flushing its log) after phase 2 begins before it kills
 // each running member's group (SIGKILL; run reason stop_timeout).
 inline constexpr std::chrono::seconds kStopTimeout{2};
+
+// How often Supervise polls `/hw/status` while waiting for the current bridge
+// run's first status message to check `protocol_version_id`. Stops once that
+// run's version has been checked.
+inline constexpr std::chrono::milliseconds kBridgeProtocolPoll{20};
+
+// How often Supervise checks whether every non-observer member's loop has
+// started while waiting to write kSimScheduleStartFile. Stops once written or
+// once sim_gateway exits with no pending restart.
+inline constexpr std::chrono::milliseconds kSimScheduleStartPoll{20};
+
+// How often Supervise polls `hardware_node`'s registry row for kFlagQuiesced
+// during phase 1 of shutdown, bounded by kBridgeStopTimeout (SIGCHLD still
+// wakes immediately if the bridge exits).
+inline constexpr std::chrono::milliseconds kBridgeQuiescePoll{5};
+
+// Two-phase shutdown state inside Launcher::Supervise (REQ-OPS-20).
+enum class SupervisionStopPhase { kNone, kBridge, kAllSignaled };
+
+// The timed deadlines a single pass of Launcher::Supervise considers when
+// choosing how long to sleep before its next pass (REQ-OPS-45).
+struct SupervisionWakeInputs {
+  SupervisionTime now{};
+  std::optional<std::chrono::microseconds> watchdog;
+  std::optional<SupervisionTime> next_lock_refresh;
+  SupervisionStopPhase stop_phase{SupervisionStopPhase::kNone};
+  bool bridge_killed{false};
+  SupervisionTime bridge_stop_deadline{SupervisionTime::max()};
+  SupervisionTime shutdown_deadline{SupervisionTime::max()};
+  SupervisionTime session_deadline{SupervisionTime::max()};
+  bool sim_schedule_polling{false};
+  bool bridge_protocol_polling{false};
+  std::span<const SupervisionTime> member_next_looks;
+  std::span<const SupervisionTime> pending_restarts;
+  std::optional<SupervisionTime> studio_next_check;
+};
+
+// Earliest time the supervision loop must wake without an external event
+// (child exit or stop signal), or SupervisionTime::max() when nothing is due.
+SupervisionTime NextSupervisionWake(const SupervisionWakeInputs& inputs);
 
 // Refusal record written atomically under the log root on a phase-1 refusal
 // (not --describe-only or --replay-inputs), served on /drive when

@@ -120,21 +120,6 @@ struct Launcher::BridgeStatusObserver {
 
 namespace {
 
-// How often Supervise polls `/hw/status` while waiting for the current bridge
-// run's first status message to check `protocol_version_id`. Stops once that
-// run's version has been checked.
-constexpr std::chrono::milliseconds kBridgeProtocolPoll{20};
-
-// How often Supervise checks whether every non-observer member's loop has
-// started while waiting to write kSimScheduleStartFile. Stops once written or
-// once sim_gateway exits with no pending restart.
-constexpr std::chrono::milliseconds kSimScheduleStartPoll{20};
-
-// How often Supervise polls `hardware_node`'s registry row for kFlagQuiesced
-// during phase 1 of shutdown, bounded by kBridgeStopTimeout (SIGCHLD still
-// wakes immediately if the bridge exits).
-constexpr std::chrono::milliseconds kBridgeQuiescePoll{5};
-
 // The topic ends a registry row published, or nullopt while it has
 // published none and its loop has not yet started: a row is visible from its
 // claim, and a writer that never sets kFlagConstructing (the hardware bridge,
@@ -2022,6 +2007,37 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
   return changed;
 }
 
+SupervisionTime NextSupervisionWake(const SupervisionWakeInputs& inputs) {
+  SupervisionTime wake = SupervisionTime::max();
+  const auto due = [&wake](SupervisionTime at) { wake = std::min(wake, at); };
+  // The pass's WATCHDOG=1 went out at about `now`.
+  if (inputs.watchdog) {
+    due(ServiceNotifier::NextDeadline(inputs.now, *inputs.watchdog));
+  }
+  if (inputs.next_lock_refresh) due(*inputs.next_lock_refresh);
+  if (inputs.stop_phase == SupervisionStopPhase::kBridge) {
+    if (!inputs.bridge_killed && inputs.now < inputs.bridge_stop_deadline) {
+      due(std::min(inputs.bridge_stop_deadline,
+                   inputs.now + kBridgeQuiescePoll));
+    }
+  } else if (inputs.stop_phase == SupervisionStopPhase::kAllSignaled) {
+    // Once passed, its SIGKILLs are sent; the exits they cause wake it.
+    if (inputs.now < inputs.shutdown_deadline) due(inputs.shutdown_deadline);
+  } else {
+    due(inputs.session_deadline);
+    if (inputs.sim_schedule_polling) due(inputs.now + kSimScheduleStartPoll);
+    if (inputs.bridge_protocol_polling) due(inputs.now + kBridgeProtocolPoll);
+    for (const SupervisionTime next_look : inputs.member_next_looks) {
+      due(next_look);
+    }
+  }
+  for (const SupervisionTime due_at : inputs.pending_restarts) {
+    due(due_at);
+  }
+  if (inputs.studio_next_check) due(*inputs.studio_next_check);
+  return wake;
+}
+
 void Launcher::Supervise(SessionManifest& manifest,
                          std::vector<NodeProcessInfo>& procs,
                          std::vector<NodeLaunch>& launches,
@@ -2029,13 +2045,17 @@ void Launcher::Supervise(SessionManifest& manifest,
                          std::optional<std::size_t> sim_gateway_index,
                          BridgeStatusObserver* status_observer,
                          std::chrono::steady_clock::time_point deadline) {
-  enum class StopPhase { kNone, kBridge, kAllSignaled };
+  using StopPhase = SupervisionStopPhase;
   StopPhase stop_phase = StopPhase::kNone;
   bool bridge_killed = false;
   bool sim_schedule_done = !sim_gateway_index.has_value();
   auto bridge_stop_deadline = std::chrono::steady_clock::time_point::max();
   auto shutdown_deadline = std::chrono::steady_clock::time_point::max();
   std::optional<introspect::RegistryMapping> registry;
+  std::vector<SupervisionTime> member_next_looks;
+  std::vector<SupervisionTime> pending_restarts;
+  member_next_looks.reserve(procs.size());
+  pending_restarts.reserve(procs.size());
   // Every first run's liveness counts from here, not its spawn.
   const auto started = options_.supervision_clock();
   for (auto& launch : launches) launch.NewRun(started);
@@ -2396,42 +2416,47 @@ void Launcher::Supervise(SessionManifest& manifest,
     // Sleeps until the earliest time a pass has something to decide without
     // an event; a child's exit and a stop signal wake it at once. Every
     // timed decision above must be here, or it waits for an unrelated wake.
-    auto wake = SupervisionTime::max();
-    const auto due = [&wake](SupervisionTime at) { wake = std::min(wake, at); };
-    // The pass's WATCHDOG=1 went out at about `now`.
-    if (watchdog) due(ServiceNotifier::NextDeadline(now, *watchdog));
-    if (refreshes_locks) due(next_lock_refresh);
-    if (stop_phase == StopPhase::kBridge) {
-      if (!bridge_killed && now < bridge_stop_deadline) {
-        due(std::min(bridge_stop_deadline, now + kBridgeQuiescePoll));
-      }
-    } else if (stop_phase == StopPhase::kAllSignaled) {
-      // Once passed, its SIGKILLs are sent; the exits they cause wake it.
-      if (now < shutdown_deadline) due(shutdown_deadline);
-    } else {
-      due(deadline);
-      if (sim_schedule_polling) due(now + kSimScheduleStartPoll);
-      if (status_observer != nullptr) {
-        for (std::size_t i = 0; i < procs.size(); ++i) {
-          if (procs[i].name == kHardwareNodeName && procs[i].pid > 0 &&
-              !procs[i].exited && !launches[i].protocol_checked) {
-            due(now + kBridgeProtocolPoll);
-            break;
-          }
+    SupervisionWakeInputs wake_inputs;
+    wake_inputs.now = now;
+    wake_inputs.watchdog = watchdog;
+    if (refreshes_locks) wake_inputs.next_lock_refresh = next_lock_refresh;
+    wake_inputs.stop_phase = stop_phase;
+    wake_inputs.bridge_killed = bridge_killed;
+    wake_inputs.bridge_stop_deadline = bridge_stop_deadline;
+    wake_inputs.shutdown_deadline = shutdown_deadline;
+    wake_inputs.session_deadline = deadline;
+    wake_inputs.sim_schedule_polling = sim_schedule_polling;
+    if (status_observer != nullptr) {
+      for (std::size_t i = 0; i < procs.size(); ++i) {
+        if (procs[i].name == kHardwareNodeName && procs[i].pid > 0 &&
+            !procs[i].exited && !launches[i].protocol_checked) {
+          wake_inputs.bridge_protocol_polling = true;
+          break;
         }
       }
-      // Each run the next pass watches (WatchRun): its row's next look.
-      for (std::size_t i = 0; i < procs.size(); ++i) {
-        if (procs[i].pid <= 0 || procs[i].exited ||
-            launches[i].heartbeat_killed || (studio && i == studio->index()))
-          continue;
-        due(launches[i].liveness.NextLook(launches[i].limits));
+    }
+    // Each run the next pass watches (WatchRun): its row's next look.
+    member_next_looks.clear();
+    for (std::size_t i = 0; i < procs.size(); ++i) {
+      if (procs[i].pid <= 0 || procs[i].exited ||
+          launches[i].heartbeat_killed || (studio && i == studio->index()))
+        continue;
+      member_next_looks.push_back(
+          launches[i].liveness.NextLook(launches[i].limits));
+    }
+    wake_inputs.member_next_looks = member_next_looks;
+    pending_restarts.clear();
+    for (const auto& launch : launches) {
+      if (launch.restart.pending()) {
+        pending_restarts.push_back(launch.restart.due_at());
       }
     }
-    for (const auto& launch : launches) {
-      if (launch.restart.pending()) due(launch.restart.due_at());
+    wake_inputs.pending_restarts = pending_restarts;
+    if (studio) {
+      wake_inputs.studio_next_check =
+          studio->NextCheck(stop_phase != StopPhase::kNone);
     }
-    if (studio) due(studio->NextCheck(stop_phase != StopPhase::kNone));
+    const SupervisionTime wake = NextSupervisionWake(wake_inputs);
     wakeup.Wait(wake == SupervisionTime::max()
                     ? std::chrono::nanoseconds::max()
                     : wake - options_.supervision_clock());
