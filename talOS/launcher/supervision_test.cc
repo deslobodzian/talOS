@@ -6232,6 +6232,7 @@ TEST(Supervision, QuiescedBridgeDecouplesActuatorStopFromLogFlushTimeout) {
     testing::SupervisionPasses passes;
     bool owners_signaled_on_quiesced = false;
     bool hw_alive_at_800ms = false;
+    std::atomic<bool> session_done{false};
     std::jthread driver{[&](const std::stop_token& stop) {
       const testing::SteppedClock::ReleaseOnExit release_clock{clock};
       if (!WaitFor(stop, [&] {
@@ -6262,12 +6263,19 @@ TEST(Supervision, QuiescedBridgeDecouplesActuatorStopFromLogFlushTimeout) {
       hw_alive_at_800ms =
           !mid_hw.empty() &&
           mid_hw.back().find("\"running\"") != std::string::npos;
-      // Release hardware_node at 800 ms so it exits 0 cleanly.
+      // Release hardware_node at 800 ms so it exits 0 cleanly; keep clock
+      // held until RunSession finishes so ReleaseOnExit cannot jump past
+      // kStopTimeout while children are still being reaped.
       std::ofstream{release_hw}.close();
-      WaitFor(stop, [&] { return ReadLines(events).size() >= 5; });
+      WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return session_done.load(std::memory_order_acquire);
+      });
     }};
 
     EXPECT_EQ(RunSession(options), 0);
+    session_done.store(true, std::memory_order_release);
+    driver.request_stop();
     driver.join();
     EXPECT_TRUE(owners_signaled_on_quiesced)
         << "actuator owners were not signaled immediately on kFlagQuiesced";
@@ -6327,6 +6335,7 @@ TEST(Supervision, QuiescedBridgeDecouplesActuatorStopFromLogFlushTimeout) {
         options.output_dir + "/" + std::to_string(session) + "/manifest.json";
     testing::SupervisionPasses passes;
     bool hw_alive_before_2s = false;
+    std::atomic<bool> session_done{false};
     std::jthread driver{[&](const std::stop_token& stop) {
       const testing::SteppedClock::ReleaseOnExit release_clock{clock};
       if (!WaitFor(stop, [&] {
@@ -6338,10 +6347,18 @@ TEST(Supervision, QuiescedBridgeDecouplesActuatorStopFromLogFlushTimeout) {
       }
       ::kill(::getpid(), SIGTERM);
       // Wait for kFlagQuiesced -> kAllSignaled (shutdown_deadline = start +
-      // 2s).
+      // 2s) and for alpha/beta to exit cleanly before advancing to
+      // kStopTimeout.
       if (!WaitFor(stop, [&] {
             SupervisionWakeup::Wake();
-            return ReadLines(events).size() >= 4;
+            if (ReadLines(events).size() < 4) return false;
+            const std::string cur = ReadFile(live);
+            const auto alpha = ManifestRuns(cur, "alpha");
+            const auto beta = ManifestRuns(cur, "beta");
+            return !alpha.empty() &&
+                   alpha.back().find("\"running\"") == std::string::npos &&
+                   !beta.empty() &&
+                   beta.back().find("\"running\"") == std::string::npos;
           })) {
         return;
       }
@@ -6356,10 +6373,15 @@ TEST(Supervision, QuiescedBridgeDecouplesActuatorStopFromLogFlushTimeout) {
           !mid_hw.empty() &&
           mid_hw.back().find("\"running\"") != std::string::npos;
       clock.HoldAt(start + kStopTimeout);
-      SupervisionWakeup::Wake();
+      WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return session_done.load(std::memory_order_acquire);
+      });
     }};
 
     EXPECT_EQ(RunSession(options), -1);
+    session_done.store(true, std::memory_order_release);
+    driver.request_stop();
     driver.join();
     EXPECT_TRUE(hw_alive_before_2s)
         << "quiesced hardware_node ended before kStopTimeout (2 s)";
@@ -6413,6 +6435,7 @@ TEST(Supervision, QuiescedBridgeDecouplesActuatorStopFromLogFlushTimeout) {
     testing::SupervisionPasses passes;
     std::vector<std::string> events_before_500ms;
     bool held_before_500ms = false;
+    std::atomic<bool> session_done{false};
     std::jthread driver{[&](const std::stop_token& stop) {
       const testing::SteppedClock::ReleaseOnExit release_clock{clock};
       if (!WaitFor(stop, [&] {
@@ -6444,11 +6467,19 @@ TEST(Supervision, QuiescedBridgeDecouplesActuatorStopFromLogFlushTimeout) {
           mid_hw.back().find("\"running\"") != std::string::npos &&
           !mid_alpha.empty() &&
           mid_alpha.back().find("\"running\"") != std::string::npos;
+      // Hold clock at start + kBridgeStopTimeout until RunSession finishes so
+      // ReleaseOnExit cannot jump to wall time (> kStopTimeout) while alpha
+      // and beta are handling SIGINT and exiting.
       clock.HoldAt(start + kBridgeStopTimeout);
-      SupervisionWakeup::Wake();
+      WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return session_done.load(std::memory_order_acquire);
+      });
     }};
 
     EXPECT_EQ(RunSession(options), -1);
+    session_done.store(true, std::memory_order_release);
+    driver.request_stop();
     driver.join();
     EXPECT_TRUE(held_before_500ms)
         << "un-quiesced hardware_node or alpha ended before 500 ms";
