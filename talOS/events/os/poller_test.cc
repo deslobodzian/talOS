@@ -24,12 +24,15 @@
 #endif
 
 #if defined(__linux__)
+#include <fcntl.h>
 #include <sys/epoll.h>
+#include <sys/resource.h>
 #include <sys/utsname.h>
 
 #include <cerrno>
 #include <charconv>
 #include <ctime>
+#include <filesystem>
 #include <string_view>
 #include <system_error>
 #endif
@@ -541,6 +544,89 @@ TEST(PollerTest, EpollPwait2EarlyTimeoutRetriesUntilDeadline) {
   EXPECT_EQ(reason, Poller::WakeReason::DEADLINE);
   EXPECT_GE(Poller::now(), deadline);
   EXPECT_GE(early_timeout_pwait2_calls, 2);
+}
+
+std::size_t CountOpenFds() {
+  std::size_t count = 0;
+  for (const auto& entry :
+       std::filesystem::directory_iterator{"/proc/self/fd"}) {
+    (void)entry;
+    ++count;
+  }
+  return count;
+}
+
+class ScopedNofileLimit {
+ public:
+  explicit ScopedNofileLimit(rlim_t soft_limit) {
+    if (::getrlimit(RLIMIT_NOFILE, &saved_) != 0) {
+      return;
+    }
+    rlimit lowered = saved_;
+    lowered.rlim_cur = soft_limit;
+    active_ = ::setrlimit(RLIMIT_NOFILE, &lowered) == 0;
+  }
+
+  ~ScopedNofileLimit() {
+    if (active_) {
+      (void)::setrlimit(RLIMIT_NOFILE, &saved_);
+    }
+  }
+
+  ScopedNofileLimit(const ScopedNofileLimit&) = delete;
+  ScopedNofileLimit& operator=(const ScopedNofileLimit&) = delete;
+
+  bool active() const noexcept { return active_; }
+
+ private:
+  rlimit saved_{};
+  bool active_{false};
+};
+
+// REQ-RT-19, REQ-RT-20
+// Partial EpollPoller construction failure (0, 1, or 2 free descriptors below
+// RLIMIT_NOFILE, failing at epoll_create1, timerfd_create, or eventfd) must
+// report EMFILE and close every descriptor opened so far.
+TEST(PollerTest, ConstructorFailureUnderFdCapReportsEmfileAndLeaksNoFds) {
+  for (const std::size_t free_fds :
+       {std::size_t{0}, std::size_t{1}, std::size_t{2}}) {
+    SCOPED_TRACE(free_fds);
+    const std::size_t fds_before = CountOpenFds();
+
+    // Opening free_fds + 1 descriptors finds the exact (free_fds + 1)-th
+    // lowest unused descriptor number, even when lower descriptor numbers have
+    // gaps; capping RLIMIT_NOFILE there leaves exactly free_fds available.
+    std::vector<int> probes;
+    probes.reserve(free_fds + 1);
+    for (std::size_t i = 0; i <= free_fds; ++i) {
+      const int fd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+      if (fd < 0) break;
+      probes.push_back(fd);
+    }
+    const int limit_fd = probes.size() == free_fds + 1 ? probes.back() : -1;
+    for (const int fd : probes) {
+      ::close(fd);
+    }
+    ASSERT_GE(limit_fd, 0);
+
+    bool caught = false;
+    std::error_code caught_code;
+    {
+      const ScopedNofileLimit cap(static_cast<rlim_t>(limit_fd));
+      ASSERT_TRUE(cap.active());
+      try {
+        [[maybe_unused]] EpollPoller poller;
+      } catch (const std::system_error& e) {
+        caught = true;
+        caught_code = e.code();
+      }
+    }
+
+    EXPECT_TRUE(caught);
+    EXPECT_EQ(caught_code.value(), EMFILE);
+    EXPECT_TRUE(caught_code == std::errc::too_many_files_open);
+    EXPECT_EQ(CountOpenFds(), fds_before);
+  }
 }
 #endif
 

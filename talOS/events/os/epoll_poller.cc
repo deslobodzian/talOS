@@ -99,24 +99,25 @@ EpollPoller::Pwait2 EpollPoller::system_pwait2() {
 #endif
 }
 
-EpollPoller::EpollPoller(Pwait2 pwait2)
-    : pwait2_(pwait2),
-      epoll_fd_(::epoll_create1(EPOLL_CLOEXEC)),
-      timer_fd_(::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC)),
-      wake_fd_(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) {
+EpollPoller::EpollPoller(Pwait2 pwait2) : pwait2_(pwait2) {
+  epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
   if (epoll_fd_ == -1) {
-    throw std::system_error(errno, std::generic_category(), "epoll_create1");
+    const int saved_errno = errno;
+    close_all();
+    throw std::system_error(saved_errno, std::generic_category(),
+                            "epoll_create1");
   }
+  timer_fd_ = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
   if (timer_fd_ == -1) {
     const int saved_errno = errno;
-    ::close(epoll_fd_);
+    close_all();
     throw std::system_error(saved_errno, std::generic_category(),
                             "timerfd_create");
   }
+  wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
   if (wake_fd_ == -1) {
     const int saved_errno = errno;
-    ::close(epoll_fd_);
-    ::close(timer_fd_);
+    close_all();
     throw std::system_error(saved_errno, std::generic_category(), "eventfd");
   }
 
