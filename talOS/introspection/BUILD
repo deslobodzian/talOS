@@ -92,6 +92,7 @@ cc_library(
         ":describe",
         ":registry",
         "//talOS/memory:residency",
+        "//talOS/process",
     ],
 )
 
@@ -132,6 +133,7 @@ cc_test(
         ":reporter",
         "//talOS/events",
         "//talOS/events:events_log",
+        "//talOS/process",
         "//talOS/rtms",
         "//talOS/rtms:wake",
         "@googletest//:gtest_main",

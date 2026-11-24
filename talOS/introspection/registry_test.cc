@@ -36,6 +36,7 @@
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
 #include "talOS/introspection/reporter.h"
+#include "talOS/process/process.h"
 #include "talOS/rtms/rtms.h"
 #include "talOS/rtms/wake.h"
 
@@ -1909,6 +1910,63 @@ TEST_F(Registry, SourceIdScopedEndpointAttributesDoNotSmearAcrossSameTopic) {
   ASSERT_EQ(nodes.front().sources.size(), 2u);
   EXPECT_EQ(nodes.front().sources[0].flags, naming::kSourceFlagOptional);
   EXPECT_EQ(nodes.front().sources[1].flags, 0u);
+}
+
+// REQ-RT-10: Reporter's helper thread configures itself via
+// ConfigureBackgroundThread() (SCHED_OTHER + nice >= kBackgroundNice on Linux,
+// QOS_CLASS_UTILITY on macOS) so it runs below every node loop thread,
+// verifiable without realtime privilege.
+TEST_F(Registry, ReporterThreadRunsAsBackground) {
+  // Verify on a fresh std::thread (not the gtest main thread, which macOS CI
+  // launchd runners spawn at QOS_CLASS_UTILITY) that new threads do not
+  // inherit background priority by default.
+  bool plain_thread_background = true;
+  std::thread baseline{
+      [&] { plain_thread_background = process::ThreadIsBackground(); }};
+  baseline.join();
+  ASSERT_FALSE(plain_thread_background)
+      << "fresh std::thread already runs at background priority";
+  event::RealtimeEventLoop<> loop;
+  struct Handler {
+    std::function<void()> on_tick;
+    void OnTick(const event::Context&) { on_tick(); }
+  } handler;
+  auto timer = event::make_timer<&Handler::OnTick>(loop, "bg_tick", &handler);
+  std::atomic<bool> observed{false};
+  std::atomic<bool> selection_background{false};
+  std::atomic<bool> extra_background{false};
+  Reporter reporter{
+      {.name = "bg_probe",
+       .extra = {{.kind = event::SourceKind::SENDER,
+                  .name = "/bg/telemetry/p" + std::to_string(::getpid()),
+                  .message_bytes = 8,
+                  .events =
+                      [&] {
+                        extra_background.store(process::ThreadIsBackground(),
+                                               std::memory_order_relaxed);
+                        return std::uint64_t{1};
+                      }}},
+       .selections = {{.sources = {"teleop"},
+                       .selected =
+                           [&] {
+                             selection_background.store(
+                                 process::ThreadIsBackground(),
+                                 std::memory_order_relaxed);
+                             observed.store(true, std::memory_order_release);
+                             return 0;
+                           }}},
+       .period = 5ms,
+       .registry_path = path_}};
+  reporter.start(loop);
+  handler.on_tick = [&] {
+    if (observed.load(std::memory_order_acquire)) loop.exit();
+  };
+  timer.setup_periodic(event::Poller::now() + 1ms, 2ms);
+  loop.run_for(5s);  // Bound only; exits as soon as a sample is observed.
+
+  ASSERT_TRUE(observed.load(std::memory_order_acquire)) << reporter.error();
+  EXPECT_TRUE(extra_background.load(std::memory_order_relaxed));
+  EXPECT_TRUE(selection_background.load(std::memory_order_relaxed));
 }
 
 }  // namespace
