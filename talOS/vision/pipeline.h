@@ -34,8 +34,9 @@ struct PipelineConfig {
   bool deferred_gpu_init{false};
   std::chrono::milliseconds gpu_init_timeout{5000};
   std::string log_name;
-  // Builds the GPU backend (default: Metal); tests inject a slow one. A
-  // backend whose supports_gpu() is false means the GPU is unavailable.
+  // Builds the GPU backend (default: Metal); tests inject a slow one. A null
+  // return or a backend whose supports_gpu() is false means the GPU is
+  // unavailable.
   std::function<std::shared_ptr<ComputeBackend>(
       const apriltag::DetectorOptions&)>
       gpu_backend_factory;

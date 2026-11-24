@@ -1,7 +1,10 @@
+import contextlib
+import io
 import json
 import os
 import pathlib
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -19,34 +22,52 @@ BENCH_BOUNDS = {"period_us": 5000, "command_timeout_us": 100000}
 
 
 class SessionReportTest(unittest.TestCase):
-    def test_recorded_session(self):
+    @classmethod
+    def setUpClass(cls):
         files = runfiles.Create()
-        fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
-        binary = files.Rlocation("_main/talOS/launcher/session_report")
-        with tempfile.TemporaryDirectory() as directory:
-            subprocess.run([fixture, directory], check=True)
-            result = subprocess.run([binary, "--json", "--strict", directory],
-                                    capture_output=True, text=True)
-            self.assertEqual(result.returncode, 2, result.stderr)
-            report = json.loads(result.stdout)
-            self.assertEqual(report["config_sha256"], "fixture-sha256")
-            self.assertEqual(report["state_overall"],
-                             {"count": 7, "min_ms": 5, "median_ms": 5, "p99_ms": 200, "max_ms": 200})
-            self.assertEqual(report["state_enabled"],
-                             {"count": 5, "min_ms": 5, "median_ms": 5, "p99_ms": 120, "max_ms": 120})
-            self.assertEqual((report["enabled_gaps"], report["enabled_gap_bound_ms"]), (1, 100))
-            self.assertEqual(report["state_p99_bound_ms"], 10)
-            self.assertEqual(report["timer_lateness"]["fixture:update"]["max_ms"], 1)
-            self.assertEqual(report["target_receipt_age"]["fixture:/fixture/target/test"]["median_ms"], 3)
-            verdicts = {v["measurement"]: v["verdict"] for v in report["verdicts"]}
-            self.assertEqual(verdicts["enabled state median"], "PASS")
-            self.assertEqual(verdicts["enabled state gaps"], "FAIL")
-            self.assertEqual(report["target_age_at_tick"],
-                             {"fixture:/fixture/target/test":
-                                  {"count": 1, "min_ms": 4, "median_ms": 4, "p99_ms": 4, "max_ms": 4}})
-            # The manifest's signal death reaches the node summary.
-            self.assertEqual(report["nodes"][0]["exit_signal"], 9)
-            self.assertEqual(verdicts["target age at tick"], "PASS")
+        cls._fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
+        cls._binary = files.Rlocation("_main/talOS/launcher/session_report")
+        cls._probe = files.Rlocation("_main/talOS/launcher/target_lane_probe")
+        cls._default_fixture_tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._default_fixture_tmp.cleanup)
+        cls._default_fixture_dir = cls._default_fixture_tmp.name
+        subprocess.run([cls._fixture, cls._default_fixture_dir], check=True)
+
+    @staticmethod
+    def run_in_process(*args):
+        """Runs session_report.main() in-process (still executing the real
+        log_dump binary) to avoid redundant Python interpreter startups while
+        preserving full CLI argument, stdout/stderr, and exit-code coverage."""
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["session_report", *args]), \
+                contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            returncode = session_report.main()
+        return subprocess.CompletedProcess(
+            ["session_report", *args], returncode, stdout.getvalue(), stderr.getvalue())
+
+    def test_recorded_session(self):
+        result = self.run_in_process("--json", "--strict", self._default_fixture_dir)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["config_sha256"], "fixture-sha256")
+        self.assertEqual(report["state_overall"],
+                         {"count": 7, "min_ms": 5, "median_ms": 5, "p99_ms": 200, "max_ms": 200})
+        self.assertEqual(report["state_enabled"],
+                         {"count": 5, "min_ms": 5, "median_ms": 5, "p99_ms": 120, "max_ms": 120})
+        self.assertEqual((report["enabled_gaps"], report["enabled_gap_bound_ms"]), (1, 100))
+        self.assertEqual(report["state_p99_bound_ms"], 10)
+        self.assertEqual(report["timer_lateness"]["fixture:update"]["max_ms"], 1)
+        self.assertEqual(report["target_receipt_age"]["fixture:/fixture/target/test"]["median_ms"], 3)
+        verdicts = {v["measurement"]: v["verdict"] for v in report["verdicts"]}
+        self.assertEqual(verdicts["enabled state median"], "PASS")
+        self.assertEqual(verdicts["enabled state gaps"], "FAIL")
+        self.assertEqual(report["target_age_at_tick"],
+                         {"fixture:/fixture/target/test":
+                              {"count": 1, "min_ms": 4, "median_ms": 4, "p99_ms": 4, "max_ms": 4}})
+        # The manifest's signal death reaches the node summary.
+        self.assertEqual(report["nodes"][0]["exit_signal"], 9)
+        self.assertEqual(verdicts["target age at tick"], "PASS")
 
     # REQ-RT-15, REQ-OPS-16 (TODO.md SPEC-4): the /hw/state cadence is judged
     # against the recorded config, not the bench's. A robot with period_us
@@ -55,13 +76,10 @@ class SessionReportTest(unittest.TestCase):
     # under its 250 ms timeout, so both pass where the bench's 10 ms and
     # 100 ms would fail them.
     def test_cadence_is_judged_against_the_manifests_period_and_timeout(self):
-        files = runfiles.Create()
-        fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
-        binary = files.Rlocation("_main/talOS/launcher/session_report")
         with tempfile.TemporaryDirectory() as directory:
-            subprocess.run([fixture, directory, "slow-gateway"], check=True)
+            subprocess.run([self._fixture, directory, "slow-gateway"], check=True)
             report = json.loads(subprocess.run(
-                [binary, "--json", directory], capture_output=True, text=True,
+                [self._binary, "--json", directory], capture_output=True, text=True,
                 check=True).stdout)
         self.assertEqual(report["state_enabled"],
                          {"count": 116, "min_ms": 10, "median_ms": 10, "p99_ms": 10,
@@ -79,13 +97,9 @@ class SessionReportTest(unittest.TestCase):
     # against: the rows are NOT MEASURED, never judged against a bench
     # constant, and --strict names each.
     def test_a_manifest_without_the_bounds_does_not_judge_the_cadence(self):
-        files = runfiles.Create()
-        fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
-        binary = files.Rlocation("_main/talOS/launcher/session_report")
         with tempfile.TemporaryDirectory() as directory:
-            subprocess.run([fixture, directory, "unrecorded-bounds"], check=True)
-            result = subprocess.run([binary, "--json", "--strict", directory],
-                                    capture_output=True, text=True)
+            subprocess.run([self._fixture, directory, "unrecorded-bounds"], check=True)
+            result = self.run_in_process("--json", "--strict", directory)
         self.assertEqual(result.returncode, 2, result.stderr)
         report = json.loads(result.stdout)
         verdicts = {v["measurement"]: v for v in report["verdicts"]}
@@ -105,17 +119,14 @@ class SessionReportTest(unittest.TestCase):
 
     # REQ-RT-20 (the bridge acts on a request when it arrives), REQ-OPS-16.
     def test_disabled_session_of_an_event_driven_bridge(self):
-        files = runfiles.Create()
-        fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
-        binary = files.Rlocation("_main/talOS/launcher/session_report")
         with tempfile.TemporaryDirectory() as directory:
-            subprocess.run([fixture, directory, "disabled-bridge"], check=True)
-            result = subprocess.run([binary, "--strict", directory],
+            subprocess.run([self._fixture, directory, "disabled-bridge"], check=True)
+            result = subprocess.run([self._binary, "--strict", directory],
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 2, result.stderr)
-            report = json.loads(subprocess.run(
-                [binary, "--json", directory], capture_output=True, text=True,
-                check=True).stdout)
+            json_result = self.run_in_process("--json", directory)
+            self.assertEqual(json_result.returncode, 0, json_result.stderr)
+            report = json.loads(json_result.stdout)
         # The bridge has no timer: it is judged on the time from a request to
         # the first command carrying its observation; the heartbeat that
         # repeats an observation 20 ms later is not a reaction to a request.
@@ -144,13 +155,9 @@ class SessionReportTest(unittest.TestCase):
     # /hw/state cadence) are still measured. log_dump's own tests cover how
     # it decides (the manifest's version, then the codecs).
     def test_strict_judges_no_hardware_packet_of_another_protocol(self):
-        files = runfiles.Create()
-        fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
-        binary = files.Rlocation("_main/talOS/launcher/session_report")
         with tempfile.TemporaryDirectory() as directory:
-            subprocess.run([fixture, directory, "foreign-protocol"], check=True)
-            result = subprocess.run([binary, "--json", "--strict", directory],
-                                    capture_output=True, text=True)
+            subprocess.run([self._fixture, directory, "foreign-protocol"], check=True)
+            result = self.run_in_process("--json", "--strict", directory)
         self.assertEqual(result.returncode, 2, result.stderr)
         report = json.loads(result.stdout)
         verdicts = {v["measurement"]: v["verdict"] for v in report["verdicts"]}
@@ -224,13 +231,11 @@ class SessionReportTest(unittest.TestCase):
             with open(path, "wb") as f:
                 f.write(file_header + manifest_entry + schema_block + rec_header + stored)
 
-        files = runfiles.Create()
-        fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
-        binary = files.Rlocation("_main/talOS/launcher/session_report")
         with tempfile.TemporaryDirectory() as directory:
-            subprocess.run([fixture, directory], check=True)
+            shutil.copytree(self._default_fixture_dir, directory, dirs_exist_ok=True)
             manifest_path = os.path.join(directory, "manifest.json")
-            manifest = json.loads(open(manifest_path).read())
+            with open(manifest_path) as f:
+                manifest = json.load(f)
             build_version = manifest["hardware_protocol_version"]
             other_version = build_version - 1
             bridge_log = os.path.join(directory, "hardware_node.tlog")
@@ -241,8 +246,7 @@ class SessionReportTest(unittest.TestCase):
             with open(manifest_path, "w") as f:
                 json.dump(manifest, f)
             write_bridge_status_log(bridge_log, manifest["session_id"], build_version)
-            result = subprocess.run([binary, "--json", directory],
-                                    capture_output=True, text=True)
+            result = self.run_in_process("--json", directory)
             self.assertEqual(result.returncode, 0, result.stderr)
             expected = (
                 f"session_report: warning: the session's bridge recorded hardware protocol "
@@ -260,8 +264,7 @@ class SessionReportTest(unittest.TestCase):
             with open(manifest_path, "w") as f:
                 json.dump(manifest, f)
             write_bridge_status_log(bridge_log, manifest["session_id"], other_version)
-            result = subprocess.run([binary, "--json", "--strict", directory],
-                                    capture_output=True, text=True)
+            result = self.run_in_process("--json", "--strict", directory)
             self.assertEqual(result.returncode, 2, result.stderr)
             expected = (
                 f"session_report: warning: the session's bridge recorded hardware protocol "
@@ -280,15 +283,12 @@ class SessionReportTest(unittest.TestCase):
     # left with no interval, are NOT MEASURED rather than a 140 ms FAIL; the
     # gap is listed in the text and JSON, and --strict names it.
     def test_a_log_gap_is_listed_not_measured_and_fails_strict(self):
-        files = runfiles.Create()
-        fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
-        binary = files.Rlocation("_main/talOS/launcher/session_report")
         with tempfile.TemporaryDirectory() as directory:
-            subprocess.run([fixture, directory, "log-gap"], check=True)
-            result = subprocess.run([binary, "--json", "--strict", directory],
-                                    capture_output=True, text=True)
-            text = subprocess.run([binary, directory], capture_output=True, text=True,
-                                  check=True).stdout
+            subprocess.run([self._fixture, directory, "log-gap"], check=True)
+            result = self.run_in_process("--json", "--strict", directory)
+            text_result = self.run_in_process(directory)
+            self.assertEqual(text_result.returncode, 0, text_result.stderr)
+            text = text_result.stdout
         self.assertEqual(result.returncode, 2, result.stderr)
         report = json.loads(result.stdout)
         verdicts = {v["measurement"]: v["verdict"] for v in report["verdicts"]}
@@ -734,11 +734,8 @@ class SessionReportTest(unittest.TestCase):
         self.assertIsNone(session_report.analyze({"nodes": []}, records[:1])["clock_drift_ppm"])
 
     def test_strict_names_a_damaged_log_and_its_offset(self):
-        files = runfiles.Create()
-        fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
-        binary = files.Rlocation("_main/talOS/launcher/session_report")
         with tempfile.TemporaryDirectory() as directory:
-            subprocess.run([fixture, directory], check=True)
+            shutil.copytree(self._default_fixture_dir, directory, dirs_exist_ok=True)
             log = os.path.join(directory, "fixture.tlog")
             with open(log, "r+b") as file:
                 data = file.read()
@@ -755,8 +752,7 @@ class SessionReportTest(unittest.TestCase):
                 offset += 64 + stored
                 file.seek(offset + 8)
                 file.write(bytes([data[offset + 8] ^ 0xFF]))
-            result = subprocess.run([binary, "--json", "--strict", directory],
-                                    capture_output=True, text=True)
+            result = self.run_in_process("--json", "--strict", directory)
             damaged = [issue for issue in json.loads(result.stdout)["session_issues"]
                        if issue.startswith("damaged log " + log)]
             self.assertEqual(len(damaged), 1, result.stderr)
@@ -919,9 +915,8 @@ class SessionReportTest(unittest.TestCase):
         # refuses a graph that uses them.
         relaxed = ["/lift/target/cmd", "/drive/target/teleop",
                    "/lift/target/teleop_out", "/lift/target/align_tx"]
-        probe = runfiles.Create().Rlocation("_main/talOS/launcher/target_lane_probe")
         names = agree + relaxed
-        verdicts = subprocess.run([probe], input="\n".join(names) + "\n",
+        verdicts = subprocess.run([self._probe], input="\n".join(names) + "\n",
                                   capture_output=True, text=True,
                                   check=True).stdout.split()
         self.assertEqual(len(verdicts), len(names))
@@ -1388,7 +1383,6 @@ class SessionReportTest(unittest.TestCase):
     # JSON, NaN/Infinity literals, wrong field types) and non-finite decoded
     # scalars must never raise uncaught tracebacks or emit invalid NaN JSON.
     def test_adversarial_manifests_and_non_finite_scalars(self):
-        binary = runfiles.Create().Rlocation("_main/talOS/launcher/session_report")
         hostile_cli_manifests = [
             ("list root", "[]"),
             ("null root", "null"),
@@ -1401,11 +1395,16 @@ class SessionReportTest(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as directory:
             session = pathlib.Path(directory)
-            for label, text in hostile_cli_manifests:
+            for index, (label, text) in enumerate(hostile_cli_manifests):
                 with self.subTest(manifest=label):
                     (session / "manifest.json").write_text(text)
-                    result = subprocess.run([binary, str(session)],
-                                            capture_output=True, text=True)
+                    # Prove the real py_binary CLI exits 1 without a traceback
+                    # on the first hostile input; run the rest in-process.
+                    if index == 0:
+                        result = subprocess.run([self._binary, str(session)],
+                                                capture_output=True, text=True)
+                    else:
+                        result = self.run_in_process(str(session))
                     self.assertEqual(result.returncode, 1)
                     self.assertNotIn("Traceback", result.stderr)
                     self.assertNotIn("no .tlog files", result.stderr)

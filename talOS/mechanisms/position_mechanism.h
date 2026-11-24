@@ -73,7 +73,7 @@ enum class PositionFault : std::uint8_t {
   kHomingStall,    // limit-switch homing pushed a still mechanism
   kSwitchStuck,    // the home switch reads closed well away from home
   kStall,          // short of the goal and not moving for stall_time_us
-  kMoveTimeout,    // one goal not reached within move_timeout_us
+  kMoveTimeout,    // outside tolerance_rot of one goal for move_timeout_us
 };
 
 enum class Homing : std::uint8_t {

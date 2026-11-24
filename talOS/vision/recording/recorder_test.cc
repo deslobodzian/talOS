@@ -13,10 +13,12 @@
 #include <cerrno>
 #include <cfenv>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -637,6 +639,106 @@ TEST_F(RecorderTest, DuplicateStemsDisambiguateAndTrimKeepsNewerFile) {
     surviving_tag_ids.push_back(parsed.detections[0].tag_id);
   }
   EXPECT_EQ(surviving_tag_ids, (std::vector<int>{2}));
+}
+
+TEST_F(RecorderTest, QueueFullDropDoesNotAdvanceRateLimit) {
+  std::mutex gate_mu;
+  std::condition_variable gate_cv;
+  int pairs_popped = 0;
+  int allowed_pairs = 0;
+
+  const Frame frame = MakeGrayFrame();
+  {
+    FrameRecorder::Options opts;
+    opts.output_dir = dir_;
+    opts.context = MakeContext();
+    opts.sample_hz = 1.0;  // 1 s interval
+    opts.rejected_hz = 1.0;
+    opts.queue_slots = 1;
+    opts.test_before_pair = [&](const std::function<bool()>& stop_requested) {
+      std::unique_lock lock(gate_mu);
+      ++pairs_popped;
+      gate_cv.notify_all();
+      gate_cv.wait(lock, [&] {
+        return pairs_popped <= allowed_pairs || stop_requested();
+      });
+    };
+    FrameRecorder rec{std::move(opts)};
+    // Always unblock the writer before ~FrameRecorder() joins it, even on
+    // early ASSERT failure.
+    struct ReleaseWriterOnExit {
+      std::mutex& mu;
+      std::condition_variable& cv;
+      int& allowed;
+      ~ReleaseWriterOnExit() {
+        {
+          std::lock_guard lock(mu);
+          allowed = 100;
+        }
+        cv.notify_all();
+      }
+    } release_on_exit{gate_mu, gate_cv, allowed_pairs};
+
+    // Enqueue the first sampled frame at t = 0.0 s and hold the writer inside
+    // test_before_pair so the queue stays predictable.
+    ASSERT_TRUE(rec.Record(frame, MakeRecord(0, "sampled")));
+    {
+      std::unique_lock lock(gate_mu);
+      ASSERT_TRUE(gate_cv.wait_for(lock, std::chrono::seconds{10},
+                                   [&] { return pairs_popped == 1; }));
+    }
+
+    // Fill the single queue slot with a rejected frame at t = 0.0 s so the
+    // sampled rate-limit timestamp remains at 0.0 s.
+    ASSERT_TRUE(rec.Record(frame, MakeRecord(0, "rejected")));
+
+    // Queue is full: sampled frame at t = 1.0 s is dropped and must NOT
+    // advance the sampled rate-limit timestamp.
+    EXPECT_FALSE(rec.Record(frame, MakeRecord(1'000'000'000, "sampled")));
+    EXPECT_EQ(rec.dropped(), 1u);
+
+    // Release pair 1 so the writer pops pair 2 and frees the queue slot.
+    {
+      std::lock_guard lock(gate_mu);
+      allowed_pairs = 1;
+    }
+    gate_cv.notify_all();
+    {
+      std::unique_lock lock(gate_mu);
+      ASSERT_TRUE(gate_cv.wait_for(lock, std::chrono::seconds{10},
+                                   [&] { return pairs_popped == 2; }));
+    }
+
+    // At t = 1.05 s, the slot is free and >= 1.0 s has elapsed since the last
+    // actually enqueued sampled frame (t = 0.0 s): this frame must be queued.
+    ASSERT_TRUE(rec.Record(frame, MakeRecord(1'050'000'000, "sampled")));
+    EXPECT_EQ(rec.recorded(), 3u);
+    EXPECT_EQ(rec.dropped(), 1u);
+
+    // Rate-limit timestamp is now 1.05 s, so t = 1.50 s is rate-limited
+    // (returns false without incrementing dropped).
+    EXPECT_FALSE(rec.Record(frame, MakeRecord(1'500'000'000, "sampled")));
+    EXPECT_EQ(rec.recorded(), 3u);
+    EXPECT_EQ(rec.dropped(), 1u);
+
+    // Let the writer pop pair 3 (t = 1.05 s) and finish writing it on
+    // destruction.
+    {
+      std::lock_guard lock(gate_mu);
+      allowed_pairs = 3;
+    }
+    gate_cv.notify_all();
+    {
+      std::unique_lock lock(gate_mu);
+      ASSERT_TRUE(gate_cv.wait_for(lock, std::chrono::seconds{10},
+                                   [&] { return pairs_popped == 3; }));
+    }
+  }
+
+  EXPECT_FALSE(std::filesystem::exists(
+      dir_ / (RecordStem(1'000'000'000, "sampled") + ".json")));
+  EXPECT_TRUE(std::filesystem::exists(
+      dir_ / (RecordStem(1'050'000'000, "sampled") + ".json")));
 }
 
 }  // namespace
