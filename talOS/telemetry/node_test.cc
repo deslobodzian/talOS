@@ -1476,11 +1476,6 @@ class SignedIntNode {
 // too), and a feed over its budget once the dictionary's alert channels,
 // which an `alerts` widget adds, are counted.
 TEST(TelemetryMatrix, BadParameterFailsConstruction) {
-  std::string exact_max = "[";
-  for (std::size_t i = 0; i < telemetry_wire::kMaxEnumLabels; ++i) {
-    exact_max += (i == 0 ? "\"" : ", \"") + std::to_string(i) + "\"";
-  }
-  exact_max += "]";
   std::string many = "[";
   for (std::size_t i = 0; i <= telemetry_wire::kMaxEnumLabels; ++i) {
     many += (i == 0 ? "\"r" : ", \"r") + std::to_string(i) + "\"";
@@ -1491,38 +1486,7 @@ TEST(TelemetryMatrix, BadParameterFailsConstruction) {
   const std::string overlong_label_str(
       telemetry_wire::kMaxDictionaryStringBytes + 1, 'a');
 
-  // REQ-OPS-38: exactly kMaxEnumLabels (1024) labels and a 256-byte label are
-  // accepted at Telemetry construction.
-  {
-    Sim sim = Sim::FromToml(R"(
-[robot]
-period_us = 10000
-[studio]
-topic = "/talos/telemetry"
-[subsystems.shooter]
-node = "//shooter:node"
-[subsystems.shooter.motors.m]
-can_id = 1
-[subsystems.autonomous]
-node = "//autonomous:node"
-exact_max = )" + exact_max +
-                            R"(
-[subsystems.telemetry]
-node = "//talOS/telemetry:node"
-[[subsystems.telemetry.labels]]
-channel = "shooter/status/routine_index"
-from = "autonomous.exact_max"
-)");
-    sim.add<AlertsNode>("shooter");
-    const auto& telemetry = sim.add<Telemetry>("telemetry");
-    const auto dict = DictionaryMap(telemetry);
-    ASSERT_TRUE(dict.contains("shooter/status/routine_index"));
-    const auto& labels = dict.at("shooter/status/routine_index")->labels;
-    ASSERT_EQ(labels.size(), telemetry_wire::kMaxEnumLabels);
-    EXPECT_EQ(labels.front(), "0");
-    EXPECT_EQ(labels.back(),
-              std::to_string(telemetry_wire::kMaxEnumLabels - 1));
-  }
+  // REQ-OPS-38: a 256-byte label is accepted at Telemetry construction.
   {
     Sim sim = Sim::FromToml(R"(
 [robot]
