@@ -397,16 +397,32 @@ InstanceFactory MakeInstance() {
 
 template <class T>
 std::int32_t HostCppNode(void* raw_node) noexcept {
+  static_assert(std::is_constructible_v<T, Node&>,
+                "a talos node class must be constructible from talos::Node&");
+  NodeDetail::set_host_error({});
   try {
-    if (raw_node == nullptr) return -1;
+    if (raw_node == nullptr) {
+      NodeDetail::set_host_error("HostCppNode: null node");
+      return -1;
+    }
     auto& node = *static_cast<Node*>(raw_node);
-    auto instance = MakeInstance<T>()(node);
-    NodeDetail::add_extension(node, typeid(T), std::move(instance));
+    if (NodeDetail::find_extension(node, typeid(T)) != nullptr) {
+      throw std::logic_error(std::string{node.name()} +
+                             ": extension added twice");
+    }
+    auto object = std::make_shared<T>(node);
+    T* raw = object.get();
+    NodeDetail::add_extension(node, typeid(T), std::move(object));
+    if constexpr (requires(T& t) { t.update(); }) {
+      NodeDetail::set_update(node, [raw] { raw->update(); });
+    }
     return 0;
   } catch (const std::exception& e) {
+    NodeDetail::set_host_error(e.what());
     std::fprintf(stderr, "HostCppNode: %s\n", e.what());
     return -1;
   } catch (...) {
+    NodeDetail::set_host_error("HostCppNode: unknown error");
     return -1;
   }
 }

@@ -162,6 +162,42 @@ class CppNodeTest(unittest.TestCase):
         self.assertIn("TIMER", [s["kind"] for s in described["sources"]])
         self.assertFalse(described["abi_update"])
 
+    # REQ-DEV-09: HostCppNode propagates C++ constructor diagnostics into
+    # talos_last_error() so talos.cpp_node raises the real message, and a
+    # duplicate instantiation on the same Node fails without leaving a dangling
+    # update() pointer.
+    def test_hosted_node_propagates_init_errors_and_guards_duplicate_host(self):
+        from talos.testing import Sim
+
+        files = runfiles.Create()
+        path = files.Rlocation(os.environ["TALOS_PROBE_LIB"])
+        FailingProbe = talos.cpp_node(path, "failing_probe")
+        Probe = talos.cpp_node(path, "probe")
+
+        sim = Sim.from_toml(
+            "[robot]\nperiod_us = 10000\ncommand_timeout_us = 100000\n"
+            "[subsystems.probe]\n"
+        )
+        with self.assertRaisesRegex(talos.TalosError, "required_gain"):
+            sim.add(FailingProbe, "probe")
+
+        errors = []
+
+        class DuplicateHost:
+            def __init__(self, node):
+                self.first = Probe(node)
+                try:
+                    self.second = Probe(node)
+                except talos.TalosError as err:
+                    errors.append(str(err))
+
+        sim.add(DuplicateHost, "probe")
+        self.assertEqual(len(errors), 1)
+        self.assertIn("extension added twice", errors[0])
+        # Stepping exercises the first Probe's installed C++ update().
+        sim.step(0.03)
+        self.assertEqual(sim.node("probe").tick, 3)
+
     # REQ-DEV-09: talos_cc_shared_node links libtalos_node.so dynamically with
     # soname matching and Linux -z defs, and libtalos_node.so claims the whole
     # //talOS framework closure in exports_filter while linking its packages

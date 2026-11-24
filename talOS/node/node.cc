@@ -649,6 +649,29 @@ void NodeDetail::add_extension(Node& node, std::type_index type,
   node.impl_->extensions.emplace_back(type, std::move(object));
 }
 
+namespace {
+thread_local std::string g_host_error;
+std::atomic<NodeAccess::HostErrorCallback> g_host_error_callback{nullptr};
+}  // namespace
+
+void NodeDetail::set_host_error(std::string_view message) noexcept {
+  try {
+    g_host_error.assign(message);
+  } catch (...) {
+    g_host_error.clear();
+  }
+  if (const auto callback =
+          g_host_error_callback.load(std::memory_order_acquire)) {
+    callback(g_host_error.c_str());
+  }
+}
+
+const char* NodeDetail::host_error() noexcept { return g_host_error.c_str(); }
+
+void NodeAccess::set_host_error_callback(HostErrorCallback callback) noexcept {
+  g_host_error_callback.store(callback, std::memory_order_release);
+}
+
 // --- params ------------------------------------------------------------------
 
 std::optional<bool> NodeDetail::find_bool(const Node& node,
