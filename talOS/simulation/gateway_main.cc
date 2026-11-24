@@ -580,15 +580,19 @@ int Run(int argc, char** argv,
         }
         extension->BeforeTick({.now_us = now,
                                .schedule_us = schedule_us,
-                               .driver_station = &driver_station},
-                              fms_stamp);
+                               .driver_station = &driver_station});
+      }
+      endpoint.Tick(now, GatewayEnabled(driver_station.fms.flags));
+      // After the tick's plant steps, so a packet sent on this tick carries
+      // the extension's stamp as of this tick.
+      if (extension != nullptr) {
+        extension->Stamp(fms_stamp);
         driver_station.fms.match_time_s = fms_stamp.match_time_s;
         std::copy(fms_stamp.game_specific_message.begin(),
                   fms_stamp.game_specific_message.end() - 1,
                   std::begin(driver_station.fms.game_specific_message));
         std::end(driver_station.fms.game_specific_message)[-1] = '\0';
       }
-      endpoint.Tick(now, GatewayEnabled(driver_station.fms.flags));
       if (truth_publisher) {
         const auto sample_time = talos::event::Poller::now();
         const auto& truth = physics_backend.truth();

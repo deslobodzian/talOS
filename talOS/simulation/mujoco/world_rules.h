@@ -48,6 +48,14 @@ class WorldRules {
   // Throws std::invalid_argument naming a missing site, numeric or body.
   // The data is mj_forward's at the plant's current qpos and qvel.
   virtual void Attach(const mjModel_& model, mjData_& data) = 0;
+  // Each time the plant is given a match input (MujocoPlant::SetMatchInput),
+  // before the steps that use it and whether or not any follow: what a rule
+  // reports that depends on the input alone (a match clock, its period)
+  // follows it here, so it is current on a tick whose plant time rounds to
+  // no step. It touches no model or data, and the steps then see the same
+  // input in AfterStep. No clock, no allocation. False, or a throw: the
+  // plant fails with failure().
+  virtual bool ObserveMatch(const MatchInput& /*input*/) { return true; }
   // `step` counts plant steps from 1. False: the plant fails with failure().
   virtual bool AfterStep(mjModel_& model, mjData_& data, uint64_t step,
                          const MatchInput& input) = 0;

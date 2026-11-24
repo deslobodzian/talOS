@@ -556,6 +556,37 @@ TEST(Rebuilt2026Rules, PeriodBoundariesAndNoRestart) {
   EXPECT_EQ(b.auto_points, 0u) << "AUTO's assessment ended at TELEOP start";
 }
 
+// REQ-DEV-40: the rules follow the match input when the plant is given it,
+// with no step: TELEOP's period, time and game data at once (the gateway's
+// tick that sees TELEOP may run no plant step), then SHIFT 1 with red's HUB
+// inactive past its grace (seed 1 draws 0.567: red inactive first); a step
+// on the next input carries on from there.
+TEST(Rebuilt2026Rules, ObservesTheMatchInputWithoutAStep) {
+  Game game{.plant = Make("observe")};
+  Attach(game, 1);
+  const GameRules& rules = *game.rules;
+  game.plant->SetMatchInput(Input(Mode::kTeleop, 5.0));
+  sim::MatchState match = ReportOf(rules);
+  EXPECT_EQ(match.period(), sim::MatchPeriod::Teleop);
+  EXPECT_EQ(match.period_remaining_us(), 140 * kSecondUs);
+  EXPECT_TRUE(match.tie_drawn());
+  EXPECT_FALSE(match.blue_inactive_first());
+  EXPECT_FLOAT_EQ(rules.Fms().match_time_s, 140.0F);
+  EXPECT_EQ(rules.Fms().game_specific_message[0], 'R');
+
+  game.plant->SetMatchInput(Input(Mode::kTeleop, 19.0));
+  match = ReportOf(rules);
+  EXPECT_EQ(match.stage_index(), 1);
+  EXPECT_EQ(match.period_remaining_us(), 126 * kSecondUs);
+  EXPECT_TRUE(match.blue_scoring_active());
+  EXPECT_FALSE(match.red_scoring_active());
+
+  ASSERT_TRUE(Step(game, Input(Mode::kTeleop, 19.005)));
+  match = ReportOf(rules);
+  EXPECT_EQ(match.period(), sim::MatchPeriod::Teleop);
+  EXPECT_EQ(match.period_remaining_us(), 125'995'000u);
+}
+
 // One release's draws: the exit, the speed and the heading off the exit's +x.
 struct Release {
   int exit;
