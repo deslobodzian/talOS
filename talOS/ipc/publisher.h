@@ -37,10 +37,12 @@ class RawPublisher {
   RTMSQueue& queue() { return queue_; }
 
  private:
-  // A publisher owns its topic's layout outside a session; see
-  // RTMSOptions::publisher.
+  // A publisher claims writer ownership and never acts as session owner
+  // (replacing or unlinking the segment), whatever the caller left set in
+  // RTMSOptions; see RTMSOptions::publisher and RTMSOptions::session_owner.
   static RTMSOptions publishing(RTMSOptions options) {
     options.publisher = true;
+    options.session_owner = false;
     return options;
   }
 
