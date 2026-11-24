@@ -3511,5 +3511,364 @@ TEST_F(ReviewTest, ForeignProtocolRefusesHardwareAndDriverStationTopics) {
   std::filesystem::remove_all(dir);
 }
 
+// Guards REQ-OPS-41, REQ-OPS-42: LogFile's overflow bitset for source_id >= 63
+// stays within its per-file source and byte caps even on a crafted log with
+// >= 512 reviewed overflow sources across 2,000 checkpoints, falling back to
+// Checkpoint::sources bit 63 past either cap so ReadSeries and Snapshot stay
+// exact while keeping heap bounded.
+// REQ-OPS-41, REQ-OPS-42
+TEST_F(ReviewTest, OverflowBitmapIsBoundedAndFallsBackToBit63) {
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+  using D = talos::Descriptor<review_test::Shot>;
+
+  constexpr std::uint16_t kLowId = 1;
+  constexpr std::uint16_t kFirstHighId = 64;
+  constexpr std::uint16_t kHighCount = 512;
+  constexpr std::int64_t kCheckpoints = 2000;
+
+  const std::string dir = Library() + "/overflow_cap";
+  std::filesystem::create_directories(dir);
+  const auto make_reg = [](std::uint16_t id, const std::string& name) {
+    talos::event::Registration reg;
+    reg.id = id;
+    reg.kind = SourceKind::SENDER;
+    reg.name = name;
+    reg.message_bytes = sizeof(review_test::Shot);
+    reg.schema = {std::string{D::kName}, D::kHash,
+                  std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                              D::kBfbs.size()}};
+    return reg;
+  };
+  {
+    std::vector<talos::event::Registration> regs;
+    regs.reserve(kHighCount + 1);
+    regs.push_back(make_reg(kLowId, "/low/state"));
+    for (std::uint16_t i = 0; i < kHighCount; ++i) {
+      const std::uint16_t id = static_cast<std::uint16_t>(kFirstHighId + i);
+      regs.push_back(make_reg(id, "/ov" + std::to_string(id) + "/state"));
+    }
+    tlog::LogWriter writer{dir + "/many_sources.tlog", "many_sources",
+                           tlog::LogWriterOptions{65536, 1, false}, 1};
+    writer.start(regs, MonotonicTime::from_nanos(kStartNs));
+
+    std::uint64_t seq = 0;
+    const auto send = [&](std::uint16_t id, std::int64_t s, double pos) {
+      review_test::Shot shot{pos, static_cast<std::uint32_t>(seq),
+                             review_test::Mode::IDLE, true, seq};
+      Context ctx{};
+      ctx.dispatch_index = ++seq;
+      ctx.event_time = ctx.now =
+          MonotonicTime::from_nanos(kStartNs + s * kSecond);
+      writer.send(ctx, id, std::as_bytes(std::span{&shot, 1}), 0, seq);
+    };
+
+    for (std::int64_t s = 0; s < kCheckpoints; ++s) {
+      if (s < kHighCount) {
+        const std::uint16_t id = static_cast<std::uint16_t>(kFirstHighId + s);
+        send(id, s, static_cast<double>(id));
+      } else {
+        // Low-id source keeps checkpoints advancing without setting bit 63.
+        send(kLowId, s, static_cast<double>(s));
+      }
+      if (s == 10) send(kFirstHighId, s, 1001.5);
+      if (s == 1900) send(kFirstHighId, s, 1900.5);
+      if (s == 1950) {
+        send(static_cast<std::uint16_t>(kFirstHighId + kHighCount - 1), s,
+             1950.25);
+      }
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+
+  const auto session = Session::Open(dir);
+  ASSERT_EQ(session->files().size(), 1u);
+  ASSERT_EQ(session->log_seconds(), static_cast<std::size_t>(kCheckpoints));
+  const LogFile& file = session->files()[0];
+  EXPECT_TRUE(file.overflow_capped);
+  EXPECT_LE(file.overflow_source_ids.size(), kMaxOverflowSources);
+  EXPECT_LE(file.overflow_words_per_cp, kMaxOverflowWordsPerCheckpoint);
+  EXPECT_LE(file.overflow_bits.size() * sizeof(std::uint64_t),
+            kMaxOverflowBytesPerFile);
+  EXPECT_LE(session->index_bytes(),
+            session->log_seconds() * sizeof(Checkpoint) +
+                kMaxOverflowBytesPerFile +
+                kMaxOverflowSources * sizeof(std::uint16_t));
+
+  const auto ref_low = session->Find("low/state/position_m");
+  const auto ref_first =
+      session->Find("ov" + std::to_string(kFirstHighId) + "/state/position_m");
+  const auto ref_mid = session->Find("ov" + std::to_string(kFirstHighId + 255) +
+                                     "/state/position_m");
+  const auto ref_last =
+      session->Find("ov" + std::to_string(kFirstHighId + kHighCount - 1) +
+                    "/state/position_m");
+  ASSERT_TRUE(ref_low.has_value());
+  ASSERT_TRUE(ref_first.has_value());
+  ASSERT_TRUE(ref_mid.has_value());
+  ASSERT_TRUE(ref_last.has_value());
+
+  // Tracked overflow source inside and past the overflow byte cap.
+  {
+    const auto early =
+        session->ReadSeries(std::span{&*ref_first, 1}, kStartNs + 10 * kSecond,
+                            kStartNs + 11 * kSecond, 1);
+    EXPECT_EQ(early[0].count[0], 1u);
+    EXPECT_EQ(early[0].last[0], 1001.5);
+
+    const auto late = session->ReadSeries(std::span{&*ref_first, 1},
+                                          kStartNs + 1900 * kSecond,
+                                          kStartNs + 1901 * kSecond, 1);
+    EXPECT_EQ(late[0].count[0], 1u);
+    EXPECT_EQ(late[0].last[0], 1900.5);
+  }
+
+  // Untracked overflow source (past the source cap) inside and past byte cap.
+  {
+    const auto early =
+        session->ReadSeries(std::span{&*ref_last, 1}, kStartNs + 511 * kSecond,
+                            kStartNs + 512 * kSecond, 1);
+    EXPECT_EQ(early[0].count[0], 1u);
+    EXPECT_EQ(early[0].last[0],
+              static_cast<double>(kFirstHighId + kHighCount - 1));
+
+    const auto late =
+        session->ReadSeries(std::span{&*ref_last, 1}, kStartNs + 1950 * kSecond,
+                            kStartNs + 1951 * kSecond, 1);
+    EXPECT_EQ(late[0].count[0], 1u);
+    EXPECT_EQ(late[0].last[0], 1950.25);
+  }
+
+  // Window with only low-id records (bit 63 clear) still skips completely.
+  {
+    ReadStats stats{};
+    const std::array<ChannelRef, 2> refs{*ref_first, *ref_last};
+    const auto empty = session->ReadSeries(
+        refs, kStartNs + 1200 * kSecond, kStartNs + 1500 * kSecond, 3, &stats);
+    EXPECT_EQ(stats.seeks, 0u);
+    for (const auto& s : empty) {
+      for (const auto c : s.count) EXPECT_EQ(c, 0u);
+    }
+  }
+
+  // Snapshot returns exact latest values for tracked, untracked, and low ids.
+  {
+    const auto snap = session->Snapshot(kStartNs + 1960 * kSecond);
+    const auto get_val = [&](ChannelRef ref) -> std::optional<double> {
+      const auto it =
+          std::find_if(snap.begin(), snap.end(), [&](const Sample& s) {
+            return s.channel.topic == ref.topic &&
+                   s.channel.channel == ref.channel;
+          });
+      if (it == snap.end()) return std::nullopt;
+      return ValueOf(session->channel(ref).kind, it->raw);
+    };
+    EXPECT_EQ(get_val(*ref_low), 1960.0);
+    EXPECT_EQ(get_val(*ref_first), 1900.5);
+    EXPECT_EQ(get_val(*ref_mid), static_cast<double>(kFirstHighId + 255));
+    EXPECT_EQ(get_val(*ref_last), 1950.25);
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// Guards REQ-OPS-42 session-wide channel cap and Snapshot early stopping:
+//   - a crafted multi-topic session exceeding the session-wide channel cap
+//     fails with HTTP 422 while sibling sessions stay 200;
+//   - Session::Snapshot stops seeking/decoding remaining topic files once
+//     earlier topics in output order have already filled max_channels.
+// REQ-OPS-42
+TEST_F(ReviewTest, SessionChannelCapFailsOnlyThatSessionAndSnapshotStopsAtCap) {
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+
+  const auto write_topics = [](const std::string& tlog_path,
+                               const std::string& proc,
+                               const std::string& topic_prefix,
+                               std::size_t topic_count,
+                               std::uint16_t fields_per_topic) {
+    const std::string schema_name = "review_test." + proc;
+    const std::string bfbs =
+        ManyBoolsSchema(schema_name, "f", fields_per_topic);
+    std::vector<talos::event::Registration> regs;
+    regs.reserve(topic_count);
+    for (std::size_t t = 0; t < topic_count; ++t) {
+      talos::event::Registration reg;
+      reg.id = static_cast<std::uint16_t>(t + 1);
+      reg.kind = SourceKind::SENDER;
+      reg.name = "/" + topic_prefix + std::to_string(t) + "/state";
+      reg.message_bytes = fields_per_topic;
+      reg.schema = {schema_name, 500 + t, bfbs};
+      regs.push_back(std::move(reg));
+    }
+    tlog::LogWriter writer{tlog_path, proc,
+                           tlog::LogWriterOptions{65536, 1, false}, 1};
+    writer.start(regs, MonotonicTime::from_nanos(kStartNs));
+    const std::vector<std::byte> payload(fields_per_topic, std::byte{1});
+    for (std::size_t t = 0; t < topic_count; ++t) {
+      Context ctx{};
+      ctx.dispatch_index = t + 1;
+      ctx.event_time = ctx.now = MonotonicTime::from_nanos(kStartNs);
+      writer.send(ctx, static_cast<std::uint16_t>(t + 1), payload, 0, t + 1);
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  };
+
+  // 1. 9 topics x 2,000 channels = 18,000 > kMaxSessionChannels (16,384) ->
+  //    422, while an 8 x 2,000 = 16,000 session and sibling s1 stay 200.
+  {
+    const std::string over_dir = Library() + "/over_session_cap";
+    std::filesystem::create_directories(over_dir);
+    write_topics(over_dir + "/many.tlog", "many", "m", 9, 2000);
+
+    const std::string under_dir = Library() + "/under_session_cap";
+    std::filesystem::create_directories(under_dir);
+    write_topics(under_dir + "/ok.tlog", "ok", "ok", 8, 2000);
+
+    Review review{Library(), 1u << 20};
+    const Response bad_ch =
+        review.Get("/review/over_session_cap/channels.json", "");
+    EXPECT_EQ(bad_ch.status, 422) << "body bytes=" << bad_ch.body.size();
+    const Response bad_bounds =
+        review.Get("/review/over_session_cap/bounds.json", "");
+    EXPECT_EQ(bad_bounds.status, 422) << bad_bounds.body;
+
+    // Session within kMaxSessionChannels and healthy sibling s1 remain 200.
+    EXPECT_EQ(review.Get("/review/under_session_cap/bounds.json", "").status,
+              200);
+    EXPECT_EQ(review.Get("/review/s1/bounds.json", "").status, 200);
+    EXPECT_EQ(review.Get("/review/s1/channels.json", "").status, 200);
+    std::filesystem::remove_all(over_dir);
+    std::filesystem::remove_all(under_dir);
+  }
+
+  // 2. Snapshot stops before seeking files whose topics all sort past
+  //    max_channels once earlier topics have filled max_channels.
+  {
+    const std::string early_dir = Library() + "/snap_early_stop";
+    std::filesystem::create_directories(early_dir);
+    // alpha.tlog has 9 x 1,000 = 9,000 channels (/a0../a8); zeta.tlog has
+    // 5 x 1,000 = 5,000 channels (/z0../z4); total 14,000 <= 16,384.
+    write_topics(early_dir + "/alpha.tlog", "alpha", "a", 9, 1000);
+    write_topics(early_dir + "/zeta.tlog", "zeta", "z", 5, 1000);
+
+    const auto session = Session::Open(early_dir);
+    ReadStats stats{};
+    const auto snap = session->Snapshot(kStartNs, &stats, kMaxSnapshotChannels);
+    EXPECT_EQ(snap.size(), kMaxSnapshotChannels);
+    EXPECT_EQ(stats.seeks, 1u);
+    std::filesystem::remove_all(early_dir);
+  }
+}
+
+// Guards REQ-OPS-41, REQ-OPS-42: declared.json and manifest.json validate the
+// session id and directory without calling Open(), so manifest-only and
+// foreign-format-version sessions still return 200 and requesting them never
+// opens a session or evicts an LRU OpenSession.
+// REQ-OPS-41, REQ-OPS-42
+TEST_F(ReviewTest, DeclaredAndManifestServeWithoutOpeningOrEvictingSessions) {
+  const std::string manifest_body =
+      R"({"session_id":42,"start_wall_ns":100,"end_wall_ns":200,"nodes":[]})";
+  const std::string graph_body = R"({"nodes":[],"topics":[]})";
+
+  // 1. Manifest-only session (no .tlog): manifest.json and declared.json return
+  //    200 without opening any session; bounds.json still returns 422.
+  const std::string manifest_only = Library() + "/manifest_only";
+  std::filesystem::create_directories(manifest_only);
+  std::ofstream{manifest_only + "/manifest.json"} << manifest_body;
+  std::ofstream{manifest_only + "/graph.json"} << graph_body;
+
+  // 2. Foreign-format-version session (v99 .tlog + manifest.json + graph.json).
+  const std::string foreign_fmt = Library() + "/foreign_fmt";
+  testing::WriteFixtureSession(foreign_fmt);
+  std::ofstream{foreign_fmt + "/manifest.json"} << manifest_body;
+  std::ofstream{foreign_fmt + "/graph.json"} << graph_body;
+  for (const auto& entry : std::filesystem::directory_iterator(foreign_fmt)) {
+    if (entry.path().extension() != ".tlog") continue;
+    std::fstream f{entry.path(),
+                   std::ios::in | std::ios::out | std::ios::binary};
+    std::uint32_t bad_ver = 99;
+    f.seekp(4);
+    f.write(reinterpret_cast<const char*>(&bad_ver), sizeof bad_ver);
+  }
+
+  // 3. Non-session directory (has graph.json only, neither manifest nor .tlog).
+  const std::string not_a_session = Library() + "/not_a_session";
+  std::filesystem::create_directories(not_a_session);
+  std::ofstream{not_a_session + "/graph.json"} << graph_body;
+
+  {
+    Review review{Library(), 1u << 20};
+    const Response mo_m = review.Get("/review/manifest_only/manifest.json", "");
+    ASSERT_EQ(mo_m.status, 200) << mo_m.body;
+    EXPECT_EQ(mo_m.body, manifest_body);
+    const Response mo_d = review.Get("/review/manifest_only/declared.json", "");
+    ASSERT_EQ(mo_d.status, 200) << mo_d.body;
+    EXPECT_EQ(mo_d.body, graph_body);
+    EXPECT_EQ(review.open_sessions(), 0u);
+    EXPECT_EQ(review.Get("/review/manifest_only/bounds.json", "").status, 422);
+
+    const Response ff_m = review.Get("/review/foreign_fmt/manifest.json", "");
+    ASSERT_EQ(ff_m.status, 200) << ff_m.body;
+    EXPECT_EQ(ff_m.body, manifest_body);
+    const Response ff_d = review.Get("/review/foreign_fmt/declared.json", "");
+    ASSERT_EQ(ff_d.status, 200) << ff_d.body;
+    EXPECT_EQ(ff_d.body, graph_body);
+    EXPECT_EQ(review.open_sessions(), 0u);
+    EXPECT_EQ(review.Get("/review/foreign_fmt/bounds.json", "").status, 422);
+
+    EXPECT_EQ(review.Get("/review/not_a_session/declared.json", "").status,
+              404);
+    EXPECT_EQ(review.Get("/review/missing_id/manifest.json", "").status, 404);
+    EXPECT_EQ(review.Get("/review/../declared.json", "").status, 400);
+  }
+
+  // 4. LRU preservation: fill all kMaxOpenSessions slots, corrupt slot 0's
+  //    .tlog version on disk, then fetch manifest.json/declared.json of a 5th
+  //    session (s1). Slot 0 must remain cached (still returns 200).
+  std::vector<std::string> lru_dirs;
+  for (std::size_t i = 0; i < kMaxOpenSessions; ++i) {
+    const std::string dir = Library() + "/lru" + std::to_string(i);
+    testing::WriteFixtureSession(dir);
+    lru_dirs.push_back(dir);
+  }
+  {
+    Review review{Library(), 1u << 20};
+    for (std::size_t i = 0; i < kMaxOpenSessions; ++i) {
+      ASSERT_EQ(
+          review.Get("/review/lru" + std::to_string(i) + "/bounds.json", "")
+              .status,
+          200);
+    }
+    ASSERT_EQ(review.open_sessions(), kMaxOpenSessions);
+
+    // Corrupt lru0's .tlog version so any eviction + re-open returns 422.
+    for (const auto& entry : std::filesystem::directory_iterator(lru_dirs[0])) {
+      if (entry.path().extension() != ".tlog") continue;
+      std::fstream f{entry.path(),
+                     std::ios::in | std::ios::out | std::ios::binary};
+      std::uint32_t bad_ver = 99;
+      f.seekp(4);
+      f.write(reinterpret_cast<const char*>(&bad_ver), sizeof bad_ver);
+    }
+
+    EXPECT_EQ(review.Get("/review/s1/manifest.json", "").status, 200);
+    EXPECT_EQ(review.Get("/review/s1/declared.json", "").status, 200);
+    EXPECT_EQ(review.open_sessions(), kMaxOpenSessions);
+    // lru0 was not evicted -> still served from cache without re-opening.
+    EXPECT_EQ(review.Get("/review/lru0/bounds.json", "").status, 200);
+  }
+
+  std::filesystem::remove_all(manifest_only);
+  std::filesystem::remove_all(foreign_fmt);
+  std::filesystem::remove_all(not_a_session);
+  for (const std::string& dir : lru_dirs) std::filesystem::remove_all(dir);
+}
+
 }  // namespace
 }  // namespace studio::review
