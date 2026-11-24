@@ -1396,6 +1396,17 @@ class PhoenixBackendRecovery : public ::testing::Test {
   static auto& Motor(PhoenixBackend& backend, std::size_t i) {
     return *backend.motors_[i];
   }
+  static auto& SensorEncoder(PhoenixBackend& backend, std::size_t i) {
+    return *backend.sensors_[i].encoder;
+  }
+  static auto& SensorImu(PhoenixBackend& backend, std::size_t i) {
+    return *backend.sensors_[i].imu;
+  }
+  static void SetResetPoller(
+      PhoenixBackend& backend,
+      std::function<bool(ctre::phoenix6::hardware::ParentDevice&)> poller) {
+    backend.poll_device_reset_ = std::move(poller);
+  }
   static auto& MotorConfig(PhoenixBackend& backend, std::size_t i) {
     return backend.config_.motors[i];
   }
@@ -2437,10 +2448,12 @@ class PhoenixBackendTorque : public PhoenixBackendFoc {
 };
 
 // A torque-current request is TorqueCurrentFOC with the demand in amperes,
-// peak torque current +-max_torque_current_a, and a duty cap of max_voltage
-// over the last battery reading: none before the first reading (cap 0, no
-// output), following the battery, and kept over a lost reading. A neutral
-// after it is NeutralOut.
+// peak torque current +-max_torque_current_a (configured and restored after a
+// reset), and a duty cap of max_voltage over the last valid (> 1 V, finite)
+// battery reading, clamped to [0, 1]: 0 before the first valid reading,
+// following the battery, kept over an invalid/lost reading, and clamped to 1.0
+// when battery voltage falls below max_voltage. A neutral after it is
+// NeutralOut.
 // REQ-SAFE-43
 TEST_F(PhoenixBackendTorque, ARequestIsTorqueCurrentFocCappedAtMaxVoltage) {
   EnsureHal();
@@ -2464,6 +2477,16 @@ TEST_F(PhoenixBackendTorque, ARequestIsTorqueCurrentFocCappedAtMaxVoltage) {
   EXPECT_EQ(AppliedFields(backend, 0), TorqueCurrentFoc(-2.5, 0.0))
       << "before a battery reading";
   hw::State state;
+  // Readings at or below the 1 V floor or non-finite before the first valid
+  // reading must leave the duty cap at 0.0.
+  for (const double invalid_v :
+       {1.0, std::numeric_limits<double>::quiet_NaN()}) {
+    battery.Set(invalid_v);
+    backend.Read(state);
+    ASSERT_TRUE(ApplySent(backend, torque));
+    EXPECT_EQ(AppliedFields(backend, 0), TorqueCurrentFoc(-2.5, 0.0))
+        << "invalid battery_v=" << invalid_v << " before first valid reading";
+  }
   for (const double battery_v : {12.5, 8.0}) {
     battery.Set(battery_v);
     backend.Read(state);
@@ -2472,16 +2495,46 @@ TEST_F(PhoenixBackendTorque, ARequestIsTorqueCurrentFocCappedAtMaxVoltage) {
               TorqueCurrentFoc(-2.5, 4.0 / battery_v))
         << battery_v << " V";
   }
-  battery.Set(0.0);
+  for (const double lost_v :
+       {0.0, 1.0, std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity()}) {
+    battery.Set(lost_v);
+    backend.Read(state);
+    ASSERT_TRUE(ApplySent(backend, torque));
+    EXPECT_EQ(AppliedFields(backend, 0), TorqueCurrentFoc(-2.5, 4.0 / 8.0))
+        << "a lost/invalid reading (" << lost_v << " V) keeps the last";
+  }
+
+  // A valid battery voltage below max_voltage (2.0 V < 4.0 V) clamps the duty
+  // cap to 1.0 rather than sending MaxAbsDutyCycle > 1.0.
+  battery.Set(2.0);
   backend.Read(state);
   ASSERT_TRUE(ApplySent(backend, torque));
-  EXPECT_EQ(AppliedFields(backend, 0), TorqueCurrentFoc(-2.5, 4.0 / 8.0))
-      << "a lost reading keeps the last";
+  EXPECT_EQ(AppliedFields(backend, 0), TorqueCurrentFoc(-2.5, 1.0))
+      << "2.0 V < max_voltage 4.0 V clamps duty cap to 1.0";
 
   const std::array<hw::MotorRequest, 1> neutral{
       Request(1, hw::Mode::kNeutral, 0.0)};
   ASSERT_TRUE(ApplySent(backend, neutral));
   EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut");
+
+  // Overwriting the TalonFX with Phoenix defaults (800 A peak torque current)
+  // and running RestorePass must restore +-max_torque_current_a.
+  const ctre::phoenix6::configs::TalonFXConfiguration defaults;
+  ASSERT_TRUE(AwaitAnswer([&] {
+                return Motor(backend, 0).GetConfigurator().Apply(defaults);
+              }).IsOK());
+  ASSERT_TRUE(AppliedConfig(backend, 0, applied));
+  ASSERT_NE(applied.TorqueCurrent.PeakForwardTorqueCurrent.value(), 5.0)
+      << "not reset";
+  ASSERT_NE(applied.TorqueCurrent.PeakReverseTorqueCurrent.value(), -5.0)
+      << "not reset";
+  const std::array<uint16_t, 1> ids{1};
+  ASSERT_TRUE(RestorePass(backend, ids));
+  ASSERT_TRUE(AppliedConfig(backend, 0, applied));
+  EXPECT_DOUBLE_EQ(applied.TorqueCurrent.PeakForwardTorqueCurrent.value(), 5.0);
+  EXPECT_DOUBLE_EQ(applied.TorqueCurrent.PeakReverseTorqueCurrent.value(),
+                   -5.0);
 }
 
 // A torque-current request the gateway would have neutralized never drives
@@ -2820,6 +2873,92 @@ TEST_F(PhoenixBackendRecovery,
   // clears UnavailableDevices().
   ASSERT_TRUE(RestorePass(backend, ids));
   EXPECT_TRUE(backend.UnavailableDevices().empty());
+}
+
+// PollDeviceResets polls every configured TalonFX, CANcoder, and Pigeon2,
+// returns their logical device ids (never raw CAN ids), clears stale entries
+// and reset latches across subsequent polls, and logs each reset via RioLog
+// without coalescing motor and sensor slots.
+// REQ-SAFE-24
+TEST_F(PhoenixBackendRecovery, PollDeviceResetsReportsLogicalIdsClearsAndLogs) {
+  EnsureHal();
+  Console console;
+  hw::Config config;
+  // Logical ids (10, 11, 20, 30) are intentionally distinct from raw CAN ids
+  // (1, 4, 2, 3).
+  config.motors = {TestMotor(10, "lift", 1), TestMotor(11, "intake", 4)};
+  config.sensors = {
+      hw::SensorConfig{20, "steer_enc", hw::SensorKind::kCANcoder, 2, "rio"},
+      hw::SensorConfig{30, "imu", hw::SensorKind::kPigeon2, 3, "rio"}};
+
+  PhoenixBackend backend(true, console.log());
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  // Exercise the default HasResetOccurred() path first: drain any initial sim
+  // boot latch, then verify a clean poll clears pre-existing reset_ids and
+  // returns false.
+  std::vector<uint16_t> reset_ids{999};
+  backend.PollDeviceResets(reset_ids);
+  reset_ids = {999};
+  EXPECT_FALSE(backend.PollDeviceResets(reset_ids));
+  EXPECT_TRUE(reset_ids.empty());
+
+  // Phoenix 6 desktop sim has no reset-latch trigger, so stand in for
+  // ParentDevice::HasResetOccurred() with a one-shot latch set keyed by the
+  // real device object pointers.
+  std::vector<ctre::phoenix6::hardware::ParentDevice*> latched;
+  SetResetPoller(
+      backend, [&latched](ctre::phoenix6::hardware::ParentDevice& device) {
+        const auto it = std::find(latched.begin(), latched.end(), &device);
+        if (it == latched.end()) return false;
+        latched.erase(it);
+        return true;
+      });
+
+  // No device latched: clears stale output and returns false.
+  reset_ids = {999};
+  EXPECT_FALSE(backend.PollDeviceResets(reset_ids));
+  EXPECT_TRUE(reset_ids.empty());
+
+  // Latch TalonFX (id=10, can=1), CANcoder (id=20, can=2), and Pigeon2
+  // (id=30, can=3), leaving motor intake (id=11, can=4) unlatched.
+  latched = {&Motor(backend, 0), &SensorEncoder(backend, 0),
+             &SensorImu(backend, 1)};
+  reset_ids = {999};
+  ASSERT_TRUE(backend.PollDeviceResets(reset_ids));
+  EXPECT_EQ(reset_ids, (std::vector<uint16_t>{10, 20, 30}));
+
+  // Each reset logs its device kind, name, logical id, bus, and CAN id.
+  // Motor slot 0 and sensor slot 0 must not coalesce into one rate-limit key.
+  EXPECT_EQ(console
+                .Lines({"[phoenix] device reset detected: motor lift "
+                        "(id=10, bus=rio, can_id=1)"})
+                .size(),
+            1u);
+  EXPECT_EQ(console
+                .Lines({"[phoenix] device reset detected: sensor steer_enc "
+                        "(id=20, bus=rio, can_id=2)"})
+                .size(),
+            1u);
+  EXPECT_EQ(console
+                .Lines({"[phoenix] device reset detected: sensor imu "
+                        "(id=30, bus=rio, can_id=3)"})
+                .size(),
+            1u);
+  EXPECT_TRUE(console.Lines({"device reset detected:", "intake"}).empty());
+
+  // Subsequent poll reports nothing once latches were consumed.
+  EXPECT_FALSE(backend.PollDeviceResets(reset_ids));
+  EXPECT_TRUE(reset_ids.empty());
+
+  // A single sensor reset returns only that sensor's logical id and clears on
+  // the next poll.
+  latched = {&SensorImu(backend, 1)};
+  ASSERT_TRUE(backend.PollDeviceResets(reset_ids));
+  EXPECT_EQ(reset_ids, (std::vector<uint16_t>{30}));
+  EXPECT_FALSE(backend.PollDeviceResets(reset_ids));
+  EXPECT_TRUE(reset_ids.empty());
 }
 
 // Config validation allows a follower motor to precede its master in
