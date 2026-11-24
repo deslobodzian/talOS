@@ -1917,6 +1917,25 @@ TEST(LauncherGraphTest, AnOptOutTheProbeDidNotDescribeIsAnEndpointMismatch) {
   EXPECT_EQ(EndpointMismatch({opted_out}, {opted_out}), "");
 }
 
+// REQ-SAFE-27, REQ-CONTRACT-11: EndpointMismatch catches a live node that
+// drops or adds hardware_request on /hw/request/<node> compared to its
+// --describe probe.
+TEST(LauncherGraphTest, DroppedHardwareRequestFlagIsAnEndpointMismatch) {
+  auto described = Sender("/hw/request/alpha", 64);
+  described.flags = introspect::naming::kSourceFlagHardwareRequest;
+  auto raw_live = Sender("/hw/request/alpha", 64);
+
+  const std::string dropped = EndpointMismatch({described}, {raw_live});
+  EXPECT_NE(dropped.find("/hw/request/alpha"), std::string::npos) << dropped;
+  EXPECT_NE(dropped.find("hardware_request"), std::string::npos) << dropped;
+
+  const std::string added = EndpointMismatch({raw_live}, {described});
+  EXPECT_NE(added.find("/hw/request/alpha"), std::string::npos) << added;
+  EXPECT_NE(added.find("hardware_request"), std::string::npos) << added;
+
+  EXPECT_EQ(EndpointMismatch({described}, {described}), "");
+}
+
 // REQ-SAFE-14, REQ-CONTRACT-11: EndpointMismatch catches a live node that
 // drops operator_arming on a target lane or drops internal_driver_station on
 // /hw/state/driver_station compared to its --describe probe.

@@ -5328,14 +5328,28 @@ bool AdvanceClockWithHealthyNodes(const std::stop_token& stop,
 // A Studio bridge that registers its row, advances dispatch_count, and then
 // hangs without exiting is detected by the launcher's liveness watch, killed
 // as `stalled`, and restarted on the bridge's schedule without disturbing any
-// other node.
+// other node; holding the restarted run before registration while the clock
+// stays at `retry_at` must not kill it across supervision passes.
 // REQ-OPS-30
 TEST(Supervision, HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes) {
   const auto bridge_runs = TempPath("bridge_hang_bridge_runs");
   const auto hang = TempPath("bridge_hang_now");
   const auto hung_ack = hang + ".hung";
-  for (const auto* path : {&bridge_runs, &hang, &hung_ack})
+  const auto hold_run2 = TempPath("bridge_hang_hold_run2");
+  const auto hold_ready = hold_run2 + ".ready";
+  for (const auto* path :
+       {&bridge_runs, &hang, &hung_ack, &hold_run2, &hold_ready}) {
     ::remove(path->c_str());
+  }
+  struct HoldCleanup {
+    std::string hold;
+    std::string ready;
+    ~HoldCleanup() {
+      ::remove(hold.c_str());
+      ::remove(ready.c_str());
+    }
+  } hold_cleanup{hold_run2, hold_ready};
+  std::ofstream{hold_run2}.close();
   testing::SteppedClock clock;
   const SupervisionTime start = clock.Freeze();
   auto options = BaseOptions("bridge_hang");
@@ -5350,7 +5364,8 @@ TEST(Supervision, HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes) {
   const std::string binary = RunfileBinary("TALOS_HANGING_BRIDGE");
   options.binary_overrides["//studio/bridge:studio_bridge"] = WriteStub(
       "bridge_hang_bridge",
-      "exec " + binary + " '" + bridge_runs + "' '" + hang + "' once \"$@\"\n",
+      "TALOS_HOLD_RUN2_BEFORE_REGISTER='" + hold_run2 + "' exec " + binary +
+          " '" + bridge_runs + "' '" + hang + "' once \"$@\"\n",
       "studio_bridge");
   const std::string live = options.output_dir + "/" +
                            std::to_string(options.session_id) +
@@ -5359,6 +5374,8 @@ TEST(Supervision, HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes) {
   constexpr std::array kNodes{"hardware_node", "alpha", "beta"};
   testing::SupervisionPasses passes;
   std::string before;
+  bool held_before_register = false;
+  std::vector<std::string> held_history;
   bool restarted = false;
   std::jthread driver{[&](const std::stop_token& stop) {
     const testing::SteppedClock::ReleaseOnExit release{clock};
@@ -5407,21 +5424,38 @@ TEST(Supervision, HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes) {
                      std::string::npos &&
                  retry_at > 0;
         });
-        // Advance exactly to `retry_at` and hold there until the restarted
-        // run registers its own row (matched by run 2's PID, distinct from
-        // run 1's SIGKILLed row) and one supervision pass observes it.
+        // Advance exactly to `retry_at` and hold there while run 2 is parked
+        // before claiming its registry row: two supervision passes must leave
+        // the unregistered restart running rather than killing it. Then
+        // release `hold_run2` and wait until run 2 registers its own row
+        // (matched by run 2's PID, distinct from run 1's SIGKILLed row) and
+        // one supervision pass observes it.
         if (stalled &&
             AdvanceClockWithHealthyNodes(
                 stop, clock, passes, session, now,
                 SupervisionTime{std::chrono::nanoseconds{retry_at}})) {
-          restarted = WaitFor(stop,
-                              [&] {
-                                const auto lines = ReadLines(bridge_runs);
-                                if (lines.size() != 2) return false;
-                                return RegisteredPid("studio_bridge", session,
-                                                     ParsePidLine(lines[1]));
-                              }) &&
-                      observe_pass();
+          held_before_register =
+              WaitFor(stop,
+                      [&] {
+                        return std::filesystem::exists(hold_ready) &&
+                               ManifestRuns(ReadFile(live), "studio_bridge")
+                                       .size() >= 2;
+                      }) &&
+              observe_pass() && observe_pass();
+          if (held_before_register) {
+            held_history = ManifestRuns(ReadFile(live), "studio_bridge");
+          }
+          ::remove(hold_run2.c_str());
+          if (held_before_register) {
+            restarted = WaitFor(stop,
+                                [&] {
+                                  const auto lines = ReadLines(bridge_runs);
+                                  if (lines.size() != 2) return false;
+                                  return RegisteredPid("studio_bridge", session,
+                                                       ParsePidLine(lines[1]));
+                                }) &&
+                        observe_pass();
+          }
         }
       }
     }
@@ -5429,6 +5463,14 @@ TEST(Supervision, HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes) {
   }};
   const int status = RunSession(options);
   driver.join();
+  EXPECT_TRUE(held_before_register)
+      << "restarted studio_bridge did not park before registering";
+  EXPECT_EQ(held_history.size(), 2u);
+  if (held_history.size() >= 2u) {
+    EXPECT_NE(held_history[1].find("\"reason\": \"running\""),
+              std::string::npos)
+        << held_history[1];
+  }
   EXPECT_TRUE(restarted) << "hung studio_bridge was not killed and restarted";
   EXPECT_EQ(status, 0);
   const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
@@ -6587,8 +6629,10 @@ TEST(Supervision, QuiescedBridgeDecouplesActuatorStopFromLogFlushTimeout) {
     std::jthread driver{[&](const std::stop_token& stop) {
       const testing::SteppedClock::ReleaseOnExit release_clock{clock};
       if (!WaitFor(stop, [&] {
+            const auto init_hw = ManifestRuns(ReadFile(live), "hardware_node");
             return ReadLines(ready).size() == 3 &&
-                   Registered("hardware_node", session);
+                   Registered("hardware_node", session) && !init_hw.empty() &&
+                   init_hw.back().find("\"running\"") != std::string::npos;
           })) {
         std::ofstream{release_hw}.close();
         ::kill(::getpid(), SIGTERM);
@@ -6690,8 +6734,10 @@ TEST(Supervision, QuiescedBridgeDecouplesActuatorStopFromLogFlushTimeout) {
     std::jthread driver{[&](const std::stop_token& stop) {
       const testing::SteppedClock::ReleaseOnExit release_clock{clock};
       if (!WaitFor(stop, [&] {
+            const auto init_hw = ManifestRuns(ReadFile(live), "hardware_node");
             return ReadLines(ready).size() == 3 &&
-                   Registered("hardware_node", session);
+                   Registered("hardware_node", session) && !init_hw.empty() &&
+                   init_hw.back().find("\"running\"") != std::string::npos;
           })) {
         ::kill(::getpid(), SIGTERM);
         return;
@@ -6790,8 +6836,10 @@ TEST(Supervision, QuiescedBridgeDecouplesActuatorStopFromLogFlushTimeout) {
     std::jthread driver{[&](const std::stop_token& stop) {
       const testing::SteppedClock::ReleaseOnExit release_clock{clock};
       if (!WaitFor(stop, [&] {
+            const auto init_hw = ManifestRuns(ReadFile(live), "hardware_node");
             return ReadLines(ready).size() == 3 &&
-                   Registered("hardware_node", session);
+                   Registered("hardware_node", session) && !init_hw.empty() &&
+                   init_hw.back().find("\"running\"") != std::string::npos;
           })) {
         ::kill(::getpid(), SIGTERM);
         return;

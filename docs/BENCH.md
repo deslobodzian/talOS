@@ -505,9 +505,11 @@ sleep precision. Releasing a lane is not a mechanical brake.
   invented pass threshold. The 200 ms recovery must require neutral inputs
   before teleop resumes. Record target publication/tick ages and drive timing.
 - [ ] Pause the motor node with SIGSTOP for 200 ms, then SIGCONT. Expected:
-  gateway per-owner request watchdog neutralizes within command timeout plus
-  its tick even though the node cannot execute; record actual delay and timeout
-  mask. Disable/release before resuming and verify no unintended motion.
+  bridge per-owner request watchdog neutralizes after the owner timeout
+  (`max(2 × period_us, command_timeout_us / 2)`, 50 ms on the bench) plus
+  bridge/gateway tick latency even though the node cannot execute; record
+  actual delay and timeout mask. Disable/release before resuming and verify no
+  unintended motion.
 - [ ] While spinning slowly, unplug RIO Ethernet (on this bench that also
   cuts the Driver Station's link, which disables). Expected: gateway watchdog
   neutralizes, Mini feedback becomes stale/disconnected and state age rises.

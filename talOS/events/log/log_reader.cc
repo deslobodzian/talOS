@@ -90,6 +90,26 @@ void check_identity(const FileHeader& header) {
   }
 }
 
+// Rejects header, manifest or schema sizes above the reader's caps before any
+// reader streams or allocates for them (REQ-OPS-42).
+void check_header_bounds(const FileHeader& header) {
+  if (header.header_bytes > kMaxFileHeaderBytes) {
+    throw std::runtime_error(
+        "LogReader: file header size " + std::to_string(header.header_bytes) +
+        " exceeds limit " + std::to_string(kMaxFileHeaderBytes));
+  }
+  if (header.manifest_count > kMaxManifestEntries) {
+    throw std::runtime_error(
+        "LogReader: manifest count " + std::to_string(header.manifest_count) +
+        " exceeds limit " + std::to_string(kMaxManifestEntries));
+  }
+  if (header.schema_bytes > kMaxSchemaBlockBytes) {
+    throw std::runtime_error(
+        "LogReader: schema block size " + std::to_string(header.schema_bytes) +
+        " exceeds limit " + std::to_string(kMaxSchemaBlockBytes));
+  }
+}
+
 bool IsGap(const RecordHeader& header) noexcept {
   return header.kind == static_cast<std::uint16_t>(EventKind::GAP);
 }
@@ -114,6 +134,11 @@ class SpanSource {
     if (offset >= data_.size()) return {};
     const auto at = static_cast<std::size_t>(offset);
     return data_.subspan(at, std::min(n, data_.size() - at));
+  }
+  std::span<const std::byte> view_at_least(std::uint64_t offset,
+                                           std::size_t /*min_n*/,
+                                           std::size_t max_n) const {
+    return view(offset, max_n);
   }
 
  private:
@@ -192,20 +217,33 @@ class FileSource {
   // Up to `n` (at most kChunk) bytes at `offset`, valid until the next call;
   // fewer only at the end of the file.
   std::span<const std::byte> view(std::uint64_t offset, std::size_t n) {
-    if (offset < window_offset_ || n > window_.size() ||
-        offset - window_offset_ > window_.size() - n) {
+    return view_at_least(offset, n, n);
+  }
+  // Up to `max_n` (at most kChunk) bytes at `offset`, reusing the cached
+  // window whenever at least `min(min_n, remaining)` bytes are already in it;
+  // valid until the next call. Fewer than `min_n` only at the end of the file.
+  std::span<const std::byte> view_at_least(std::uint64_t offset,
+                                           std::size_t min_n,
+                                           std::size_t max_n) {
+    if (offset >= size_ || max_n == 0) return {};
+    const std::uint64_t remaining = size_ - offset;
+    const std::size_t clamped_min = std::min(min_n, max_n);
+    const std::size_t want = static_cast<std::size_t>(std::min<std::uint64_t>(
+        std::max<std::size_t>(1, clamped_min), remaining));
+    if (offset < window_offset_ || want > window_.size() ||
+        offset - window_offset_ > window_.size() - want) {
       DescriptorCache& cache = DescriptorCache::instance();
       // Held across the read, so no other source closes this descriptor.
       const std::lock_guard lock{cache.mutex()};
       reopen(cache);
       fill(offset);
     }
-    if (offset < window_offset_ || offset >= window_offset_ + window_.size()) {
+    if (offset < window_offset_ || offset - window_offset_ >= window_.size()) {
       return {};
     }
     const auto at = static_cast<std::size_t>(offset - window_offset_);
     return std::span<const std::byte>{window_}.subspan(
-        at, std::min(n, window_.size() - at));
+        at, std::min(max_n, window_.size() - at));
   }
 
  private:
@@ -252,7 +290,9 @@ class FileSource {
                                 static_cast<off_t>(offset + got));
       if (n < 0) {
         if (errno == EINTR) continue;
-        throw std::system_error(errno, std::generic_category(),
+        const int error = errno;
+        window_.resize(got);
+        throw std::system_error(error, std::generic_category(),
                                 "LogReader: read failed");
       }
       if (n == 0) break;  // Shrank under us: what is there is the file.
@@ -301,7 +341,8 @@ std::uint64_t find_magic(Source& source, std::uint64_t from) {
   std::array<std::byte, sizeof(RECORD_MAGIC)> magic{};
   std::memcpy(magic.data(), &RECORD_MAGIC, magic.size());
   while (from < source.size() && source.size() - from >= magic.size()) {
-    const std::span<const std::byte> bytes = source.view(from, Source::kChunk);
+    const std::span<const std::byte> bytes =
+        source.view_at_least(from, magic.size(), Source::kChunk);
     const auto found =
         std::search(bytes.begin(), bytes.end(), magic.begin(), magic.end());
     if (found != bytes.end()) {
@@ -487,8 +528,12 @@ LogReader::LogReader(std::string_view path)
   FileHeader header{};
   std::memcpy(&header, data_.data(), std::min(data_.size(), sizeof(header)));
   check_identity(header);
-  if (header.header_bytes < sizeof(FileHeader) ||
-      data_.size() < header.header_bytes) {
+  if (data_.size() < sizeof(FileHeader) ||
+      header.header_bytes < sizeof(FileHeader)) {
+    throw IncompleteLogHeader("LogReader: file too short for its header");
+  }
+  check_header_bounds(header);
+  if (data_.size() < header.header_bytes) {
     throw IncompleteLogHeader("LogReader: file too short for its header");
   }
 
@@ -647,10 +692,13 @@ WindowedLogReader::WindowedLogReader(std::string_view path)
     throw IncompleteLogHeader("LogReader: file too short for a header");
   }
   check_identity(header);
+  if (header_read < sizeof(FileHeader) ||
+      header.header_bytes < sizeof(FileHeader)) {
+    throw IncompleteLogHeader("LogReader: file too short for its header");
+  }
+  check_header_bounds(header);
   std::uint32_t ignored = 0;
-  if (header.header_bytes < sizeof(FileHeader) ||
-      header_read < sizeof(FileHeader) ||
-      !stream.fold(header.header_bytes - sizeof(FileHeader), ignored)) {
+  if (!stream.fold(header.header_bytes - sizeof(FileHeader), ignored)) {
     throw IncompleteLogHeader("LogReader: file too short for its header");
   }
 
