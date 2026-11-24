@@ -44,7 +44,7 @@ using hardware::MotorRequest;
 // start pose, its teleop bindings' speeds, its schedule.
 constexpr hardware::sim::PhysicsOptions kStartPose{
     .start_x_m = 1.907, .start_y_m = 5.302, .start_yaw_rad = 2.705};
-constexpr double kFlywheelRps = 41.0;
+constexpr double kFlywheelRps = 43.0;
 constexpr double kFeederRps = 30.0;
 constexpr uint64_t kTickUs = 5000;
 constexpr int kTeleopFromTick = 200;  // disabled for 1 s

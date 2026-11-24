@@ -45,7 +45,7 @@ max_velocity_rps = 100.0
 # p until the step response stops lagging, then s to break static friction.
 slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 
-# The beam break across the chute where a piece waits for the feeder.
+# The beam break across the hopper where a piece waits for the feeder.
 # PLACEHOLDER channel, as the CAN id above.
 [digital_inputs.feeder_beam]
 dio = 1

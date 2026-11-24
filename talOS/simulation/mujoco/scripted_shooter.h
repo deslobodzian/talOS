@@ -15,7 +15,8 @@
 // the launch leaves the flywheel with, where w is the flywheel's speed before
 // and k = (1 + beta)/2 m r_c / J; the flywheel loses k v. README.md
 // "Scripted shooter" says the rest of what a launch does and when a body
-// waits.
+// waits: among others, while it would meet the shooter's previous launch in
+// flight, for at most 0.5 s after that launch.
 
 #include <cstddef>
 #include <cstdint>
@@ -72,14 +73,23 @@ class ScriptedShooters final : public WorldRules {
     double beta{};      // I/(m r^2), I the mean principal inertia
   };
 
-  // Launches `body` from `shooter` unless the flywheel is not turning forward
-  // or another body is still at the exit. True when it launched.
+  // The last body a shooter launched (its bodies_ index; -1: none yet) and
+  // the step it launched in.
+  struct Last {
+    int body{-1};
+    uint64_t step{};
+  };
+
+  // Launches `body` from `shooter` unless the flywheel is not turning forward,
+  // another body is still at the exit, or it would meet `leader` (a bodies_
+  // index; -1: none to space from) in flight. True when it launched.
   bool Launch(const mjModel_& model, mjData_& data, const Shooter& shooter,
-              const Body& body);
+              const Body& body, int leader);
 
   std::vector<Shooter> shooters_;
   std::vector<Body> bodies_;
   std::vector<uint64_t> launched_step_;  // by bodies_ entry; 0: never
+  std::vector<Last> last_;               // by shooters_ entry
   uint64_t shots_{};
 };
 

@@ -25,7 +25,7 @@ seed = 1
 # shot's speed on /flywheel/target/teleop.
 [[subsystems.flywheel.teleop.bindings]]
 button = 3
-while_held = { velocity_rps = 41.0 }
+while_held = { velocity_rps = 43.0 }
 
 # The simulated motor's gains (volts per rps), not the mechanism's.
 [subsystems.flywheel.motors.flywheel_motor]
