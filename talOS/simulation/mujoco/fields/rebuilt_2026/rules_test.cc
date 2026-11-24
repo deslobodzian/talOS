@@ -762,11 +762,10 @@ Recording RunScenario(uint64_t seed) {
 }
 
 // REQ-DEV-40: the same model, seed and inputs give the same match and the
-// same world, bit for bit; another seed releases differently.
-TEST(Rebuilt2026Rules, RunsAreBitIdenticalAndTheSeedMatters) {
+// same world, bit for bit.
+TEST(Rebuilt2026Rules, RunsAreBitIdentical) {
   const Recording a = RunScenario(1);
   const Recording b = RunScenario(1);
-  const Recording c = RunScenario(2);
   ASSERT_GE(a.matches.back().blue_points_count(), 3u);
   ASSERT_LT(a.matches.back().pieces_held_count(), 3u) << "nothing released";
   for (std::size_t i = 0; i < a.matches.size(); ++i) {
@@ -778,6 +777,15 @@ TEST(Rebuilt2026Rules, RunsAreBitIdenticalAndTheSeedMatters) {
   const std::size_t qvel = sizeof(mjtNum) * a.qvel.size();
   EXPECT_EQ(std::memcmp(a.qpos.data(), b.qpos.data(), qpos), 0);
   EXPECT_EQ(std::memcmp(a.qvel.data(), b.qvel.data(), qvel), 0);
+}
+
+// REQ-DEV-40: another seed releases differently (its own case, so each
+// shard runs two scenarios, not three).
+TEST(Rebuilt2026Rules, TheSeedMatters) {
+  const Recording a = RunScenario(1);
+  const Recording c = RunScenario(2);
+  ASSERT_LT(a.matches.back().pieces_held_count(), 3u) << "nothing released";
+  const std::size_t qvel = sizeof(mjtNum) * a.qvel.size();
   EXPECT_NE(std::memcmp(a.qvel.data(), c.qvel.data(), qvel), 0)
       << "seed 2 released as seed 1 did";
 }

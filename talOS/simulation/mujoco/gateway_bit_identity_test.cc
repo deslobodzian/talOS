@@ -291,6 +291,18 @@ constexpr int kAutoFromTick = 10;
 constexpr int kTeleopFromTick = 110;  // after 0.5 s of AUTO
 constexpr int kGameTicks = 400;       // 2 s; a HUB returns its FUEL after 1 s
 constexpr int kGameProbeTick = 150;   // in TELEOP, after the launch
+// The identical-runs comparison runs through the HUB's return of the FUEL
+// it scored (at tick 309, 1 s after the score on the tick TELEOP starts,
+// measured), and asserts that return, so it stops 11 ticks after it rather
+// than at kGameTicks.
+constexpr int kReturnedByTicks = 320;
+// The seed's draw is made on the tick TELEOP starts (a 0-0 tie after AUTO):
+// a run that ends on it has it.
+constexpr int kDrawnByTicks = kTeleopFromTick + 1;
+// A 1 us shift at kGameProbeTick shows from the next tick on (measured: tick
+// 151); 49 ticks after the probe leave room and stop long before the HUB's
+// release, which that comparison does not need.
+constexpr int kShiftedTicks = kGameProbeTick + 50;
 
 uint32_t FlagsAt(int tick) {
   if (tick < kAutoFromTick) return ds::kDsAttached;
@@ -384,18 +396,18 @@ struct GameWorld {
   std::vector<int> tree_asleep;
 };
 
-// Jittered ticks as RunSchedule's; `shift_us` moves kGameProbeTick's sample
-// time (and only it) across a step boundary. `world`, when given, receives
-// the world after the last tick.
+// Jittered ticks as RunSchedule's, `count` of them; `shift_us` moves
+// kGameProbeTick's sample time (and only it) across a step boundary.
+// `world`, when given, receives the world after the last tick.
 std::vector<GameTick> RunGame(uint64_t seed, int64_t shift_us,
-                              bool sleeping = false,
+                              int count = kGameTicks, bool sleeping = false,
                               GameWorld* world = nullptr) {
   GameAssembly a(GameConfig(seed, sleeping));
   std::vector<GameTick> ticks;
   constexpr uint64_t kStartUs = 1000;
   uint64_t now_us = kStartUs;
   uint64_t probe_us = 0;
-  for (int i = 0; i < kGameTicks; ++i) {
+  for (int i = 0; i < count; ++i) {
     uint64_t next =
         now_us + 5000 + static_cast<uint64_t>((i * 7919) % 401) - 200;
     if (i == kGameProbeTick) {
@@ -426,9 +438,9 @@ std::vector<GameTick> RunGame(uint64_t seed, int64_t shift_us,
 
 // REQ-DEV-37, REQ-DEV-39, REQ-DEV-40
 TEST(MujocoGatewayBitIdentity, GameRunsGiveIdenticalStatesAndMatches) {
-  const std::vector<GameTick> a = RunGame(1, 0);
-  const std::vector<GameTick> b = RunGame(1, 0);
-  for (int i = 0; i < kGameTicks; ++i) {
+  const std::vector<GameTick> a = RunGame(1, 0, kReturnedByTicks);
+  const std::vector<GameTick> b = RunGame(1, 0, kReturnedByTicks);
+  for (int i = 0; i < kReturnedByTicks; ++i) {
     ASSERT_EQ(a[i].state, b[i].state) << "tick " << i;
     ASSERT_EQ(a[i].match, b[i].match) << "tick " << i;
   }
@@ -456,10 +468,13 @@ TEST(MujocoGatewayBitIdentity, GameRunsGiveIdenticalStatesAndMatches) {
         << "the first launch's tick";
     break;
   }
+  // The HUB held what it scored and returned it to the field.
+  ASSERT_GT(MatchOf(a[kGameProbeTick]).pieces_held_count(), 0u);
+  ASSERT_EQ(last.pieces_held_count(), 0u) << "the HUB returned nothing";
   // Each tick's stamp is that tick's match, the ticks a mode changes on
   // included: the period's time left, and from TELEOP the alliance inactive
   // first.
-  for (int i = 0; i < kGameTicks; ++i) {
+  for (int i = 0; i < kReturnedByTicks; ++i) {
     const ::sim::MatchState match = MatchOf(a[i]);
     const FmsStamp& stamp = a[i].stamp;
     EXPECT_FLOAT_EQ(stamp.match_time_s,
@@ -472,18 +487,26 @@ TEST(MujocoGatewayBitIdentity, GameRunsGiveIdenticalStatesAndMatches) {
   }
   EXPECT_FLOAT_EQ(a[kTeleopFromTick].stamp.match_time_s, 140.0F)
       << "the tick TELEOP starts on";
+}
 
-  // The seed decides TELEOP's tie (0-0 after AUTO), the game's first draw:
-  // seed 1 draws 0.567 (red inactive first), seed 3 draws 0.113 (blue).
+// REQ-DEV-40: the seed decides TELEOP's tie (0-0 after AUTO), the game's
+// first draw: seed 1 draws 0.567 (red inactive first), seed 3 draws 0.113
+// (blue). Both runs end on the tick that draws it.
+TEST(MujocoGatewayBitIdentity, TheSeedDecidesTeleopsTie) {
+  const ::sim::MatchState last = MatchOf(RunGame(1, 0, kDrawnByTicks).back());
   ASSERT_TRUE(last.tie_drawn());
-  const std::vector<GameTick> reseeded = RunGame(3, 0);
+  const std::vector<GameTick> reseeded = RunGame(3, 0, kDrawnByTicks);
   EXPECT_NE(MatchOf(reseeded.back()).blue_inactive_first(),
             last.blue_inactive_first());
+}
 
-  // A 1 us change at one tick changes what follows.
-  const std::vector<GameTick> shifted = RunGame(1, 1);
+// REQ-DEV-37: a 1 us change at one tick changes what follows, so the
+// identical runs above are not identical by being insensitive.
+TEST(MujocoGatewayBitIdentity, AOneMicrosecondShiftChangesWhatFollows) {
+  const std::vector<GameTick> a = RunGame(1, 0, kShiftedTicks);
+  const std::vector<GameTick> shifted = RunGame(1, 1, kShiftedTicks);
   int differing = 0;
-  for (int i = kGameProbeTick + 1; i < kGameTicks; ++i) {
+  for (int i = kGameProbeTick + 1; i < kShiftedTicks; ++i) {
     differing += a[i].state != shifted[i].state;
   }
   EXPECT_GT(differing, 0) << "a 1 us change at tick " << kGameProbeTick
@@ -497,8 +520,9 @@ TEST(MujocoGatewayBitIdentity, GameRunsGiveIdenticalStatesAndMatches) {
 TEST(MujocoGatewayBitIdentity, GameRunsWithSleepingOnGiveIdenticalWorlds) {
   GameWorld first_world;
   GameWorld second_world;
-  const std::vector<GameTick> a = RunGame(1, 0, true, &first_world);
-  const std::vector<GameTick> b = RunGame(1, 0, true, &second_world);
+  const std::vector<GameTick> a = RunGame(1, 0, kGameTicks, true, &first_world);
+  const std::vector<GameTick> b =
+      RunGame(1, 0, kGameTicks, true, &second_world);
   for (int i = 0; i < kGameTicks; ++i) {
     ASSERT_EQ(a[i].state, b[i].state) << "tick " << i;
     ASSERT_EQ(a[i].match, b[i].match) << "tick " << i;

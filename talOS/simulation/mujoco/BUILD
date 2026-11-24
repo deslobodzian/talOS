@@ -183,13 +183,17 @@ cc_test(
 # REQ-DEV-37: two compiles of one model, ticked at the same jittered times
 # with the same commands and faults, give identical encoded States; a 1 us
 # change at one tick does not; with sleeping on, two game runs end in the
-# same world.
+# same world. Five shards, so each has its own timeout under
+# --config=tsan: gtest gives case i to shard i % 5, which runs the two
+# 2 s game runs of GameRunsGiveIdenticalStatesAndMatches beside only the
+# cheap first case.
 cc_test(
     name = "gateway_bit_identity_test",
     size = "small",
     srcs = ["gateway_bit_identity_test.cc"],
     data = ["//talOS/simulation/mujoco/fields/rebuilt_2026"],
     env = {"FIELD_XML": "$(rlocationpath //talOS/simulation/mujoco/fields/rebuilt_2026)"},
+    shard_count = 5,
     deps = [
         ":gateway_extension",
         ":plant",
