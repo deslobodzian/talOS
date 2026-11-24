@@ -173,23 +173,49 @@ uint64_t SessionId(const std::string& text) {
   return value;
 }
 
-talos::event::Manifest Manifest(bool physics) {
-  if (!physics) return {};
-  return {{
-      .id = 0,
-      .kind = talos::event::SourceKind::SENDER,
-      .name = sim::topics::kState,
-      .message_bytes = sizeof(geometry::OdometrySample),
-      .alignment = alignof(geometry::OdometrySample),
-      .schema = talos::schema::Of<geometry::OdometrySample>(),
-  }};
+// /sim/state under --physics, then the extension's own topics (Topics(),
+// asked once per program), numbered after it. Refuses a topic declared twice
+// (the gateway's own included) and more sources than a registry row holds,
+// which the row would otherwise drop.
+talos::event::Manifest Manifest(bool physics,
+                                const talos::event::Manifest& extension) {
+  talos::event::Manifest manifest;
+  if (physics) {
+    manifest.push_back({
+        .id = 0,
+        .kind = talos::event::SourceKind::SENDER,
+        .name = sim::topics::kState,
+        .message_bytes = sizeof(geometry::OdometrySample),
+        .alignment = alignof(geometry::OdometrySample),
+        .schema = talos::schema::Of<geometry::OdometrySample>(),
+    });
+  }
+  if (manifest.size() + extension.size() >
+      talos::introspect::kMaxSourcesPerNode) {
+    throw std::invalid_argument(
+        "sim_gateway: " + std::to_string(manifest.size() + extension.size()) +
+        " topics, more than the " +
+        std::to_string(talos::introspect::kMaxSourcesPerNode) +
+        " a registry row holds");
+  }
+  for (const auto& topic : extension) {
+    for (const auto& earlier : manifest) {
+      if (earlier.name == topic.name) {
+        throw std::invalid_argument("sim_gateway: topic " + topic.name +
+                                    " is declared twice");
+      }
+    }
+    manifest.push_back(topic);
+    manifest.back().id = static_cast<uint16_t>(manifest.size() - 1);
+  }
+  return manifest;
 }
 
 // Use the same manifest for the launcher probe and the live registration.
-int Describe(std::string_view target, bool physics) {
+int Describe(std::string_view target, const talos::event::Manifest& manifest) {
   std::cout << talos::introspect::DescribeToJson(
       talos::introspect::DescribeManifest(kNodeName, std::string{target},
-                                          Manifest(physics), MAX_SLOTS));
+                                          manifest, MAX_SLOTS));
   return 0;
 }
 
@@ -292,7 +318,12 @@ int Run(int argc, char** argv,
       throw std::invalid_argument(
           std::string{"physics options require --physics\n"} + kUsage);
     }
-    if (describe) return Describe(program.target, physics);
+    // The extension's topics, asked once: the probe and the live row must
+    // declare the same endpoints.
+    const talos::event::Manifest extension_topics =
+        extension != nullptr ? extension->Topics() : talos::event::Manifest{};
+    const talos::event::Manifest manifest = Manifest(physics, extension_topics);
+    if (describe) return Describe(program.target, manifest);
     if (config_path == nullptr) {
       throw std::invalid_argument(
           "sim_gateway needs --config PATH: an unconfigured gateway stamps "
@@ -443,7 +474,7 @@ int Run(int argc, char** argv,
           .session_id = session_id,
           .flags = talos::introspect::kFlagSimulation,
       });
-      registration->publish(Manifest(physics));
+      registration->publish(manifest);
     } catch (const std::exception& e) {
       std::fprintf(stderr, "sim_gateway: node registry unavailable: %s\n",
                    e.what());
@@ -490,6 +521,13 @@ int Run(int argc, char** argv,
     uint64_t truth_dropped = 0;
     uint64_t truth_sequence = 0;
     int64_t last_truth_ns = 0;
+    // What the extension stamps into the Driver Station packets (FmsStamp),
+    // kept across ticks; and its topics' counts, sized once.
+    talos::simulation::FmsStamp fms_stamp;
+    std::vector<talos::simulation::TopicCount> topic_counts(
+        extension_topics.size());
+    const std::size_t first_extension_source =
+        manifest.size() - extension_topics.size();
     while (!talos::process::stop_requested.load()) {
       const auto tick_time = talos::event::Poller::now();
       if (!start_ns) {
@@ -535,6 +573,21 @@ int Run(int argc, char** argv,
           phases.empty() ? ds::kDsAttached | ds::kEnabled | ds::kTeleop
                          : phases[phase].flags;
       mode_tracker.Stamp(driver_station);
+      if (extension != nullptr) {
+        std::optional<uint64_t> schedule_us;
+        if (start_ns && tick_time.nanos() >= *start_ns) {
+          schedule_us = static_cast<uint64_t>(elapsed.count());
+        }
+        extension->BeforeTick({.now_us = now,
+                               .schedule_us = schedule_us,
+                               .driver_station = &driver_station},
+                              fms_stamp);
+        driver_station.fms.match_time_s = fms_stamp.match_time_s;
+        std::copy(fms_stamp.game_specific_message.begin(),
+                  fms_stamp.game_specific_message.end() - 1,
+                  std::begin(driver_station.fms.game_specific_message));
+        std::end(driver_station.fms.game_specific_message)[-1] = '\0';
+      }
       endpoint.Tick(now, GatewayEnabled(driver_station.fms.flags));
       if (truth_publisher) {
         const auto sample_time = talos::event::Poller::now();
@@ -572,6 +625,18 @@ int Run(int argc, char** argv,
         if (physics) {
           registration->set_source(0, truth_samples, truth_dropped,
                                    truth_sequence, last_truth_ns, 0, 0);
+        }
+        if (!topic_counts.empty()) {
+          std::fill(topic_counts.begin(), topic_counts.end(),
+                    talos::simulation::TopicCount{});
+          extension->Counts(topic_counts);
+          for (std::size_t i = 0; i < topic_counts.size(); ++i) {
+            const auto& count = topic_counts[i];
+            registration->set_source(
+                static_cast<uint32_t>(first_extension_source + i),
+                count.samples, count.dropped, count.sequence, count.last_ns, 0,
+                0);
+          }
         }
         if (talos::memory::LateLockRefused()) {
           registration->note_realtime_refused(talos::process::kStepRingLock);
