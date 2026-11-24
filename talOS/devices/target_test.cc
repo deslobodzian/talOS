@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -417,14 +418,20 @@ TEST_F(TargetTest, RebootedGatewayRetiresTheOldBootsGeneration) {
     sim.publish(hardware::kDriverStationTopic, packet);
     return data.mode_since_us;
   };
-  constexpr uint64_t kBootA = 0xA1, kBootB = 0xB1;
+  const auto latest_state = sim.latest<hardware::Packet>(hardware::kStateTopic);
+  ASSERT_TRUE(latest_state.has_value());
+  hardware::State hw_state{};
+  ASSERT_TRUE(hardware::Decode(latest_state->bytes(), hw_state));
+  const uint64_t boot_a_id = hw_state.boot_id;
+  const uint64_t boot_b_id = boot_a_id + 1;
 
-  const uint64_t a = publish_ds(boot_a, kBootA, 900'000'000, kTeleop);
+  const uint64_t a = publish_ds(boot_a, boot_a_id, 900'000'000, kTeleop);
   PublishTarget(sim, "lift", "teleop", Goal{1.0}, a);
   sim.step(5ms);
   ASSERT_EQ(Seen(), 1.0);
 
-  const uint64_t b = publish_ds(boot_b, kBootB, 1000, kTeleop);
+  hw.reboot();
+  const uint64_t b = publish_ds(boot_b, boot_b_id, 1000, kTeleop);
   ASSERT_LT(b, a);
   PublishTarget(sim, "lift", "teleop", Goal{2.0}, a);
   sim.step(5ms);
@@ -432,18 +439,18 @@ TEST_F(TargetTest, RebootedGatewayRetiresTheOldBootsGeneration) {
 
   // A's last packet, delayed past the reboot, cannot bring A's generation
   // back.
-  publish_ds(boot_a, kBootA, 900'020'000, kTeleop);
+  publish_ds(boot_a, boot_a_id, 900'020'000, kTeleop);
   PublishTarget(sim, "lift", "teleop", Goal{2.5}, a);
   sim.step(5ms);
   EXPECT_EQ(Seen(), std::nullopt);
 
-  publish_ds(boot_b, kBootB, 21000, kTeleop);
+  publish_ds(boot_b, boot_b_id, 21000, kTeleop);
   PublishTarget(sim, "lift", "teleop", Goal{3.0}, b);
   sim.step(5ms);
   EXPECT_EQ(Seen(), 3.0);
 
   // Disabled in boot B: neutral, whatever generation the lane carries.
-  const uint64_t disabled = publish_ds(boot_b, kBootB, 41000, 0);
+  const uint64_t disabled = publish_ds(boot_b, boot_b_id, 41000, 0);
   PublishTarget(sim, "lift", "teleop", Goal{3.5}, b);
   sim.step(5ms);
   EXPECT_EQ(Seen(), std::nullopt);
@@ -452,7 +459,7 @@ TEST_F(TargetTest, RebootedGatewayRetiresTheOldBootsGeneration) {
   EXPECT_EQ(Seen(), std::nullopt);
 
   // Enabled again, then silent past command_timeout_us: stale is neutral.
-  const uint64_t again = publish_ds(boot_b, kBootB, 61000, kTeleop);
+  const uint64_t again = publish_ds(boot_b, boot_b_id, 61000, kTeleop);
   PublishTarget(sim, "lift", "teleop", Goal{4.0}, again);
   sim.step(5ms);
   ASSERT_EQ(Seen(), 4.0);
@@ -559,6 +566,7 @@ TEST(Target, HardwareStateNotReadyIsNullWithFreshTeleopAndTarget) {
   ASSERT_TRUE(hardware::Decode(latest_state_packet->bytes(), last_state));
   const std::uint64_t config_id = last_state.config_id;
   hw.reset();
+  ds_data.boot_id = 0x55;
   const auto publish_state = [&](std::uint64_t sample_time_us,
                                  std::uint32_t flags) {
     hardware::State state{};
@@ -1473,6 +1481,7 @@ TEST_F(OperatorArmingTest, InputHeldThroughANewBootOfTheSameGenerationWaits) {
   ASSERT_TRUE(ds::Decode(last->bytes(), data));
   ASSERT_NE(data.mode_since_us, 0u);
   hw.stop_driver_station();
+  hw.reboot();
   data.boot_id += 1;
   // The new boot's packets every 5 ms for `d`, with the button held or not.
   const auto publish = [&](bool held, std::chrono::milliseconds d) {
@@ -2501,6 +2510,262 @@ TEST(Target, LateOpenTargetFailsAtomicallyWithoutLeakingSubscriptions) {
   Node& node = sim.node("lift");
   EXPECT_THROW((void)Target<Goal>(node), std::logic_error);
   EXPECT_TRUE(detail::NodeAccess::optional_topics(node).empty());
+}
+
+// REQ-SAFE-07, REQ-SAFE-11, REQ-SAFE-13: Target::get() refuses cross-boot
+// actuation when State(B2, kConfigured|kEnabled) arrives before DS(B2) while
+// DS(B1) and an OperatorArming producer's held-stick target remain fresh.
+// Once DS(B2) arrives, OperatorArming disarms until neutral, then drives on B2.
+// A zero ds.boot_id (send_joystick) still selects with nonzero hw.boot_id.
+TEST(Target, TargetGetRefusesCrossBootStateAndDriverStation) {
+  const auto make_ds = [](bool held) {
+    auto data = DsPacket(kTeleop);
+    data.joysticks[0].connected = true;
+    data.joysticks[0].button_count = 1;
+    data.joysticks[0].buttons = held ? 1u : 0u;
+    return data;
+  };
+
+  auto sim = Sim::FromToml(std::string{kRobotToml} +
+                           "[subsystems.operator]\nperiod_us = 20000\n");
+  auto& op = sim.add<Operator>("operator");
+  auto& lift = sim.add<ActuatingConsumer>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(make_ds(false));
+  sim.step(60ms);
+  hw.set_driver_station(make_ds(true));
+  sim.step(40ms);
+  ASSERT_TRUE(op.arming.armed());
+  ASSERT_NE(lift.target.get(), nullptr);
+  ASSERT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kDutyCycle);
+
+  const auto state1_pkt = sim.latest<hardware::Packet>(hardware::kStateTopic);
+  ASSERT_TRUE(state1_pkt.has_value());
+  hardware::State state1{};
+  ASSERT_TRUE(hardware::Decode(state1_pkt->bytes(), state1));
+  ASSERT_NE(state1.boot_id, 0u);
+
+  // Gateway reboots to B2 and publishes State(B2, kConfigured|kEnabled) while
+  // DS(B2) is withheld and DS(B1) stays fresh (< 100 ms command_timeout_us).
+  hw.stop_driver_station();
+  hw.reboot();
+  sim.step(20ms);
+
+  const auto state2_pkt = sim.latest<hardware::Packet>(hardware::kStateTopic);
+  ASSERT_TRUE(state2_pkt.has_value());
+  hardware::State state2{};
+  ASSERT_TRUE(hardware::Decode(state2_pkt->bytes(), state2));
+  ASSERT_NE(state2.boot_id, state1.boot_id);
+  EXPECT_TRUE(robot_enabled(sim.node("lift")));
+  EXPECT_TRUE(op.arming.armed());
+  const auto active_b1 = LatestTarget<Goal>(sim, "lift", "teleop");
+  ASSERT_TRUE(active_b1.has_value());
+  EXPECT_EQ(active_b1->active, 1);
+
+  EXPECT_EQ(lift.target.get(), nullptr);
+  EXPECT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kNeutral);
+  EXPECT_EQ(hw.applied_motor("lift", "m").mode, hardware::Mode::kNeutral);
+  const auto req_pkt = sim.latest<hardware::Packet>("/hw/request/lift");
+  ASSERT_TRUE(req_pkt.has_value());
+  hardware::Command req{};
+  ASSERT_TRUE(hardware::Decode(req_pkt->bytes(), req));
+  EXPECT_EQ(req.boot_id, state2.boot_id);
+  ASSERT_GE(req.count, 1u);
+  EXPECT_EQ(req.motors[0].mode, hardware::Mode::kNeutral);
+
+  // Deliver DS(B2) with button still held: OperatorArming disarms until
+  // neutral, then drives on B2.
+  hw.set_driver_station(make_ds(true));
+  sim.step(40ms);
+  EXPECT_FALSE(op.arming.armed());
+  EXPECT_EQ(lift.target.get(), nullptr);
+  EXPECT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kNeutral);
+
+  hw.set_driver_station(make_ds(false));
+  sim.step(40ms);
+  EXPECT_TRUE(op.arming.armed());
+  hw.set_driver_station(make_ds(true));
+  sim.step(40ms);
+  EXPECT_NE(lift.target.get(), nullptr);
+  EXPECT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kDutyCycle);
+  EXPECT_EQ(hw.applied_motor("lift", "m").mode, hardware::Mode::kDutyCycle);
+
+  // send_joystick compatibility: ds.boot_id == 0 still selects with nonzero
+  // hw.boot_id.
+  {
+    auto sim2 = Sim::FromToml(kRobotToml);
+    auto& consumer = sim2.add<ActuatingConsumer>("lift");
+    SimHardware hw2{sim2};
+    hw2.enable();
+    sim2.step(10ms);
+    const auto hw2_state_pkt =
+        sim2.latest<hardware::Packet>(hardware::kStateTopic);
+    ASSERT_TRUE(hw2_state_pkt.has_value());
+    hardware::State hw2_state{};
+    ASSERT_TRUE(hardware::Decode(hw2_state_pkt->bytes(), hw2_state));
+    ASSERT_NE(hw2_state.boot_id, 0u);
+
+    ds::ModeTracker tracker;
+    auto zero_boot_ds = DsPacket(kTeleop);
+    zero_boot_ds.boot_id = 0;
+    zero_boot_ds.sample_time_us = 10000;
+    tracker.Stamp(zero_boot_ds);
+    hardware::Packet packet{};
+    packet.size =
+        static_cast<std::uint32_t>(ds::Encode(zero_boot_ds, packet.data));
+    sim2.publish(hardware::kDriverStationTopic, packet);
+    PublishTarget(sim2, "lift", "teleop", Goal{0.5},
+                  zero_boot_ds.mode_since_us);
+    sim2.step(5ms);
+    const Goal* selected = consumer.target.get();
+    ASSERT_NE(selected, nullptr);
+    EXPECT_DOUBLE_EQ(selected->position_rot(), 0.5);
+    EXPECT_EQ(hw2.motor_request("lift", "m").mode, hardware::Mode::kDutyCycle);
+  }
+}
+
+// REQ-RT-04, REQ-RT-06: device handle construction refuses off-loop-thread
+// calls and refuses registering new devices after NodeAccess::start().
+TEST(Target, DeviceHandlesRefuseOffLoopThreadAndPostStart) {
+  constexpr const char* kDeviceGuardToml = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.mech.motors.a]
+can_id = 1
+[subsystems.mech.motors.b]
+can_id = 2
+[subsystems.mech.digital_outputs.led]
+dio = 0
+[subsystems.mech.pwm_outputs.servo]
+channel = 0
+[subsystems.mech.digital_inputs.beam]
+dio = 1
+)";
+  struct LateOpener {
+    explicit LateOpener(Node& n) : node{n}, a{n, "a"} {
+      AllowUntargetedOutputs(n);
+    }
+    void update() {
+      if (!probe_post_start) return;
+      probe_post_start = false;
+      const auto expect_refused = [](const auto& fn) {
+        try {
+          fn();
+          return false;
+        } catch (const std::logic_error&) {
+          return true;
+        }
+      };
+      motor_b_refused = expect_refused([&] { (void)Motor(node, "b"); });
+      dout_refused = expect_refused([&] { (void)DigitalOutput(node, "led"); });
+      pwm_refused = expect_refused([&] { (void)PwmOutput(node, "servo"); });
+      din_refused = expect_refused([&] { (void)DigitalInput(node, "beam"); });
+    }
+    Node& node;
+    Motor a;
+    bool probe_post_start = false;
+    bool motor_b_refused = false;
+    bool dout_refused = false;
+    bool pwm_refused = false;
+    bool din_refused = false;
+  };
+
+  auto sim = Sim::FromToml(kDeviceGuardToml);
+  auto& mech = sim.add<LateOpener>("mech");
+  mech.probe_post_start = true;
+  sim.step(5ms);
+  EXPECT_TRUE(mech.motor_b_refused);
+  EXPECT_TRUE(mech.dout_refused);
+  EXPECT_TRUE(mech.pwm_refused);
+  EXPECT_TRUE(mech.din_refused);
+
+  // Off-loop-thread construction refuses both existing and new handles.
+  bool off_motor_a = false;
+  bool off_motor_b = false;
+  bool off_dout = false;
+  bool off_pwm = false;
+  bool off_din = false;
+  std::thread worker{[&] {
+    const auto refused = [](const auto& fn) {
+      try {
+        fn();
+        return false;
+      } catch (const std::logic_error&) {
+        return true;
+      }
+    };
+    off_motor_a = refused([&] { (void)Motor(mech.node, "a"); });
+    off_motor_b = refused([&] { (void)Motor(mech.node, "b"); });
+    off_dout = refused([&] { (void)DigitalOutput(mech.node, "led"); });
+    off_pwm = refused([&] { (void)PwmOutput(mech.node, "servo"); });
+    off_din = refused([&] { (void)DigitalInput(mech.node, "beam"); });
+  }};
+  worker.join();
+  EXPECT_TRUE(off_motor_a);
+  EXPECT_TRUE(off_motor_b);
+  EXPECT_TRUE(off_dout);
+  EXPECT_TRUE(off_pwm);
+  EXPECT_TRUE(off_din);
+
+  // Post-start input construction on a node without HardwareLink fails without
+  // lazily attaching HardwareLink.
+  struct Empty {
+    explicit Empty(Node&) {}
+  };
+  auto sim_empty = Sim::FromToml(kDeviceGuardToml);
+  sim_empty.add<Empty>("mech");
+  Node& empty_node = sim_empty.node("mech");
+  EXPECT_THROW((void)DigitalInput(empty_node, "beam"), std::logic_error);
+  EXPECT_EQ(
+      detail::NodeAccess::find_extension(empty_node, typeid(HardwareLink)),
+      nullptr);
+}
+
+// REQ-CONTRACT-14, REQ-RT-04, REQ-RT-06: invalid-index TargetAccess lookups
+// fail cleanly without lazily attaching Targets, and target_sources /
+// target_bytes refuse off-loop-thread calls.
+TEST(Target, InvalidTargetLookupsDoNotAttachExtensionAndRefuseOffLoopThread) {
+  struct Empty {
+    explicit Empty(Node&) {}
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Empty>("lift");
+  Node& empty = sim.node("lift");
+  std::int32_t source = -1;
+  EXPECT_THROW((void)detail::TargetAccess::target_get(empty, 0, source),
+               std::out_of_range);
+  EXPECT_THROW((void)detail::TargetAccess::target_sources(empty, 0),
+               std::out_of_range);
+  EXPECT_THROW((void)detail::TargetAccess::target_bytes(empty, 0),
+               std::out_of_range);
+  EXPECT_THROW((void)detail::TargetAccess::lane_release(empty, 0),
+               std::out_of_range);
+  EXPECT_THROW((void)detail::TargetAccess::arming_armed(empty, 0),
+               std::out_of_range);
+
+  auto sim2 = Sim::FromToml(kRobotToml);
+  sim2.add<Consumer<Goal>>("lift");
+  Node& node = sim2.node("lift");
+  bool sources_refused = false;
+  bool bytes_refused = false;
+  std::thread worker{[&] {
+    try {
+      (void)detail::TargetAccess::target_sources(node, 0);
+    } catch (const std::logic_error&) {
+      sources_refused = true;
+    }
+    try {
+      (void)detail::TargetAccess::target_bytes(node, 0);
+    } catch (const std::logic_error&) {
+      bytes_refused = true;
+    }
+  }};
+  worker.join();
+  EXPECT_TRUE(sources_refused);
+  EXPECT_TRUE(bytes_refused);
 }
 
 }  // namespace

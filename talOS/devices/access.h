@@ -112,6 +112,8 @@ struct HardwareAccess {
   // outputs (devices.h). Target::get() calls it on every selecting call made
   // inside update().
   static void note_live_target(HardwareLink& link);
+  // Boot id of the latest accepted hardware state, or 0 before any state.
+  static std::uint64_t boot_id(const HardwareLink& link);
 };
 
 // The Driver Station mode a target policy is keyed by: none while the DS is
