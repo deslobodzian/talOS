@@ -32,6 +32,45 @@ robot_model_sync_test(
     parameters = "examples/shooter_rig.toml",
 )
 
+# The MuJoCo rig example's model (examples/mujoco_rig), for rig_shot_test;
+# the example's model_twin_test holds its own copy to these bytes.
+exports_files(["testdata/mujoco_rig/robot.xml"])
+
+robot_model_sync_test(
+    name = "mujoco_rig_sync_test",
+    model = "testdata/mujoco_rig/robot.xml",
+    parameters = "testdata/mujoco_rig/robot_params.toml",
+)
+
+# REQ-DEV-37, REQ-DEV-39, REQ-DEV-40, REQ-DEV-41: the rig example's shot
+# without processes: its model on the 2026 field, assembled as the MuJoCo
+# gateway assembles it and given its nodes' commands, launches all eight
+# preloads and scores at least seven in TELEOP, the same every run.
+cc_test(
+    name = "rig_shot_test",
+    size = "small",
+    srcs = ["rig_shot_test.cc"],
+    data = [
+        "testdata/mujoco_rig/robot.xml",
+        "//talOS/simulation/mujoco/fields/rebuilt_2026",
+    ],
+    env = {
+        "FIELD_XML": "$(rlocationpath //talOS/simulation/mujoco/fields/rebuilt_2026)",
+        "RIG_XML": "$(rlocationpath testdata/mujoco_rig/robot.xml)",
+    },
+    deps = [
+        "//talOS/configuration",
+        "//talOS/driver_station",
+        "//talOS/hardware",
+        "//talOS/hardware:codecs",
+        "//talOS/hardware:sim_messages",
+        "//talOS/simulation/mujoco:gateway_extension",
+        "//talOS/simulation/mujoco:plant",
+        "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
 # REQ-DEV-41: bad parameter files are refused naming the key, config names
 # pass through, the examples carry their scripted-shooter parameters, the
 # output is the same bytes from run to run, and --check fails on an edited
