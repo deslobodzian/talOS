@@ -2,7 +2,7 @@
 
 Scope: the reusable FRC platform needed to build robot logic reliably: actuation safety, transport, runtime/API contracts, sensing, deployment and diagnostics. Game strategy, shot timing, mechanism coordination rules and additional autonomous routines are not readiness requirements here.
 
-This is an **open-work list**, not a changelog. Completed work and its reasoning remain in `git log`; measurements and bench observations are recorded, dated, in [docs/BENCH_RESULTS.md](docs/BENCH_RESULTS.md), and an entry links to them instead of repeating them. Remove an item only after its acceptance check passes; a passing existing suite does not close a newly identified coverage gap. Physical acceptance follows [docs/BRINGUP.md](docs/BRINGUP.md).
+This is an **open-work list**, not a changelog. Features nobody is building yet are in [FEATURES.md](FEATURES.md). Completed work and its reasoning remain in `git log`; measurements and bench observations are recorded, dated, in [docs/BENCH_RESULTS.md](docs/BENCH_RESULTS.md), and an entry links to them instead of repeating them. Remove an item only after its acceptance check passes; a passing existing suite does not close a newly identified coverage gap. Physical acceptance follows [docs/BRINGUP.md](docs/BRINGUP.md).
 
 Entry form: `- [ ] **ID — the problem, in one line.**` then at most about four lines: what is wrong and where (file or symbol); the one piece of evidence that matters, or a link to its dated section in the results record; `OWNER DECISION:` with the options when a person must decide; and `Close when:` the complete acceptance check. No measurement narrative and no history; a long entry is trimmed when it is next touched.
 
