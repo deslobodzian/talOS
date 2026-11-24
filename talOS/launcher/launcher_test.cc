@@ -1394,11 +1394,19 @@ TEST(LauncherTest, ManifestSerializesLockFlagsCriticalAndStudioBridge) {
 }
 
 TEST(LauncherTest, MaxRestartsComesFromFlagThenConfigThenDefault) {
-  const auto with_robot_keys = [](std::string_view keys) {
+  const auto toml_with_robot_keys = [](std::string_view keys) {
     std::string toml{kFixtureToml};
     const std::string header = "[robot]\n";
     toml.insert(toml.find(header) + header.size(), keys);
-    return config::ParseRobotConfigString(toml);
+    return toml;
+  };
+  const auto with_robot_keys = [&](std::string_view keys) {
+    return config::ParseRobotConfigString(toml_with_robot_keys(keys));
+  };
+  const auto raw_with_robot_keys = [&](std::string_view keys) {
+    config::RobotConfig cfg;
+    cfg.toml_data = toml::parse(toml_with_robot_keys(keys));
+    return cfg;
   };
   int max = -1;
   std::string error;
@@ -1417,15 +1425,15 @@ TEST(LauncherTest, MaxRestartsComesFromFlagThenConfigThenDefault) {
                                  max, error));
   EXPECT_EQ(max, 0);
 
-  EXPECT_FALSE(ResolveMaxRestarts(with_robot_keys("max_restarts = -1\n"), {},
-                                  max, error));
-  // A config cannot turn off critical members' restarts; only the flag can.
-  EXPECT_FALSE(ResolveMaxRestarts(with_robot_keys("max_restarts = 0\n"), {},
-                                  max, error));
-  EXPECT_FALSE(ResolveMaxRestarts(with_robot_keys("max_restarts = 1.5\n"), {},
-                                  max, error));
-  EXPECT_FALSE(ResolveMaxRestarts(with_robot_keys("max_restarts = \"3\"\n"), {},
-                                  max, error));
+  // Config load rejects invalid [robot] max_restarts (REQ-CONTRACT-17), and
+  // ResolveMaxRestarts also rejects them in depth if given raw toml_data.
+  for (const std::string_view bad :
+       {"max_restarts = -1\n", "max_restarts = 0\n", "max_restarts = 1.5\n",
+        "max_restarts = \"3\"\n"}) {
+    SCOPED_TRACE(bad);
+    EXPECT_THROW((void)with_robot_keys(bad), std::invalid_argument);
+    EXPECT_FALSE(ResolveMaxRestarts(raw_with_robot_keys(bad), {}, max, error));
+  }
 }
 
 // A stand-in for a node binary.
