@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
@@ -914,9 +915,10 @@ TEST(ConfigTest, SimSensorStaysOffTheWireAndExcludesSimMotor) {
 }
 
 // [simulation.mujoco] parses to resolved paths, against the include that sets
-// the model, with robot.toml's field over the include's. (Which files the
-// build lists is the shared cases' `files`, SharedResolutionCases.)
-// REQ-DEV-37
+// the model, with robot.toml's field and seed (0, a valid seed) over the
+// include's. (Which files the build lists is the shared cases' `files`,
+// SharedResolutionCases.)
+// REQ-DEV-37, REQ-DEV-40
 TEST(ConfigTest, SimulationMujocoResolvesPathsAgainstTheFileThatSetsThem) {
   const std::string root =
       "talOS/configuration/testdata/accept_simulation_mujoco";
@@ -927,15 +929,38 @@ TEST(ConfigTest, SimulationMujocoResolvesPathsAgainstTheFileThatSetsThem) {
                 .robot_model = root + "/base/mujoco/robot.xml",
                 .robot_model_files = {root + "/base/mujoco/meshes/a.stl",
                                       root + "/base/mujoco/meshes/b.stl"},
-                .field = "rebuilt_2026"}));
+                .field = "rebuilt_2026",
+                .seed = 0}));
   const auto& input = config.hardware.digital_inputs.at(0);
   EXPECT_EQ(input.sim_sensor.sensor, "intake_beam");
   EXPECT_TRUE(input.sim_sensor.closed_reads);
 }
 
+// [simulation.mujoco] seed, the draws of a field's game rules: 1 when no file
+// sets it, and the whole range of a TOML integer that is not negative.
+// REQ-DEV-40
+TEST_F(ManifestTest, SimulationMujocoSeedDefaultsToOneAndTakesTheFullRange) {
+  Write("robot.xml", "<mujoco/>\n");
+  const struct {
+    const char* seed_line;
+    std::uint64_t seed;
+  } cases[] = {
+      {"", 1},
+      {"seed = 9223372036854775807\n", 9223372036854775807u},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.seed_line);
+    Write("robot.toml", "[simulation.mujoco]\nrobot_model = \"robot.xml\"\n" +
+                            std::string(c.seed_line) + std::string(kMotor));
+    const auto config = ParseRobotConfig(Robot());
+    ASSERT_TRUE(config.simulation.mujoco.has_value());
+    EXPECT_EQ(config.simulation.mujoco->seed, c.seed);
+  }
+}
+
 // Each refusal of [simulation.mujoco] names the key and the file that set it
 // (an include's own name when the include set it).
-// REQ-DEV-37
+// REQ-DEV-37, REQ-DEV-40
 TEST_F(ManifestTest, SimulationMujocoRefusalsNameTheKeyAndFile) {
   Write("robot.xml", "<mujoco/>\n");
   struct Case {
@@ -983,6 +1008,24 @@ TEST_F(ManifestTest, SimulationMujocoRefusalsNameTheKeyAndFile) {
        "field = \"rebuilt_2025\"\n",
        nullptr,
        {"field", "rebuilt_2025", "robot.toml"}},
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\nseed = -1\n",
+       nullptr,
+       {"seed", "robot.toml"}},
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\nseed = 1.0\n",
+       nullptr,
+       {"seed", "robot.toml"}},
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\nseed = \"1\"\n",
+       nullptr,
+       {"seed", "robot.toml"}},
+      // Past a TOML integer: the TOML parser refuses it, naming the file.
+      {"[simulation.mujoco]\nrobot_model = \"robot.xml\"\n"
+       "seed = 9223372036854775808\n",
+       nullptr,
+       {"robot.toml"}},
+      // An include's negative seed names the include.
+      {"include = \"base.toml\"\n",
+       "[simulation.mujoco]\nrobot_model = \"robot.xml\"\nseed = -1\n",
+       {"seed", "base.toml"}},
       {"[simulation]\nmujoco = 1\n",
        nullptr,
        {"[simulation.mujoco]", "robot.toml"}},
