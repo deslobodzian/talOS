@@ -91,7 +91,8 @@ refuses from the start (RULES.md 2):
   `-trigraphs`/`-ftrigraphs`/`-fms-extensions`/`-fms-compatibility`/`-I`/
   `-iquote`/`-isystem`/`-cxx-isystem`/`-idirafter`/`--include-directory`/
   `-iwithprefix`/`-iwithsysroot` compiler flags (joined, separate, or via
-  `-Wp,`/`-Xclang`).
+  `-Wp,`/`-Xclang`), as well as non-empty (or dynamic) `includes = ...`
+  keyword arguments that add `-isystem` include search paths.
 
 Structural enforcement (ARCH-2 / RULES.md 2): Bazel visibility (checked above
 for every restricted target) prevents robot node code from depending on
@@ -967,6 +968,8 @@ def _is_non_cpp_include(norm):
 
 def scan_cpp_text(path, text):
     """Returns a list of SourceViolation found in one C++ source/header."""
+    # GCC and Clang accept a leading UTF-8 BOM before line-1 directives.
+    text = text.removeprefix("\ufeff")
     violations = []
     with_strings, no_strings, line_map, errors = _strip_cpp_comments(text)
     for lineno, kind, detail in errors:
@@ -1227,11 +1230,25 @@ def _extract_starlark_header_candidates(value):
                 yield f"{pkg}/{name}"
 
 
+def _is_empty_starlark_includes(node, bindings, seen=frozenset()):
+    """True only when a Starlark `includes` value is provably empty (`[]`, `()`,
+    or `None`, directly or via top-level bindings)."""
+    if isinstance(node, ast.Constant) and node.value is None:
+        return True
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return len(node.elts) == 0
+    if (isinstance(node, ast.Name) and node.id in bindings and
+            node.id not in seen):
+        return _is_empty_starlark_includes(
+            bindings[node.id], bindings, seen | {node.id})
+    return False
+
+
 def scan_starlark_ast(path, tree):
     """Refuses BUILD / `.bzl` string constants carrying bypass symbols,
     token pasting, C++ trigraphs, forbidden header paths, or forbidden
     `-include`/`-imacros`/`-trigraphs`/`-ftrigraphs`/include-path compiler
-    flags."""
+    flags, as well as non-empty or dynamic `includes` keyword arguments."""
     bindings = _collect_starlark_bindings(tree)
     violations = []
     seen_keys = set()
@@ -1243,6 +1260,38 @@ def scan_starlark_ast(path, tree):
             seen_keys.add(key)
             violations.append(SourceViolation(path, lineno, kind, detail,
                                               header=header))
+
+    # Refuse non-empty (or dynamic) `includes = ...` attributes on rule/macro
+    # calls: Bazel translates `includes` into `-isystem` search paths that can
+    # shorten `#include` paths past static header checks.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for kw in node.keywords:
+            if kw.arg == "includes":
+                if not _is_empty_starlark_includes(kw.value, bindings):
+                    lineno = getattr(kw, "lineno", getattr(node, "lineno", 1))
+                    add(lineno, "starlark-forbidden-includes",
+                        "Starlark call sets `includes` (adds -isystem search "
+                        "paths that can shorten #include paths)")
+            elif kw.arg is None:
+                val = kw.value
+                seen_names = set()
+                while (isinstance(val, ast.Name) and val.id in bindings and
+                       val.id not in seen_names):
+                    seen_names.add(val.id)
+                    val = bindings[val.id]
+                if isinstance(val, ast.Dict):
+                    for k, v in zip(val.keys, val.values):
+                        if (k is not None and
+                                _eval_starlark_str(k, bindings) == "includes"
+                                and not _is_empty_starlark_includes(v, bindings)):
+                            lineno = getattr(
+                                kw, "lineno", getattr(node, "lineno", 1))
+                            add(lineno, "starlark-forbidden-includes",
+                                "Starlark call sets `includes` via kwargs "
+                                "(adds -isystem search paths that can shorten "
+                                "#include paths)")
 
     # First detect adjacent flag+arg list/tuple pairs like `["-include", "foo"]`.
     for node in ast.walk(tree):
@@ -1428,7 +1477,7 @@ def discover_scanned_files(files, read):
             continue
         if _is_starlark_file(path):
             try:
-                content = read(path)
+                content = read(path).removeprefix("\ufeff")
             except (OSError, UnicodeDecodeError) as exc:
                 read_errors.append((path, f"cannot read Starlark file: {exc}"))
                 continue
@@ -1537,7 +1586,7 @@ def tracked_files():
 
 
 def read_source_file(path):
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:
         return f.read()
 
 
