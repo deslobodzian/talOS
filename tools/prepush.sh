@@ -121,7 +121,7 @@ done
 # More commits than this to push need --full (docs/DEVELOPMENT.md §5).
 full_after_commits=20
 
-tools="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+tools="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=tools/prepush_robot_repository.sh
 . "$tools/prepush_robot_repository.sh" || die "cannot read prepush_robot_repository.sh"
 repo="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not in a git checkout"
@@ -130,13 +130,60 @@ commit="$(git -C "$repo" rev-parse --verify --quiet "$ref^{commit}")" ||
 disk_cache="${TALOS_BAZEL_DISK_CACHE:-$HOME/.cache/talos-bazel-disk}"
 # Absolute and physical: git -C "$repo" and `cd` would resolve a relative
 # TMPDIR against different directories.
-tmp="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P)" ||
+tmp="$(CDPATH='' cd -- "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P)" ||
   die "TMPDIR is not a directory: ${TMPDIR:-/tmp}"
 wt="$tmp/talos-prepush-$(id -u)"
 lock="$wt.lock"
 start=$SECONDS
-[ "$(cd "$repo" && pwd -P)" != "$wt" ] ||
+[ "$(CDPATH='' cd -- "$repo" && pwd -P)" != "$wt" ] ||
   die "run from the checkout, not from prepush's own worktree $wt"
+
+bazel_started=0
+dependents_started=""
+worktree_owned=0
+lock_owned=0
+retake_owned=0
+remove_worktree() {
+  if [ -e "$wt" ]; then
+    chmod -R u+w "$wt" 2>/dev/null
+    git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
+  fi
+  # Still registered with its directory gone (deleted by hand, or by the
+  # rm above): only `git worktree prune` drops that, and it prunes every
+  # worktree whose directory is missing, so it runs only in this case.
+  if git -C "$repo" worktree list --porcelain | grep -qxF "worktree $wt"; then
+    git -C "$repo" worktree prune
+  fi
+}
+cleanup() {
+  if [ "$worktree_owned" = 1 ]; then
+    if [ "$keep" = 1 ]; then
+      echo "prepush: worktree kept at $wt (remove: chmod -R u+w $wt && git worktree remove --force $wt)"
+    else
+      if [ "$bazel_started" = 1 ] && [ -d "$wt" ]; then
+        (CDPATH='' cd -- "$wt" && bazel shutdown >/dev/null 2>&1)
+      fi
+      for dependent in $dependents_started; do
+        if [ -d "$wt/examples/$dependent" ]; then
+          (CDPATH='' cd -- "$wt/examples/$dependent" && bazel shutdown >/dev/null 2>&1)
+        fi
+      done
+      remove_worktree
+    fi
+  fi
+  if [ "$retake_owned" = 1 ]; then
+    rmdir "$lock.retake" 2>/dev/null || true
+  fi
+  if [ "$lock_owned" = 1 ]; then
+    rm -rf "$lock"
+  fi
+}
+install_cleanup_traps() {
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+}
 
 # One run at a time owns the worktree path.
 # The pid file appears whole (written beside it, then renamed), so a lock
@@ -160,48 +207,31 @@ if ! mkdir "$lock" 2>/dev/null; then
   fi
   mkdir "$lock.retake" 2>/dev/null ||
     die "another prepush is retaking $lock from a dead run (if none is, rmdir $lock.retake)"
+  retake_owned=1
+  install_cleanup_traps
   # Under the retake lock: the lock must still be the dead holder's.
   if [ "$(cat "$lock/pid" 2>/dev/null || true)" != "$holder" ]; then
     rmdir "$lock.retake"
+    retake_owned=0
     die "another prepush took $lock first"
   fi
   rm -rf "$lock"
-  if ! { mkdir "$lock" 2>/dev/null && write_pid; }; then
-    rmdir "$lock.retake"
+  if ! mkdir "$lock" 2>/dev/null; then
+    die "cannot take $lock"
+  fi
+  lock_owned=1
+  if ! write_pid; then
     die "cannot take $lock"
   fi
   rmdir "$lock.retake"
+  retake_owned=0
 else
+  lock_owned=1
+  install_cleanup_traps
   write_pid || die "cannot write $lock/pid"
 fi
 
-bazel_started=0
-remove_worktree() {
-  if [ -e "$wt" ]; then
-    chmod -R u+w "$wt" 2>/dev/null
-    git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
-  fi
-  # Still registered with its directory gone (deleted by hand, or by the
-  # rm above): only `git worktree prune` drops that, and it prunes every
-  # worktree whose directory is missing, so it runs only in this case.
-  if git -C "$repo" worktree list --porcelain | grep -qxF "worktree $wt"; then
-    git -C "$repo" worktree prune
-  fi
-}
-cleanup() {
-  if [ "$keep" = 1 ]; then
-    echo "prepush: worktree kept at $wt (remove: chmod -R u+w $wt && git worktree remove --force $wt)"
-  else
-    if [ "$bazel_started" = 1 ] && [ -d "$wt" ]; then
-      (cd "$wt" && bazel shutdown >/dev/null 2>&1)
-    fi
-    remove_worktree
-  fi
-  rm -rf "$lock"
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+worktree_owned=1
 
 # A worktree left by --keep or a killed run.
 remove_worktree
@@ -219,7 +249,7 @@ run_step() {
   shift
   local log="$logs/$name.log"
   local t0=$SECONDS
-  if (cd "$wt" && "$@") >"$log" 2>&1; then
+  if (CDPATH='' cd -- "$wt" && "$@") >"$log" 2>&1; then
     report "$name ok ($((SECONDS - t0)) s)"
     return 0
   fi
@@ -389,7 +419,7 @@ if run_step build sh -c \
   else
     t0=$SECONDS
     tidy_status=0
-    (cd "$wt" && bash tools/tidy.sh "${diff_base[@]}") >"$logs/tidy.log" 2>&1 ||
+    (CDPATH='' cd -- "$wt" && bash tools/tidy.sh "${diff_base[@]}") >"$logs/tidy.log" 2>&1 ||
       tidy_status=$?
     case $tidy_status in
       0) report "tidy ok ($((SECONDS - t0)) s)" ;;
@@ -424,25 +454,32 @@ fi
 dependent_paths=(MODULE.bazel REPO.bazel talos.bazelrc .bazelversion third_party/ talOS/ studio/ tools/ examples/robot_repo/ examples/wrist_repo/)
 if ! touches "${dependent_paths[@]}"; then
   report "dependents not needed (nothing under ${dependent_paths[*]} since $touches_from)"
-elif [ ! -d "$wt/examples/robot_repo" ]; then
-  report "dependents not needed (this commit has no examples/robot_repo)"
+elif [ ! -d "$wt/examples/robot_repo" ] && [ ! -d "$wt/examples/wrist_repo" ]; then
+  report "dependents not needed (this commit has no examples/robot_repo or examples/wrist_repo)"
 else
   for dependent in robot_repo wrist_repo; do
+    if [ ! -d "$wt/examples/$dependent" ]; then
+      report "dependent-$dependent not needed (this commit has no examples/$dependent)"
+      continue
+    fi
+    dependents_started="${dependents_started:+$dependents_started }$dependent"
     run_step "dependent-$dependent" sh -c \
-      'cd "examples/$1" && shift && bazel test //... @talos//talOS/configuration:config_fuzz_test "$@"' _ \
+      'CDPATH="" cd -- "examples/$1" && shift && bazel test //... @talos//talOS/configuration:config_fuzz_test "$@"' _ \
       "$dependent" --test_output=errors --nocache_test_results --noshow_progress \
       "--disk_cache=$disk_cache" || true
   done
   # What new_subsystem writes, built in a copy of robot_repo, with and
   # without target coverage required, as CI's robot-repo job runs it.
-  if [ -f "$wt/tools/check_robot_repo_scaffold.sh" ]; then
-    # The step runs from the worktree: hand it the absolute TMPDIR.
-    run_step scaffold-robot_repo env "TMPDIR=$tmp" \
-      bash tools/check_robot_repo_scaffold.sh \
-      --noshow_progress --nocache_test_results "--disk_cache=$disk_cache" ||
-      true
-  else
-    no_tool scaffold-robot_repo tools/check_robot_repo_scaffold.sh
+  if [ -d "$wt/examples/robot_repo" ]; then
+    if [ -f "$wt/tools/check_robot_repo_scaffold.sh" ]; then
+      # The step runs from the worktree: hand it the absolute TMPDIR.
+      run_step scaffold-robot_repo env "TMPDIR=$tmp" \
+        bash tools/check_robot_repo_scaffold.sh \
+        --noshow_progress --nocache_test_results "--disk_cache=$disk_cache" ||
+        true
+    else
+      no_tool scaffold-robot_repo tools/check_robot_repo_scaffold.sh
+    fi
   fi
 fi
 # A robot repository that consumes talOS (TALOS_ROBOT_REPOSITORY, its
@@ -479,7 +516,7 @@ elif ! touches "${rio_paths[@]}"; then
   report "gradle not needed (nothing under ${rio_paths[*]} since $touches_from)"
 else
   run_step gradle sh -c \
-    'cd controller_processor/rio && ./gradlew phoenixTest buildRio -Pcompanion=10.0.0.2 -Pheadless --offline' ||
+    'CDPATH="" cd -- controller_processor/rio && ./gradlew phoenixTest buildRio -Pcompanion=10.0.0.2 -Pheadless --offline' ||
     true
 fi
 
@@ -545,13 +582,13 @@ else
       cmp -s "$repo/studio/node_modules/.pnpm/lock.yaml" "$wt/studio/pnpm-lock.yaml"; then
     ln -s "$repo/studio/node_modules" "$wt/studio/node_modules"
   elif ! run_step studio-install sh -c \
-      'cd studio && pnpm install --frozen-lockfile --offline'; then
+      'CDPATH="" cd -- studio && pnpm install --frozen-lockfile --offline'; then
     studio_ready=0
     skip studio "no studio/node_modules in $repo installed from this pnpm-lock.yaml, and an offline pnpm install failed"
   fi
   if [ "$studio_ready" = 1 ]; then
-    run_step studio-test sh -c 'cd studio && pnpm test' || true
-    run_step studio-build sh -c 'cd studio && pnpm build' || true
+    run_step studio-test sh -c 'CDPATH="" cd -- studio && pnpm test' || true
+    run_step studio-build sh -c 'CDPATH="" cd -- studio && pnpm build' || true
   fi
 fi
 

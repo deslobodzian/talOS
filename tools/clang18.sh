@@ -11,32 +11,142 @@ CLANG18_VERSION="18.1.8"
 
 clang18_die() { printf '%s: error: %s\n' "$(basename "$0")" "$*" >&2; exit 2; }
 
+clang18_ready() {
+  [ -x "$1/venv/bin/clang-format" ] &&
+    [ -x "$1/venv/bin/clang-tidy" ] &&
+    [ "$(cat "$1/version" 2>/dev/null || true)" = "$CLANG18_VERSION" ]
+}
+
 clang18_setup() {
-  local home="${XDG_CACHE_HOME:-$HOME/.cache}/talos/clang-18"
+  local cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/talos"
+  local home="$cache_root/clang-18"
   local bin="$home/venv/bin" shim="$home/shim"
-  if [ ! -x "$bin/clang-format" ] || [ ! -x "$bin/clang-tidy" ] ||
-     [ "$(cat "$home/version" 2>/dev/null)" != "$CLANG18_VERSION" ]; then
-    echo "installing clang-format/clang-tidy $CLANG18_VERSION into $home" >&2
-    rm -rf "$home"
-    mkdir -p "$home"
-    if command -v uv >/dev/null 2>&1; then
-      { uv venv -q "$home/venv" &&
-          uv pip install -q --python "$bin/python" \
-            "clang-format==$CLANG18_VERSION" "clang-tidy==$CLANG18_VERSION"; } ||
-        { rm -rf "$home"; clang18_die "uv could not install the wheels"; }
-    else
-      command -v python3 >/dev/null 2>&1 || clang18_die "need uv or python3"
-      { python3 -m venv "$home/venv" &&
-          "$bin/pip" install -q \
-            "clang-format==$CLANG18_VERSION" "clang-tidy==$CLANG18_VERSION"; } ||
-        { rm -rf "$home"; clang18_die "pip could not install the wheels"; }
-    fi
-    printf '%s\n' "$CLANG18_VERSION" > "$home/version"
+  if ! clang18_ready "$home"; then
+    # Run installation in a subshell so its lock/staging traps do not clobber
+    # the caller's EXIT/signal traps.
+    (
+      local lock="$cache_root/.clang-18.lock"
+      local lock_held=0 staging="" old="" retake_held=0
+      cleanup_clang18_install() {
+        [ -n "$staging" ] && rm -rf "$staging"
+        [ -n "$old" ] && rm -rf "$old"
+        [ "$retake_held" = 1 ] && rmdir "$lock.retake" 2>/dev/null || true
+        [ "$lock_held" = 1 ] && rm -rf "$lock"
+      }
+      trap cleanup_clang18_install EXIT
+      trap 'exit 130' INT
+      trap 'exit 143' TERM
+      trap 'exit 129' HUP
+
+      mkdir -p "$cache_root" || clang18_die "cannot create cache directory $cache_root"
+
+      local waited=0 holder
+      while ! mkdir "$lock" 2>/dev/null; do
+        if [ -f "$lock/pid" ]; then
+          holder="$(cat "$lock/pid" 2>/dev/null || true)"
+          case "$holder" in
+            ''|*[!0-9]*) ;;
+            *)
+              if ! kill -0 "$holder" 2>/dev/null; then
+                if mkdir "$lock.retake" 2>/dev/null; then
+                  retake_held=1
+                  if [ "$(cat "$lock/pid" 2>/dev/null || true)" = "$holder" ]; then
+                    rm -rf "$lock"
+                  fi
+                  rmdir "$lock.retake" 2>/dev/null || true
+                  retake_held=0
+                  continue
+                fi
+              fi
+              ;;
+          esac
+        fi
+        [ "$waited" -lt 3000 ] || clang18_die "timed out waiting for $lock"
+        sleep 0.1
+        waited=$((waited + 1))
+      done
+      lock_held=1
+      { printf '%s\n' "$$" > "$lock/pid.$$" && mv -f "$lock/pid.$$" "$lock/pid"; } ||
+        clang18_die "cannot write $lock/pid"
+
+      if clang18_ready "$home"; then
+        exit 0
+      fi
+
+      echo "installing clang-format/clang-tidy $CLANG18_VERSION into $home" >&2
+      staging="$(mktemp -d "$cache_root/.clang-18.staging.XXXXXX")" ||
+        clang18_die "cannot create staging directory in $cache_root"
+      local sbin="$staging/venv/bin"
+      if command -v uv >/dev/null 2>&1; then
+        { uv venv -q "$staging/venv" &&
+            uv pip install -q --python "$sbin/python" \
+              "clang-format==$CLANG18_VERSION" "clang-tidy==$CLANG18_VERSION"; } ||
+          clang18_die "uv could not install the wheels"
+      else
+        command -v python3 >/dev/null 2>&1 || clang18_die "need uv or python3"
+        { python3 -m venv "$staging/venv" &&
+            "$sbin/pip" install -q \
+              "clang-format==$CLANG18_VERSION" "clang-tidy==$CLANG18_VERSION"; } ||
+          clang18_die "pip could not install the wheels"
+      fi
+      # Console scripts written by pip/uv embed the staging venv path in their
+      # shebang (or long-path sh exec wrapper); rewrite it to the final $home
+      # path before swapping into place.
+      local py="$sbin/python" f
+      [ -x "$py" ] || py="$(command -v python3 2>/dev/null || true)"
+      for f in "$sbin/clang-format" "$sbin/clang-tidy"; do
+        if [ -f "$f" ] && [ -n "$py" ] && head -c 512 "$f" | LC_ALL=C grep -qF "$staging" 2>/dev/null; then
+          "$py" -c '
+import os, sys
+path, old_dir, new_dir = sys.argv[1:4]
+with open(path, "rb") as fp:
+    data = fp.read()
+if data.startswith(b"#!"):
+    lines = data.splitlines(keepends=True)
+    old_b, new_b = old_dir.encode(), new_dir.encode()
+    for i in range(min(2, len(lines))):
+        lines[i] = lines[i].replace(old_b, new_b)
+    st = os.stat(path)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "wb") as fp:
+        fp.writelines(lines)
+    os.chmod(tmp_path, st.st_mode)
+    os.replace(tmp_path, path)
+' "$f" "$staging" "$home" || clang18_die "cannot rewrite shebang in $f"
+        fi
+      done
+      mkdir -p "$staging/shim"
+      ln -sf "$bin/clang-format" "$staging/shim/clang-format-18"
+      ln -sf "$bin/clang-tidy" "$staging/shim/clang-tidy-18"
+      printf '%s\n' "$CLANG18_VERSION" > "$staging/version"
+
+      if [ -e "$home" ]; then
+        old="$cache_root/.clang-18.old.$$"
+        rm -rf "$old"
+        mv "$home" "$old" || clang18_die "cannot replace existing $home"
+        if ! mv "$staging" "$home"; then
+          mv "$old" "$home" 2>/dev/null || true
+          old=""
+          clang18_die "cannot move $staging into $home"
+        fi
+        staging=""
+        rm -rf "$old"
+        old=""
+      else
+        mv "$staging" "$home" || clang18_die "cannot move $staging into $home"
+        staging=""
+      fi
+    )
   fi
-  # CI invokes the tools by their versioned names.
-  mkdir -p "$shim"
-  ln -sf "$bin/clang-format" "$shim/clang-format-18"
-  ln -sf "$bin/clang-tidy" "$shim/clang-tidy-18"
+  # CI invokes the tools by their versioned names. Pre-populated caches (such as
+  # test fixtures) may lack shim/; populate atomically to avoid concurrent races.
+  if [ ! -x "$shim/clang-format-18" ] || [ ! -x "$shim/clang-tidy-18" ]; then
+    mkdir -p "$shim"
+    ln -sf "$bin/clang-format" "$shim/.clang-format-18.$$" &&
+      mv -f "$shim/.clang-format-18.$$" "$shim/clang-format-18"
+    ln -sf "$bin/clang-tidy" "$shim/.clang-tidy-18.$$" &&
+      mv -f "$shim/.clang-tidy-18.$$" "$shim/clang-tidy-18"
+  fi
   export PATH="$shim:$PATH"
   local v
   v="$(clang-format-18 --version 2>&1)" || clang18_die "clang-format-18 does not run: $v"
