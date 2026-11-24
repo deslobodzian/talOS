@@ -279,6 +279,40 @@ TEST(StraightLineTest, ExtremeDurationMidpointDoesNotOverflowAcceleration) {
   EXPECT_EQ(s.alpha_radps2, 0.0);
 }
 
+// Guards: huge distances and limits where distance * accel and speed * speed
+// both overflow double still classify trapezoid vs triangle accurately without
+// tripping +inf <= +inf.
+// REQ-DEV-20
+TEST(StraightLineTest, HugeLimitsAvoidDistanceAccelOverflow) {
+  // speed^2 / accel = 1e160 * (1e160 / 1e120) = 1e200 m.
+  const StraightLineLimits limits{1e160, 1e120, 3.0, 6.0};
+  {
+    // Trapezoidal: distance = 2e200 > 1e200 -> ramp 1e40, cruise 1e40, ramp
+    // 1e40.
+    Trajectory out;
+    out.reserve(kStraightLineSamples);
+    const StraightLineResult result = MakeStraightLine(
+        MakePose(0.0, 0.0, 0.0), MakePose(2e200, 0.0, 0.0), limits, out);
+    ASSERT_TRUE(result) << ToString(result.error);
+    EXPECT_NEAR(out.total_time_s(), 3e40, 1e28);
+    EXPECT_NEAR(out.sample(1.5e40).vx_mps, 1e160, 1e148);
+    EXPECT_DOUBLE_EQ(out.final_sample().x_m, 2e200);
+  }
+  {
+    // Triangular: distance = 0.5e200 < 1e200 -> peak speed sqrt(0.5) * 1e160.
+    Trajectory out;
+    out.reserve(kStraightLineSamples);
+    const StraightLineResult result = MakeStraightLine(
+        MakePose(0.0, 0.0, 0.0), MakePose(0.5e200, 0.0, 0.0), limits, out);
+    ASSERT_TRUE(result) << ToString(result.error);
+    const double expected_s = 2.0 * std::sqrt(0.5e80);
+    EXPECT_NEAR(out.total_time_s(), expected_s, 1e-12 * expected_s);
+    EXPECT_NEAR(out.sample(0.5 * expected_s).vx_mps, std::sqrt(0.5) * 1e160,
+                1e-12 * 1e160);
+    EXPECT_DOUBLE_EQ(out.final_sample().x_m, 0.5e200);
+  }
+}
+
 // Guards: the line flipped for the other alliance is the line between the
 // flipped poses, for both symmetries, so a node may flip either the goal or
 // the trajectory.

@@ -5,6 +5,9 @@
 #include <cmath>
 #include <limits>
 #include <numbers>
+#include <random>
+
+#include "talOS/geometry/so2.h"
 
 namespace talos::geometry {
 namespace {
@@ -73,6 +76,67 @@ TEST(OptimizeSwerveModule, NonFiniteInputGivesZero) {
     EXPECT_EQ(setpoint.speed, 0.0);
     EXPECT_EQ(setpoint.steer_delta_rad, 0.0);
     EXPECT_FALSE(setpoint.reversed);
+  }
+}
+
+// REQ-DEV-26: exact half-turn (+-pi) reverses the drive with zero steering
+// change; negative and zero asked speeds preserve sign/zero behavior.
+TEST(OptimizeSwerveModule, ExactHalfTurnNegativeAndZeroSpeed) {
+  for (const double half_turn : {kPi, -kPi}) {
+    SCOPED_TRACE(half_turn);
+    const auto sp = OptimizeSwerveModule(2.5, half_turn, 0.0);
+    EXPECT_TRUE(sp.reversed);
+    EXPECT_NEAR(sp.steer_delta_rad, 0.0, kTight);
+    EXPECT_NEAR(sp.speed, -2.5, kTight);
+  }
+
+  // Negative asked speed: kept negative without flip, negated to positive on
+  // flip.
+  const auto neg_no_flip = OptimizeSwerveModule(-2.5, 0.4, 0.0);
+  EXPECT_FALSE(neg_no_flip.reversed);
+  EXPECT_NEAR(neg_no_flip.steer_delta_rad, 0.4, kTight);
+  EXPECT_NEAR(neg_no_flip.speed, -2.5 * std::cos(0.4), kTight);
+
+  const auto neg_flip = OptimizeSwerveModule(-2.5, kPi - 0.3, 0.0);
+  EXPECT_TRUE(neg_flip.reversed);
+  EXPECT_NEAR(neg_flip.steer_delta_rad, -0.3, kTight);
+  EXPECT_NEAR(neg_flip.speed, 2.5 * std::cos(0.3), kTight);
+
+  // Zero speed: stays zero with shortest steering path.
+  const auto zero_no_flip = OptimizeSwerveModule(0.0, 0.4, 0.0);
+  EXPECT_FALSE(zero_no_flip.reversed);
+  EXPECT_NEAR(zero_no_flip.steer_delta_rad, 0.4, kTight);
+  EXPECT_EQ(zero_no_flip.speed, 0.0);
+
+  const auto zero_flip = OptimizeSwerveModule(0.0, kPi - 0.3, 0.0);
+  EXPECT_TRUE(zero_flip.reversed);
+  EXPECT_NEAR(zero_flip.steer_delta_rad, -0.3, kTight);
+  EXPECT_EQ(zero_flip.speed, 0.0);
+}
+
+// REQ-DEV-26: across arbitrary speeds, headings and unwrapped measured angles,
+// the steering change never exceeds a quarter turn and the resulting heading
+// (accounting for reversal) matches the asked heading.
+TEST(OptimizeSwerveModule, PropertySweepMaintainsQuarterTurnAndHeading) {
+  std::mt19937_64 rng(0x5AE0F10EULL);
+  std::uniform_real_distribution<double> speed_dist(-5.0, 5.0);
+  std::uniform_real_distribution<double> asked_dist(-4.0 * kPi, 4.0 * kPi);
+  std::uniform_real_distribution<double> measured_dist(-10.0 * kPi, 10.0 * kPi);
+  for (int i = 0; i < 1000; ++i) {
+    const double speed = speed_dist(rng);
+    const double asked = asked_dist(rng);
+    const double measured = measured_dist(rng);
+    const auto sp = OptimizeSwerveModule(speed, asked, measured);
+    ASSERT_TRUE(std::isfinite(sp.speed));
+    ASSERT_TRUE(std::isfinite(sp.steer_delta_rad));
+    EXPECT_LE(std::abs(sp.steer_delta_rad), kQuarter + 1e-12);
+    const double effective_heading =
+        measured + sp.steer_delta_rad + (sp.reversed ? kPi : 0.0);
+    EXPECT_NEAR(SO2<double>(effective_heading).boxminus(SO2<double>(asked)),
+                0.0, 1e-9);
+    const double expected_speed =
+        (sp.reversed ? -speed : speed) * std::cos(sp.steer_delta_rad);
+    EXPECT_NEAR(sp.speed, expected_speed, 1e-9);
   }
 }
 

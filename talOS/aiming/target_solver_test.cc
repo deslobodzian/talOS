@@ -463,6 +463,77 @@ TEST(TargetSolverTurret, SeamHysteresisStopsAFullTurnSweep) {
   EXPECT_NEAR(around.turret_rad, -kPi + 0.2, kTight);
 }
 
+// Aiming at an exact travel limit with seam_hysteresis_rad > 0 and measured
+// angle inside [min_rad, max_rad] must remain reachable even when
+// measured_rad + AngleDiff(needed_rad, measured_rad) rounds 1 ULP past the
+// limit; a genuinely out-of-range angle inside the hysteresis band still holds
+// the limit as unreachable.
+// REQ-DEV-18
+// REQ-DEV-19
+TEST(TargetSolverTurret, ExactLimitsWithHysteresisStayReachable) {
+  const ShotTable table = RealisticTable();
+  const SE2<double> origin = Pose(0.0, 0.0, 0.0);
+
+  for (const TurretTravel& travel :
+       {TurretTravel{-3.5, 3.5, 0.05}, TurretTravel{-1.0, 1.0, 0.05},
+        TurretTravel{-kPi, kPi, 0.05}}) {
+    const TargetSolver solver(Turret(0.0, 0.0, 0.0, travel), table);
+    const Eigen::Vector2d at_max(4.0 * std::cos(travel.max_rad),
+                                 4.0 * std::sin(travel.max_rad));
+    const Eigen::Vector2d at_min(4.0 * std::cos(travel.min_rad),
+                                 4.0 * std::sin(travel.min_rad));
+
+    for (const double offset : {0.0, 0.1, 0.5, 1.0, 1.7}) {
+      const double measured_near_max = travel.max_rad - offset;
+      if (measured_near_max >= travel.min_rad &&
+          measured_near_max <= travel.max_rad) {
+        SCOPED_TRACE(::testing::Message() << "max=" << travel.max_rad
+                                          << " measured=" << measured_near_max);
+        const Solution s =
+            solver.SolveStatic(origin, at_max, measured_near_max);
+        ASSERT_TRUE(s.valid);
+        EXPECT_TRUE(s.turret_reachable);
+        EXPECT_GE(s.turret_rad, travel.min_rad);
+        EXPECT_LE(s.turret_rad, travel.max_rad);
+        EXPECT_NEAR(s.turret_rad, travel.max_rad, kTight);
+      }
+
+      const double measured_near_min = travel.min_rad + offset;
+      if (measured_near_min >= travel.min_rad &&
+          measured_near_min <= travel.max_rad) {
+        SCOPED_TRACE(::testing::Message() << "min=" << travel.min_rad
+                                          << " measured=" << measured_near_min);
+        const Solution s =
+            solver.SolveStatic(origin, at_min, measured_near_min);
+        ASSERT_TRUE(s.valid);
+        EXPECT_TRUE(s.turret_reachable);
+        EXPECT_GE(s.turret_rad, travel.min_rad);
+        EXPECT_LE(s.turret_rad, travel.max_rad);
+        EXPECT_NEAR(s.turret_rad, travel.min_rad, kTight);
+      }
+    }
+
+    // Genuine out-of-range within seam_hysteresis_rad is still rejected.
+    const double past_max = travel.max_rad + 1e-4;
+    const Solution out_max = solver.SolveStatic(
+        origin,
+        Eigen::Vector2d(4.0 * std::cos(past_max), 4.0 * std::sin(past_max)),
+        travel.max_rad - 0.01);
+    ASSERT_TRUE(out_max.valid);
+    EXPECT_FALSE(out_max.turret_reachable);
+    EXPECT_DOUBLE_EQ(out_max.turret_rad, travel.max_rad);
+
+    const double past_min = travel.min_rad - 1e-4;
+    const Solution out_min = solver.SolveStatic(
+        origin,
+        Eigen::Vector2d(4.0 * std::cos(past_min), 4.0 * std::sin(past_min)),
+        travel.min_rad + 0.01);
+    ASSERT_TRUE(out_min.valid);
+    EXPECT_FALSE(out_min.turret_reachable);
+    EXPECT_DOUBLE_EQ(out_min.turret_rad, travel.min_rad);
+  }
+}
+
 // Extreme measured turret angles, half-infinite travel limits, exact limit
 // boundaries with zero hysteresis, and unwrapped large mount yaw must never
 // emit non-finite or out-of-travel turret commands or lose aim direction.
@@ -667,6 +738,88 @@ TEST(TargetSolverMoving, CompensatedShotLandsWhereNaiveShotMisses) {
         SimulateLanding(c.config, table, c.pose, c.field_velocity, naive);
     EXPECT_GT((naive_hit_m - c.target_m).norm(), kNaiveMiss_m);
   }
+}
+
+// An offset fixed shooter with nonzero yaw rate rotates its exit point as the
+// solved robot heading changes, so time of flight alone can agree across two
+// iterations (especially on a flat/constant-ToF segment) while the virtual
+// target is still moving. The solver must converge both time of flight and
+// virtual target, and report a consistent virtual target.
+// REQ-DEV-17
+TEST(TargetSolverMoving, OffsetFixedShooterWithYawRateConvergesAccurately) {
+  const SolverConfig config = Fixed(0.5, 0.0, 0.0);
+  const SE2<double> pose = Pose(0.0, 0.0, 0.0);
+  const FieldTwist velocity{0.4, 0.0, 4.0};
+  const Eigen::Vector2d target_m(5.0, 0.0);
+
+  const std::array<ShotRow, 2> constant_rows = {{
+      {1.0, 50.0, 0.4, 0.9},
+      {10.0, 50.0, 0.4, 0.9},
+  }};
+  const ShotTable realistic = RealisticTable();
+  const ShotTable constant_tof(constant_rows);
+
+  for (const auto& [name, table] :
+       std::array<std::pair<const char*, const ShotTable*>, 2>{
+           {{"realistic", &realistic}, {"constant_tof", &constant_tof}}}) {
+    SCOPED_TRACE(name);
+    const TargetSolver solver(config, *table);
+    const Solution s = solver.SolveWithFieldVelocity(pose, velocity, target_m);
+    ASSERT_TRUE(s.valid);
+    EXPECT_TRUE(s.converged);
+    EXPECT_TRUE(s.in_range);
+    EXPECT_LT(s.iteration_count, solver.config().max_iteration_count);
+
+    const Eigen::Vector2d hit_m =
+        SimulateLanding(config, *table, pose, velocity, s);
+    EXPECT_LT((hit_m - target_m).norm(), kLandingTolerance_m)
+        << "landed at " << hit_m.transpose();
+
+    // Reported virtual_target matches target - shooter_velocity * tof for the
+    // converged shooter position.
+    const Eigen::Vector2d offset_m(s.shooter_x_m - pose.translation().x(),
+                                   s.shooter_y_m - pose.translation().y());
+    const Eigen::Vector2d shooter_v_mps(
+        velocity.vx_mps - velocity.omega_radps * offset_m.y(),
+        velocity.vy_mps + velocity.omega_radps * offset_m.x());
+    const Eigen::Vector2d expected_virtual_m =
+        target_m - shooter_v_mps * s.time_of_flight_s;
+    EXPECT_NEAR(s.virtual_target_x_m, expected_virtual_m.x(), kTight);
+    EXPECT_NEAR(s.virtual_target_y_m, expected_virtual_m.y(), kTight);
+  }
+}
+
+// End-to-end SolveWithChassisVelocity with nonzero pose yaw, full chassis
+// twist, offset turret mount, and nonzero measured turret angle lands on
+// target. REQ-DEV-17 REQ-DEV-18
+TEST(TargetSolverMoving, SolveWithChassisVelocityLandsOnTarget) {
+  const ShotTable table = RealisticTable();
+  const SolverConfig config = Turret(-0.2, 0.15, 0.3, {-3.5, 3.5, 0.05});
+  const TargetSolver solver(config, table);
+  const SE2<double> pose = Pose(2.5, -1.5, 1.1);
+  const Twist chassis(1.8, -1.2, 1.5);
+  const Eigen::Vector2d target_m(7.0, 2.5);
+  const double measured_turret_rad = -0.6;
+
+  const Solution s = solver.SolveWithChassisVelocity(pose, chassis, target_m,
+                                                     measured_turret_rad);
+  ASSERT_TRUE(s.valid);
+  EXPECT_TRUE(s.converged);
+  EXPECT_TRUE(s.in_range);
+  EXPECT_TRUE(s.turret_reachable);
+
+  const FieldTwist field_vel = ToFieldTwist(pose, chassis);
+  const Eigen::Vector2d hit_m =
+      SimulateLanding(config, table, pose, field_vel, s);
+  EXPECT_LT((hit_m - target_m).norm(), kLandingTolerance_m)
+      << "landed at " << hit_m.transpose();
+
+  const Solution naive =
+      solver.SolveStatic(pose, target_m, measured_turret_rad);
+  ASSERT_TRUE(naive.valid);
+  const Eigen::Vector2d naive_hit_m =
+      SimulateLanding(config, table, pose, field_vel, naive);
+  EXPECT_GT((naive_hit_m - target_m).norm(), kNaiveMiss_m);
 }
 
 // the iteration is bounded, and when it does not settle the
