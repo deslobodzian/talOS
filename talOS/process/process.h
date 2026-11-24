@@ -120,7 +120,8 @@ struct LoopPolicy {
 
 // The policy for `options`: the tier's FIFO priority; for the bridge and
 // kControl, a time-constraint period of options.period (1 ms when not
-// positive), computation half of it and constraint all of it.
+// positive, floored to 50 us), computation half of it clamped to XNU's
+// [50 us, 50 ms] RT quantum bounds, and constraint equal to period.
 LoopPolicy PolicyFor(const RealtimeOptions& options) noexcept;
 
 // Whether a node binary (talos::Run, the hardware bridge) asks for realtime
