@@ -274,6 +274,7 @@ numbered section, a number in RULES a rule:
 | REQ-DEV-34 | `tools/check_deps_listed.py` fails prepush and CI unless the "Bazel module" table in `docs/METHODOLOGY.md` §13 lists exactly `MODULE.bazel`'s `bazel_dep`s. | P2 | METH §13; TEST §9 | lint output and exit status | unit |
 | REQ-DEV-35 | `//tools:check_data_flow_sizes_test` fails `bazel test //...` (so CI and prepush) unless every number in `docs/DATA_FLOW.md` that carries a `<!-- size: name -->` marker equals the value `//tools:data_flow_sizes` computes from the defining headers, and every value it prints is marked at least once. | P2 | RULES 9; DF; TEST §9 | test output and exit status | unit |
 | REQ-DEV-36 | `tools/format.sh --check` checks every C/C++ file CI's clang-format job would check once the working tree is committed, untracked files git does not ignore included. | P2 | RULES 11; TEST §9 | lint output and exit status | unit |
+| REQ-DEV-37 | `//talOS/simulation/mujoco:mujoco_gateway` stands in for the RoboRIO as `sim_gateway --physics` does (REQ-DEV-31), with a MuJoCo model as the plant: a motor that a model actuator of the same name binds is driven by the physics backend's emulated controller output and reports that actuator's position and velocity through the motor's gearing; a motor no actuator binds behaves as under `--physics`; and the same model, config and tick times give bit-identical States. | P1 | SR "MuJoCo gateway" | motor samples; `/sim/state`; repeated runs' States | component |
 
 ## Package scope
 
@@ -293,7 +294,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/driver_station` | REQ-SAFE-10, REQ-SAFE-11 |
 | `talOS/configuration` | REQ-SAFE-26, REQ-SAFE-40, REQ-CONTRACT-10, REQ-CONTRACT-17, REQ-CONTRACT-31, REQ-DEV-29, REQ-CONTRACT-39, REQ-SAFE-43 |
 | `talOS/launcher` | REQ-SAFE-28 to REQ-SAFE-30, REQ-SAFE-40, REQ-CONTRACT-09, REQ-CONTRACT-11, REQ-CONTRACT-12, REQ-CONTRACT-42, REQ-OPS-01 to REQ-OPS-11, REQ-OPS-14 to REQ-OPS-16, REQ-OPS-19, REQ-OPS-25, REQ-OPS-30, REQ-OPS-32, REQ-DEV-04, REQ-OPS-33, REQ-OPS-37, REQ-OPS-43, REQ-OPS-51, REQ-OPS-52, REQ-RT-23, REQ-RT-25 (`session_report` rows) |
-| `talOS/simulation` | REQ-DEV-05 (the simulator and its schedules), REQ-DEV-31 |
+| `talOS/simulation` | REQ-DEV-05 (the simulator and its schedules), REQ-DEV-31, REQ-DEV-37 (`talOS/simulation/mujoco`) |
 | `talOS/introspection` | REQ-SAFE-41, REQ-SAFE-42, REQ-CONTRACT-08, REQ-CONTRACT-09, REQ-CONTRACT-33, REQ-CONTRACT-36, REQ-CONTRACT-37, REQ-RT-18, REQ-RT-21, REQ-OPS-17, REQ-OPS-18, REQ-OPS-32, REQ-OPS-52 |
 | `talOS/process` | REQ-RT-08 to REQ-RT-10, REQ-RT-21, REQ-OPS-06, REQ-OPS-12 |
 | `talOS/node_api`, `talOS/python` | REQ-SAFE-06, REQ-SAFE-42, REQ-CONTRACT-13 to REQ-CONTRACT-15, REQ-DEV-09, REQ-RT-23, REQ-SAFE-43, REQ-OPS-55 |
