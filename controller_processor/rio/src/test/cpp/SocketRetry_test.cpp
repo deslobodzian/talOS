@@ -6,12 +6,26 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <optional>
+#include <span>
+#include <utility>
+#include <vector>
+
+#include "DriverStationSampler.h"
+#include "LoopConsole.h"
+#include "RioLog.h"
+#include "SocketLinkTick.h"
+#include "driver_station/driver_station.h"
+#include "hardware/endpoint.h"
+#include "hardware/gateway.h"
 
 #ifndef _WIN32
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -476,6 +490,659 @@ TEST(SocketRetry, ASocketThatCannotSendIsReplacedOnItsPorts) {
             SocketRetry::Event::kReplaced);
   EXPECT_EQ(send(replaced_us + SocketRetry::kPeriodUs),
             protocol::UdpStatus::kOk);
+}
+
+// Unconnected loopback companion socket bound to an ephemeral port, so it
+// receives frames from an Endpoint both before and after Endpoint::Reopen()
+// without binding any fixed port.
+class LoopbackCompanion {
+ public:
+  LoopbackCompanion() : fd_{::socket(AF_INET, SOCK_DGRAM, 0)} {
+    if (fd_ < 0) return;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const int flags = ::fcntl(fd_, F_GETFL, 0);
+    if (flags < 0 || ::fcntl(fd_, F_SETFL, flags | O_NONBLOCK) != 0 ||
+        ::bind(fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) !=
+            0) {
+      ::close(fd_);
+      fd_ = -1;
+      return;
+    }
+    port_ = BoundPort(fd_);
+  }
+  ~LoopbackCompanion() {
+    if (fd_ >= 0) ::close(fd_);
+  }
+  LoopbackCompanion(const LoopbackCompanion&) = delete;
+  LoopbackCompanion& operator=(const LoopbackCompanion&) = delete;
+
+  uint16_t port() const { return port_; }
+
+  struct Frame {
+    talos::protocol::FrameType type{};
+    uint64_t sequence{0};
+    uint64_t monotonic_time_us{0};
+    std::optional<talos::driver_station::DriverStationData> ds;
+  };
+
+  std::vector<Frame> DrainFrames() {
+    std::vector<Frame> out;
+    std::array<uint8_t, talos::protocol::kMaxFrameSize + 1> buf{};
+    for (;;) {
+      const ssize_t n =
+          ::recvfrom(fd_, buf.data(), buf.size(), 0, nullptr, nullptr);
+      if (n <= 0) break;
+      talos::protocol::DecodedFrame decoded;
+      if (talos::protocol::DecodeFrame(buf.data(), static_cast<std::size_t>(n),
+                                       &decoded) !=
+          talos::protocol::DecodeStatus::kOk) {
+        continue;
+      }
+      Frame item;
+      item.type = decoded.header.type;
+      item.sequence = decoded.header.sequence;
+      item.monotonic_time_us = decoded.header.monotonic_time_us;
+      if (decoded.header.type == talos::protocol::FrameType::kDriverStation) {
+        talos::driver_station::DriverStationData ds_data;
+        if (talos::driver_station::Decode(
+                {decoded.payload, decoded.payload_size}, ds_data)) {
+          item.ds = ds_data;
+        }
+      }
+      out.push_back(item);
+    }
+    return out;
+  }
+
+ private:
+  int fd_{-1};
+  uint16_t port_{0};
+};
+
+// Minimal in-memory hardware backend to observe real Gateway::Tick(now, false)
+// disabling and neutralizing energized outputs during closed-socket ticks.
+class LinkTestBackend final : public talos::hardware::Backend {
+ public:
+  bool Configure(const talos::hardware::Config&) override { return true; }
+  bool Read(talos::hardware::State& state) override {
+    for (uint8_t i = 0; i < state.motor_count; ++i) {
+      state.motors[i].valid = true;
+    }
+    return true;
+  }
+  bool Apply(std::span<const talos::hardware::MotorRequest>) override {
+    ++apply_calls;
+    energized = true;
+    return true;
+  }
+  std::span<const uint16_t> ApplyFailedDevices() const override { return {}; }
+  void Neutral() override {
+    ++neutral_calls;
+    energized = false;
+  }
+
+  bool energized{false};
+  int apply_calls{0};
+  int neutral_calls{0};
+};
+
+// Thin wrapper around a real talos::hardware::Endpoint that counts lifecycle
+// calls (Open, Close, Reopen, SendFrame) and supports one-shot send/reopen
+// fault injection while forwarding normal ticks directly to the real Endpoint.
+class FaultingEndpoint {
+ public:
+  explicit FaultingEndpoint(talos::hardware::Gateway& gateway)
+      : inner_{gateway} {}
+
+  talos::hardware::Endpoint& inner() { return inner_; }
+
+  talos::protocol::UdpStatus Open(const char* local, uint16_t local_port,
+                                  const char* remote, uint16_t remote_port) {
+    ++open_calls;
+    const auto status = inner_.Open(local, local_port, remote, remote_port);
+    if (status == talos::protocol::UdpStatus::kOk) closed = false;
+    return status;
+  }
+
+  talos::protocol::UdpStatus Reopen() {
+    ++reopen_calls;
+    reopen_times_us.push_back(current_now_us);
+    if (fail_reopen) {
+      errno = fail_reopen_errno;
+      return talos::protocol::UdpStatus::kSocketError;
+    }
+    const auto status = inner_.Reopen();
+    if (status == talos::protocol::UdpStatus::kOk) closed = false;
+    return status;
+  }
+
+  void Close() {
+    ++close_calls;
+    closed = true;
+    inner_.Close();
+  }
+
+  const talos::protocol::UdpStats& udp_stats() const {
+    return use_stats_override_ ? stats_override_ : inner_.udp_stats();
+  }
+
+  talos::protocol::UdpStatus Tick(uint64_t now_us, bool enabled) {
+    use_stats_override_ = false;
+    const auto real_status = inner_.Tick(now_us, enabled);
+    if (injected_tick_send_.has_value()) {
+      const auto fault = *injected_tick_send_;
+      injected_tick_send_.reset();
+      stats_override_ = inner_.udp_stats();
+      if (fault.status == talos::protocol::UdpStatus::kSocketError) {
+        stats_override_.last_send_error = fault.err;
+      } else if (fault.status == talos::protocol::UdpStatus::kWouldBlock) {
+        ++stats_override_.send_would_block;
+      }
+      use_stats_override_ = true;
+      return fault.status;
+    }
+    return real_status;
+  }
+
+  talos::protocol::UdpStatus last_receive_status() const {
+    return inner_.last_receive_status();
+  }
+  int last_receive_error() const { return inner_.last_receive_error(); }
+  const talos::hardware::DrainedCommand& drained() const {
+    return inner_.drained();
+  }
+
+  talos::protocol::UdpStatus SendFrame(talos::protocol::FrameType type,
+                                       uint64_t now_us, const void* payload,
+                                       std::size_t payload_size) {
+    ++send_frame_calls;
+    use_stats_override_ = false;
+    if (injected_ds_send_.has_value()) {
+      const auto fault = *injected_ds_send_;
+      injected_ds_send_.reset();
+      stats_override_ = inner_.udp_stats();
+      if (fault.status == talos::protocol::UdpStatus::kSocketError) {
+        stats_override_.last_send_error = fault.err;
+      } else if (fault.status == talos::protocol::UdpStatus::kWouldBlock) {
+        ++stats_override_.send_would_block;
+      }
+      use_stats_override_ = true;
+      return fault.status;
+    }
+    return inner_.SendFrame(type, now_us, payload, payload_size);
+  }
+
+  struct InjectedSend {
+    talos::protocol::UdpStatus status;
+    int err{0};
+  };
+
+  void InjectNextTickSend(talos::protocol::UdpStatus status, int err = 0) {
+    injected_tick_send_ = InjectedSend{status, err};
+  }
+  void InjectNextDsSend(talos::protocol::UdpStatus status, int err = 0) {
+    injected_ds_send_ = InjectedSend{status, err};
+  }
+
+  uint64_t current_now_us{0};
+  bool fail_reopen{false};
+  int fail_reopen_errno{ENETUNREACH};
+  bool closed{true};
+  int open_calls{0};
+  int reopen_calls{0};
+  int close_calls{0};
+  int send_frame_calls{0};
+  std::vector<uint64_t> reopen_times_us;
+
+ private:
+  talos::hardware::Endpoint inner_;
+  std::optional<InjectedSend> injected_tick_send_;
+  std::optional<InjectedSend> injected_ds_send_;
+  talos::protocol::UdpStats stats_override_{};
+  bool use_stats_override_{false};
+};
+
+// Drives talos::rio::TickSocketLink() (Robot.cpp's production socket-loss tick
+// path) with a real Gateway, real Endpoint, real loopback UDP companion, real
+// SocketRetry, and real DriverStationSampler without NetComm or wall-clock
+// sleeps.
+struct SocketLinkHarness {
+  static constexpr uint64_t kBootId = 0x1020'3040'5060'7081ULL;
+
+  SocketLinkHarness()
+      : gateway{MakeConfig(), backend, kBootId}, endpoint{gateway} {}
+
+  static talos::hardware::Config MakeConfig() {
+    talos::hardware::Config config;
+    config.commissioned = true;
+    config.period_us = static_cast<uint32_t>(kLoopPeriodUs);
+    config.command_timeout_us = 100'000;
+    talos::hardware::MotorConfig motor;
+    motor.id = 1;
+    motor.name = "drive";
+    motor.can_id = 1;
+    config.motors.push_back(motor);
+    return config;
+  }
+
+  void Tick(uint64_t now_us, uint32_t ds_flags) {
+    endpoint.current_now_us = now_us;
+    talos::driver_station::DriverStationData view{};
+    view.fms.flags = ds_flags;
+    talos::rio::SocketLinkTickContext ctx{
+        .now_us = now_us,
+        .boot_id = kBootId,
+        .period_us = kLoopPeriodUs,
+        .ds_refreshed_us = now_us,
+        .driver_station_view = view,
+        .socket_retry = socket_retry,
+        .ds_sampler = ds_sampler,
+        .log = log,
+        .loop_console = loop_console,
+        .ds_buffer = ds_buffer,
+        .ds_packet = ds_packet,
+    };
+    talos::rio::TickSocketLink(
+        ctx, endpoint, gateway,
+        [&] {
+          return endpoint.Open("127.0.0.1", 0, "127.0.0.1", companion.port());
+        },
+        [&](uint64_t pre_arm_us) { last_pre_arm_us = pre_arm_us; },
+        [&] { return now_us * 1000; });
+  }
+
+  bool EnergizeMotor(uint64_t seq, uint64_t now_us) {
+    const auto state = gateway.snapshot();
+    talos::hardware::Command command{};
+    command.config_id = state.config_id;
+    command.boot_id = state.boot_id;
+    command.epoch = state.epoch;
+    command.observed_time_us = state.sample_time_us;
+    command.count = state.motor_count;
+    command.motors[0] = {state.motors[0].id, talos::hardware::Mode::kDutyCycle,
+                         0, 0.25, 0};
+    return gateway.Accept(command, seq, now_us);
+  }
+
+  LoopbackCompanion companion;
+  LinkTestBackend backend;
+  talos::hardware::Gateway gateway;
+  FaultingEndpoint endpoint;
+  SocketRetry socket_retry;
+  talos::rio::DriverStationSampler ds_sampler;
+  talos::rio::RioLog log;
+  talos::rio::LoopConsole loop_console{log};
+  std::array<uint8_t, talos::protocol::kMaxPayloadSize> ds_buffer{};
+  talos::driver_station::DriverStationData ds_packet{};
+  uint64_t last_pre_arm_us{0};
+};
+
+int g_injected_recv_errno = 0;
+
+struct ScopedReceiveErrorSeam {
+  explicit ScopedReceiveErrorSeam(talos::hardware::Endpoint& endpoint)
+      : endpoint_{endpoint} {
+    g_injected_recv_errno = 0;
+    endpoint_.SetReceiveErrorSeam(
+        []() -> int { return std::exchange(g_injected_recv_errno, 0); });
+  }
+  ~ScopedReceiveErrorSeam() {
+    g_injected_recv_errno = 0;
+    endpoint_.SetReceiveErrorSeam(nullptr);
+  }
+  talos::hardware::Endpoint& endpoint_;
+};
+
+// Exercises Robot.cpp's actual TickSocketLink() path on receive errors:
+// - Transient ECONNREFUSED keeps the real Endpoint open and outputs energized.
+// - Permanent EBADF closes the real Endpoint immediately, suppresses the DS
+//   send on that tick, ticks Gateway disabled (neutralizing active outputs!)
+//   on every closed tick while throttled, retries Reopen() strictly on the
+//   100 ms SocketRetry cadence without blocking, and resumes delivering
+//   State (continuous sequence) and the pending DS mode generation on reopen.
+// REQ-RT-22
+TEST(
+    SocketRetry,
+    RobotTickPermanentReceiveErrorClosesEndpointTicksGatewayDisabledAndReopensOnCadence) {
+  namespace ds = talos::driver_station;
+  namespace hw = talos::hardware;
+  namespace protocol = talos::protocol;
+  constexpr uint32_t kTeleopEnabled =
+      ds::kDsAttached | ds::kEnabled | ds::kTeleop;
+  constexpr uint32_t kAutoEnabled =
+      ds::kDsAttached | ds::kEnabled | ds::kAutonomous;
+
+  SocketLinkHarness h;
+  ASSERT_NE(h.companion.port(), 0);
+  ScopedReceiveErrorSeam recv_seam{h.endpoint.inner()};
+
+  // Tick 0: initial open succeeds, State + DS reach the real companion.
+  h.Tick(kStartUs, kTeleopEnabled);
+  ASSERT_TRUE(h.socket_retry.open());
+  ASSERT_EQ(h.endpoint.open_calls, 1);
+  ASSERT_EQ(h.endpoint.close_calls, 0);
+  auto frames = h.companion.DrainFrames();
+  ASSERT_EQ(frames.size(), 2u);
+  EXPECT_EQ(frames[0].type, protocol::FrameType::kHardwareState);
+  EXPECT_EQ(frames[0].sequence, 1u);
+  EXPECT_EQ(frames[1].type, protocol::FrameType::kDriverStation);
+  EXPECT_EQ(frames[1].sequence, 2u);
+
+  // Energize the motor so closed-socket Gateway::Tick(now, false)
+  // neutralization is directly observable on the backend and gateway flags.
+  ASSERT_TRUE(h.EnergizeMotor(/*seq=*/1, kStartUs));
+  ASSERT_TRUE(h.backend.energized);
+  ASSERT_NE(h.gateway.snapshot().flags & hw::kCommandActive, 0u);
+
+  // Tick 1 (+5 ms): transient receive error (ECONNREFUSED) keeps socket open.
+  g_injected_recv_errno = ECONNREFUSED;
+  h.Tick(kStartUs + kLoopPeriodUs, kTeleopEnabled);
+  EXPECT_TRUE(h.socket_retry.open());
+  EXPECT_EQ(h.endpoint.close_calls, 0);
+  EXPECT_EQ(h.endpoint.reopen_calls, 0);
+  EXPECT_TRUE(h.backend.energized);
+  frames = h.companion.DrainFrames();
+  ASSERT_EQ(frames.size(), 1u);
+  EXPECT_EQ(frames[0].type, protocol::FrameType::kHardwareState);
+  EXPECT_EQ(frames[0].sequence, 3u);
+
+  // Tick 2 (+10 ms): permanent receive error (EBADF) on the same tick as a
+  // mode transition (teleop -> auto) closes the real Endpoint immediately and
+  // suppresses sending the DS frame on the lost socket.
+  const uint64_t loss_us = kStartUs + 2 * kLoopPeriodUs;
+  g_injected_recv_errno = EBADF;
+  const int ds_sends_before_loss = h.endpoint.send_frame_calls;
+  h.Tick(loss_us, kAutoEnabled);
+  EXPECT_FALSE(h.socket_retry.open());
+  EXPECT_EQ(h.endpoint.close_calls, 1);
+  EXPECT_TRUE(h.endpoint.closed);
+  EXPECT_EQ(h.endpoint.send_frame_calls, ds_sends_before_loss)
+      << "DS frame must not be sent after ObserveReceive closed the socket";
+  // Confirm the underlying real OS socket inside Endpoint is genuinely closed.
+  const uint8_t probe = 0;
+  EXPECT_EQ(h.endpoint.inner().SendFrame(protocol::FrameType::kDriverStation,
+                                         loss_us, &probe, sizeof(probe)),
+            protocol::UdpStatus::kSocketError);
+  frames = h.companion.DrainFrames();
+  uint64_t last_seq_before_loss = 3u;
+  for (const auto& f : frames) {
+    EXPECT_NE(f.type, protocol::FrameType::kDriverStation)
+        << "no DS frame may leave after receive loss";
+    last_seq_before_loss = f.sequence;
+  }
+
+  // Closed ticks inside the 100 ms throttle window: Gateway must be ticked
+  // disabled immediately (neutralizing active outputs!) with zero Reopen()
+  // attempts and zero frames sent.
+  const int neutral_before_closed = h.backend.neutral_calls;
+  for (uint64_t now = loss_us + kLoopPeriodUs;
+       now < kStartUs + SocketRetry::kPeriodUs; now += kLoopPeriodUs) {
+    h.Tick(now, kAutoEnabled);
+    EXPECT_FALSE(h.socket_retry.open()) << now;
+    EXPECT_EQ(h.endpoint.reopen_calls, 0)
+        << "reopened before 100 ms at " << now;
+    EXPECT_FALSE(h.backend.energized)
+        << "closed-socket tick did not neutralize energized outputs at " << now;
+    EXPECT_EQ(h.gateway.snapshot().flags & hw::kEnabled, 0u) << now;
+    EXPECT_EQ(h.gateway.snapshot().flags & hw::kCommandActive, 0u) << now;
+    EXPECT_TRUE(h.companion.DrainFrames().empty())
+        << "closed-socket tick sent a frame at " << now;
+  }
+  EXPECT_GT(h.backend.neutral_calls, neutral_before_closed);
+
+  // At +100 ms: first Reopen() attempt fails ENETUNREACH without blocking;
+  // socket stays closed and Gateway keeps ticking disabled for another 100 ms.
+  h.endpoint.fail_reopen = true;
+  const uint64_t first_reopen_us = kStartUs + SocketRetry::kPeriodUs;
+  h.Tick(first_reopen_us, kAutoEnabled);
+  EXPECT_FALSE(h.socket_retry.open());
+  EXPECT_EQ(h.endpoint.reopen_calls, 1);
+  EXPECT_EQ(h.gateway.snapshot().flags & hw::kEnabled, 0u);
+  EXPECT_TRUE(h.companion.DrainFrames().empty());
+
+  for (uint64_t now = first_reopen_us + kLoopPeriodUs;
+       now < first_reopen_us + SocketRetry::kPeriodUs; now += kLoopPeriodUs) {
+    h.Tick(now, kAutoEnabled);
+    EXPECT_FALSE(h.socket_retry.open()) << now;
+    EXPECT_EQ(h.endpoint.reopen_calls, 1) << "reopened early at " << now;
+    EXPECT_EQ(h.gateway.snapshot().flags & hw::kEnabled, 0u) << now;
+    EXPECT_TRUE(h.companion.DrainFrames().empty()) << now;
+  }
+
+  // At +200 ms: network returns, Reopen() succeeds, State resumes with
+  // continuous frame sequence and the deferred auto-enabled DS packet goes out
+  // immediately with the original loss_us mode_since_us generation.
+  h.endpoint.fail_reopen = false;
+  const uint64_t second_reopen_us = first_reopen_us + SocketRetry::kPeriodUs;
+  h.Tick(second_reopen_us, kAutoEnabled);
+  EXPECT_TRUE(h.socket_retry.open());
+  EXPECT_FALSE(h.endpoint.closed);
+  ASSERT_EQ(h.endpoint.reopen_calls, 2);
+  EXPECT_EQ(h.endpoint.reopen_times_us,
+            (std::vector<uint64_t>{first_reopen_us, second_reopen_us}));
+  EXPECT_NE(h.gateway.snapshot().flags & hw::kEnabled, 0u);
+
+  frames = h.companion.DrainFrames();
+  ASSERT_EQ(frames.size(), 2u);
+  EXPECT_EQ(frames[0].type, protocol::FrameType::kHardwareState);
+  EXPECT_EQ(frames[0].sequence, last_seq_before_loss + 1);
+  EXPECT_EQ(frames[1].type, protocol::FrameType::kDriverStation);
+  EXPECT_EQ(frames[1].sequence, last_seq_before_loss + 2);
+  ASSERT_TRUE(frames[1].ds.has_value());
+  EXPECT_EQ(frames[1].ds->fms.flags, kAutoEnabled);
+  EXPECT_EQ(frames[1].ds->mode_since_us, loss_us);
+}
+
+// Exercises Robot.cpp's actual TickSocketLink() path when Endpoint::Tick()
+// fails to send State with a permanent error (ENETUNREACH, source address
+// gone): closes the Endpoint, suppresses DS send on that tick, tries Reopen()
+// on the next tick (>= 100 ms since open), ticks Gateway disabled when Reopen()
+// fails, and recovers on the 100 ms cadence.
+// REQ-RT-22
+TEST(
+    SocketRetry,
+    RobotTickPermanentStateSendErrorClosesEndpointSuppressesDsTicksDisabledAndReopens) {
+  namespace ds = talos::driver_station;
+  namespace hw = talos::hardware;
+  namespace protocol = talos::protocol;
+  constexpr uint32_t kTeleopEnabled =
+      ds::kDsAttached | ds::kEnabled | ds::kTeleop;
+  constexpr uint32_t kAutoEnabled =
+      ds::kDsAttached | ds::kEnabled | ds::kAutonomous;
+
+  SocketLinkHarness h;
+  ASSERT_NE(h.companion.port(), 0);
+
+  h.Tick(kStartUs, kTeleopEnabled);
+  ASSERT_TRUE(h.socket_retry.open());
+  ASSERT_EQ(h.companion.DrainFrames().size(), 2u);
+
+  // Advance > 100 ms past initial open and energize the motor.
+  const uint64_t steady_us = kStartUs + 200'000;
+  h.Tick(steady_us, kTeleopEnabled);
+  ASSERT_TRUE(h.EnergizeMotor(/*seq=*/1, steady_us));
+  ASSERT_TRUE(h.backend.energized);
+  ASSERT_FALSE(h.companion.DrainFrames().empty());
+
+  // State send fails permanently (ENETUNREACH) on the same tick as a mode
+  // change (teleop -> auto): must close Endpoint and skip DS send.
+  const uint64_t loss_us = steady_us + kLoopPeriodUs;
+  const int ds_sends_before = h.endpoint.send_frame_calls;
+  h.endpoint.InjectNextTickSend(protocol::UdpStatus::kSocketError, ENETUNREACH);
+  h.Tick(loss_us, kAutoEnabled);
+  EXPECT_FALSE(h.socket_retry.open());
+  EXPECT_EQ(h.endpoint.close_calls, 1);
+  EXPECT_TRUE(h.endpoint.closed);
+  EXPECT_EQ(h.endpoint.send_frame_calls, ds_sends_before)
+      << "DS frame must not be sent after SendEvent::kLost closed the socket";
+  (void)h.companion.DrainFrames();
+
+  // Next tick (+5 ms, already >= 100 ms since initial open): Reopen() is tried
+  // immediately; when it fails ENETUNREACH, Gateway ticks disabled and
+  // neutralizes the energized motor, and no further Reopen() runs for 100 ms.
+  h.endpoint.fail_reopen = true;
+  const uint64_t first_reopen_us = loss_us + kLoopPeriodUs;
+  h.Tick(first_reopen_us, kAutoEnabled);
+  EXPECT_FALSE(h.socket_retry.open());
+  EXPECT_EQ(h.endpoint.reopen_calls, 1);
+  EXPECT_FALSE(h.backend.energized);
+  EXPECT_EQ(h.gateway.snapshot().flags & hw::kEnabled, 0u);
+  EXPECT_EQ(h.gateway.snapshot().flags & hw::kCommandActive, 0u);
+  EXPECT_TRUE(h.companion.DrainFrames().empty());
+
+  for (uint64_t now = first_reopen_us + kLoopPeriodUs;
+       now < first_reopen_us + SocketRetry::kPeriodUs; now += kLoopPeriodUs) {
+    h.Tick(now, kAutoEnabled);
+    EXPECT_EQ(h.endpoint.reopen_calls, 1) << now;
+    EXPECT_EQ(h.gateway.snapshot().flags & hw::kEnabled, 0u) << now;
+    EXPECT_TRUE(h.companion.DrainFrames().empty()) << now;
+  }
+
+  // 100 ms after the failed reopen: Reopen() succeeds, sending State and the
+  // deferred auto-enabled DS packet with its original loss_us generation.
+  h.endpoint.fail_reopen = false;
+  const uint64_t recovered_us = first_reopen_us + SocketRetry::kPeriodUs;
+  h.Tick(recovered_us, kAutoEnabled);
+  EXPECT_TRUE(h.socket_retry.open());
+  EXPECT_EQ(h.endpoint.reopen_calls, 2);
+  EXPECT_EQ(h.endpoint.reopen_times_us,
+            (std::vector<uint64_t>{first_reopen_us, recovered_us}));
+  const auto frames = h.companion.DrainFrames();
+  ASSERT_EQ(frames.size(), 2u);
+  EXPECT_EQ(frames[0].type, protocol::FrameType::kHardwareState);
+  EXPECT_EQ(frames[1].type, protocol::FrameType::kDriverStation);
+  ASSERT_TRUE(frames[1].ds.has_value());
+  EXPECT_EQ(frames[1].ds->fms.flags, kAutoEnabled);
+  EXPECT_EQ(frames[1].ds->mode_since_us, loss_us);
+}
+
+// Exercises Robot.cpp's actual TickSocketLink() Driver Station send &
+// RevertSample() path on both transient (kWouldBlock) and permanent (EPIPE)
+// DS send failures:
+// - Transient kWouldBlock keeps the Endpoint open, reverts ds_sampler, and
+//   retries the mode transition on the very next 5 ms tick (inside the 20 ms
+//   kSamplePeriodUs window) with the original mode_since_us generation.
+// - Permanent EPIPE closes the Endpoint, reverts ds_sampler, immediately
+//   delivers the reverted mode transition upon 1-tick Reopen() with continuous
+//   frame sequence, and a second EPIPE within 100 ms ticks Gateway disabled
+//   until the 100 ms reopen cadence expires.
+// REQ-RT-22
+TEST(
+    SocketRetry,
+    RobotTickDriverStationSendFailureRevertsSampleClosesOnPermanentAndRetriesImmediately) {
+  namespace ds = talos::driver_station;
+  namespace hw = talos::hardware;
+  namespace protocol = talos::protocol;
+  constexpr uint32_t kTeleopEnabled =
+      ds::kDsAttached | ds::kEnabled | ds::kTeleop;
+  constexpr uint32_t kAutoEnabled =
+      ds::kDsAttached | ds::kEnabled | ds::kAutonomous;
+
+  SocketLinkHarness h;
+  ASSERT_NE(h.companion.port(), 0);
+
+  // Tick 0: initial teleop-enabled State + DS sent.
+  h.Tick(kStartUs, kTeleopEnabled);
+  ASSERT_TRUE(h.socket_retry.open());
+  ASSERT_EQ(h.companion.DrainFrames().size(), 2u);
+
+  // Part A: transient kWouldBlock on DS send during teleop -> auto switch.
+  const uint64_t switch1_us = kStartUs + kLoopPeriodUs;
+  h.endpoint.InjectNextDsSend(protocol::UdpStatus::kWouldBlock);
+  h.Tick(switch1_us, kAutoEnabled);
+  EXPECT_TRUE(h.socket_retry.open());
+  EXPECT_EQ(h.endpoint.close_calls, 0);
+  EXPECT_EQ(h.endpoint.reopen_calls, 0);
+  auto frames = h.companion.DrainFrames();
+  ASSERT_EQ(frames.size(), 1u);
+  EXPECT_EQ(frames[0].type, protocol::FrameType::kHardwareState);
+
+  // Next tick (+10 ms total, well inside 20 ms kSamplePeriodUs): RevertSample()
+  // causes the auto-enabled DS packet to retry immediately with switch1_us gen.
+  const uint64_t retry1_us = switch1_us + kLoopPeriodUs;
+  h.Tick(retry1_us, kAutoEnabled);
+  frames = h.companion.DrainFrames();
+  ASSERT_EQ(frames.size(), 2u);
+  EXPECT_EQ(frames[1].type, protocol::FrameType::kDriverStation);
+  ASSERT_TRUE(frames[1].ds.has_value());
+  EXPECT_EQ(frames[1].ds->fms.flags, kAutoEnabled);
+  EXPECT_EQ(frames[1].ds->mode_since_us, switch1_us);
+
+  // Part B: advance > 100 ms so a 1-tick Reopen() is due, send a periodic DS
+  // packet at t2 so last_sample_us_ == t2, then fail DS send permanently
+  // (EPIPE) on an auto -> teleop switch 5 ms later.
+  const uint64_t t2 = kStartUs + 200'000;
+  h.Tick(t2, kAutoEnabled);
+  frames = h.companion.DrainFrames();
+  ASSERT_EQ(frames.size(), 2u);
+  const uint64_t seq_after_t2 = frames.back().sequence;
+
+  const uint64_t switch2_us = t2 + kLoopPeriodUs;
+  h.endpoint.InjectNextDsSend(protocol::UdpStatus::kSocketError, EPIPE);
+  h.Tick(switch2_us, kTeleopEnabled);
+  EXPECT_FALSE(h.socket_retry.open());
+  EXPECT_EQ(h.endpoint.close_calls, 1);
+  EXPECT_TRUE(h.endpoint.closed);
+  frames = h.companion.DrainFrames();
+  ASSERT_EQ(frames.size(), 1u);
+  EXPECT_EQ(frames[0].type, protocol::FrameType::kHardwareState);
+  EXPECT_EQ(frames[0].sequence, seq_after_t2 + 1);
+
+  // Next tick (t2 + 10 ms, still < 20 ms after t2): Reopen() runs at once and
+  // the reverted teleop-enabled DS packet goes out immediately with switch2_us
+  // generation and continuous UDP sequence.
+  const uint64_t reopen1_us = switch2_us + kLoopPeriodUs;
+  h.Tick(reopen1_us, kTeleopEnabled);
+  EXPECT_TRUE(h.socket_retry.open());
+  EXPECT_EQ(h.endpoint.reopen_calls, 1);
+  frames = h.companion.DrainFrames();
+  ASSERT_EQ(frames.size(), 2u);
+  EXPECT_EQ(frames[0].type, protocol::FrameType::kHardwareState);
+  EXPECT_EQ(frames[0].sequence, seq_after_t2 + 2);
+  EXPECT_EQ(frames[1].type, protocol::FrameType::kDriverStation);
+  EXPECT_EQ(frames[1].sequence, seq_after_t2 + 3);
+  ASSERT_TRUE(frames[1].ds.has_value());
+  EXPECT_EQ(frames[1].ds->fms.flags, kTeleopEnabled);
+  EXPECT_EQ(frames[1].ds->mode_since_us, switch2_us);
+
+  // Part C: energize motor and inject a second EPIPE on the next periodic DS
+  // tick (within 100 ms of reopen1_us): Endpoint closes, Gateway ticks
+  // disabled (neutralizing outputs!) until reopen1_us + 100 ms, then Reopen()
+  // succeeds and delivers the reverted DS packet.
+  ASSERT_TRUE(h.EnergizeMotor(/*seq=*/1, reopen1_us));
+  ASSERT_TRUE(h.backend.energized);
+  const uint64_t periodic_ds_us = reopen1_us + ds::kSamplePeriodUs;
+  h.endpoint.InjectNextDsSend(protocol::UdpStatus::kSocketError, EPIPE);
+  h.Tick(periodic_ds_us, kTeleopEnabled);
+  EXPECT_FALSE(h.socket_retry.open());
+  EXPECT_EQ(h.endpoint.close_calls, 2);
+  (void)h.companion.DrainFrames();
+
+  for (uint64_t now = periodic_ds_us + kLoopPeriodUs;
+       now < reopen1_us + SocketRetry::kPeriodUs; now += kLoopPeriodUs) {
+    h.Tick(now, kTeleopEnabled);
+    EXPECT_FALSE(h.socket_retry.open()) << now;
+    EXPECT_EQ(h.endpoint.reopen_calls, 1) << now;
+    EXPECT_FALSE(h.backend.energized) << now;
+    EXPECT_EQ(h.gateway.snapshot().flags & hw::kEnabled, 0u) << now;
+    EXPECT_TRUE(h.companion.DrainFrames().empty()) << now;
+  }
+
+  const uint64_t reopen2_us = reopen1_us + SocketRetry::kPeriodUs;
+  h.Tick(reopen2_us, kTeleopEnabled);
+  EXPECT_TRUE(h.socket_retry.open());
+  EXPECT_EQ(h.endpoint.reopen_calls, 2);
+  EXPECT_EQ(h.endpoint.reopen_times_us,
+            (std::vector<uint64_t>{reopen1_us, reopen2_us}));
+  frames = h.companion.DrainFrames();
+  ASSERT_EQ(frames.size(), 2u);
+  EXPECT_EQ(frames[0].type, protocol::FrameType::kHardwareState);
+  EXPECT_EQ(frames[1].type, protocol::FrameType::kDriverStation);
+  ASSERT_TRUE(frames[1].ds.has_value());
+  EXPECT_EQ(frames[1].ds->fms.flags, kTeleopEnabled);
+  EXPECT_EQ(frames[1].ds->mode_since_us, switch2_us);
 }
 #endif
 
