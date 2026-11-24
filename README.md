@@ -15,8 +15,9 @@ Terms: [docs/GLOSSARY.md](docs/GLOSSARY.md).
 2. [Glossary](docs/GLOSSARY.md), when a word is new.
 3. [Node anatomy](docs/METHODOLOGY.md#2-anatomy-of-a-node) and [units](docs/METHODOLOGY.md#6-units).
 4. [examples/superstructure](examples/superstructure/README.md): three mechanisms that cooperate.
-5. [The node test matrix](docs/TESTING.md#7-the-node-test-matrix): the tests your node needs.
-6. [Node API reference](docs/NODE_DEVELOPMENT_GUIDE.md).
+5. [examples/mujoco_rig](examples/mujoco_rig/README.md): a shooter rig whose nodes score FUEL in the 2026 HUB under the MuJoCo simulator.
+6. [The node test matrix](docs/TESTING.md#7-the-node-test-matrix): the tests your node needs.
+7. [Node API reference](docs/NODE_DEVELOPMENT_GUIDE.md).
 
 **Debugging a match (a programmer).**
 

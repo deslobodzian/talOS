@@ -1,0 +1,102 @@
+# The rig's MuJoCo model parameters (talOS/simulation/mujoco/robots/README.md),
+# from the generator's shooter_rig example. robot.xml beside it is generated
+# from this file; after editing it, regenerate:
+#   bazel run //talOS/simulation/mujoco/robots:generate_robot -- \
+#     --parameters examples/mujoco_rig/main_processor/configuration/mujoco/robot_params.toml \
+#     --out examples/mujoco_rig/main_processor/configuration/mujoco/robot.xml
+# Every number is an estimate, not a measurement of a robot. What differs from
+# shooter_rig, and why, is in examples/mujoco_rig/README.md.
+
+[robot]
+name = "mujoco_rig"
+root = "welded"
+mass_kg = 40.0
+
+[game_piece]
+radius_m = 0.07506  # the 2026 FUEL
+
+[frame]
+length_m = 1.6
+width_m = 0.6985
+belly_clearance_m = 0.035
+rail_height_m = 0.0508
+rail_width_m = 0.0254
+
+[bumpers]
+bottom_m = 0.0635
+height_m = 0.127
+thickness_m = 0.085
+
+# The motors' names are the subsystem files' (subsystems/*.toml).
+[motors.feeder_motor]
+gear = 1.0
+rotor_inertia_kg_m2 = 1.0e-4
+
+[motors.flywheel_motor]
+gear = 1.0
+rotor_inertia_kg_m2 = 1.0e-4
+
+# A single-file chute: one piece wide, so the pocket behind the feeder holds
+# one piece at a time, and long enough (with the 1.6 m frame) for the eight
+# preloads in one layer. Measured: pieces stacked in a hopper arch over the
+# feeder and jam, and pieces abreast in the pocket launch back to back and
+# collide in flight (examples/mujoco_rig/README.md).
+[hopper]
+width_m = 0.17
+floor_front_m = 0.36
+floor_slope_deg = 12.0
+wall_top_m = 0.61
+
+[feeder]
+motor = "feeder_motor"
+x_m = -0.59
+roller_radius_m = 0.0254
+roller_mass_kg = 0.3
+compression_m = 0.005
+
+# shooter_rig's flywheel at 2.5 times its mass and 4 times its inertia: it
+# loses 2 % of its speed per launch instead of 7 %.
+[flywheel]
+motor = "flywheel_motor"
+radius_m = 0.0508
+width_m = 0.12
+mass_kg = 2.0
+inertia_kg_m2 = 0.01
+axle_x_m = -0.336
+axle_z_m = 0.55
+compression_m = 0.02
+hood_start_deg = -20.0
+exit_elevation_deg = 60.0
+exit_offset_m = 0.15
+efficiency = 0.5
+
+# Across the chute where a FUEL waits against the feeder, at its centre.
+[[beam_breaks]]
+name = "feeder_beam"
+position_m = [-0.48, -0.1, 0.171]
+direction = [0.0, 1.0, 0.0]
+cutoff_m = 0.2
+
+# Across the chute under the feeder's roller, at a FUEL centre's height:
+# closed while a FUEL is held at or rolls under the roller. (A beam across
+# the pocket would see nothing: the flywheel takes a FUEL in the step it
+# enters the pocket.)
+[[beam_breaks]]
+name = "shooter_beam"
+position_m = [-0.59, -0.1, 0.144]
+direction = [0.0, 1.0, 0.0]
+cutoff_m = 0.2
+
+# Eight FUEL in a row on the chute's floor, the first 1 cm in front of the
+# feeder's roller, each 1 cm clear of the next.
+[preload]
+positions_m = [
+  [-0.48, 0.0, 0.171],
+  [-0.32, 0.0, 0.205],
+  [-0.16, 0.0, 0.239],
+  [0.0, 0.0, 0.273],
+  [0.16, 0.0, 0.307],
+  [0.32, 0.0, 0.341],
+  [0.48, 0.0, 0.375],
+  [0.64, 0.0, 0.409],
+]
