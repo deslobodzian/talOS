@@ -2247,4 +2247,367 @@ can_id = 1
 }
 
 }  // namespace
+
+namespace detail {
+// node.cc: tests only, snapshots this process's newest alive registry row.
+std::vector<introspect::naming::SourceShape> RegistrySourcesForTest(
+    std::string_view name);
+}  // namespace detail
+
+namespace {
+
+// REQ-OPS-01, REQ-SAFE-14: endpoint attributes (optional, external, observer,
+// internal_driver_station, hardware_request, operator_arming,
+// untargeted_outputs) stay scoped to their own manifest source_id and do not
+// smear onto other endpoints sharing the same topic name in --describe or live
+// registry snapshots.
+TEST(Node, EndpointAttributesStayScopedBySourceIdInDescribeAndRegistry) {
+  constexpr const char* kSourceIdToml = R"(
+[robot]
+period_us = 2000
+command_timeout_us = 100000
+
+[robot.targets]
+teleop = ["teleop"]
+
+[subsystems.source_id_node]
+period_us = 2000
+
+[subsystems.mechanism.motors.unused]
+can_id = 1
+)";
+  Sim config_holder = Sim::FromToml(kSourceIdToml);
+  const std::string& config_path =
+      detail::SimAccess::config_path(config_holder);
+
+  struct Captured {
+    int status;
+    std::string out;
+    std::string err;
+  };
+  const auto run_with = [&](std::vector<std::string> args,
+                            const detail::InstanceFactory& factory) {
+    std::vector<char*> argv;
+    argv.reserve(args.size());
+    for (auto& a : args) argv.push_back(a.data());
+    ::testing::internal::CaptureStdout();
+    ::testing::internal::CaptureStderr();
+    const int status = detail::RunMain(static_cast<int>(argv.size()),
+                                       argv.data(), "source_id_node",
+                                       "//talOS/node:source_id_node", factory);
+    std::string out = ::testing::internal::GetCapturedStdout();
+    std::string err = ::testing::internal::GetCapturedStderr();
+    process::stop_requested.store(false);
+    return Captured{status, std::move(out), std::move(err)};
+  };
+
+  // Subcase 1: --describe with colliding topic names across every attribute
+  // class, including an explicit Driver Station subscriber paired with an
+  // observer on /hw/state/driver_station and an armed lane paired with an
+  // unarmed lane on /mechanism/target/teleop.
+  {
+    SCOPED_TRACE("--describe: explicit DS + observer + colliding attributes");
+    const auto factory = [](Node& node) -> detail::Instance {
+      // source 0: explicit /hw/state/driver_station watcher (flags == 0)
+      (void)node.subscribe<Count>(introspect::naming::kDriverStationTopic);
+      // source 1: observer /hw/state/driver_station watcher
+      (void)detail::NodeAccess::add_observer(
+          node, introspect::naming::kDriverStationTopic, sizeof(Count),
+          kMessageAlignment, schema::Of<Count>());
+      // source 2: required /arm/state watcher
+      (void)node.subscribe<Count>("/arm/state");
+      // source 3: optional /arm/state watcher
+      (void)node.subscribe<Count>("/arm/state", {.optional = true});
+      // source 4: armed /mechanism/target/teleop sender
+      (void)detail::NodeAccess::add_target_lane_publisher(
+          node, "/mechanism/target/teleop", sizeof(Count), kMessageAlignment,
+          schema::Of<Count>(), /*operator_arming=*/true);
+      // source 5: unarmed /mechanism/target/teleop sender
+      (void)detail::NodeAccess::add_target_lane_publisher(
+          node, "/mechanism/target/teleop", sizeof(Count), kMessageAlignment,
+          schema::Of<Count>(), /*operator_arming=*/false);
+      // source 6: hardware_request + untargeted_outputs sender
+      (void)detail::NodeAccess::add_hardware_request(
+          node, sizeof(Count), kMessageAlignment, schema::Of<Count>());
+      detail::NodeAccess::mark_untargeted_outputs(node);
+      // source 7: observer on /hw/request/source_id_node
+      (void)detail::NodeAccess::add_observer(node, "/hw/request/source_id_node",
+                                             sizeof(Count), kMessageAlignment,
+                                             schema::Of<Count>());
+      // source 8: optional watcher on /source_id_node/telemetry
+      (void)node.subscribe<Count>("/source_id_node/telemetry",
+                                  {.optional = true});
+      // extra source 9: external byte publisher on /source_id_node/telemetry
+      (void)node.publish_bytes("/source_id_node/telemetry", 64,
+                               {.external = true});
+      return std::make_shared<int>(0);
+    };
+
+    const auto [status, out, err] = run_with(
+        {"source_id_node", "--describe", "--config", config_path}, factory);
+    ASSERT_EQ(status, 0) << err;
+    introspect::Description described;
+    std::string error;
+    ASSERT_TRUE(introspect::DescribeReader::Parse(out, described, error))
+        << error << "\n"
+        << out;
+    ASSERT_EQ(described.sources.size(), 10u);
+
+    constexpr std::uint32_t kNonLatestMask =
+        ~introspect::naming::kSourceFlagLatestOnly;
+    EXPECT_EQ(described.sources[0].name,
+              introspect::naming::kDriverStationTopic);
+    EXPECT_EQ(described.sources[0].flags & kNonLatestMask, 0u);
+    EXPECT_EQ(described.sources[1].name,
+              introspect::naming::kDriverStationTopic);
+    EXPECT_EQ(described.sources[1].flags & kNonLatestMask,
+              introspect::naming::kSourceFlagObserver);
+
+    EXPECT_EQ(described.sources[2].name, "/arm/state");
+    EXPECT_EQ(described.sources[2].flags & kNonLatestMask, 0u);
+    EXPECT_EQ(described.sources[3].name, "/arm/state");
+    EXPECT_EQ(described.sources[3].flags & kNonLatestMask,
+              introspect::naming::kSourceFlagOptional);
+
+    EXPECT_EQ(described.sources[4].name, "/mechanism/target/teleop");
+    EXPECT_EQ(described.sources[4].flags & kNonLatestMask,
+              introspect::naming::kSourceFlagOperatorArming);
+    EXPECT_EQ(described.sources[5].name, "/mechanism/target/teleop");
+    EXPECT_EQ(described.sources[5].flags & kNonLatestMask, 0u);
+
+    EXPECT_EQ(described.sources[6].name, "/hw/request/source_id_node");
+    EXPECT_EQ(described.sources[6].flags & kNonLatestMask,
+              introspect::naming::kSourceFlagHardwareRequest |
+                  introspect::naming::kSourceFlagUntargetedOutputs);
+    EXPECT_EQ(described.sources[7].name, "/hw/request/source_id_node");
+    EXPECT_EQ(described.sources[7].flags & kNonLatestMask,
+              introspect::naming::kSourceFlagObserver);
+
+    EXPECT_EQ(described.sources[8].name, "/source_id_node/telemetry");
+    EXPECT_EQ(described.sources[8].flags & kNonLatestMask,
+              introspect::naming::kSourceFlagOptional);
+    EXPECT_EQ(described.sources[9].name, "/source_id_node/telemetry");
+    EXPECT_EQ(described.sources[9].flags & kNonLatestMask,
+              introspect::naming::kSourceFlagExternal);
+
+    // REQ-SAFE-14: LintGraph must still identify the node as an explicit Driver
+    // Station reader (not masked by the observer on the same topic) and flag
+    // the unarmed teleop lane (not masked by the armed sender on the same
+    // topic).
+    const std::vector<introspect::naming::NodeShape> graph = {
+        {"hardware_node",
+         "//talOS/bridge:hardware_node",
+         {{event::SourceKind::SENDER,
+           std::string{introspect::naming::kDriverStationTopic}, sizeof(Count),
+           0, "node_test.Count", Descriptor<Count>::kHash, kMessageAlignment,
+           1024}},
+         /*hardware_bridge=*/true},
+        {described.name, "//talOS/node:source_id_node", described.sources},
+        {"mechanism",
+         "//robot/mechanism:node",
+         {{event::SourceKind::WATCHER, "/mechanism/target/teleop",
+           sizeof(Count), 0, "node_test.Count", Descriptor<Count>::kHash,
+           kMessageAlignment, 1024}}},
+    };
+    const auto diagnostics = introspect::naming::LintGraph(
+        graph, {{"mechanism", {"teleop"}}},
+        {{"mechanism", {{"teleop", {"teleop"}}}}});
+    const auto arming_err =
+        std::find_if(diagnostics.begin(), diagnostics.end(), [](const auto& d) {
+          return d.severity == introspect::naming::Severity::ERROR &&
+                 d.subject == "/mechanism/target/teleop" &&
+                 d.message.find("OperatorArming") != std::string::npos;
+        });
+    EXPECT_NE(arming_err, diagnostics.end());
+  }
+
+  // Subcase 2: --describe and live registry snapshot for an internal DS
+  // subscriber paired with an observer on /hw/state/driver_station, plus
+  // optional/required, armed sender/optional watcher, hardware_request/observer
+  // and optional watcher/external byte publisher on shared topic names.
+  {
+    SCOPED_TRACE(
+        "--describe + registry: internal DS + observer + shared topics");
+    const std::string pid = std::to_string(::getpid());
+    const std::string log_path =
+        ::testing::TempDir() + "/node_source_id_" + pid + ".tlog";
+    const std::string arm_topic = "/arm/state/s_" + pid;
+    const std::string lane_topic = "/mechanism/target/teleop";
+    const std::string hw_req_topic = "/hw/request/source_id_node";
+    const std::string telem_topic = "/source_id_node/telemetry";
+    struct Cleanup {
+      std::vector<std::string> topics;
+      std::string log;
+      ~Cleanup() {
+        for (const std::string& t : topics) {
+          ::shm_unlink(ShmObjectName(t).c_str());
+        }
+        ::unlink(log.c_str());
+      }
+    } cleanup{{std::string{introspect::naming::kDriverStationTopic}, arm_topic,
+               lane_topic, hw_req_topic, telem_topic},
+              log_path};
+
+    std::vector<introspect::naming::SourceShape> observed;
+    const auto make_factory = [&](bool stop_on_registry) {
+      return [&, stop_on_registry](Node& node) -> detail::Instance {
+        // source 0: internal DS watcher
+        (void)detail::NodeAccess::add_internal_driver_station_subscription(
+            node, introspect::naming::kDriverStationTopic, sizeof(Count),
+            kMessageAlignment, schema::Of<Count>(), {});
+        // source 1: observer on /hw/state/driver_station
+        (void)detail::NodeAccess::add_observer(
+            node, introspect::naming::kDriverStationTopic, sizeof(Count),
+            kMessageAlignment, schema::Of<Count>());
+        // source 2: required watcher on arm_topic
+        (void)node.subscribe<Count>(arm_topic);
+        // source 3: optional watcher on arm_topic
+        (void)node.subscribe<Count>(arm_topic, {.optional = true});
+        // source 4: armed sender on lane_topic
+        (void)detail::NodeAccess::add_target_lane_publisher(
+            node, lane_topic, sizeof(Count), kMessageAlignment,
+            schema::Of<Count>(), /*operator_arming=*/true);
+        // source 5: optional watcher on lane_topic
+        (void)node.subscribe<Count>(lane_topic, {.optional = true});
+        // source 6: hardware_request + untargeted_outputs sender
+        (void)detail::NodeAccess::add_hardware_request(
+            node, sizeof(Count), kMessageAlignment, schema::Of<Count>());
+        detail::NodeAccess::mark_untargeted_outputs(node);
+        // source 7: observer on hw_req_topic
+        (void)detail::NodeAccess::add_observer(node, hw_req_topic,
+                                               sizeof(Count), kMessageAlignment,
+                                               schema::Of<Count>());
+        // source 8: optional watcher on telem_topic (matching Bytes layout so
+        // the live run opens the same RTMS segment as publish_bytes)
+        (void)detail::NodeDetail::add_subscription(
+            node, telem_topic, 64, kMessageAlignment, schema::Bytes(),
+            /*optional=*/true, {});
+        // extra source (last): external byte publisher on telem_topic
+        (void)node.publish_bytes(telem_topic, 64, {.external = true});
+        detail::NodeAccess::set_update(node, [&observed, stop_on_registry] {
+          if (!stop_on_registry) return;
+          observed = detail::RegistrySourcesForTest("source_id_node");
+          if (!observed.empty()) process::stop_requested.store(true);
+        });
+        return std::make_shared<int>(0);
+      };
+    };
+
+    const auto assert_sources =
+        [&](const std::vector<introspect::naming::SourceShape>& sources,
+            std::string_view where) {
+          // 9 loop topic sources + 1 tick timer + 1 byte publisher = 11.
+          ASSERT_EQ(sources.size(), 11u) << where;
+          constexpr std::uint32_t kNonLatestMask =
+              ~introspect::naming::kSourceFlagLatestOnly;
+          EXPECT_EQ(sources[0].name, introspect::naming::kDriverStationTopic)
+              << where;
+          EXPECT_EQ(sources[0].flags & kNonLatestMask,
+                    introspect::naming::kSourceFlagInternalDriverStation)
+              << where;
+          EXPECT_EQ(sources[1].name, introspect::naming::kDriverStationTopic)
+              << where;
+          EXPECT_EQ(sources[1].flags & kNonLatestMask,
+                    introspect::naming::kSourceFlagObserver)
+              << where;
+          EXPECT_EQ(sources[2].name, arm_topic) << where;
+          EXPECT_EQ(sources[2].flags & kNonLatestMask, 0u) << where;
+          EXPECT_EQ(sources[3].name, arm_topic) << where;
+          EXPECT_EQ(sources[3].flags & kNonLatestMask,
+                    introspect::naming::kSourceFlagOptional)
+              << where;
+          EXPECT_EQ(sources[4].name, lane_topic) << where;
+          EXPECT_EQ(sources[4].flags & kNonLatestMask,
+                    introspect::naming::kSourceFlagOperatorArming)
+              << where;
+          EXPECT_EQ(sources[5].name, lane_topic) << where;
+          EXPECT_EQ(sources[5].flags & kNonLatestMask,
+                    introspect::naming::kSourceFlagOptional)
+              << where;
+          EXPECT_EQ(sources[6].name, hw_req_topic) << where;
+          EXPECT_EQ(sources[6].flags & kNonLatestMask,
+                    introspect::naming::kSourceFlagHardwareRequest |
+                        introspect::naming::kSourceFlagUntargetedOutputs)
+              << where;
+          EXPECT_EQ(sources[7].name, hw_req_topic) << where;
+          EXPECT_EQ(sources[7].flags & kNonLatestMask,
+                    introspect::naming::kSourceFlagObserver)
+              << where;
+          EXPECT_EQ(sources[8].name, telem_topic) << where;
+          EXPECT_EQ(sources[8].flags & kNonLatestMask,
+                    introspect::naming::kSourceFlagOptional)
+              << where;
+          EXPECT_EQ(sources[9].kind, event::SourceKind::TIMER) << where;
+          EXPECT_EQ(sources[9].flags & kNonLatestMask, 0u) << where;
+          EXPECT_EQ(sources[10].kind, event::SourceKind::SENDER) << where;
+          EXPECT_EQ(sources[10].name, telem_topic) << where;
+          EXPECT_EQ(sources[10].flags & kNonLatestMask,
+                    introspect::naming::kSourceFlagExternal)
+              << where;
+        };
+
+    const auto [desc_status, desc_out, desc_err] =
+        run_with({"source_id_node", "--describe", "--config", config_path},
+                 make_factory(/*stop_on_registry=*/false));
+    ASSERT_EQ(desc_status, 0) << desc_err;
+    introspect::Description described;
+    std::string error;
+    ASSERT_TRUE(introspect::DescribeReader::Parse(desc_out, described, error))
+        << error << "\n"
+        << desc_out;
+    assert_sources(described.sources, "--describe");
+
+    const auto [live_status, live_out, live_err] =
+        run_with({"source_id_node", "--sim", "--duration-s", "5", "--log",
+                  log_path, "--config", config_path},
+                 make_factory(/*stop_on_registry=*/true));
+    ASSERT_EQ(live_status, 0) << live_out << "\n" << live_err;
+    assert_sources(observed, "registry");
+  }
+
+  // Subcase 3: live registry snapshot for explicit DS subscriber + observer on
+  // /hw/state/driver_station (REQ-SAFE-14).
+  {
+    SCOPED_TRACE(
+        "registry: explicit DS + observer on /hw/state/driver_station");
+    const std::string pid = std::to_string(::getpid());
+    const std::string log_path =
+        ::testing::TempDir() + "/node_source_id_ds_" + pid + ".tlog";
+    struct Cleanup {
+      std::string log;
+      ~Cleanup() {
+        ::shm_unlink(
+            ShmObjectName(introspect::naming::kDriverStationTopic).c_str());
+        ::unlink(log.c_str());
+      }
+    } cleanup{log_path};
+
+    std::vector<introspect::naming::SourceShape> observed;
+    const auto [live_status, live_out, live_err] = run_with(
+        {"source_id_node", "--sim", "--duration-s", "5", "--log", log_path,
+         "--config", config_path},
+        [&observed](Node& node) -> detail::Instance {
+          (void)node.subscribe<Count>(introspect::naming::kDriverStationTopic);
+          (void)detail::NodeAccess::add_observer(
+              node, introspect::naming::kDriverStationTopic, sizeof(Count),
+              kMessageAlignment, schema::Of<Count>());
+          detail::NodeAccess::set_update(node, [&observed] {
+            observed = detail::RegistrySourcesForTest("source_id_node");
+            if (!observed.empty()) process::stop_requested.store(true);
+          });
+          return std::make_shared<int>(0);
+        });
+    ASSERT_EQ(live_status, 0) << live_out << "\n" << live_err;
+    ASSERT_EQ(observed.size(), 3u);
+    constexpr std::uint32_t kNonLatestMask =
+        ~introspect::naming::kSourceFlagLatestOnly;
+    EXPECT_EQ(observed[0].name, introspect::naming::kDriverStationTopic);
+    EXPECT_EQ(observed[0].flags & kNonLatestMask, 0u);
+    EXPECT_EQ(observed[1].name, introspect::naming::kDriverStationTopic);
+    EXPECT_EQ(observed[1].flags & kNonLatestMask,
+              introspect::naming::kSourceFlagObserver);
+  }
+}
+
+}  // namespace
 }  // namespace talos
