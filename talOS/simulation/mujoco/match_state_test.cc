@@ -3,7 +3,8 @@
 // match its mode schedule plays. /sim/state/match reports the periods in order
 // and a countdown, the Driver Station packets carry the match time and game
 // message, and the live registry row declares what --describe declares, as
-// the launcher's live-endpoint check requires.
+// the launcher's live-endpoint check requires. REQ-DEV-43: the same run
+// publishes /sim/telemetry/pieces, the field's 504 FUEL every 50 ms.
 #include <arpa/inet.h>
 #include <gtest/gtest.h>
 #include <netinet/in.h>
@@ -26,6 +27,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -34,6 +36,7 @@
 #include "sim/sim_generated.h"
 #include "sim/topics.h"
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/hardware/sim_rings.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
 #include "talOS/introspection/registry.h"
@@ -139,7 +142,8 @@ std::vector<Endpoint> Endpoints(const std::vector<Source>& sources) {
 struct MatchRun {
   std::vector<ds::DriverStationData> packets;  // from time zero on
   std::vector<::sim::MatchState> matches;
-  std::optional<introspect::NodeSnapshot> row;  // with the topic counted
+  std::vector<::sim::GamePieces> pieces;
+  std::optional<introspect::NodeSnapshot> row;  // with the topics counted
   uint64_t start_us{0};
   int status{-1};
   std::string log;
@@ -180,27 +184,39 @@ MatchRun RunGateway() {
     ::_exit(127);
   }
   std::optional<ipc::Subscriber<::sim::MatchState>> subscriber;
+  std::optional<ipc::Subscriber<::sim::GamePieces>> pieces;
+  const auto drain = [&] {
+    if (subscriber) {
+      while (const auto message = subscriber->read_next()) {
+        run.matches.push_back(message->message);
+      }
+    }
+    if (pieces) {
+      while (const auto message = pieces->read_next()) {
+        run.pieces.push_back(message->message);
+      }
+    }
+  };
   // The counts only bound a hang: 200 receives that time out (10 s without
   // a datagram), or 20000 datagrams (100 s of State at 200 Hz).
   int idle = 0;
   int received = 0;
   std::array<uint8_t, protocol::kMaxFrameSize> buffer{};
   while (idle < 200 && received < 20000) {
-    if (subscriber) {
-      while (const auto message = subscriber->read_next()) {
-        run.matches.push_back(message->message);
-      }
-    }
+    drain();
     if (!run.row) {
       if (const auto reader = introspect::RegistryReader::open()) {
         for (const auto& row : reader->nodes()) {
           if (row.pid != static_cast<uint64_t>(child) || !row.alive) continue;
+          int counted = 0;
           for (const auto& source : row.sources) {
-            if (source.name == ::sim::topics::kMatchState &&
+            if ((source.name == ::sim::topics::kMatchState ||
+                 source.name == ::sim::topics::kPieces) &&
                 source.events > 0) {
-              run.row = row;
+              ++counted;
             }
           }
+          if (counted == 2) run.row = row;
         }
       }
     }
@@ -219,6 +235,11 @@ MatchRun RunGateway() {
           std::ofstream{partial} << run.start_us * 1000 << "\n";
           std::filesystem::rename(partial, start_file);
           subscriber.emplace(::sim::topics::kMatchState);
+          pieces.emplace(
+              ::sim::topics::kPieces,
+              RTMSOptions{.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
+                          .read_mode = ReadMode::SEQUENCE},
+              hardware::sim::kPiecesSlots);
         }
         if (data.sample_time_us >= run.start_us) run.packets.push_back(data);
       }
@@ -235,11 +256,7 @@ MatchRun RunGateway() {
     ::kill(child, SIGKILL);
     ::waitpid(child, nullptr, 0);
   }
-  if (subscriber) {
-    while (const auto message = subscriber->read_next()) {
-      run.matches.push_back(message->message);
-    }
-  }
+  drain();
   ::close(receiver);
   run.log = ReadFile(log);
   return run;
@@ -326,9 +343,37 @@ TEST_F(MujocoGatewayMatch, DriverStationPacketsCarryTheirTicksMatch) {
   EXPECT_GT(teleop, 0) << run_->log;
 }
 
+// REQ-DEV-43: /sim/telemetry/pieces carries the field's 504 FUEL on every
+// 10th tick: each message is stamped with a tick's /sim/state/match time,
+// and nine ticks' matches lie between two messages (50 ms at 5 ms ticks;
+// the run's real-time jitter moves the stamps, not the count).
+TEST_F(MujocoGatewayMatch, PublishesThePiecesEveryTenthTick) {
+  ASSERT_EQ(run_->status, 0) << run_->log;
+  ASSERT_GE(run_->pieces.size(), 10u) << run_->log;
+  std::vector<uint64_t> ticks;
+  ticks.reserve(run_->matches.size());
+  for (const auto& match : run_->matches)
+    ticks.push_back(match.sample_time_ns());
+  int checked = 0;
+  for (std::size_t i = 0; i < run_->pieces.size(); ++i) {
+    EXPECT_EQ(run_->pieces[i].pieces_count(), 504u) << "message " << i;
+    if (i == 0) continue;
+    const uint64_t from = run_->pieces[i - 1].sample_time_ns();
+    const uint64_t to = run_->pieces[i].sample_time_ns();
+    if (ticks.empty() || from < ticks.front()) continue;
+    ASSERT_TRUE(std::binary_search(ticks.begin(), ticks.end(), to))
+        << "message " << i << " is stamped with no tick's time";
+    const auto between = std::upper_bound(ticks.begin(), ticks.end(), from);
+    const auto at = std::lower_bound(ticks.begin(), ticks.end(), to);
+    EXPECT_EQ(at - between, 9) << "message " << i;
+    ++checked;
+  }
+  EXPECT_GE(checked, 10) << run_->log;
+}
+
 // The launcher refuses a run whose live endpoints differ from its --describe
-// probe: /sim/state/match is in both, with sim.MatchState's schema, and the
-// row counts what was published on it.
+// probe: /sim/state/match and /sim/telemetry/pieces are in both, with their
+// schemas, and the row counts what was published on each.
 TEST_F(MujocoGatewayMatch, LiveRowDeclaresWhatDescribeDeclares) {
   ASSERT_EQ(run_->status, 0) << run_->log;
   const std::string out_path = TempPath("describe.out");
@@ -340,16 +385,21 @@ TEST_F(MujocoGatewayMatch, LiveRowDeclaresWhatDescribeDeclares) {
   ASSERT_TRUE(
       introspect::DescribeReader::Parse(ReadFile(out_path), described, error))
       << error;
-  const auto topic =
-      std::find_if(described.sources.begin(), described.sources.end(),
-                   [](const auto& source) {
-                     return source.name == ::sim::topics::kMatchState;
-                   });
-  ASSERT_NE(topic, described.sources.end());
-  const auto schema = schema::Of<::sim::MatchState>();
-  EXPECT_EQ(topic->schema, schema.name);
-  EXPECT_EQ(topic->schema_hash, schema.hash);
-  EXPECT_EQ(topic->message_bytes, sizeof(::sim::MatchState));
+  const auto expect_topic = [&described](std::string_view name,
+                                         const schema::Identity& schema,
+                                         std::size_t bytes) {
+    const auto topic = std::find_if(
+        described.sources.begin(), described.sources.end(),
+        [name](const auto& source) { return source.name == name; });
+    ASSERT_NE(topic, described.sources.end()) << name;
+    EXPECT_EQ(topic->schema, schema.name) << name;
+    EXPECT_EQ(topic->schema_hash, schema.hash) << name;
+    EXPECT_EQ(topic->message_bytes, bytes) << name;
+  };
+  expect_topic(::sim::topics::kMatchState, schema::Of<::sim::MatchState>(),
+               sizeof(::sim::MatchState));
+  expect_topic(::sim::topics::kPieces, schema::Of<::sim::GamePieces>(),
+               sizeof(::sim::GamePieces));
   ASSERT_TRUE(run_->row.has_value()) << run_->log;
   EXPECT_EQ(Endpoints(run_->row->sources), Endpoints(described.sources));
 }

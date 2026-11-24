@@ -6,6 +6,7 @@ import {checkExportFormat, Coordinator, type Dictionary, dictionaryKey, exportPa
 import {AlertTracker} from './data/alerts';
 import {graphStale} from './data/freshness';
 import {MAX_MANIFEST_BYTES, manifestUrl, parseManifest, type SessionManifest} from './data/manifest';
+import {isPiecesMessage, PiecesDecoder} from './data/pieces';
 import {type Connection, type PlaybackState} from './data/types';
 import {WorkerUpdateStream} from './data/worker-stream';
 import {demoDeclaredGraph, demoPacket, demoSystemGraph} from './demo';
@@ -63,6 +64,11 @@ const historyHooks: HistoryHooks = {
 let history = new TelemetryHistory(historyHooks);
 let coordinator = new Coordinator(history.timeline);
 let decoder = new TelemetryDecoder();
+// The MuJoCo gateway's game pieces (REQ-DEV-43): live only, never recorded.
+const pieces = new PiecesDecoder();
+function postPieces() {
+  updates.push({type: 'pieces', pieces: pieces.snapshot()});
+}
 let socket: WebSocket|null = null, demo = false, sequence = 0n,
             status = 'Disconnected';
 let nextDemo = 0, lastTick = performance.now();
@@ -331,6 +337,8 @@ function reset() {
   history = new TelemetryHistory(historyHooks);
   coordinator = new Coordinator(history.timeline);
   decoder = new TelemetryDecoder();
+  pieces.reset();
+  postPieces();
   needsReset = true;
   pendingFrames = [];
   alertTracker.reset();
@@ -372,9 +380,17 @@ function close() {
   }
   demo = false;
 }
-// One WebSocket message: a dictionary page or an update page. A snapshot
-// comes out at each update's last page.
+// One WebSocket message: a dictionary page or an update page, or the game
+// pieces. A snapshot comes out at each update's last page.
 function ingest(bytes: Uint8Array, now: number) {
+  if (isPiecesMessage(bytes)) {
+    try {
+      if (pieces.apply(bytes)) postPieces();
+    } catch {
+      history.jitter.stats.invalid++;
+    }
+    return;
+  }
   try {
     for (const frame of decoder.decodeAll(bytes)) {
       if (!history.push(frame, decoder.currentDictionary(), now)) continue;
@@ -401,6 +417,7 @@ function connect(url: string, gen: number) {
       status = 'WebSocket connected';
       connection = 'live';
       decoder.reset();
+      pieces.reset();
       // The bridge answers an open with its graph and then, when it has
       // them, the dictionary and a keyframe: the first update on a socket.
       firstUpdate = true;
@@ -417,8 +434,9 @@ function connect(url: string, gen: number) {
     };
     socket.onmessage = e => {
       if (gen !== generation) return;
-      // Binary is telemetry, text is the system graph. The bridge picks the
-      // frame type, so neither side has to sniff the payload.
+      // Binary is telemetry or the game pieces (told apart by the pieces'
+      // magic, data/pieces.ts), text is the system graph. The bridge picks
+      // the frame type.
       if (e.data instanceof ArrayBuffer) {
         ingest(new Uint8Array(e.data), performance.now());
       } else if (typeof e.data === 'string')

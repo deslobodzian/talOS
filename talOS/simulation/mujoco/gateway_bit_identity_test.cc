@@ -113,7 +113,7 @@ struct Assembly {
                    .log = &log,
                    .summary = &log,
                    // Two assemblies at once: one writer per topic.
-                   .tests_only_skip_match_writes = true}) {
+                   .tests_only_skip_writes = true}) {
     hardware::Config hw = config.hardware;
     hw.commissioned = true;
     InstallMujocoProcessHandlers();

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -211,11 +212,38 @@ talos::event::Manifest Manifest(bool physics,
   return manifest;
 }
 
-// Use the same manifest for the launcher probe and the live registration.
-int Describe(std::string_view target, const talos::event::Manifest& manifest) {
-  std::cout << talos::introspect::DescribeToJson(
+// The ring of each extension topic (GatewayExtension::TopicSlots), MAX_SLOTS
+// for 0; refuses one RTMS cannot open.
+std::vector<uint32_t> ExtensionSlots(
+    const talos::simulation::GatewayExtension* extension,
+    const talos::event::Manifest& topics) {
+  std::vector<uint32_t> slots;
+  for (std::size_t i = 0; i < topics.size(); ++i) {
+    const uint32_t ring = extension->TopicSlots(i);
+    if (ring != 0 &&
+        (ring < 2 || ring > MAX_SLOTS || !std::has_single_bit(ring))) {
+      throw std::invalid_argument(
+          "sim_gateway: topic " + topics[i].name + " declares a ring of " +
+          std::to_string(ring) + " slots; RTMS needs a power of two in [2, " +
+          std::to_string(MAX_SLOTS) + "]");
+    }
+    slots.push_back(ring == 0 ? static_cast<uint32_t>(MAX_SLOTS) : ring);
+  }
+  return slots;
+}
+
+// Use the same manifest for the launcher probe and the live registration;
+// the extension's topics, last in it, on their own rings.
+int Describe(std::string_view target, const talos::event::Manifest& manifest,
+             const std::vector<uint32_t>& extension_slots) {
+  talos::introspect::Description description =
       talos::introspect::DescribeManifest(kNodeName, std::string{target},
-                                          manifest, MAX_SLOTS));
+                                          manifest, MAX_SLOTS);
+  const std::size_t first = description.sources.size() - extension_slots.size();
+  for (std::size_t i = 0; i < extension_slots.size(); ++i) {
+    description.sources[first + i].slots = extension_slots[i];
+  }
+  std::cout << talos::introspect::DescribeToJson(description);
   return 0;
 }
 
@@ -323,7 +351,10 @@ int Run(int argc, char** argv,
     const talos::event::Manifest extension_topics =
         extension != nullptr ? extension->Topics() : talos::event::Manifest{};
     const talos::event::Manifest manifest = Manifest(physics, extension_topics);
-    if (describe) return Describe(program.target, manifest);
+    const std::vector<uint32_t> extension_slots =
+        extension != nullptr ? ExtensionSlots(extension, extension_topics)
+                             : std::vector<uint32_t>{};
+    if (describe) return Describe(program.target, manifest, extension_slots);
     if (config_path == nullptr) {
       throw std::invalid_argument(
           "sim_gateway needs --config PATH: an unconfigured gateway stamps "

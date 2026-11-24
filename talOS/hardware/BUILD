@@ -59,18 +59,28 @@ cc_library(
 # Simulation ground truth (reserved owner `sim`), written only by a simulator,
 # never on a robot: the simulated robot's true field pose and field-frame
 # velocity as geometry.OdometrySample on /sim/state (a physics-backed
-# simulator), and the match a field's game rules referee as sim.MatchState
-# (sim.fbs) on /sim/state/match.
+# simulator), the match a field's game rules referee as sim.MatchState
+# (sim.fbs) on /sim/state/match, and where the field's game pieces are as
+# sim.GamePieces on /sim/telemetry/pieces (the MuJoCo gateway's, for Studio).
 talos_messages(
     name = "sim_messages",
     srcs = ["sim.fbs"],
     include_prefix = "sim",
     topics = {
         "match_state": "/sim/state/match",
+        "pieces": "/sim/telemetry/pieces",
         "state": "/sim/state",
     },
     visibility = ["//visibility:public"],
     deps = ["//talOS/msgs:geometry"],
+)
+
+# The rings of the simulation truth topics whose ring is not MAX_SLOTS,
+# for their writer and readers alike.
+cc_library(
+    name = "sim_rings",
+    hdrs = ["sim_rings.h"],
+    visibility = ["//visibility:public"],
 )
 
 # Compile-time checks of sim.fbs's shared-memory layout: building it is the

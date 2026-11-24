@@ -102,6 +102,9 @@ class MujocoPlant final : public hardware::sim::ExternalPlant {
   // rules write what world_rules.h allows).
   const mjModel_* model() const { return model_.get(); }
   const mjData_* data() const { return data_.get(); }
+  // The robot model's root body in model(): every robot body is in its
+  // subtree (body_rootid), and no other body is.
+  int robot_root_body() const { return root_body_; }
 
   // World rules (world_rules.h). Before the first Step; not owned; run in the
   // order added. Calls Attach, then mj_forward and mj_step's position,

@@ -29,3 +29,17 @@ struct MatchState {
   blue_inactive_first: bool;
   tie_drawn: bool;
 }
+
+// Where a field's game pieces are, on /sim/telemetry/pieces (8336 B; layout
+// pinned in sim_layout_asserts.cc and docs/DATA_FLOW.md), for Studio's 3D
+// viewport (REQ-DEV-43). Piece i is the field model's i-th free body in body
+// order (the robot's never); entries at and past pieces_count are zero.
+struct GamePieces {
+  sample_time_ns: ulong;   // node clock, as /sim/state
+  pieces_count: uint;      // at most 640
+  radius_m: float;         // the first piece's bounding radius; every piece's
+  x_m: [float:640];        // field frame: the model's world, metres
+  y_m: [float:640];
+  z_m: [float:640];
+  in_play: [bool:640];     // false: the game holds it out of play
+}

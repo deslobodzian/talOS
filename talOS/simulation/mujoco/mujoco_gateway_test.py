@@ -73,9 +73,10 @@ _DIVERGING = """<mujoco><compiler angle="radian"/><worldbody>
 
 class MujocoGatewayTest(unittest.TestCase):
 
-    # REQ-DEV-37, REQ-DEV-40: the same roster member as sim_gateway
-    # --physics (name, /sim/state, schema) plus /sim/state/match, so the
-    # launcher and the graph lint see the program's label and the match.
+    # REQ-DEV-37, REQ-DEV-40, REQ-DEV-43: the same roster member as
+    # sim_gateway --physics (name, /sim/state, schema) plus /sim/state/match
+    # and /sim/telemetry/pieces, so the launcher and the graph lint see the
+    # program's label, the match and the game pieces.
     def test_describes_as_sim_gateway_physics_with_the_match(self):
         mujoco = _run("--describe")
         self.assertEqual(mujoco.returncode, 0, mujoco.stderr)
@@ -94,6 +95,12 @@ class MujocoGatewayTest(unittest.TestCase):
         self.assertEqual(match[0]["schema"], "sim.MatchState")
         self.assertEqual(match[0]["kind"], "SENDER")
         mujoco_json["sources"].remove(match[0])
+        pieces = [source for source in mujoco_json["sources"]
+                  if source["name"] == "/sim/telemetry/pieces"]
+        self.assertEqual(len(pieces), 1, mujoco_json["sources"])
+        self.assertEqual(pieces[0]["schema"], "sim.GamePieces")
+        self.assertEqual(pieces[0]["kind"], "SENDER")
+        mujoco_json["sources"].remove(pieces[0])
         self.assertEqual(mujoco_json, plain_json)
 
     # REQ-DEV-37: refused before the socket opens, exit 1, naming the key or
