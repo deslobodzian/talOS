@@ -423,6 +423,71 @@ TEST(Capture, LinuxDisconnectReleasesDeviceAllowsSelfStopAndSetMode) {
       EXPECT_EQ(state.active_mmaps, 0);
     }
   }
+
+  // Case 4: External Stop() overlapping FrameCallback invoking Stop() must
+  // never AB-BA deadlock on lifecycle_mutex_ vs worker_.join().
+  {
+    FakeV4L2State state;
+    std::atomic<int> poll_calls{0};
+    auto sys = state.Syscalls([&](pollfd* fds, nfds_t, int) {
+      if (poll_calls.fetch_add(1) == 0) {
+        fds[0].revents = POLLIN;
+        return 1;
+      }
+      return 0;
+    });
+    auto base_ioctl = sys.ioctl_fn;
+    sys.ioctl_fn = [base_ioctl](int fd, unsigned long req, void* arg) {
+      if (req == VIDIOC_DQBUF) {
+        auto* b = static_cast<v4l2_buffer*>(arg);
+        b->index = 0;
+        b->bytesused = FakeV4L2State::kBufSize;
+        b->flags = 0;
+        return 0;
+      }
+      return base_ioctl(fd, req, arg);
+    };
+    auto source = CreateV4L2CameraSourceForTest(config, std::move(sys));
+    std::mutex mu;
+    std::condition_variable cv;
+    bool in_callback = false;
+    bool external_stop_started = false;
+    source->SetFrameCallback([&](const Frame&) {
+      {
+        std::lock_guard lock(mu);
+        in_callback = true;
+      }
+      cv.notify_one();
+      {
+        std::unique_lock lock(mu);
+        cv.wait_for(lock, std::chrono::seconds{5},
+                    [&] { return external_stop_started; });
+      }
+      // Concurrent self-Stop() while external Stop() is joining worker_.
+      source->Stop();
+    });
+    ASSERT_TRUE(source->Start());
+    {
+      std::unique_lock lock(mu);
+      ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds{10},
+                              [&] { return in_callback; }));
+    }
+    std::thread stopper([&] {
+      {
+        std::lock_guard lock(mu);
+        external_stop_started = true;
+      }
+      cv.notify_one();
+      source->Stop();
+    });
+    stopper.join();
+    EXPECT_FALSE(source->IsRunning());
+    {
+      std::lock_guard lock(state.mu);
+      EXPECT_EQ(state.open_fds, 0);
+      EXPECT_EQ(state.active_mmaps, 0);
+    }
+  }
 }
 
 // FIELD-4 (no REQ row covers live capture modes yet): a live camera opens
