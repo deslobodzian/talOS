@@ -14,7 +14,11 @@ from python.runfiles import runfiles
 
 
 def read(env):
-    path = runfiles.Create().Rlocation(os.environ[env], source_repo="")
+    location = os.environ[env]
+    resolver = runfiles.Create()
+    path = resolver.Rlocation(location, source_repo="") if resolver else None
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError(f"missing runfile for {env}: {location}")
     with open(path, "rb") as f:
         return f.read()
 

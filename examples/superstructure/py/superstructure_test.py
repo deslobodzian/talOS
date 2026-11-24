@@ -4,10 +4,12 @@ SimHardware in place of the bridge and the Driver Station, all configured by
 config/robot_py.toml and config/subsystems/. Detailed mechanism behavior is
 covered once in cpp/superstructure_test.cc; these exercise the Python host."""
 
+import math
 import os
 import unittest
 
 import talos
+from demo.ElevatorGoal import ElevatorGoal
 from demo.ElevatorState import ElevatorState
 from demo.ElevatorStatus import ElevatorStatus
 from demo.IntakeCommand import IntakeCommand
@@ -179,6 +181,10 @@ class SuperstructureTest(unittest.TestCase):
         self.hold(Command.SCORE_HIGH, 0.2)
         self.assertEqual(self.roller().mode, NEUTRAL)
         self.assertEqual(self.lift().mode, NEUTRAL)
+        self.assertEqual(self.hw.applied_motor("intake", "roller").mode,
+                         NEUTRAL)
+        self.assertEqual(self.hw.applied_motor("elevator", "lift").mode,
+                         NEUTRAL)
         self.assertEqual(self.superstructure_state(), SuperstructureState.HOLDING)
         self.assertEqual(self.intake_status().state, IntakeState.HOLDING)
         self.assertEqual(self.elevator_status().state, ElevatorState.STOWED)
@@ -282,6 +288,64 @@ class SuperstructureTest(unittest.TestCase):
 
         self.hold(Command.STOW, 0.06)
         self.assertEqual(self.superstructure_state(), SuperstructureState.STOWED)
+
+    def test_earlier_generation_goal_is_ignored(self):
+        enable_teleop(self.sim, self.hw)
+        self.hw.ideal_motors()
+        self.hold(Command.INTAKE, 0.1)
+        self.assertEqual(self.superstructure_state(),
+                         SuperstructureState.INTAKING)
+        before = self.sim.driver_station_generation
+        self.hw.set_driver_station(teleop=True)  # disabled
+        self.sim.step(0.04)
+        self.hw.set_driver_station(enabled=True, teleop=True)
+        self.sim.step(0.02)
+        self.assertNotEqual(self.sim.driver_station_generation, before)
+        # Goal stamped with the earlier generation counts as STOW.
+        self.sim.publish_target(SuperstructureGoal, "superstructure", "teleop",
+                                mode_since_us=before, command=Command.INTAKE)
+        self.sim.step(0.04)
+        self.assertEqual(self.superstructure_state(), SuperstructureState.STOWED)
+        self.assertEqual(self.hw.applied_motor("intake", "roller").mode,
+                         NEUTRAL)
+        # A goal stamped with the current generation drives immediately.
+        self.hold(Command.INTAKE, 0.1)
+        self.assertEqual(self.superstructure_state(),
+                         SuperstructureState.INTAKING)
+        self.assertEqual(self.hw.applied_motor("intake", "roller")[:2],
+                         (VOLTAGE, INTAKE_VOLTS))
+
+    # REQ-SAFE-04
+    def test_elevator_non_finite_goal_goes_neutral(self):
+        sim = Sim(CONFIG)
+        sim.add(elevator.Elevator, "elevator")
+        hw = SimHardware(sim)
+        hw.set_digital_input("elevator", "bottom_limit", False)
+        sim.step(0.03)
+        hw.set_digital_input("elevator", "bottom_limit", True)
+        enable_teleop(sim, hw)
+        hw.ideal_motors()
+
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(height_rot=bad):
+                for _ in range(5):
+                    sim.publish_target(ElevatorGoal, "elevator",
+                                       "superstructure", height_rot=HIGH_ROT)
+                    sim.step(0.01)
+                self.assertEqual(
+                    hw.applied_motor("elevator", "lift").mode, MOTION_MAGIC)
+                for _ in range(5):
+                    sim.publish_target(ElevatorGoal, "elevator",
+                                       "superstructure", height_rot=bad)
+                    sim.step(0.01)
+                self.assertEqual(
+                    hw.motor_request("elevator", "lift").mode, NEUTRAL)
+                self.assertEqual(
+                    hw.applied_motor("elevator", "lift").mode, NEUTRAL)
+                status = sim.latest(ElevatorStatus, "/elevator/state")
+                self.assertIsNotNone(status)
+                self.assertTrue(math.isfinite(status.height_rot))
+                self.assertTrue(math.isfinite(status.goal_rot))
 
 
 if __name__ == "__main__":

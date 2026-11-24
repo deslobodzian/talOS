@@ -5,6 +5,7 @@ repository: the case names are the matrix's, which talos's
 //tools:check_node_matrix looks for.
 """
 
+import math
 import os
 import unittest
 
@@ -75,7 +76,10 @@ class GateTest(unittest.TestCase):
     # devices flush's (REQ-SAFE-02, proved in talOS/devices), not this
     # node's evidence.
     def test_disabled_robot_goes_neutral(self):
-        self.teleop(enabled=False)
+        self.teleop()
+        self.hold(30.0, 0.04)
+        self.assertEqual(self.applied(), talos.Mode.VELOCITY)
+        self.hw.enable(False)
         self.hold(30.0, 0.06)
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         self.assertEqual(self.applied(), talos.Mode.NEUTRAL)
@@ -137,6 +141,7 @@ class GateTest(unittest.TestCase):
         # so the node's own feedback gate is what stops it.
         self.assertTrue(talos.robot_enabled(self.sim.node("gate")))
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        self.assertEqual(self.applied(), talos.Mode.NEUTRAL)
         state = self.state()
         self.assertFalse(state.connected)
         self.assertFalse(state.enabled)
@@ -144,9 +149,16 @@ class GateTest(unittest.TestCase):
     # REQ-SAFE-04
     def test_non_finite_demand_goes_neutral(self):
         self.teleop()
-        self.hold(float("nan"), 0.04)
-        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
-        self.assertFalse(self.state().enabled)
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(velocity_rps=bad):
+                self.hold(30.0, 0.04)
+                self.assertEqual(self.applied(), talos.Mode.VELOCITY)
+                self.hold(bad, 0.04)
+                self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+                self.assertEqual(self.applied(), talos.Mode.NEUTRAL)
+                state = self.state()
+                self.assertFalse(state.enabled)
+                self.assertTrue(math.isfinite(state.velocity_rps))
 
     # matrix: n/a 9 (the gate reads no parameters)
 
