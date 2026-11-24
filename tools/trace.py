@@ -452,6 +452,41 @@ def _contains_string_constant(node, target, bindings=None, seen=frozenset()):
     )
 
 
+def _expr_ref_names(node):
+    """Variable names referenced in an expression (skipping bare Call.func
+    names like `dict(...)`)."""
+    if node is None:
+        return set()
+    skip = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+            skip.add(id(n.func))
+    return {
+        n.id for n in ast.walk(node)
+        if isinstance(n, ast.Name) and id(n) not in skip
+    }
+
+
+def _container_ref_names(node):
+    """Variable names embedded inside expressions that may hold or alias
+    mutable containers (literals, BinOp, IfExp, comprehensions, Call)."""
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict,
+                         ast.ListComp, ast.SetComp, ast.DictComp,
+                         ast.IfExp, ast.Call)):
+        return _expr_ref_names(node)
+    if isinstance(node, ast.BinOp) and isinstance(
+        node.op, (ast.Add, ast.BitOr, ast.Mult)
+    ):
+        return (
+            _container_ref_names(node.left) | _container_ref_names(node.right)
+            | (_expr_ref_names(node.left)
+               if isinstance(node.left, (ast.Name, ast.Subscript)) else set())
+            | (_expr_ref_names(node.right)
+               if isinstance(node.right, (ast.Name, ast.Subscript)) else set())
+        )
+    return set()
+
+
 class _QuarantineEvalState:
     """Statement-order binding tracker for `quarantined_targets()`."""
 
@@ -460,6 +495,7 @@ class _QuarantineEvalState:
         self.build_path = build_path
         self.bindings = {}
         self.alias_group = {}
+        self.contained_names = {}
         self.next_alias_id = 1
         self.targets = []
 
@@ -467,6 +503,9 @@ class _QuarantineEvalState:
         copy = _QuarantineEvalState(self.package, self.build_path)
         copy.bindings = dict(self.bindings)
         copy.alias_group = dict(self.alias_group)
+        copy.contained_names = {
+            k: set(v) for k, v in self.contained_names.items()
+        }
         copy.next_alias_id = self.next_alias_id
         copy.targets = self.targets
         return copy
@@ -482,9 +521,26 @@ class _QuarantineEvalState:
             return {name}
         return {k for k, v in self.alias_group.items() if v == gid}
 
-    def mark_mutated(self, name, include_self=True):
+    def mark_mutated(self, name, include_self=True, include_contained=True):
+        visited = set()
+        queue = list(self.alias_members(name))
+        if include_contained:
+            for member in list(queue):
+                queue.extend(self.contained_names.get(member, ()))
+        while queue:
+            cur = queue.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            for member in self.alias_members(cur):
+                if member not in visited:
+                    queue.append(member)
+            if include_contained:
+                for inner in self.contained_names.get(cur, ()):
+                    if inner not in visited:
+                        queue.append(inner)
         affected = set()
-        for member in self.alias_members(name):
+        for member in visited:
             if not include_self and member == name:
                 continue
             self.bindings[member] = _MUTATED
@@ -506,6 +562,11 @@ def _apply_quarantine_mutating_call(call, state):
     method = func.attr
     if method not in _MUTATING_METHODS:
         return set()
+    inserted = set()
+    for arg in call.args:
+        inserted |= _expr_ref_names(arg)
+    for kw in call.keywords:
+        inserted |= _expr_ref_names(kw.value)
     if isinstance(func.value, ast.Name):
         target = func.value.id
         if target not in state.bindings and target not in state.alias_group:
@@ -520,12 +581,20 @@ def _apply_quarantine_mutating_call(call, state):
             )
             modified = {target}
             modified |= state.mark_mutated(target, include_self=False)
+            if inserted:
+                state.contained_names.setdefault(target, set()).update(inserted)
             return modified
-        return state.mark_mutated(target, include_self=True)
+        modified = state.mark_mutated(target, include_self=True)
+        if inserted:
+            state.contained_names.setdefault(target, set()).update(inserted)
+        return modified
     if isinstance(func.value, ast.Subscript):
         root = _subscript_root_name(func.value)
         if root and (root in state.bindings or root in state.alias_group):
-            return state.mark_mutated(root, include_self=True)
+            modified = state.mark_mutated(root, include_self=True)
+            if inserted:
+                state.contained_names.setdefault(root, set()).update(inserted)
+            return modified
     return set()
 
 
@@ -600,6 +669,7 @@ def _walk_quarantine_stmts(stmts, state):
                 alias_source = stmt.value.id
             elif isinstance(stmt.value, ast.Subscript):
                 alias_source = _subscript_root_name(stmt.value)
+            contained = _container_ref_names(stmt.value)
             shared_gid = None
             if alias_source is not None:
                 shared_gid = state.alias_group.get(alias_source)
@@ -615,16 +685,25 @@ def _walk_quarantine_stmts(stmts, state):
                         shared_gid if shared_gid is not None
                         else state.alloc_alias_id()
                     )
+                    if contained:
+                        state.contained_names[tid] = set(contained)
+                    else:
+                        state.contained_names.pop(tid, None)
                 elif isinstance(target, ast.Subscript):
                     root = _subscript_root_name(target)
                     if root:
                         modified |= state.mark_mutated(root, include_self=True)
+                        inserted = _expr_ref_names(stmt.value)
+                        if inserted:
+                            state.contained_names.setdefault(
+                                root, set()).update(inserted)
                 else:
                     for node in ast.walk(target):
                         if isinstance(node, ast.Name):
                             modified.add(node.id)
                             state.bindings[node.id] = _MUTATED
                             state.alias_group[node.id] = state.alloc_alias_id()
+                            state.contained_names.pop(node.id, None)
         elif isinstance(stmt, ast.AugAssign):
             modified |= _walk_quarantine_expr(stmt.target, state)
             modified |= _walk_quarantine_expr(stmt.value, state)
@@ -640,12 +719,20 @@ def _walk_quarantine_stmts(stmts, state):
                         is_add=isinstance(stmt.op, ast.Add),
                     )
                     modified |= state.mark_mutated(tid, include_self=False)
+                    inserted = _expr_ref_names(stmt.value)
+                    if inserted:
+                        state.contained_names.setdefault(tid, set()).update(
+                            inserted)
                 else:
                     modified |= state.mark_mutated(tid, include_self=True)
             elif isinstance(stmt.target, ast.Subscript):
                 root = _subscript_root_name(stmt.target)
                 if root:
                     modified |= state.mark_mutated(root, include_self=True)
+                    inserted = _expr_ref_names(stmt.value)
+                    if inserted:
+                        state.contained_names.setdefault(root, set()).update(
+                            inserted)
         elif isinstance(stmt, ast.AnnAssign):
             modified |= _walk_quarantine_expr(stmt.target, state)
             if stmt.value is not None:

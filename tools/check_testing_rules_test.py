@@ -631,6 +631,105 @@ cc_test(
                 "pkg/bad.cc",
                 "int main() { return 0; }\n",
             ),
+            (
+                "contained_item_append_perf",
+                """
+TAGS = ["fast"]
+BOX = [TAGS]
+ITEM = BOX[0]
+ITEM.append("perf")
+cc_test(
+    name = "contained_item_append_perf_test",
+    srcs = ["bad.cc"],
+    tags = TAGS,
+    deps = [],
+)
+""",
+                "pkg/bad.cc",
+                "int main() { return 0; }\n",
+            ),
+            (
+                "binop_container_subscript_append_perf",
+                """
+TAGS = ["fast"]
+BOX = [TAGS] + []
+BOX[0].append("perf")
+cc_test(
+    name = "binop_container_perf_test",
+    srcs = ["bad.cc"],
+    tags = TAGS,
+    deps = [],
+)
+""",
+                "pkg/bad.cc",
+                "int main() { return 0; }\n",
+            ),
+            (
+                "post_insert_dict_subscript_append_perf",
+                """
+TAGS = ["fast"]
+BOX = {}
+BOX["k"] = TAGS
+BOX["k"].append("perf")
+cc_test(
+    name = "post_insert_dict_perf_test",
+    srcs = ["bad.cc"],
+    tags = TAGS,
+    deps = [],
+)
+""",
+                "pkg/bad.cc",
+                "int main() { return 0; }\n",
+            ),
+            (
+                "post_insert_list_append_then_mutate_perf",
+                """
+TAGS = ["fast"]
+BOX = []
+BOX.append(TAGS)
+BOX[0].append("perf")
+cc_test(
+    name = "post_insert_list_perf_test",
+    srcs = ["bad.cc"],
+    tags = TAGS,
+    deps = [],
+)
+""",
+                "pkg/bad.cc",
+                "int main() { return 0; }\n",
+            ),
+            (
+                "ifexp_bare_name_alias_append_perf",
+                """
+TAGS = ["fast"]
+ALIAS = TAGS if True else ["fast"]
+ALIAS.append("perf")
+cc_test(
+    name = "ifexp_alias_perf_test",
+    srcs = ["bad.cc"],
+    tags = TAGS,
+    deps = [],
+)
+""",
+                "pkg/bad.cc",
+                "int main() { return 0; }\n",
+            ),
+            (
+                "listcomp_and_dict_call_append_perf",
+                """
+TAGS = ["fast"]
+BOX = dict(k = TAGS)
+BOX["k"].append("perf")
+cc_test(
+    name = "dict_call_perf_test",
+    srcs = ["bad.cc"],
+    tags = TAGS,
+    deps = [],
+)
+""",
+                "pkg/bad.cc",
+                "int main() { return 0; }\n",
+            ),
         )
         for case, build, src_path, src_text in alias_cases:
             with self.subTest(case=case):

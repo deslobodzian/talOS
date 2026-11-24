@@ -859,6 +859,63 @@ class TraceTest(unittest.TestCase):
                 '    srcs = ["node_test.cc"],\n'
                 '    tags = TAGS,\n)\n',
             ),
+            (
+                "contained_list_subscript_append_fails_closed",
+                'TAGS = ["fast"]\n'
+                'BOX = [TAGS]\n'
+                'BOX[0].append("quarantine")\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n',
+            ),
+            (
+                "binop_contained_list_item_append_fails_closed",
+                'TAGS = ["fast"]\n'
+                'BOX = [TAGS] + []\n'
+                'ITEM = BOX[0]\n'
+                'ITEM.append("quarantine")\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n',
+            ),
+            (
+                "post_insert_dict_subscript_fails_closed",
+                'TAGS = ["fast"]\n'
+                'BOX = {}\n'
+                'BOX["k"] = TAGS\n'
+                'BOX["k"].append("quarantine")\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n',
+            ),
+            (
+                "post_insert_list_append_fails_closed",
+                'TAGS = ["fast"]\n'
+                'BOX = []\n'
+                'BOX.append(TAGS)\n'
+                'BOX[0].append("quarantine")\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n',
+            ),
+            (
+                "ifexp_bare_name_alias_fails_closed",
+                'TAGS = ["fast"]\n'
+                'ALIAS = TAGS if True else ["fast"]\n'
+                'ALIAS.append("quarantine")\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n',
+            ),
+            (
+                "dict_call_container_fails_closed",
+                'TAGS = ["fast"]\n'
+                'BOX = dict(k = TAGS)\n'
+                'BOX["k"].append("quarantine")\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = TAGS,\n)\n',
+            ),
         ):
             with self.subTest(case=name):
                 failures, out = check(tree(**{"talOS/node/BUILD": build}))

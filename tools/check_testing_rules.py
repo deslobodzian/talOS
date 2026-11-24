@@ -924,11 +924,39 @@ MUTATING_METHODS = frozenset({
 })
 
 
-def _container_ref_names(node):
-    """Variable names directly embedded inside a list/tuple/set/dict literal."""
-    if not isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+def _expr_ref_names(node):
+    """Variable names referenced in an expression (skipping bare Call.func
+    names like `dict(...)` so rule/builtin names do not pollute aliases)."""
+    if node is None:
         return set()
-    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+    skip = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+            skip.add(id(n.func))
+    return {
+        n.id for n in ast.walk(node)
+        if isinstance(n, ast.Name) and id(n) not in skip
+    }
+
+
+def _container_ref_names(node):
+    """Variable names embedded inside expressions that may hold or alias
+    mutable containers (literals, BinOp, IfExp, comprehensions, Call)."""
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict,
+                         ast.ListComp, ast.SetComp, ast.DictComp,
+                         ast.IfExp, ast.Call)):
+        return _expr_ref_names(node)
+    if isinstance(node, ast.BinOp) and isinstance(
+        node.op, (ast.Add, ast.BitOr, ast.Mult)
+    ):
+        return (
+            _container_ref_names(node.left) | _container_ref_names(node.right)
+            | (_expr_ref_names(node.left)
+               if isinstance(node.left, (ast.Name, ast.Subscript)) else set())
+            | (_expr_ref_names(node.right)
+               if isinstance(node.right, (ast.Name, ast.Subscript)) else set())
+        )
+    return set()
 
 
 def _subscript_root_name(node):
@@ -1109,6 +1137,10 @@ def _apply_assign(targets, value, state):
             if root:
                 modified |= state.invalidate_with_aliases(
                     root, include_self=True, include_contained=True)
+                inserted = _expr_ref_names(value)
+                if inserted:
+                    state.contained_names.setdefault(root, set()).update(
+                        inserted)
         else:
             for node in ast.walk(target):
                 if isinstance(node, ast.Name):
@@ -1134,15 +1166,24 @@ def _apply_aug_assign(target, op, value, state):
                 is_add=isinstance(op, ast.Add),
             )
             # In Starlark, `A += [...]` mutates a list in place, so any
-            # variable aliased to `tid` may observe the mutation.
-            modified |= state.invalidate_with_aliases(tid, include_self=False)
+            # variable aliased to `tid` (or embedded in an aliased container)
+            # may observe the mutation.
+            modified |= state.invalidate_with_aliases(
+                tid, include_self=False, include_contained=True)
+            inserted = _expr_ref_names(value)
+            if inserted:
+                state.contained_names.setdefault(tid, set()).update(inserted)
         else:
-            modified |= state.invalidate_with_aliases(tid, include_self=True)
+            modified |= state.invalidate_with_aliases(
+                tid, include_self=True, include_contained=True)
     elif isinstance(target, ast.Subscript):
         root = _subscript_root_name(target)
         if root:
             modified |= state.invalidate_with_aliases(
                 root, include_self=True, include_contained=True)
+            inserted = _expr_ref_names(value)
+            if inserted:
+                state.contained_names.setdefault(root, set()).update(inserted)
     return modified
 
 
@@ -1157,6 +1198,11 @@ def _apply_mutating_call(expr, state):
     method = func.attr
     if method not in MUTATING_METHODS:
         return set()
+    inserted = set()
+    for arg in expr.args:
+        inserted |= _expr_ref_names(arg)
+    for kw in expr.keywords:
+        inserted |= _expr_ref_names(kw.value)
     if isinstance(func.value, ast.Name):
         target = func.value.id
         if target not in state.bindings and target not in state.alias_group:
@@ -1170,14 +1216,23 @@ def _apply_mutating_call(expr, state):
             )
             modified = {target}
             modified |= state.invalidate_with_aliases(
-                target, include_self=False)
+                target, include_self=False, include_contained=True)
+            if inserted:
+                state.contained_names.setdefault(target, set()).update(inserted)
             return modified
-        return state.invalidate_with_aliases(target, include_self=True)
+        modified = state.invalidate_with_aliases(
+            target, include_self=True, include_contained=True)
+        if inserted:
+            state.contained_names.setdefault(target, set()).update(inserted)
+        return modified
     if isinstance(func.value, ast.Subscript):
         root = _subscript_root_name(func.value)
         if root and (root in state.bindings or root in state.alias_group):
-            return state.invalidate_with_aliases(
+            modified = state.invalidate_with_aliases(
                 root, include_self=True, include_contained=True)
+            if inserted:
+                state.contained_names.setdefault(root, set()).update(inserted)
+            return modified
     return set()
 
 
