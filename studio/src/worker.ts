@@ -6,7 +6,7 @@ import {checkExportFormat, Coordinator, type Dictionary, dictionaryKey, exportPa
 import {AlertTracker} from './data/alerts';
 import {graphStale} from './data/freshness';
 import {MAX_MANIFEST_BYTES, manifestUrl, parseManifest, type SessionManifest} from './data/manifest';
-import {isPiecesMessage, PiecesDecoder} from './data/pieces';
+import {isPiecesMessage, PiecesDecoder, PiecesHistory} from './data/pieces';
 import {type Connection, type PlaybackState} from './data/types';
 import {WorkerUpdateStream} from './data/worker-stream';
 import {demoDeclaredGraph, demoPacket, demoSystemGraph} from './demo';
@@ -64,10 +64,31 @@ const historyHooks: HistoryHooks = {
 let history = new TelemetryHistory(historyHooks);
 let coordinator = new Coordinator(history.timeline);
 let decoder = new TelemetryDecoder();
-// The MuJoCo gateway's game pieces (REQ-DEV-43): live only, never recorded.
+// The MuJoCo gateway's game pieces (REQ-DEV-43), decoded, and kept over
+// the running session so they follow the playhead; never recorded.
 const pieces = new PiecesDecoder();
-function postPieces() {
-  updates.push({type: 'pieces', pieces: pieces.snapshot()});
+const piecesHistory = new PiecesHistory();
+// The history record the page's pieces were posted from (null: none), or
+// undefined before any post.
+let postedPieces: object|null|undefined = undefined;
+// Posts the pieces as of what the playhead shows, when that is another
+// record than the one last posted: live, the latest; otherwise those of
+// the last message at or before the shown frame's time.
+function syncPieces() {
+  if (coordinator.mode === 'LIVE_STREAMING') {
+    const newest = piecesHistory.newest();
+    if (newest === postedPieces) return;
+    postedPieces = newest;
+    updates.push({type: 'pieces', pieces: pieces.snapshot()});
+    return;
+  }
+  const shown = coordinator.snapshot()?.timestamp_ns;
+  const time = shown === undefined ? null : BigInt(shown);
+  const record = time === null ? null : piecesHistory.recordAt(time);
+  if (record === postedPieces) return;
+  postedPieces = record;
+  updates.push(
+      {type: 'pieces', pieces: time === null ? null : piecesHistory.at(time)});
 }
 let socket: WebSocket|null = null, demo = false, sequence = 0n,
             status = 'Disconnected';
@@ -339,7 +360,7 @@ function reset() {
   coordinator = new Coordinator(history.timeline);
   decoder = new TelemetryDecoder();
   pieces.reset();
-  postPieces();
+  piecesHistory.reset();
   needsReset = true;
   pendingFrames = [];
   alertTracker.reset();
@@ -387,7 +408,10 @@ function close() {
 function ingest(bytes: Uint8Array, now: number) {
   if (isPiecesMessage(bytes)) {
     try {
-      if (pieces.apply(bytes)) postPieces();
+      if (pieces.apply(bytes)) {
+        const view = pieces.snapshot()!;
+        piecesHistory.record(view, BigInt(view.sample_time_ns));
+      }
     } catch {
       history.jitter.stats.invalid++;
     }
@@ -421,6 +445,7 @@ function connect(url: string, gen: number) {
       connection = 'live';
       decoder.reset();
       pieces.reset();
+      piecesHistory.reset();
       // The bridge answers an open with its graph and then, when it has
       // them, the dictionary and a keyframe: the first update on a socket.
       firstUpdate = true;
@@ -591,6 +616,9 @@ setInterval(() => {
     }
   }
   history.flush(now);
+  // The pieces are kept as far back as the timeline is.
+  const bounds = coordinator.timeline.bounds();
+  if (bounds) piecesHistory.trim(BigInt(bounds.start));
   // The session manifest is re-read once a second while connected: it is a
   // live document, and the launcher replaces it atomically as nodes restart.
   if (manifestBase !== null && connection === 'live' && now >= nextManifestPoll) {
@@ -601,6 +629,7 @@ setInterval(() => {
       Math.max(0, Math.round((now - lastTick) * 1e6)) : 0;
   coordinator.tick(BigInt(tickDt));
   lastTick = now;
+  syncPieces();
   // A graph goes stale with time or a dropped socket, not only with a new
   // document, so its freshness is re-judged every tick and posted on change.
   if (systemStale(now) !== postedSystemStale) postSystem();

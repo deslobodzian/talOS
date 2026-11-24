@@ -61,8 +61,8 @@ export function useSystem(): SystemState {
   return useSyncExternalStore(studio.subscribe, () => studio.system, () => studio.system);
 }
 
-// The live game pieces (data/pieces.ts); null while a recorded session is
-// shown, which carries none.
+// The game pieces at the playhead, the latest while live (data/pieces.ts);
+// null while a recorded session is shown, which carries none.
 export function usePieces(): PiecesSnapshot|null {
   const studio = useStudio();
   const get = () => studio.recorded ? null : studio.pieces;

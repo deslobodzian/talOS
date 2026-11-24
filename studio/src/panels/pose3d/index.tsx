@@ -50,7 +50,9 @@ function OrbitNavigation() {
 
 // The game pieces in play, one instanced unit sphere scaled by their
 // radius. The mesh and its transforms are allocated once per mount, for
-// MAX_PIECES; a pieces message rewrites them in place and asks for one frame.
+// MAX_PIECES; each pieces update (a new message while live, the pieces at
+// another playhead time otherwise) rewrites them in place and asks for one
+// frame.
 function GamePieces() {
   const pieces = usePieces();
   const {invalidate} = useThree();

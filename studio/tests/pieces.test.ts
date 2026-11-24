@@ -9,9 +9,9 @@ import {test} from 'node:test';
 
 import * as THREE from 'three';
 
-import {MAX_PIECES, PiecesDecoder, pieceMatrices} from '../src/data/pieces';
+import {KEYFRAME_EVERY, MAX_HISTORY_BYTES, MAX_PIECES, PiecesDecoder, PiecesHistory, type PiecesSnapshot, pieceMatrices} from '../src/data/pieces';
 import {FIELD_MODEL_ROTATION_X} from '../src/panels/pose3d/field_model';
-import {piecesMessage} from './pieces_message';
+import {type PieceRecord, piecesMessage} from './pieces_message';
 
 test('a keyframe, then a delta, decode to the latest view', () => {
   const decoder = new PiecesDecoder();
@@ -216,4 +216,172 @@ test('pieceMatrices skips non-finite coordinates, rejects bad radii, and clamps 
   }, tiny);
   assert.equal(nCapped, 1);
   assert.equal(tiny[12], 1);
+});
+
+// A seeded generator (mulberry32), so a failing sequence replays.
+function prng(seed: number) {
+  return () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+type Message = {time_ns: bigint; bytes: Uint8Array};
+
+// A bridge-like stream: a keyframe, then mostly deltas of a few pieces (a
+// piece moved, its in-play flag flipped where it stands, or restated
+// unchanged), now and then an empty delta, a repeated time, a delta the
+// decoder drops (wrong count), or a keyframe of a new count or radius.
+function piecesStream(seed: number, length: number): Message[] {
+  const random = prng(seed);
+  const int = (n: number) => Math.floor(random() * n);
+  // What the decoder holds per piece, as the last applied message left it.
+  let held: PieceRecord[] = [];
+  const piece = (index: number): PieceRecord => {
+    const before = held[index];
+    const roll = random();
+    if (roll < 0.25) return {...before, in_play: !before.in_play};
+    if (roll < 0.5) return {...before};
+    return {index, in_play: random() < 0.8, x_mm: int(16000) - 8000,
+            y_mm: int(8000) - 4000, z_mm: int(2000)};
+  };
+  const neutral = (index: number): PieceRecord =>
+      ({index, in_play: false, x_mm: 0, y_mm: 0, z_mm: 0});
+  let count = 30 + int(20), radius = 0.075, time = 1_000_000_000n;
+  const out: Message[] = [];
+  for (let m = 0; m < length; m++) {
+    time += random() < 0.05 ? 0n : BigInt(1 + int(100_000_000));
+    const roll = random();
+    let bytes: Uint8Array;
+    if (m === 0 || roll < 0.03) {
+      if (m > 0 && random() < 0.5) count = 20 + int(40);
+      if (m > 0 && random() < 0.3) radius = 0.05 + int(5) / 100;
+      held = Array.from({length: count}, (_, i) => held[i] ?? neutral(i));
+      const records = Array.from({length: count}, (_, i) => piece(i))
+                          .filter(() => random() < 0.9);
+      held = Array.from({length: count}, (_, i) => neutral(i));
+      for (const r of records) held[r.index] = r;
+      bytes = piecesMessage(true, count, radius, time, records);
+    } else if (roll < 0.05) {
+      bytes = piecesMessage(false, count + 1, radius, time, []);
+    } else {
+      const moved = new Set<number>();
+      const n = roll < 0.1 ? 0 : 1 + int(5);
+      while (moved.size < n) moved.add(int(count));
+      const records = [...moved].map(piece);
+      for (const r of records) held[r.index] = r;
+      bytes = piecesMessage(false, count, radius, time, records);
+    }
+    out.push({time_ns: time, bytes});
+  }
+  return out;
+}
+
+function recordAll(messages: Message[]): PiecesHistory {
+  const decoder = new PiecesDecoder();
+  const history = new PiecesHistory();
+  for (const {bytes} of messages) {
+    if (!decoder.apply(bytes)) continue;
+    const view = decoder.snapshot()!;
+    history.record(view, BigInt(view.sample_time_ns));
+  }
+  return history;
+}
+
+// Every record time, the instants either side of it, and before them all.
+function queryTimes(messages: Message[]): bigint[] {
+  const times = new Set<bigint>([0n]);
+  for (const {time_ns} of messages)
+    for (const t of [time_ns - 1n, time_ns, time_ns + 1n]) times.add(t);
+  return [...times].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+function sameView(actual: PiecesSnapshot|null, expected: PiecesSnapshot|null,
+                  where: string) {
+  if (expected === null) {
+    assert.equal(actual, null, where);
+    return;
+  }
+  assert.ok(actual, where);
+  assert.equal(actual.count, expected.count, where);
+  assert.equal(actual.radius_m, expected.radius_m, where);
+  assert.equal(actual.sample_time_ns, expected.sample_time_ns, where);
+  assert.deepEqual([...actual.positions], [...expected.positions], where);
+  assert.deepEqual([...actual.in_play], [...expected.in_play], where);
+}
+
+// What a fresh decoder holds after exactly the messages at or before each
+// query time, in order.
+function expectedViews(messages: Message[], times: bigint[]) {
+  const decoder = new PiecesDecoder();
+  const views = new Map<bigint, PiecesSnapshot|null>();
+  let next = 0;
+  for (const t of times) {
+    while (next < messages.length && messages[next].time_ns <= t)
+      decoder.apply(messages[next++].bytes);
+    views.set(t, decoder.snapshot());
+  }
+  return views;
+}
+
+// REQ-DEV-43: the pieces at a playhead time are those of the messages up to it.
+test('the history at any time is what a decoder of the messages up to then holds', () => {
+  for (const [seed, length] of [[1, 40], [2, 200], [3, 12 * KEYFRAME_EVERY]]) {
+    const messages = piecesStream(seed, length);
+    const history = recordAll(messages);
+    const times = queryTimes(messages);
+    const expected = expectedViews(messages, times);
+    for (const t of times)
+      sameView(history.at(t), expected.get(t)!, `seed ${seed}, t ${t}`);
+
+    // Trimmed at a time part-way (between records, and at one): every
+    // answer from that time on is unchanged, and none before it is another
+    // view than it was.
+    const middle = messages[Math.floor(length / 2)].time_ns;
+    for (const start of [middle - 1n, middle]) {
+      const trimmed = recordAll(messages);
+      trimmed.trim(start);
+      assert.ok(trimmed.at(start), `seed ${seed}: the trim point still answers`);
+      for (const t of times) {
+        const where = `seed ${seed}, trimmed at ${start}, t ${t}`;
+        if (t >= start)
+          sameView(trimmed.at(t), expected.get(t)!, where);
+        else if (trimmed.at(t) !== null)
+          sameView(trimmed.at(t), expected.get(t)!, where);
+      }
+    }
+  }
+});
+
+// REQ-DEV-43: piece history is bounded, and another run of the gateway (its
+// clock gone back) starts it over.
+test('the history drops its oldest records past its byte bound, and starts over when time goes back', () => {
+  const decoder = new PiecesDecoder();
+  const history = new PiecesHistory();
+  const push = (bytes: Uint8Array) => {
+    assert.ok(decoder.apply(bytes));
+    const view = decoder.snapshot()!;
+    history.record(view, BigInt(view.sample_time_ns));
+  };
+  push(piecesMessage(true, 1, 0.075, 1n,
+                     [{index: 0, in_play: true, x_mm: 0, y_mm: 0, z_mm: 0}]));
+  // Each delta is at least 256 B of the estimate: this many exceed the bound.
+  const records = MAX_HISTORY_BYTES / 256 + 100;
+  for (let i = 2; i <= records; i++)
+    push(piecesMessage(false, 1, 0.075, BigInt(i),
+                       [{index: 0, in_play: true, x_mm: i, y_mm: 0, z_mm: 0}]));
+  assert.equal(history.at(1n), null, 'the oldest record was dropped');
+  sameView(history.at(BigInt(records)), decoder.snapshot(), 'the newest');
+  sameView(history.at(BigInt(records) - 1000n),
+           {...decoder.snapshot()!, sample_time_ns: String(records - 1000),
+            positions: new Float32Array([(records - 1000) / 1000, 0, 0])},
+           'a retained earlier record');
+
+  // A message older than the newest record: the gateway restarted.
+  push(piecesMessage(true, 1, 0.075, 5n,
+                     [{index: 0, in_play: false, x_mm: 1, y_mm: 2, z_mm: 3}]));
+  assert.equal(history.at(4n), null);
+  sameView(history.at(BigInt(records)), decoder.snapshot(), 'after the restart');
 });

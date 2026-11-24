@@ -33,8 +33,8 @@ export type Studio = {
   system: SystemState;
   manifest: SessionManifest|null;
   manifestError: string;
-  // The live game pieces (data/pieces.ts), null without any; never part of
-  // a recording.
+  // The running session's game pieces as of the playhead (data/pieces.ts),
+  // null without any; never part of a recording.
   pieces: PiecesSnapshot|null;
   actions: StudioActions;
   // The source panels read: `recorded` while one is open, else live.

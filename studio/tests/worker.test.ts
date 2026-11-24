@@ -37,6 +37,7 @@ let system: SystemState|null = null;
 let lastManifest: SessionManifest|null = null;
 let frames: Snapshot[] = [];
 let pieces: PiecesSnapshot|null = null;
+let piecesPosts = 0;
 let postedFrameChunks: {reset: boolean; count: number}[] = [];
 // The main thread's render cache, fed as studio.ts feeds it.
 const store = new TelemetryStore(cb => cb());
@@ -56,6 +57,7 @@ function apply(m: Record<string, unknown>) {
     store.setAlertLatch(m.latch as AlertLatch);
   } else if (m.type === 'pieces') {
     pieces = m.pieces as PiecesSnapshot|null;
+    piecesPosts++;
   }
 }
 let exported: ArrayBuffer|null = null;
@@ -546,6 +548,50 @@ test('the bridge\'s game pieces reach the page beside telemetry, and a new conne
   connect();
   advance(40);
   assert.equal(pieces, null, 'a new connection starts with no pieces');
+});
+
+// REQ-DEV-43: paused or scrubbed, the viewport's pieces are those of the
+// shown frame's time; live, the latest.
+test('the game pieces follow the playhead back and return to the latest live', () => {
+  const socket = connect();
+  const at = (i: number) => 1_000_000_000n + BigInt(i) * 20_000_000n;
+  const piece0 = (i: number) =>
+      [{index: 0, in_play: true, x_mm: 100 * i, y_mm: 0, z_mm: 75}];
+  binary(socket, packet(21n, ['x'], 1n, at(0), [0], true));
+  binary(socket, piecesMessage(true, 2, 0.075, at(0), [
+    ...piece0(0), {index: 1, in_play: true, x_mm: 3000, y_mm: 0, z_mm: 75}]));
+  for (let i = 1; i <= 5; i++) {
+    binary(socket, packet(21n, ['x'], BigInt(i + 1), at(i), [i]));
+    binary(socket, piecesMessage(false, 2, 0.075, at(i), piece0(i)));
+    // Pieces sampled between two frames, at a position no other has.
+    if (i === 2)
+      binary(socket, piecesMessage(false, 2, 0.075, at(2) + 2_000_000n,
+                                   [{index: 0, in_play: true, x_mm: 7777, y_mm: 0, z_mm: 75}]));
+  }
+  advance(40);
+  assert.equal(pieces!.sample_time_ns, String(at(5)));
+
+  // Scrubbed to between two frames, past pieces sampled between them: the
+  // shown frame's pieces, not the playhead's.
+  send({type: 'seek', timestamp_ns: String(at(2) + 5_000_000n)});
+  advance(40);
+  assert.equal(playback!.cursor_ns, String(at(2)));
+  assert.equal(pieces!.sample_time_ns, String(at(2)));
+  assert.ok(Math.abs(pieces!.positions[0] - 0.2) < 1e-6);
+  assert.deepEqual([...pieces!.in_play], [1, 1]);
+
+  // While paused, newer pieces change nothing shown, and nothing is resent.
+  const posts = piecesPosts;
+  binary(socket, piecesMessage(false, 2, 0.075, at(6), piece0(6)));
+  advance(200);
+  assert.equal(piecesPosts, posts);
+  assert.equal(pieces!.sample_time_ns, String(at(2)));
+
+  // Back to live: the latest.
+  send({type: 'mode', mode: 'LIVE_STREAMING'});
+  advance(40);
+  assert.equal(pieces!.sample_time_ns, String(at(6)));
+  assert.ok(Math.abs(pieces!.positions[0] - 0.6) < 1e-6);
 });
 
 // REQ-OPS-37: multi-chunk postFrames() (> 2000 frames after a reset, e.g. log
