@@ -76,12 +76,15 @@ class SyntheticCameraSource : public CameraSource {
   uint64_t sequence_number() const;
 
  private:
-  void WorkerLoop();
+  void WorkerLoop(uint64_t generation);
+  void ReapRetiredLocked(std::vector<std::thread>& to_join);
   void RenderScene(Frame& frame);
 
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::thread delivery_thread_;
+  std::vector<std::thread> retired_threads_;
+  uint64_t run_generation_{0};
 
   std::atomic<bool> is_running_{false};
   std::atomic<bool> is_connected_{true};

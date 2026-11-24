@@ -687,6 +687,7 @@ class MultiTagPoseSolver {
   struct TagCandidates {
     int tag_id{-1};
     std::size_t count{0}, chosen{0}, first_pixel{0};
+    Eigen::Vector3d field_translation{Eigen::Vector3d::Zero()};
     std::array<const TagDetection3D*, kMaxDetectionsPerId> detections{};
     const TagDetection3D& Chosen() const { return *detections[chosen]; }
   };
@@ -786,6 +787,7 @@ inline RobotPoseEstimate MultiTagPoseSolver::Solve(
   candidate_pixels.reserve(4 * observations.size());
   for (auto& id : ids) {
     const auto field = *layout.GetTagPose(id.tag_id);
+    id.field_translation = field.translation();
     const auto corners = GetTagModelCorners(layout.GetTagSize(id.tag_id));
     for (std::size_t j = 0; j < 4; ++j) points.push_back(field.act(corners[j]));
     id.first_pixel = candidate_pixels.size();
@@ -869,9 +871,7 @@ inline RobotPoseEstimate MultiTagPoseSolver::Solve(
   auto& pixels = pixels_;
   pixels.clear();
   pixels.reserve(points.size());
-  double distance_sum = 0;
   for (const auto& id : ids) {
-    distance_sum += id.Chosen().T_camera_tag.translation().norm();
     for (std::size_t j = 0; j < 4; ++j)
       pixels.push_back(candidate_pixels[id.first_pixel + 4 * id.chosen + j]);
   }
@@ -997,7 +997,41 @@ inline RobotPoseEstimate MultiTagPoseSolver::Solve(
     }
     est.tag_id = -1;
     est.tag_count = static_cast<int>(ids.size());
-    est.average_distance_m = distance_sum / static_cast<double>(ids.size());
+    const auto refined_robot_field = est.T_field_robot.inverse();
+    double refined_distance_sum = 0.0;
+    for (const auto& id : ids) {
+      const Eigen::Vector3d p_cam =
+          camera_robot.act(refined_robot_field.act(id.field_translation));
+      const double d = p_cam.norm();
+      if (!p_cam.allFinite() || !std::isfinite(d)) {
+        est.validity = {false, PoseInvalidReason::kTooFar,
+                        "Refined tag distance is non-finite"};
+        return est;
+      }
+      if (p_cam.z() <= options.min_z_m) {
+        est.validity = {false, PoseInvalidReason::kBehindCamera,
+                        "Refined tag is behind camera"};
+        return est;
+      }
+      if (d > options.max_distance_m) {
+        est.validity = {false, PoseInvalidReason::kTooFar,
+                        "Refined tag distance exceeds maximum limit"};
+        return est;
+      }
+      if (d < options.min_distance_m) {
+        est.validity = {false, PoseInvalidReason::kTooClose,
+                        "Refined tag distance is below minimum limit"};
+        return est;
+      }
+      refined_distance_sum += d;
+    }
+    est.average_distance_m =
+        refined_distance_sum / static_cast<double>(ids.size());
+    if (!std::isfinite(est.average_distance_m)) {
+      est.validity = {false, PoseInvalidReason::kTooFar,
+                      "Refined average tag distance is non-finite"};
+      return est;
+    }
     est.reprojection_error_px =
         noise.pixel_std_px * std::sqrt(residual.head(pixel_rows).squaredNorm() /
                                        static_cast<double>(points.size()));
@@ -1039,7 +1073,6 @@ inline RobotPoseEstimate MultiTagPoseSolver::Solve(
         t.reprojection_error, t.ambiguity, options, &t.secondary_T_camera_tag,
         t.secondary_reprojection_error_px, noise);
     if (!seed.validity.valid) return seed;
-    distance_sum = seed.average_distance_m;
     auto result = solve_from(seed.T_field_robot);
     result.tag_id = t.tag_id;
     result.ambiguity = t.ambiguity;

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -176,11 +177,7 @@ class Frame {
         uint32_t height, PixelFormat format = PixelFormat::kGray8,
         uint32_t stride = 0)
       : Frame(NoStorage{}, camera_id, session_id, sequence_number, capture_time,
-              width, height,
-              (stride > 0)
-                  ? stride
-                  : width * static_cast<uint32_t>(BytesPerPixel(format)),
-              format) {
+              width, height, ResolveStride(width, format, stride), format) {
     AllocateAlignedOwned(static_cast<size_t>(stride_) * height_);
   }
 
@@ -302,7 +299,8 @@ class Frame {
     } else if (owned_storage_ && was_shared_.load(std::memory_order_acquire)) {
       // A previous Share() handed out a shared_ptr to owned_storage_; detach
       // via copy-on-write so those immutable readers never race with writes.
-      const auto prev = std::move(owned_storage_);
+      const auto prev = owned_storage_;
+      owned_storage_.reset();
       const size_t prev_offset = data_offset_;
       const size_t prev_size =
           prev->size() > prev_offset ? (prev->size() - prev_offset) : 0;
@@ -385,6 +383,16 @@ class Frame {
 
  private:
   static constexpr size_t kPageAlignment = 4096;
+
+  static constexpr uint32_t ResolveStride(uint32_t width, PixelFormat format,
+                                          uint32_t stride) {
+    if (stride > 0) return stride;
+    const size_t row_bytes = static_cast<size_t>(width) * BytesPerPixel(format);
+    if (row_bytes > std::numeric_limits<uint32_t>::max()) {
+      return 0;
+    }
+    return static_cast<uint32_t>(row_bytes);
+  }
 
   // Selects the constructor that sets the metadata and dimensions only; the
   // public constructors delegate to it and then attach their storage.

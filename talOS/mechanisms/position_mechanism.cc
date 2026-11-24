@@ -86,12 +86,14 @@ PositionMechanism::PositionMechanism(Node& node, std::string_view name)
     if (!std::isfinite(max_rot_)) params.fail("max_rot", why);
   }
 
+  const hardware::Config& hw = node.extension<HardwareLink>().config().hardware;
   const hardware::MotorConfig& motor = MotorConfigOf(node, name);
   // The fastest the motor can turn the mechanism, for telling a homing
   // push's frame jump from motion.
   max_velocity_rps_ = motor.max_velocity_rps;
-  rezero_skew_ =
-      RezeroAgeBound(node.extension<HardwareLink>().config().hardware);
+  rezero_skew_ = RezeroAgeBound(hw);
+  frame_jump_slack_ = std::max<Duration>(
+      rezero_skew_ / 2, std::chrono::microseconds{hw.period_us});
   // One gravity source: the controller's slot g (with its gravity_type) or
   // gravity_v here, never both, or the mechanism gets twice the feedforward.
   if (gravity_v_ != 0 && motor.slots[static_cast<std::size_t>(slot_)].g != 0) {
@@ -133,6 +135,15 @@ PositionMechanism::PositionMechanism(Node& node, std::string_view name)
     if (std::abs(homing_v_) > kMaxHomingFraction * motor.max_voltage) {
       params.fail("homing_v", "must be at most half the motor's max_voltage (" +
                                   std::to_string(motor.max_voltage) + " V)");
+    }
+    if (homing_ == Homing::kLimitSwitch) {
+      const double travel_from_home =
+          homing_v_ < 0 ? max_rot_ - home_rot_ : home_rot_ - min_rot_;
+      if (home_margin_rot_ >= travel_from_home) {
+        params.fail("home_margin_rot",
+                    "must be less than the travel from home_rot to the far "
+                    "limit");
+      }
     }
     homing_timeout_ = PositiveMicros(params, "homing_timeout_us");
     homing_stall_rps_ = params.positive("homing_stall_rps");
@@ -305,7 +316,7 @@ void PositionMechanism::update() {
     switch_closed = limit_switch_->connected() &&
                     limit_switch_->get() == switch_closed_reads_;
     home_count_ =
-        !motor_.zeroed() && switch_closed
+        phase_ != PositionPhase::kFaulted && !motor_.zeroed() && switch_closed
             ? (home_count_ < home_samples_ ? home_count_ + 1 : home_samples_)
             : 0;
     if (home_count_ >= home_samples_) {
@@ -352,6 +363,7 @@ void PositionMechanism::update() {
     // push and its evidence, but not the homing timeout).
     if (!drives_home() || !live || request != Request::kGoal) {
       push_since_.reset();
+      push_last_age_.reset();
       homing_still_since_.reset();
       idle(PositionPhase::kUnhomed);
       return;
@@ -375,18 +387,26 @@ void PositionMechanism::update() {
 bool PositionMechanism::home(Time now) {
   if (!homing_since_) homing_since_ = now;
   // A position step faster than the motor can turn the mechanism in the
-  // time since the last push tick, or a non-finite position reading, is a
-  // frame jump (a reset, a glitch), not motion: the push starts over from
-  // here, and its evidence with it.
-  const double max_jump_rot =
+  // time since the last push tick (plus one status/gateway period of CAN/UDP
+  // jitter and any decrease in sample age), or a non-finite position reading,
+  // is a frame jump (a reset, a glitch), not motion: the push starts over
+  // from here, and its evidence with it.
+  const std::optional<Duration> pos_age = motor_.position_age();
+  const double elapsed_s =
       now > push_last_at_
-          ? max_velocity_rps_ *
-                std::chrono::duration<double>(now - push_last_at_).count()
+          ? std::chrono::duration<double>(now - push_last_at_).count() +
+                std::chrono::duration<double>(frame_jump_slack_).count() +
+                (push_last_age_ && pos_age && *push_last_age_ > *pos_age
+                     ? std::chrono::duration<double>(*push_last_age_ - *pos_age)
+                           .count()
+                     : 0.0)
           : 0.0;
+  const double max_jump_rot = max_velocity_rps_ * elapsed_s;
   if (push_since_ &&
       (!std::isfinite(position_rot_) ||
        !(std::abs(position_rot_ - push_last_rot_) <= max_jump_rot))) {
     push_since_.reset();
+    push_last_age_.reset();
     homing_still_since_.reset();
   }
   if (!push_since_ && std::isfinite(position_rot_)) {
@@ -395,6 +415,7 @@ bool PositionMechanism::home(Time now) {
   }
   push_last_rot_ = position_rot_;
   push_last_at_ = now;
+  push_last_age_ = pos_age;
   // The timeout faults, and never homes, whatever else this tick shows.
   if (now - *homing_since_ >= homing_timeout_) {
     fault(PositionFault::kHomingTimeout);
@@ -463,6 +484,7 @@ void PositionMechanism::settle(Time now) {
 void PositionMechanism::reset_homing_run() {
   homing_since_.reset();
   push_since_.reset();
+  push_last_age_.reset();
   homing_still_since_.reset();
 }
 
@@ -547,6 +569,8 @@ void PositionMechanism::fault(PositionFault reason) {
   driving_ = false;
   goal_rot_ = 0;
   gravity_ff_v_ = 0;
+  home_count_ = 0;
+  reset_homing_run();
   idle(PositionPhase::kFaulted);
   fault_ = reason;
 }

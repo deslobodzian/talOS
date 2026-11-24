@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace talos::vision {
@@ -202,6 +203,21 @@ TEST(FrameTest, HoldsImageValidatesDimensionsStrideAndStorage) {
   EXPECT_TRUE(allocated.holds_image());
   allocated.set_height(11);
   EXPECT_FALSE(allocated.holds_image());
+}
+
+TEST(FrameTest, DefaultStrideOverflowLeavesStorageEmpty) {
+  const auto t0 = talos::event::MonotonicTime::from_nanos(1);
+
+  for (const auto& [width, format] :
+       {std::pair{0x40000001u, PixelFormat::kBgra8},
+        std::pair{0x55555556u, PixelFormat::kRgb8},
+        std::pair{0x80000001u, PixelFormat::kYuyv}}) {
+    const Frame f(0, 1, 1, t0, width, 1, format);
+    EXPECT_FALSE(f.holds_image());
+    EXPECT_EQ(f.stride(), 0u);
+    EXPECT_EQ(f.data(), nullptr);
+    EXPECT_TRUE(f.empty());
+  }
 }
 
 TEST(FrameTest, ConcurrentConstShareIsRaceFreeAndPreservesCow) {

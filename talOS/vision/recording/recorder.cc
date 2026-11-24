@@ -13,6 +13,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <stdexcept>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <unordered_set>
@@ -121,6 +122,18 @@ void WriteFileAtomic(const std::filesystem::path& path, const void* data,
     throw std::runtime_error("cannot rename " + tmp.string() + " -> " +
                              path.string() + ": " + ec.message());
   }
+}
+
+bool IsValidReason(std::string_view reason) {
+  if (reason.empty() || reason.find("..") != std::string_view::npos) {
+    return false;
+  }
+  for (const char c : reason) {
+    if (c == '/' || c == '\\' || c == '\0') {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace
@@ -360,12 +373,19 @@ struct FrameRecorder::Impl {
   }
 
   void StopAfterWriteFailure(const char* reason) {
-    const std::string stem =
-        pending_stem.empty() ? RecordStem(pending_capture_ns, pending_reason)
-                             : pending_stem;
-    std::error_code ec;
-    std::filesystem::remove(options.output_dir / (stem + ".png.tmp"), ec);
-    std::filesystem::remove(options.output_dir / (stem + ".json.tmp"), ec);
+    if (!pending_stem.empty()) {
+      std::error_code ec;
+      std::filesystem::remove(options.output_dir / (pending_stem + ".png.tmp"),
+                              ec);
+      std::filesystem::remove(options.output_dir / (pending_stem + ".json.tmp"),
+                              ec);
+      if (pending_png_written) {
+        std::filesystem::remove(options.output_dir / (pending_stem + ".png"),
+                                ec);
+      }
+    }
+    pending_stem.clear();
+    pending_png_written = false;
     {
       std::lock_guard lock(mutex);
       stop = true;
@@ -380,6 +400,7 @@ struct FrameRecorder::Impl {
   std::uint64_t pending_capture_ns = 0;
   std::string pending_reason;
   std::string pending_stem;
+  bool pending_png_written = false;
   ObservationRecord pending_observation;
   std::optional<TruthRecord> pending_truth;
 
@@ -388,6 +409,8 @@ struct FrameRecorder::Impl {
                  std::uint64_t capture_ns, const std::string& reason,
                  const ObservationRecord& observation,
                  const std::optional<TruthRecord>& truth) {
+    pending_stem.clear();
+    pending_png_written = false;
     FrameRecord record;
     record.capture_ns = capture_ns;
     record.reason = reason;
@@ -409,7 +432,9 @@ struct FrameRecorder::Impl {
     const std::filesystem::path json_path =
         options.output_dir / (stem + ".json");
     WriteFileAtomic(png_path, png.data(), png.size());
+    pending_png_written = true;
     WriteFileAtomic(json_path, json.data(), json.size());
+    pending_png_written = false;
 
     // files/total_bytes are writer-owned (Record() never touches them), so no
     // lock is needed; trimming does disk I/O and must not hold the queue lock.
@@ -435,7 +460,8 @@ FrameRecorder::~FrameRecorder() {
 }
 
 bool FrameRecorder::Record(const Frame& frame, const FrameRecord& record) {
-  if (!frame.holds_image() || frame.data() == nullptr ||
+  if (!IsValidReason(record.reason) || !frame.holds_image() ||
+      frame.data() == nullptr ||
       frame.width() !=
           static_cast<std::uint32_t>(impl_->options.context.width) ||
       frame.height() !=

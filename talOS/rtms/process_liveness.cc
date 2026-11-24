@@ -255,6 +255,11 @@ bool ProcessWordAlive(std::uint64_t word) {
   return ProcessWordAliveFrom(word, Own().checker);
 }
 
+bool ProcessWordCheckable(std::uint64_t word) {
+  return ProcessNamespaceComparable(
+      (word >> kProcessNamespaceShift) & kProcessNamespaceMask, Own().checker);
+}
+
 bool ProcessWordAliveFrom(std::uint64_t word, std::uint64_t checker) {
   const std::uint64_t pid = word & kProcessPidMask;
   if (pid == 0) return false;

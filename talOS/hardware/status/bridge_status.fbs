@@ -91,7 +91,7 @@ struct CanBusStatus {
 // each is true while its condition holds in the status published, and false
 // as soon as it no longer does; nothing latches. Each is derived from what
 // the bridge already tracks:
-// - alert_error_link_lost: no State accepted yet, or state_age_us above
+// - alert_error_link_lost: no State accepted yet, or state_age_us at or above
 //   [robot] command_timeout_us. Clears on the next accepted State.
 // - alert_error_protocol_mismatch: a UDP datagram from the gateway was refused
 //   for kUnsupportedVersion within [robot] command_timeout_us and no valid

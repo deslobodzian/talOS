@@ -1,6 +1,8 @@
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -47,6 +49,12 @@ inline std::optional<FrameDuration> FrameDurationFor(double fps, double min_fps,
                                                      double max_fps,
                                                      FrameDuration shortest,
                                                      FrameDuration longest) {
+  if (!std::isfinite(fps) || !std::isfinite(min_fps) ||
+      !std::isfinite(max_fps) || fps <= 0.0 || min_fps <= 0.0 ||
+      max_fps <= 0.0 || min_fps > max_fps || shortest.value <= 0 ||
+      shortest.timescale <= 0 || longest.value <= 0 || longest.timescale <= 0) {
+    return std::nullopt;
+  }
   constexpr double kTolerance = 1e-4;
   const auto near = [&](double rate) {
     return std::abs(fps - rate) <= rate * kTolerance;
@@ -54,8 +62,23 @@ inline std::optional<FrameDuration> FrameDurationFor(double fps, double min_fps,
   if (near(max_fps)) return shortest;
   if (near(min_fps)) return longest;
   if (!(fps > min_fps && fps < max_fps)) return std::nullopt;
-  const FrameDuration duration{1000,
-                               static_cast<int32_t>(std::lround(fps * 1000.0))};
+  FrameDuration duration{1000, 1};
+  const double scaled = fps * 1000.0;
+  if (scaled >= 1.0 &&
+      scaled <= static_cast<double>(std::numeric_limits<int32_t>::max())) {
+    duration = {
+        1000, std::max<int32_t>(1, static_cast<int32_t>(std::lround(scaled)))};
+  } else if (scaled < 1.0) {
+    const double seconds = 1.0 / fps;
+    if (!std::isfinite(seconds) ||
+        seconds >
+            static_cast<double>(std::numeric_limits<int64_t>::max()) / 1000.0) {
+      return longest;
+    }
+    duration = {std::max<int64_t>(1, std::llround(seconds * 1000.0)), 1000};
+  } else {
+    return std::nullopt;
+  }
   if (duration.seconds() < shortest.seconds()) return shortest;
   if (duration.seconds() > longest.seconds()) return longest;
   return duration;

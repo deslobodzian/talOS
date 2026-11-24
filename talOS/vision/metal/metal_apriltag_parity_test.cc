@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -608,6 +611,137 @@ TEST_F(MetalAprilTagParityTest, Stage2CandidateOverflowAfterLargerFrame) {
                            "Stage2CandidateOverflowAfterLargerFrame");
 }
 
+TEST_F(MetalAprilTagParityTest, RejectsUnsupportedDimensionsAndInvalidStride) {
+  // 1. Sub-4x4 at decimate=1 and 6x6 at decimate=2 must return empty without
+  // crashing in upstream threshold().
+  std::vector<uint8_t> small_gray(size_t{64} * 64, 128);
+  EXPECT_TRUE(
+      metal_backend_->Detect(small_gray.data(), 3, 3, 3, PixelFormat::kGray8)
+          .empty());
+
+  Frame frame_3x3(0, 0, 0, event::steady_now(), 3, 3, PixelFormat::kGray8, 3);
+  std::memset(frame_3x3.mutable_data(), 128, 9);
+  const auto res_3x3 = metal_backend_->Execute(frame_3x3);
+  EXPECT_TRUE(res_3x3.success);
+  EXPECT_TRUE(res_3x3.detections.empty());
+
+  auto dec2_opts = options_;
+  dec2_opts.quad_decimate = 2.0f;
+  metal_backend_->SetOptions(dec2_opts);
+  EXPECT_TRUE(
+      metal_backend_->Detect(small_gray.data(), 6, 6, 6, PixelFormat::kGray8)
+          .empty());
+
+  Frame frame_6x6(0, 0, 0, event::steady_now(), 6, 6, PixelFormat::kGray8, 6);
+  std::memset(frame_6x6.mutable_data(), 128, 36);
+  const auto res_6x6 = metal_backend_->Execute(frame_6x6);
+  EXPECT_TRUE(res_6x6.success);
+  EXPECT_TRUE(res_6x6.detections.empty());
+  metal_backend_->SetOptions(options_);
+
+  // 2. Dimensions >= 32768 must return empty before allocating buffers.
+  uint8_t dummy = 0;
+  EXPECT_TRUE(
+      metal_backend_->Detect(&dummy, 32768, 4, 32768, PixelFormat::kGray8)
+          .empty());
+  EXPECT_TRUE(
+      metal_backend_->Detect(&dummy, 4, 32768, 4, PixelFormat::kGray8).empty());
+
+  // 3. Stride < width * bpp (e.g. stride == width for kBgra8), negative
+  // stride, and width * bpp > INT_MAX must be rejected before allocation/copy.
+  std::vector<uint8_t> bgra_small(size_t{64} * 64, 128);
+  EXPECT_TRUE(metal_backend_
+                  ->Detect(bgra_small.data(), 64, 64, /*stride=*/64,
+                           PixelFormat::kBgra8)
+                  .empty());
+  EXPECT_TRUE(metal_backend_
+                  ->Detect(small_gray.data(), 64, 64, /*stride=*/-1,
+                           PixelFormat::kGray8)
+                  .empty());
+  EXPECT_TRUE(
+      metal_backend_
+          ->Detect(&dummy, 0x20000001, 4, /*stride=*/0, PixelFormat::kBgra8)
+          .empty());
+}
+
+TEST_F(MetalAprilTagParityTest, ConcurrentExecuteAndSetOptionsAreThreadSafe) {
+  const int width = 64;
+  const int height = 64;
+  Frame frame(0, 0, 0, event::steady_now(), width, height, PixelFormat::kGray8,
+              width);
+  std::memset(frame.mutable_data(), 180, static_cast<size_t>(width) * height);
+
+  std::atomic<bool> stop{false};
+  std::thread mutator([&]() {
+    auto opts_a = options_;
+    opts_a.quad_decimate = 1.0f;
+    auto opts_b = options_;
+    opts_b.quad_decimate = 2.0f;
+    for (int i = 0; i < 12; ++i) {
+      metal_backend_->SetOptions((i % 2 == 0) ? opts_a : opts_b);
+    }
+    stop.store(true, std::memory_order_release);
+  });
+
+  std::vector<std::thread> workers;
+  workers.reserve(2);
+  for (int t = 0; t < 2; ++t) {
+    workers.emplace_back([&]() {
+      while (!stop.load(std::memory_order_acquire)) {
+        const auto res = metal_backend_->Execute(frame);
+        EXPECT_TRUE(res.success);
+        const auto info = metal_backend_->device_info();
+        EXPECT_FALSE(info.empty());
+        const auto opts = metal_backend_->options();
+        EXPECT_EQ(opts.family_name, "tag36h11");
+        (void)metal_backend_->last_timings();
+      }
+    });
+  }
+
+  mutator.join();
+  for (auto& w : workers) w.join();
+  metal_backend_->SetOptions(options_);
+}
+
+TEST_F(MetalAprilTagParityTest, SetOptionsIsAtomicOnInvalidOptions) {
+  const std::string path = ResolveTestdataPath("scene_single_tag0.png");
+  ASSERT_TRUE(std::filesystem::exists(path)) << "Fixture not found: " << path;
+  image_u8_t* im = talos::vision::apriltag::LoadGrayImageU8(path);
+  ASSERT_NE(im, nullptr);
+
+  talos::vision::apriltag::DetectorOptions good_opts = options_;
+  good_opts.quad_decimate = 1.0f;
+  good_opts.quad_sigma = 0.0f;
+  metal_backend_->SetOptions(good_opts);
+
+  // Invalid threads with quad_sigma != 0 must throw without mutating
+  // impl_->options or tearing down the working detector.
+  talos::vision::apriltag::DetectorOptions bad_threads = good_opts;
+  bad_threads.quad_sigma = 1.0f;
+  bad_threads.threads = 0;
+  EXPECT_THROW(metal_backend_->SetOptions(bad_threads), std::invalid_argument);
+
+  talos::vision::apriltag::DetectorOptions bad_family = good_opts;
+  bad_family.quad_decimate = 3.0f;
+  bad_family.family_name = "not_a_real_family";
+  EXPECT_THROW(metal_backend_->SetOptions(bad_family), std::invalid_argument);
+
+  talos::vision::Frame frame(
+      0, 0, 0, talos::event::steady_now(), static_cast<uint32_t>(im->width),
+      static_cast<uint32_t>(im->height), static_cast<uint32_t>(im->stride),
+      PixelFormat::kGray8, im->buf,
+      static_cast<size_t>(im->stride) * im->height);
+  const auto res = metal_backend_->Execute(frame);
+  EXPECT_TRUE(res.success);
+  ASSERT_EQ(res.detections.size(), 1u);
+  EXPECT_EQ(res.detections[0].id, 0);
+  if (metal_backend_->supports_gpu()) {
+    EXPECT_EQ(res.effective_backend, "metal");
+  }
+  image_u8_destroy(im);
+}
+
 #if defined(__APPLE__)
 void AssertThresholdParity(MetalAprilTagBackend& backend, image_u8_t* im,
                            uint32_t min_diff = 5,
@@ -771,6 +905,22 @@ TEST_F(MetalAprilTagParityTest, GpuThresholdParityOnLowAndHighContrastTiles) {
   }
 
   AssertThresholdParity(*metal_backend_, im, 5, "LowAndHighContrastTiles");
+  image_u8_destroy(im);
+}
+
+TEST_F(MetalAprilTagParityTest, GpuThresholdParityWithMinDiff256) {
+  // min_diff == 256 must NOT truncate to 0 via uchar cast: all non-remainder
+  // pixels must binarize to 127, matching CPU threshold().
+  const int w = 64;
+  const int h = 64;
+  image_u8_t* im = image_u8_create(w, h);
+  ASSERT_NE(im, nullptr);
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      im->buf[y * im->stride + x] = (((x / 4) + (y / 4)) % 2 == 0) ? 255 : 0;
+    }
+  }
+  AssertThresholdParity(*metal_backend_, im, 256, "MinDiff256");
   image_u8_destroy(im);
 }
 

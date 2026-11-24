@@ -135,10 +135,11 @@ class CpuAprilTagBackend {
                                          const CameraIntrinsics& intrinsics,
                                          double tag_size_meters);
 
-  // 3D pose estimation from an existing detection.
-  PoseEstimation EstimatePose(const Detection& detection,
-                              const CameraIntrinsics& intrinsics,
-                              double tag_size_meters) const;
+  // 3D pose estimation from an existing detection. Returns std::nullopt when
+  // intrinsics, tag size, or corner geometry cannot produce a valid pose.
+  std::optional<PoseEstimation> EstimatePose(const Detection& detection,
+                                             const CameraIntrinsics& intrinsics,
+                                             double tag_size_meters) const;
 
  private:
   struct Impl;

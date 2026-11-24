@@ -227,6 +227,10 @@ kernel void extract_edge_candidates(
     constant uint& max_candidates [[buffer(6)]],
     uint2 gid [[thread_position_in_grid]])
 {
+    if (width < 2 || height < 2) {
+        return;
+    }
+
     uint x = gid.x;
     uint y = gid.y;
 
@@ -516,7 +520,7 @@ kernel void tile_blur_and_threshold(
     }
 
     bool is_remainder = (x >= tw * 4) || (y >= th * 4);
-    if (!is_remainder && ((max_v - min_v) < static_cast<uchar>(min_diff))) {
+    if (!is_remainder && ((uint(max_v) - uint(min_v)) < min_diff)) {
         thresh_buf[y * stride + x] = 127;
     } else {
         uchar thresh = min_v + (max_v - min_v) / 2;
