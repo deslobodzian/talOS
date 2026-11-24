@@ -206,6 +206,50 @@ TEST(PollerTest, AReadableWakeNamesOnlyTheFdsThatWereReady) {
   for (const int fd : {ready[0], ready[1], quiet[0], quiet[1]}) ::close(fd);
 }
 
+// When a watched fd and wake() arrive in the same wait_until() batch,
+// READABLE outranks WOKEN and the deferred WOKEN surfaces on the next wait
+// once the watched fd is no longer readable, then clears.
+TEST(PollerTest, WakeIsPreservedWhenReadableArrivesInSameWait) {
+  int fds[2];
+  ASSERT_EQ(::pipe(fds), 0);
+  const int read_fd = fds[0];
+  const int write_fd = fds[1];
+
+  Poller poller;
+  poller.add_fd(read_fd);
+
+  const char byte = 'x';
+  ASSERT_EQ(::write(write_fd, &byte, 1), 1);
+  poller.wake();
+
+  EXPECT_EQ(poller.wait_until(Poller::now() + 50 * kMillisecond),
+            Poller::WakeReason::READABLE);
+  EXPECT_TRUE(poller.reported_readable(read_fd));
+
+  // While the fd stays readable, READABLE still outranks the latched wake, and
+  // another wake() collapses into the same pending WOKEN.
+  poller.wake();
+  EXPECT_EQ(poller.wait_until(Poller::now() + 50 * kMillisecond),
+            Poller::WakeReason::READABLE);
+  EXPECT_TRUE(poller.reported_readable(read_fd));
+
+  char buf = 0;
+  ASSERT_EQ(::read(read_fd, &buf, 1), 1);
+
+  EXPECT_EQ(poller.wait_until(Poller::now() + 50 * kMillisecond),
+            Poller::WakeReason::WOKEN);
+  EXPECT_FALSE(poller.reported_readable(read_fd));
+
+  // The wake was consumed once; the next wait runs to its deadline.
+  const MonotonicTime start = Poller::now();
+  EXPECT_EQ(poller.wait_until(start + 20 * kMillisecond),
+            Poller::WakeReason::DEADLINE);
+  EXPECT_GE(Poller::now() - start, 20 * kMillisecond);
+
+  ::close(write_fd);
+  ::close(read_fd);
+}
+
 TEST(PollerTest, RemoveFdStopsItFromWakingThePoller) {
   int fds[2];
   ASSERT_EQ(::pipe(fds), 0);

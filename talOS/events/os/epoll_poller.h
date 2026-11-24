@@ -100,6 +100,9 @@ class EpollPoller {
   void close_all() noexcept;
 
   Pwait2 pwait2_{nullptr};
+  // Preserves a WOKEN event that arrived in the same batch as READABLE so
+  // the next wait_until() observes it instead of losing it.
+  bool pending_wake_{false};
   // The watched fds the last wait_until() reported readable.
   int readable_[kMaxEvents]{};
   int readable_count_{0};

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "talOS/events/time.h"
@@ -51,11 +52,27 @@ class Scheduler {
     std::make_heap(heap_.begin(), heap_.end(), Later{});
   }
 
-  // Moves every armed deadline by `delta`. All of them move alike, so their
-  // order, and the heap, stand.
+  // Moves every armed deadline by `delta`, saturating at MonotonicTime bounds.
+  // Saturation can collapse distinct deadlines into a tie, so rebuild the heap
+  // when that happens to keep (deadline, id) order intact.
   void shift(Duration delta) {
+    const std::int64_t d = delta.count();
+    if (d == 0) return;
+    bool saturated = false;
     for (Entry& entry : heap_) {
-      entry.deadline += delta;
+      const std::int64_t nanos = entry.deadline.nanos();
+      if (d > 0 && nanos > MonotonicTime::max().nanos() - d) {
+        entry.deadline = MonotonicTime::max();
+        saturated = true;
+      } else if (d < 0 && nanos < MonotonicTime::min().nanos() - d) {
+        entry.deadline = MonotonicTime::min();
+        saturated = true;
+      } else {
+        entry.deadline += delta;
+      }
+    }
+    if (saturated) {
+      std::make_heap(heap_.begin(), heap_.end(), Later{});
     }
   }
 
@@ -86,16 +103,30 @@ class Scheduler {
     expiration.cycles = 1;
 
     if (entry.period > Duration::zero()) {
-      const std::int64_t period = entry.period.count();
-      const std::int64_t late = (now - entry.deadline).count();
+      const std::uint64_t period =
+          static_cast<std::uint64_t>(entry.period.count());
+      const std::uint64_t late =
+          static_cast<std::uint64_t>(now.nanos()) -
+          static_cast<std::uint64_t>(entry.deadline.nanos());
+      const std::uint64_t missed = late / period;
       const std::uint64_t cycles =
-          static_cast<std::uint64_t>(late / period) + 1;
+          missed == std::numeric_limits<std::uint64_t>::max() ? missed
+                                                              : missed + 1;
 
       expiration.cycles = cycles;
-      entry.deadline += Duration{period * static_cast<std::int64_t>(cycles)};
 
-      heap_.push_back(entry);
-      std::push_heap(heap_.begin(), heap_.end(), Later{});
+      const std::uint64_t remaining =
+          static_cast<std::uint64_t>(MonotonicTime::max().nanos()) -
+          static_cast<std::uint64_t>(entry.deadline.nanos());
+      // Only re-arm when the next grid phase fits in MonotonicTime; a phase
+      // strictly past MonotonicTime::max() can never become due.
+      if (missed < remaining / period) {
+        entry.deadline = MonotonicTime::from_nanos(static_cast<std::int64_t>(
+            static_cast<std::uint64_t>(entry.deadline.nanos()) +
+            cycles * period));
+        heap_.push_back(entry);
+        std::push_heap(heap_.begin(), heap_.end(), Later{});
+      }
     }
 
     return true;
