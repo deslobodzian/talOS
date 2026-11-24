@@ -4913,6 +4913,7 @@ TEST(Gateway,
   stalling_clock_us = 90000;
   backend.stall_us = 20000;
   g.Tick(90000, true);
+  EXPECT_EQ(g.snapshot().sample_time_us, 110000u);
   EXPECT_FALSE(g.snapshot().flags & kCommandActive);
   EXPECT_GT(g.snapshot().epoch, epoch_before);
   EXPECT_GT(backend.neutral, neutrals_before);
