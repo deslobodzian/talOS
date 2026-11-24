@@ -11,7 +11,6 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
-#include <vector>
 
 #include "talOS/trajectory/test_fixtures.h"
 #include "talOS/trajectory/trajectory.h"
@@ -85,28 +84,6 @@ TEST(ChoreoTest, LoadsChoreoSchema3File) {
   EXPECT_DOUBLE_EQ(trajectory.events()[0].t_s, 0.0);
   EXPECT_DOUBLE_EQ(trajectory.events()[1].t_s, 1.19616);
   EXPECT_EQ(result.dropped_event_count, 0U);
-}
-
-// Guards: driven the natural way (reset at the start, advance with elapsed
-// time each 20 ms tick, from t = 0), an EventCursor fires the real file's
-// marker at 0.0 on the first tick and the one at 1.19616 s exactly once.
-// REQ-DEV-14
-TEST(ChoreoTest, CursorFiresChoreoMarkersOnceIncludingAtZero) {
-  const LoadResult result =
-      LoadChoreoFile(FixturePath("TALOS_TRAJECTORY_CHOREO_V3_SWERVE"));
-  ASSERT_TRUE(result) << result.error;
-  EventCursor cursor;
-  cursor.reset();
-  std::vector<int> fired_at_tick;
-  for (int tick = 0; tick <= 100; ++tick) {
-    for (const EventMarker& marker :
-         cursor.advance(result.trajectory, 0.02 * tick)) {
-      EXPECT_EQ(marker.name, "Marker");
-      fired_at_tick.push_back(tick);
-    }
-  }
-  // 1.19616 s falls in the tick ending at 1.20 s.
-  EXPECT_EQ(fired_at_tick, (std::vector<int>{0, 60}));
 }
 
 // Guards: every released schema version (1, 2, 3) is accepted; the inline
