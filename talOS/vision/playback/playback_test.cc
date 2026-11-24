@@ -640,6 +640,8 @@ TEST(RecordedCameraSourceTest,
 
   CameraSourceConfig config;
   config.device_path = dir.string();
+  config.width = 0;
+  config.height = 0;
   config.fps = 100.0;
   RecordedCameraSource source(config, RecordedCameraSource::Pacing::kRealtime);
 
