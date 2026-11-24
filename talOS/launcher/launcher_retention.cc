@@ -565,10 +565,24 @@ bool Launcher::LockSharesLogFilesystem() const {
   if (::stat(introspect::LockDirectory().c_str(), &lock_dir) != 0) return false;
   std::filesystem::path dir =
       std::filesystem::path{options_.output_dir}.parent_path();
+  std::error_code ec;
+  const std::filesystem::path absolute = std::filesystem::absolute(dir, ec);
+  if (!ec) {
+    dir = absolute;
+  } else if (dir.empty()) {
+    dir = ".";
+  }
   struct stat log_dir {};
   while (::stat(dir.c_str(), &log_dir) != 0) {
     if (errno != ENOENT || !dir.has_relative_path()) return false;
-    dir = dir.parent_path();
+    const std::filesystem::path parent = dir.parent_path();
+    if (parent == dir) return false;
+    if (parent.empty()) {
+      if (dir == ".") return false;
+      dir = ".";
+    } else {
+      dir = parent;
+    }
   }
   return lock_dir.st_dev == log_dir.st_dev;
 }

@@ -678,6 +678,38 @@ TEST(ProcessTest, RealtimeResetsPolicyOnForkAndThreadCreation) {
       << "child failed at step " << WEXITSTATUS(status);
 }
 
+// Probes in a forked child whether RLIMIT_MEMLOCK=0 actually causes mlock to
+// fail with ENOMEM or EPERM. Processes with CAP_IPC_LOCK (including root by
+// default) bypass RLIMIT_MEMLOCK, in which case the caller skips rather than
+// reporting a false pass.
+enum class MemlockProbe { kRefused, kBypassed, kError };
+
+MemlockProbe ProbeMemlockZero() {
+  const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+  const pid_t child = ::fork();
+  if (child < 0) return MemlockProbe::kError;
+  if (child == 0) {
+    const rlimit zero{0, 0};
+    if (::setrlimit(RLIMIT_MEMLOCK, &zero) != 0) ::_exit(2);
+    void* p = ::mmap(nullptr, page, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) ::_exit(3);
+    const int err = ::mlock(p, page) == 0 ? 0 : errno;
+    if (err == 0) {
+      ::munlock(p, page);
+      ::_exit(1);
+    }
+    ::_exit((err == ENOMEM || err == EPERM) ? 0 : 4);
+  }
+  int status = 0;
+  if (::waitpid(child, &status, 0) != child || !WIFEXITED(status)) {
+    return MemlockProbe::kError;
+  }
+  if (WEXITSTATUS(status) == 0) return MemlockProbe::kRefused;
+  if (WEXITSTATUS(status) == 1) return MemlockProbe::kBypassed;
+  return MemlockProbe::kError;
+}
+
 // Child body for MemlockZeroReportsRingAndStackLockRefusalsOnceOnStderr,
 // factored out of EXPECT_EXIT to avoid preprocessor comma splitting.
 [[noreturn]] void RunMemlockZeroChild() {
@@ -706,15 +738,20 @@ TEST(ProcessTest, RealtimeResetsPolicyOnForkAndThreadCreation) {
   // Probe what errno mlock returns under RLIMIT_MEMLOCK=0 on this kernel
   // (EPERM or ENOMEM) without locking anything.
   const int probe_err = ::mlock(r1, page) == 0 ? 0 : errno;
-  if (probe_err == 0) {
-    // Process holds CAP_IPC_LOCK despite non-root euid.
-    ::munlock(r1, page);
-    std::_Exit(0);
+  if (probe_err == 0) ::munlock(r1, page);
+  if (probe_err != ENOMEM && probe_err != EPERM) {
+    std::fprintf(stderr, "unexpected mlock probe errno: %d (%s)\n", probe_err,
+                 std::strerror(probe_err));
+    std::fflush(stderr);
+    std::_Exit(14);
   }
 
+  const bool before_rt_ok =
+      !memory::MappingsKeptResident() && !memory::LateLockRefused();
   memory::TrackMapping(r1, page);
   memory::TrackMapping(r2, page);
 
+  std::fflush(stderr);
   int pipefd[2]{-1, -1};
   if (::pipe(pipefd) != 0) std::_Exit(12);
   const int saved_stderr = ::dup(STDERR_FILENO);
@@ -725,13 +762,24 @@ TEST(ProcessTest, RealtimeResetsPolicyOnForkAndThreadCreation) {
 
   const RealtimeOutcome outcome =
       ConfigureRealtime({.period = 10ms, .tier = LoopTier::kControl});
-  // Two late mappings after realtime setup: only the first prints.
+  // Pre-existing ring refusals surface in outcome.refused, not LateLockRefused.
+  const bool after_rt_ok =
+      memory::MappingsKeptResident() && !memory::LateLockRefused();
+  // Two late mappings after realtime setup: LateLockRefused flips on the first
+  // and only the first prints.
   memory::TrackMapping(late1, page);
+  const bool after_late1_ok = memory::LateLockRefused();
   memory::TrackMapping(late2, page);
+  const bool after_late2_ok = memory::LateLockRefused();
   std::fflush(stderr);
 
   ::dup2(saved_stderr, STDERR_FILENO);
   ::close(saved_stderr);
+
+  for (void* p : {late2, late1, r2, r1}) {
+    memory::UntrackMapping(p);
+    ::munmap(p, page);
+  }
 
   std::string captured;
   char buf[512];
@@ -746,11 +794,16 @@ TEST(ProcessTest, RealtimeResetsPolicyOnForkAndThreadCreation) {
     lines.push_back(line);
   }
 
-  const bool outcome_ok =
-      outcome.requested && outcome.tier == LoopTier::kControl &&
-      (outcome.refused & kStepMlockall) != 0 &&
-      (outcome.refused & kStepRingLock) != 0 &&
-      (outcome.refused & kStepStackLock) != 0 && memory::LateLockRefused();
+  const RealtimeGrant expected_grant = (outcome.refused & kStepPolicy) == 0
+                                           ? RealtimeGrant::kPartial
+                                           : RealtimeGrant::kRefused;
+  const bool outcome_ok = before_rt_ok && after_rt_ok && after_late1_ok &&
+                          after_late2_ok && outcome.requested &&
+                          outcome.tier == LoopTier::kControl &&
+                          outcome.grant() == expected_grant &&
+                          (outcome.refused & kStepMlockall) != 0 &&
+                          (outcome.refused & kStepRingLock) != 0 &&
+                          (outcome.refused & kStepStackLock) != 0;
 
   const std::string err_text = std::strerror(probe_err);
   const std::string expected_prefix =
@@ -775,29 +828,36 @@ TEST(ProcessTest, RealtimeResetsPolicyOnForkAndThreadCreation) {
   }
 
   if (!outcome_ok || !lines_ok) {
-    std::fprintf(stderr,
-                 "outcome_ok=%d refused=0x%x lines=%zu\n"
-                 "captured:\n%s\nexpected0: %s\nexpected1: %s\n",
-                 outcome_ok ? 1 : 0, outcome.refused, lines.size(),
-                 captured.c_str(), expected_prefix.c_str(),
-                 expected_late.c_str());
+    std::fprintf(
+        stderr,
+        "outcome_ok=%d before_rt=%d after_rt=%d late1=%d late2=%d refused=0x%x "
+        "lines=%zu\ncaptured:\n%s\nexpected0: %s\nexpected1: %s\n",
+        outcome_ok ? 1 : 0, before_rt_ok ? 1 : 0, after_rt_ok ? 1 : 0,
+        after_late1_ok ? 1 : 0, after_late2_ok ? 1 : 0, outcome.refused,
+        lines.size(), captured.c_str(), expected_prefix.c_str(),
+        expected_late.c_str());
     std::fflush(stderr);
     std::_Exit(1);
   }
   std::_Exit(0);
 }
 
-// Under RLIMIT_MEMLOCK=0 on Linux, mlockall, ring mlock and stack mlock are
+// Under RLIMIT_MEMLOCK=0 on Linux (macOS ignores RLIMIT_MEMLOCK in favor of
+// the system-wide wired limit), mlockall, ring mlock and stack mlock are
 // refused: ConfigureRealtime reports kStepMlockall, kStepRingLock and
 // kStepStackLock in RealtimeOutcome and prints one summary line to stderr, and
-// subsequent TrackMapping calls print the late-refusal line exactly once.
-// Runs in a re-executed child so MappingsKeptResident starts false and
-// RLIMIT_MEMLOCK=0 is isolated to the child.
+// subsequent TrackMapping calls set LateLockRefused() and print the
+// late-refusal line exactly once. Runs in a re-executed child so
+// MappingsKeptResident starts false and RLIMIT_MEMLOCK=0 is isolated to the
+// child.
 // REQ-RT-09
 TEST(ProcessTest, MemlockZeroReportsRingAndStackLockRefusalsOnceOnStderr) {
-  if (::geteuid() == 0) {
-    GTEST_SKIP() << "root bypasses RLIMIT_MEMLOCK";
+  const MemlockProbe probe = ProbeMemlockZero();
+  if (probe == MemlockProbe::kBypassed) {
+    GTEST_SKIP() << "process bypasses RLIMIT_MEMLOCK=0 (e.g. CAP_IPC_LOCK)";
   }
+  ASSERT_EQ(probe, MemlockProbe::kRefused)
+      << "failed to probe RLIMIT_MEMLOCK=0 behaviour";
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   EXPECT_EXIT(RunMemlockZeroChild(), ::testing::ExitedWithCode(0), "");
 }

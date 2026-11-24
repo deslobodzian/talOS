@@ -3,10 +3,12 @@
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -187,6 +189,79 @@ TEST(LauncherAdversarial, SpawnRejectsEmptyArgsAndRelocatesPipesAboveStdFds) {
   ASSERT_EQ(::waitpid(child, &status, 0), child);
   ASSERT_TRUE(WIFEXITED(status));
   EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+// REQ-SAFE-30, REQ-OPS-11, REQ-OPS-33: The guardian must close every inherited
+// descriptor except lifetime[0] before closing errors[1], so EOF on errors[0]
+// (when SpawnProcess returns) guarantees no inherited pipe write end or flock
+// descriptor stays open in the guardian once the child exits or execs.
+TEST(LauncherAdversarial, SpawnGuardianClosesInheritedFdsBeforeReturn) {
+  // Open extra descriptors before the test pipe so any race window between
+  // closing errors[1] and CloseDescriptorsExcept is consistently exposed.
+  std::vector<int> padding_fds;
+  const int devnull = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+  ASSERT_GE(devnull, 0);
+  padding_fds.push_back(devnull);
+  for (int i = 0; i < 64; ++i) {
+    const int dup_fd = ::fcntl(devnull, F_DUPFD_CLOEXEC, 3);
+    if (dup_fd < 0) break;
+    padding_fds.push_back(dup_fd);
+  }
+  struct FdCloser {
+    std::vector<int>& fds;
+    ~FdCloser() {
+      for (const int fd : fds) ::close(fd);
+    }
+  } close_padding{padding_fds};
+
+  for (const bool cloexec : {true, false}) {
+    SCOPED_TRACE(cloexec ? "FD_CLOEXEC extra pipe" : "inherited extra pipe");
+    for (int iter = 0; iter < 30; ++iter) {
+      SCOPED_TRACE("iteration " + std::to_string(iter));
+      int extra[2]{-1, -1};
+      if (cloexec) {
+        ASSERT_TRUE(CloseOnExecPipe(extra));
+      } else {
+        ASSERT_EQ(::pipe(extra), 0);
+      }
+      const int read_flags = ::fcntl(extra[0], F_GETFL, 0);
+      ASSERT_GE(read_flags, 0);
+      ASSERT_EQ(::fcntl(extra[0], F_SETFL, read_flags | O_NONBLOCK), 0);
+
+      std::string error;
+      const pid_t pid = SpawnProcess({"/bin/sh", "-c", "exit 0"}, error);
+      ASSERT_GT(pid, 0) << error;
+
+      ::close(extra[1]);
+      int status = 0;
+      if (!cloexec) {
+        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        }
+      }
+
+      // Immediately after SpawnProcess returns (and child exits for non-CLOEXEC
+      // pipes), neither the child nor the guardian may hold extra[1].
+      struct pollfd pfd {
+        extra[0], POLLIN, 0
+      };
+      const int ready = ::poll(&pfd, 1, 0);
+      char byte = 0;
+      const ssize_t got = ::read(extra[0], &byte, 1);
+      const int read_err = errno;
+      ::close(extra[0]);
+
+      if (cloexec) {
+        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        }
+      }
+      FinishProcessGroup(pid);
+
+      ASSERT_GT(ready, 0) << "extra pipe write end still held after return";
+      ASSERT_NE(pfd.revents & POLLHUP, 0) << "revents=" << pfd.revents;
+      ASSERT_EQ(got, 0) << "expected immediate EOF, got=" << got
+                        << " errno=" << read_err;
+    }
+  }
 }
 
 // REQ-OPS-07: huge WATCHDOG_USEC (up to INT64_MAX) must not overflow

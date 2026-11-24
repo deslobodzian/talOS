@@ -171,9 +171,10 @@ py_test(
 )
 
 # REQ-RT-07: update() callback entry-to-exit p99 wall-clock benchmark for
-# representative C++ bench and framework nodes (motor, swerve_module, teleop,
-# telemetry) against docs/METHODOLOGY.md §10's 10% period budget, with
-# StallMeter host qualification (docs/TESTING.md §6.7).
+# representative C++ bench, framework, and mechanism nodes (motor,
+# swerve_module, teleop, telemetry, and a composite PositionMechanism +
+# VelocityMechanism + RollerWithSensor node) against docs/METHODOLOGY.md §10's
+# 10% period budget, with StallMeter host qualification (docs/TESTING.md §6.7).
 cc_test(
     name = "update_p99_perf_test",
     size = "small",
@@ -186,9 +187,12 @@ cc_test(
     deps = [
         "//bench/main_processor/motor",
         "//bench/main_processor/swerve_module",
+        "//talOS/devices",
         "//talOS/devices:testing",
         "//talOS/driver_station",
         "//talOS/events:events_core",
+        "//talOS/mechanisms",
+        "//talOS/msgs:control",
         "//talOS/node",
         "//talOS/node:testing",
         "//talOS/process:host_qualification",

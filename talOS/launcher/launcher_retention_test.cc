@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "talOS/introspection/describe.h"
+#include "talOS/introspection/lock_file.h"
 #include "talOS/launcher/launcher.h"
 #include "talOS/launcher/session_lock.h"
 #include "talOS/launcher/session_retention.h"
@@ -359,6 +360,229 @@ TEST(LauncherRetention, SymlinksInLogRootAndKeptSessionSurviveUntouched) {
   std::filesystem::remove_all(external_dir);
   std::filesystem::remove(external_file);
   std::filesystem::remove(options.config_path);
+}
+
+// REQ-OPS-11: SessionDirectoryLock::Held returns false only when the lock file
+// is absent (ENOENT/ENOTDIR) or when flock succeeds (or reports
+// FlockUnsupported on a lockless root). Non-ENOENT open errors (EACCES, ELOOP)
+// and flock errors fail closed (true), and flock retries on EINTR.
+TEST(LauncherRetention,
+     SessionDirectoryLockHeldFailsClosedOnErrorsAndRetriesEintr) {
+  const std::filesystem::path base = TempPath("held_fail_closed");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  // Absent lock file (ENOENT) -> not held.
+  const std::filesystem::path absent = base / "absent";
+  std::filesystem::create_directories(absent);
+  EXPECT_FALSE(
+      SessionDirectoryLock::Held(absent, /*root_takes_no_locks=*/false));
+
+  // Regular file as session dir (ENOTDIR) -> not held.
+  const std::filesystem::path not_a_dir = base / "not_a_dir";
+  std::ofstream{not_a_dir} << "x";
+  EXPECT_FALSE(
+      SessionDirectoryLock::Held(not_a_dir, /*root_takes_no_locks=*/false));
+
+  // Symlinked session.lock fails open(O_NOFOLLOW) with ELOOP -> fail closed.
+  const std::filesystem::path symlink_dir = base / "symlink_lock";
+  std::filesystem::create_directories(symlink_dir);
+  const std::filesystem::path target = base / "target_lock";
+  std::ofstream{target} << "";
+  std::filesystem::create_symlink(
+      target, symlink_dir / std::string{kSessionDirectoryLockFile});
+  EXPECT_TRUE(
+      SessionDirectoryLock::Held(symlink_dir, /*root_takes_no_locks=*/false));
+  EXPECT_TRUE(
+      SessionDirectoryLock::Held(symlink_dir, /*root_takes_no_locks=*/true));
+
+  // Unreadable session.lock (EACCES, when not running as root) -> fail closed.
+  const std::filesystem::path eacces_dir = base / "eacces_lock";
+  std::filesystem::create_directories(eacces_dir);
+  const std::filesystem::path eacces_lock =
+      eacces_dir / std::string{kSessionDirectoryLockFile};
+  std::ofstream{eacces_lock} << "";
+  if (::geteuid() != 0) {
+    ASSERT_EQ(::chmod(eacces_lock.c_str(), 0000), 0);
+    EXPECT_TRUE(
+        SessionDirectoryLock::Held(eacces_dir, /*root_takes_no_locks=*/false));
+    EXPECT_TRUE(
+        SessionDirectoryLock::Held(eacces_dir, /*root_takes_no_locks=*/true));
+    ASSERT_EQ(::chmod(eacces_lock.c_str(), 0600), 0);
+  }
+
+  // flock returning EINTR is retried before deciding held vs idle.
+  const std::filesystem::path eintr_dir = base / "eintr_lock";
+  std::error_code create_ec;
+  {
+    auto held_lock = SessionDirectoryLock::Create(
+        eintr_dir,
+        [](const std::filesystem::path& p, std::error_code& ec) {
+          std::filesystem::create_directories(p, ec);
+        },
+        create_ec);
+    ASSERT_TRUE(held_lock.has_value()) << create_ec.message();
+
+    int calls = 0;
+    const auto eintr_twice_then_real = [&calls](int fd, int op) {
+      if (calls++ < 2) {
+        errno = EINTR;
+        return -1;
+      }
+      return ::flock(fd, op);
+    };
+    EXPECT_TRUE(SessionDirectoryLock::Held(
+        eintr_dir, /*root_takes_no_locks=*/false, eintr_twice_then_real));
+    EXPECT_EQ(calls, 3);
+  }
+  {
+    int calls = 0;
+    const auto eintr_twice_then_real = [&calls](int fd, int op) {
+      if (calls++ < 2) {
+        errno = EINTR;
+        return -1;
+      }
+      return ::flock(fd, op);
+    };
+    EXPECT_FALSE(SessionDirectoryLock::Held(
+        eintr_dir, /*root_takes_no_locks=*/false, eintr_twice_then_real));
+    EXPECT_EQ(calls, 3);
+  }
+
+  // Persistent EINTR and unexpected flock errors fail closed without looping
+  // forever.
+  EXPECT_TRUE(SessionDirectoryLock::Held(
+      eintr_dir, /*root_takes_no_locks=*/false, [](int, int) {
+        errno = EINTR;
+        return -1;
+      }));
+  EXPECT_TRUE(SessionDirectoryLock::Held(
+      eintr_dir, /*root_takes_no_locks=*/false, [](int, int) {
+        errno = ENOMEM;
+        return -1;
+      }));
+
+  // FlockUnsupported respects root_takes_no_locks.
+  const auto unsupported = [](int, int) {
+    errno = EOPNOTSUPP;
+    return -1;
+  };
+  EXPECT_TRUE(SessionDirectoryLock::Held(
+      eintr_dir, /*root_takes_no_locks=*/false, unsupported));
+  EXPECT_FALSE(SessionDirectoryLock::Held(
+      eintr_dir, /*root_takes_no_locks=*/true, unsupported));
+
+  std::filesystem::remove_all(base);
+}
+
+// REQ-OPS-11, REQ-OPS-02: LockSharesLogFilesystem resolves relative
+// non-existent --output-dir paths against the working directory rather than
+// walking parent_path() to "" and falsely returning false, so unlocked
+// retention still runs when the session lock file cannot be created for ENOSPC.
+TEST(LauncherRetention, RelativeNonExistentOutputDirSharesLockFilesystem) {
+  const std::filesystem::path lock_dir{introspect::LockDirectory()};
+  const std::filesystem::path work_dir =
+      lock_dir / ("talos_rel_log_fs_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(work_dir);
+  std::filesystem::create_directories(work_dir);
+
+  struct stat lock_st {};
+  struct stat work_st {};
+  ASSERT_EQ(::stat(lock_dir.c_str(), &lock_st), 0);
+  ASSERT_EQ(::stat(work_dir.c_str(), &work_st), 0);
+  ASSERT_EQ(lock_st.st_dev, work_st.st_dev);
+
+  const std::filesystem::path saved_cwd = std::filesystem::current_path();
+  struct CwdGuard {
+    std::filesystem::path prev;
+    std::filesystem::path cleanup;
+    ~CwdGuard() {
+      std::error_code ec;
+      std::filesystem::current_path(prev, ec);
+      std::filesystem::remove_all(cleanup, ec);
+    }
+  } cwd_guard{saved_cwd, work_dir};
+  std::filesystem::current_path(work_dir);
+
+  for (const std::string_view rel_dir : {"logs", "nested/logs"}) {
+    SCOPED_TRACE(rel_dir);
+    std::filesystem::remove_all(work_dir / "logs");
+    std::filesystem::remove_all(work_dir / "nested");
+
+    auto options = RetentionFixture(rel_dir == "logs" ? "rel_one" : "rel_two");
+    options.output_dir = std::string{rel_dir};
+    int lock_calls = 0;
+    options.acquire_session_lock = [&lock_calls](std::string& error,
+                                                 bool* no_room) {
+      if (lock_calls++ == 0) {
+        error = "cannot open the session lock: No space left on device";
+        if (no_room != nullptr) *no_room = true;
+        return std::optional<SessionLock>{};
+      }
+      return SessionLock::Acquire(error, no_room);
+    };
+
+    ::testing::internal::CaptureStderr();
+    const int result = Launcher{options}.Run();
+    const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+    EXPECT_EQ(result, 0) << stderr_text;
+    EXPECT_EQ(lock_calls, 2) << stderr_text;
+    EXPECT_NE(stderr_text.find("retention runs first, then the lock is taken"),
+              std::string::npos)
+        << stderr_text;
+    EXPECT_TRUE(
+        std::filesystem::exists(work_dir / rel_dir / "10" / "manifest.json"));
+    std::filesystem::remove(options.config_path);
+  }
+}
+
+// REQ-OPS-11: A concurrent SessionDirectoryLock::Held() shared-lock probe
+// landing between OpenLockFile and flock(LOCK_EX | LOCK_NB) during Refresh()
+// returns a transient EWOULDBLOCK. TakeCurrent() retries briefly so a removed
+// session.lock is retaken instead of falsely reported lost, while a persistent
+// holder still reports kLost.
+TEST(LauncherRetention, RefreshRetriesTransientEwouldblockFromConcurrentProbe) {
+  const std::filesystem::path dir =
+      std::filesystem::path{::testing::TempDir()} /
+      ("talos_dir_lock_retry_" + std::to_string(::getpid()));
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+  std::error_code create_err;
+  auto lock = SessionDirectoryLock::Create(
+      dir,
+      [](const std::filesystem::path& p, std::error_code& err) {
+        std::filesystem::create_directories(p, err);
+      },
+      create_err);
+  ASSERT_TRUE(lock.has_value()) << create_err.message();
+
+  const std::filesystem::path lock_path = dir / kSessionDirectoryLockFile;
+  ASSERT_EQ(::unlink(lock_path.c_str()), 0);
+
+  int transient_calls = 0;
+  const auto refreshed = lock->Refresh([&](int fd, int op) -> int {
+    if (transient_calls++ < 2) {
+      errno = EWOULDBLOCK;
+      return -1;
+    }
+    return ::flock(fd, op);
+  });
+  EXPECT_EQ(refreshed, SessionDirectoryLock::Refreshed::kRetaken);
+  EXPECT_EQ(transient_calls, 3);
+  EXPECT_TRUE(SessionDirectoryLock::Held(dir, false));
+
+  ASSERT_EQ(::unlink(lock_path.c_str()), 0);
+  int persistent_calls = 0;
+  const auto lost = lock->Refresh([&](int /*fd*/, int /*op*/) -> int {
+    ++persistent_calls;
+    errno = EWOULDBLOCK;
+    return -1;
+  });
+  EXPECT_EQ(lost, SessionDirectoryLock::Refreshed::kLost);
+  EXPECT_EQ(persistent_calls, 10);
+
+  lock.reset();
+  std::filesystem::remove_all(dir, ec);
 }
 
 }  // namespace

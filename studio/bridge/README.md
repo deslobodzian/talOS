@@ -56,6 +56,9 @@ These named options are removed before positional parsing:
 - `--refusal-file PATH` or `--refusal-file=PATH`: serve a launcher phase-1
   refusal on `/drive` without opening shared memory or the registry (see
   [Driver dashboard feed](#driver-dashboard-feed)).
+- `--sim`: simulation mode; keeps the loop timeshare unless `TALOS_REALTIME=1`
+  is set and marks the bridge's registry row with `kFlagSimulation`. Ignored in
+  `--describe`.
 
 `--describe` prints the node description and exits without opening shared memory
 or sockets. In that mode, `--config PATH` supplies `[studio] topic`.
@@ -131,6 +134,14 @@ and `dispatch_count` on every loop pass, and exits nonzero if claiming fails so
 the launcher detects and restarts a hung or failed bridge
 ([Studio bridge](../../talOS/launcher/README.md#studio-bridge)). Standalone
 runs (`--session-id 0` or omitted) claim no registry row.
+Before entering its event loop (outside `--refusal-file`), the bridge
+configures realtime scheduling at `LoopTier::kObserver` via
+`talos::process::ConfigureRealtime` when
+`talos::process::RealtimeRequested(simulation)` is true (non-`--sim` by
+default, or `TALOS_REALTIME=1` even under `--sim`; `TALOS_REALTIME=0` or
+`--sim` without `TALOS_REALTIME=1` keeps it timeshare) and publishes the
+outcome on its live registry row
+([Realtime scheduling](../../docs/NODE_DEVELOPMENT_GUIDE.md#realtime-scheduling)).
 The system graph includes the bridge itself (replacing its own live registry
 row with `self()` so `/system.json` carries a single `studio_bridge` entry with
 exact bridge counters) and refreshes every 250 ms of

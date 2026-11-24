@@ -2,7 +2,7 @@ load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
-load("//talOS/build:contract.bzl", "talos_cc_node", "talos_messages")
+load("//talOS/build:contract.bzl", "talos_cc_node", "talos_cc_shared_node", "talos_messages", "talos_py_node")
 
 # One launcher console line composed and handed to its stream in one write.
 cc_library(
@@ -164,6 +164,92 @@ cc_library(
     ],
 )
 
+# Real Python and hosted talos.cpp_node actuator-owner fixtures for
+# python_period_test's Launcher --describe-only check (REQ-RT-23).
+genrule(
+    name = "python_period_py_motor_src",
+    testonly = True,
+    outs = ["python_period_py_motor.py"],
+    cmd = """cat << 'EOF' > $@
+import talos
+
+
+class PythonMotor:
+    def __init__(self, node):
+        self.motor = talos.Motor(node, "lift")
+
+    def update(self):
+        self.motor.stop()
+EOF
+""",
+    visibility = ["//visibility:private"],
+)
+
+talos_py_node(
+    name = "python_period_py_motor",
+    testonly = True,
+    class_name = "PythonMotor",
+    main = "python_period_py_motor.py",
+    node_name = "arm",
+    node_target = "//example/arm:node",
+    visibility = ["//visibility:private"],
+)
+
+genrule(
+    name = "python_period_cpp_motor_src",
+    testonly = True,
+    outs = ["python_period_cpp_motor.cc"],
+    cmd = """cat << 'EOF' > $@
+#include "talOS/devices/devices.h"
+#include "talOS/node/node.h"
+
+struct CppMotor {
+  explicit CppMotor(talos::Node& node) : motor_{node, "lift"} {}
+  void update() { motor_.stop(); }
+  talos::Motor motor_;
+};
+
+TALOS_EXPORT_NODE(cpp_motor, CppMotor)
+EOF
+""",
+    visibility = ["//visibility:private"],
+)
+
+talos_cc_shared_node(
+    name = "libpython_period_cpp_motor.so",
+    testonly = True,
+    srcs = ["python_period_cpp_motor.cc"],
+    visibility = ["//visibility:private"],
+    deps = ["//talOS/devices"],
+)
+
+genrule(
+    name = "python_period_hosted_motor_src",
+    testonly = True,
+    outs = ["python_period_hosted_motor.py"],
+    cmd = """cat << 'EOF' > $@
+import talos
+
+HostedMotor = talos.cpp_node(
+    "talOS/launcher/libpython_period_cpp_motor.so",
+    "cpp_motor",
+)
+EOF
+""",
+    visibility = ["//visibility:private"],
+)
+
+talos_py_node(
+    name = "python_period_hosted_motor",
+    testonly = True,
+    class_name = "HostedMotor",
+    data = [":libpython_period_cpp_motor.so"],
+    main = "python_period_hosted_motor.py",
+    node_name = "arm",
+    node_target = "//example/arm:node",
+    visibility = ["//visibility:private"],
+)
+
 # The graph rule on a Python actuator owner's period, on parsed configs and
 # hand-built descriptions.
 cc_test(
@@ -175,6 +261,37 @@ cc_test(
         "//talOS/configuration",
         "//talOS/introspection:names",
         "@googletest//:gtest_main",
+    ],
+)
+
+# Real talos_py_node / hosted talos.cpp_node actuator-owner binaries probed
+# through Launcher --describe-only (REQ-RT-23). Split from python_period_test
+# so the unit test stays enabled under ASan/TSan.
+cc_test(
+    name = "python_period_describe_test",
+    size = "small",
+    srcs = ["python_period_describe_test.cc"],
+    data = [
+        ":python_period_hosted_motor",
+        ":python_period_py_motor",
+        "//talOS/bridge:hardware_node",
+    ],
+    env = {
+        "TALOS_BRIDGE": "$(rlocationpath //talOS/bridge:hardware_node)",
+        "TALOS_HOSTED_MOTOR": "$(rlocationpath :python_period_hosted_motor)",
+        "TALOS_PY_MOTOR": "$(rlocationpath :python_period_py_motor)",
+    },
+    # Spawns talos_py_node binaries; ctypes cannot initialize sanitizer
+    # runtimes inside the Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
+    deps = [
+        ":describe_graph",
+        ":launcher_lib",
+        "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
     ],
 )
 
@@ -494,6 +611,45 @@ py_test(
         ":target_lane_probe",
     ],
     deps = ["@rules_python//python/runfiles"],
+)
+
+# Real launched --sim --start-sim-gateway session verified with session_report
+# --strict (REQ-RT-15). Split from session_report_test so the unit suite stays
+# enabled under macOS sanitizers.
+py_test(
+    name = "session_report_live_test",
+    size = "small",
+    srcs = [
+        "session_report.py",
+        "session_report_live_test.py",
+        "//talOS/build:sim_check.py",
+    ],
+    data = [
+        ":launcher",
+        ":log_dump",
+        "//talOS/bridge:hardware_node",
+        "//talOS/simulation:bench_motor",
+        "//talOS/simulation:sim_gateway",
+        "//talOS/teleop:node",
+    ],
+    env = {
+        "LAUNCHER": "$(rlocationpath :launcher)",
+    },
+    legacy_create_init = False,
+    main = "session_report_live_test.py",
+    # Launches five processes and asserts wall-clock 5 ms cadence p99 < 10 ms
+    # (session_report --strict): sanitizer instrumentation on a 3-vCPU hosted
+    # runner cannot hold the 5 ms wall-clock bound (cf. studio/bridge
+    # client_timeout_test and TODO.md CI-13). Both Linux and macOS CI run it.
+    tags = [
+        "no_asan",
+        "no_macos_sanitizer",
+        "no_tsan",
+    ],
+    deps = [
+        "//talOS/memory:shm_name",
+        "@rules_python//python/runfiles",
+    ],
 )
 
 # naming::IsTargetLane over stdin, for session_report_test's comparison of
@@ -1210,6 +1366,38 @@ cc_test(
         ":session",
         ":spawn",
         "//talOS/introspection:describe",
+        "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+# Edge-case regression tests for SpawnFailed exit propagation, RefuseLaunch
+# stdout draining and session lock refresh, StudioBridge::Finish exit_code,
+# and PublishedEndpoints with zero runtime sources (REQ-OPS-06, REQ-OPS-08,
+# REQ-OPS-30, REQ-OPS-33, REQ-CONTRACT-11, REQ-SAFE-29).
+cc_test(
+    name = "launcher_edge_test",
+    size = "small",
+    srcs = ["launcher_edge_test.cc"],
+    data = [":delivery_loss_node"],
+    env = {"TALOS_DELIVERY_LOSS_NODE": "$(rlocationpath :delivery_loss_node)"},
+    # Each spawn is two fork()s; see launcher_test.
+    tags = ["no_macos_sanitizer"],
+    deps = [
+        ":child_output",
+        ":first_exec",
+        ":launcher_lib",
+        ":registry_cleanup",
+        ":session",
+        ":spawn",
+        ":stop_signal_guard",
+        ":supervision_events",
+        "//talOS/configuration",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:lock_file",
+        "//talOS/introspection:names",
+        "//talOS/introspection:registry",
+        "//talOS/memory:shared_memory",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],
