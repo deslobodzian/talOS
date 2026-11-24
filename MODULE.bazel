@@ -75,6 +75,20 @@ bazel_dep(name = "nlohmann_json", version = "3.12.0.bcr.1")
 # repository, and 4.0.0 has a sparse-solver bug.
 bazel_dep(name = "mujoco", version = "3.17.0")
 
+# Root-only, like OpenCV's below: MuJoCo 3.17.0's `mjCMesh_::transformed_`
+# (src/user/user_objects.h) has no initializer and no constructor sets it, so
+# the implicit copy every nested `<default class>` makes while parsing an MJCF
+# loads an uninitialised bool, which --config=asan's UBSan reports. The value
+# is copied but never read, so the patch (`= false`) changes no behaviour.
+# A repository depending on talOS builds MuJoCo as upstream ships it, and only
+# its own UBSan run reports this. Drop the patch on the MuJoCo release that
+# initialises the member.
+single_version_override(
+    module_name = "mujoco",
+    patch_strip = 1,
+    patches = ["//third_party:mujoco_mesh_transformed_init.patch"],
+)
+
 # Hedron's Compile Commands Extractor for Bazel
 # https://github.com/hedronvision/bazel-compile-commands-extractor
 bazel_dep(name = "hedron_compile_commands", dev_dependency = True)

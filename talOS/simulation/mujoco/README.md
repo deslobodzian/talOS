@@ -1,7 +1,9 @@
 # MuJoCo
 
 The [MuJoCo](https://mujoco.org) physics engine as a Bazel dependency
-(`@mujoco//:mujoco`, 3.17.0 from source, C engine `-O2` in every build by
+(`@mujoco//:mujoco`, 3.17.0 from source with a root-only patch
+(`third_party/mujoco_mesh_transformed_init.patch`,
+[INSTALL](../../../docs/INSTALL.md)), C engine `-O2` in every build by
 `talos.bazelrc`; [why](../../../docs/METHODOLOGY.md#13-open-source-first)).
 Only this package and its subpackages may depend on it, which
 `tools/check_layers.py --source-only` enforces, so no node and not the RoboRIO
