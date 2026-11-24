@@ -615,6 +615,17 @@ py_test(
     main = "check_runfiles_collisions_test.py",
 )
 
+# tools/deploy.sh argument validation, prefix checks, and rollback safety
+# (REQ-OPS-50, REQ-OPS-54) with stub bundles.
+py_test(
+    name = "deploy_test",
+    size = "small",
+    srcs = ["deploy_test.py"],
+    data = ["deploy.sh"],
+    legacy_create_init = False,
+    deps = ["@rules_python//python/runfiles"],
+)
+
 # tools/setup.sh --check (REQ-DEV-12): syntax check and component detection
 # (passing, missing, wrong-version, --no-studio/--no-rio/--no-lint) with a
 # stubbed PATH so nothing installs or depends on host tools.

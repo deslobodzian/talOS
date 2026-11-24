@@ -150,7 +150,12 @@ if ! mkdir "$lock" 2>/dev/null; then
   [ -f "$lock/pid" ] ||
     die "$lock has no pid yet: another prepush is starting (if none is, rmdir $lock)"
   holder="$(cat "$lock/pid" 2>/dev/null || true)"
-  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+  case "$holder" in
+    ''|*[!0-9]*)
+      die "$lock has no valid pid: another prepush is starting or releasing it (if none is, remove $lock)"
+      ;;
+  esac
+  if kill -0 "$holder" 2>/dev/null; then
     die "another prepush (pid $holder) is using $wt"
   fi
   mkdir "$lock.retake" 2>/dev/null ||
