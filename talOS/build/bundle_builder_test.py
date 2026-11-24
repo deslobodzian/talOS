@@ -113,7 +113,8 @@ def node(tmp, name, target=None):
 
 class BundleBuilderTest(unittest.TestCase):
     def assemble(self, tmp, files, nodes, launches, robot=None, extra=(),
-                 studio=None, effective=None, testonly=False):
+                 studio=None, effective=None, testonly=False,
+                 launcher_text=""):
         """Runs the builder on `files` ({short_path: text}; the first is the
         config) and the node specs `nodes`, for a config whose subsystems
         launch the labels `launches` and whose effective [robot] table is
@@ -127,7 +128,9 @@ class BundleBuilderTest(unittest.TestCase):
             entries.append({"src_path": os.path.join(src, short_path),
                             "short_path": short_path})
         launcher = os.path.join(src, "launcher")
-        put(launcher, "")
+        put(launcher, launcher_text)
+        if launcher_text:
+            os.chmod(launcher, 0o755)
         spec = os.path.join(tmp, "spec.json")
         with open(spec, "w", encoding="utf-8") as f:
             json.dump({"launcher_path": launcher,
@@ -1397,6 +1400,7 @@ class BundleBuilderTest(unittest.TestCase):
                 ["//arm:node"],
                 studio=studio,
                 testonly=True,
+                launcher_text="#!/bin/sh\nexit 0\n",
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             bundle = os.path.join(tmp, "out")

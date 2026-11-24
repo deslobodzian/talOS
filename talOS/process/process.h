@@ -168,11 +168,12 @@ inline constexpr int kBackgroundNice = 10;
 // image encoding). On Linux it leaves any realtime policy it may have
 // inherited for SCHED_OTHER and raises its nice value to at least
 // kBackgroundNice; threads it creates afterwards inherit both. On macOS it
-// sets QOS_CLASS_UTILITY, below the
-// default QoS a loop thread runs at under timeshare; a thread created with
-// pthread_create starts at the default QoS again (macOS does not inherit
-// QoS or the time-constraint policy), so every thread calls this itself.
-// Independent of TALOS_REALTIME.
+// leaves any time-constraint policy for THREAD_STANDARD_POLICY and sets
+// QOS_CLASS_UTILITY (or, if XNU opted a formerly time-constraint thread out
+// of POSIX QoS, lowers its THREAD_PRECEDENCE_POLICY importance below default
+// timeshare priority); a thread created with pthread_create starts at the
+// default QoS again (macOS does not inherit QoS or the time-constraint
+// policy), so every thread calls this itself. Independent of TALOS_REALTIME.
 //
 // Returns true when every step took effect; otherwise prints one line to
 // stderr and returns false. Never throws.
