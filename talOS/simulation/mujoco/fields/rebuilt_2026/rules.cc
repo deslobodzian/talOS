@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace talos::simulation::mujoco {
@@ -75,12 +76,21 @@ int RangeNumeric(const mjModel& m, std::string_view range,
       "fuel_" + std::string(range) + "_" + std::string(what);
   const int id = mj_name2id(&m, mjOBJ_NUMERIC, name.c_str());
   if (id < 0) Refuse("the model has no numeric '" + name + "'");
+  if (m.numeric_size[id] != 1) {
+    Refuse("numeric '" + name + "' is not one integer in 0 to 65535");
+  }
   const double value = m.numeric_data[m.numeric_adr[id]];
-  if (m.numeric_size[id] != 1 || !(value >= 0.0) || value > 65535.0 ||
-      value != std::floor(value)) {
+  if (!(value >= 0.0) || value > 65535.0 || value != std::floor(value)) {
     Refuse("numeric '" + name + "' is not one integer in 0 to 65535");
   }
   return static_cast<int>(value);
+}
+
+bool AllFinite(const mjtNum* values, std::size_t count) {
+  for (std::size_t i = 0; i < count; ++i) {
+    if (!std::isfinite(values[i])) return false;
+  }
+  return true;
 }
 
 enum class Status : uint8_t { kInPlay, kHeld, kReserve };
@@ -89,7 +99,7 @@ enum class Phase : uint8_t { kBefore, kAuto, kBetween, kTeleop, kEnded };
 class Rebuilt2026Rules final : public GameRules {
  public:
   explicit Rebuilt2026Rules(const GameOptions& options)
-      : random_(options.seed) {}
+      : seed_(options.seed), random_(options.seed) {}
 
   void Attach(const mjModel& model, mjData& data) override;
   // The match clock and period (Advance), so Report and Fms follow the
@@ -153,11 +163,12 @@ class Rebuilt2026Rules final : public GameRules {
   void Release(Hub& hub, mjData& data, uint64_t step);
   void SetStatus(std::size_t fuel, Status status);
 
+  uint64_t seed_;
   SplitMix64 random_;
   std::vector<Fuel> fuel_;
   std::vector<Status> status_;
-  std::vector<int> fuel_of_body_;       // by body id: its FUEL index, or -1
-  std::vector<uint64_t> release_step_;  // by FUEL index, while held
+  std::vector<int> fuel_of_body_;      // by body id: its FUEL index, or -1
+  std::vector<uint64_t> scored_step_;  // by FUEL index, while held
   std::array<Hub, 2> hubs_{};
   double radius_m_{};
   uint64_t delay_steps_{};
@@ -169,30 +180,34 @@ class Rebuilt2026Rules final : public GameRules {
   uint64_t auto_start_us_{};
   uint64_t auto_end_us_{};
   uint64_t teleop_start_us_{};
+  uint64_t teleop_end_us_{};
   bool teleop_started_{false};
   bool blue_inactive_first_{false};
   bool tie_drawn_{false};
 };
 
 void Rebuilt2026Rules::Attach(const mjModel& model, mjData& data) {
-  // The FUEL, by index, from the field's range numerics.
+  // Validate and stage into local state so a refusal leaves existing state
+  // intact, and a successful Attach resets every match, clock, queue and PRNG
+  // field cleanly.
   int count = 0;
   int reserve_first = 0;
   int reserve_count = 0;
   for (const std::string_view range : kRanges) {
     const int first = RangeNumeric(model, range, "first");
     const int size = RangeNumeric(model, range, "count");
-    count = std::max(count, first + size);
+    if (size > 0) count = std::max(count, first + size);
     if (range == kReserve) {
       reserve_first = first;
       reserve_count = size;
     }
   }
   if (count > 65535) Refuse("more than 65535 FUEL");
-  fuel_.assign(static_cast<std::size_t>(count), Fuel{});
-  status_.assign(fuel_.size(), Status::kInPlay);
-  release_step_.assign(fuel_.size(), 0);
-  fuel_of_body_.assign(static_cast<std::size_t>(model.nbody), -1);
+  std::vector<Fuel> fuel(static_cast<std::size_t>(count));
+  std::vector<Status> status(fuel.size(), Status::kInPlay);
+  std::vector<uint64_t> scored_step(fuel.size(), 0);
+  std::vector<int> fuel_of_body(static_cast<std::size_t>(model.nbody), -1);
+  double radius_m = 0.0;
   for (int k = 0; k < count; ++k) {
     std::array<char, 16> name{};
     std::snprintf(name.data(), name.size(), "fuel_%03d", k);
@@ -206,69 +221,130 @@ void Rebuilt2026Rules::Attach(const mjModel& model, mjData& data) {
              "' is not a free body with one free joint and a geom");
     }
     const int joint = model.body_jntadr[body];
-    fuel_of_body_[static_cast<std::size_t>(body)] = k;
-    fuel_[static_cast<std::size_t>(k)] = {model.jnt_qposadr[joint],
-                                          model.jnt_dofadr[joint]};
-    if (k == 0) radius_m_ = model.geom_rbound[model.body_geomadr[body]];
+    fuel_of_body[static_cast<std::size_t>(body)] = k;
+    fuel[static_cast<std::size_t>(k)] = {model.jnt_qposadr[joint],
+                                         model.jnt_dofadr[joint]};
+    if (k == 0) {
+      radius_m = model.geom_rbound[model.body_geomadr[body]];
+      if (!(radius_m > 0.0) || !std::isfinite(radius_m)) {
+        Refuse("FUEL body '" + std::string(name.data()) +
+               "' has a non-positive or non-finite bounding radius");
+      }
+    }
   }
   for (int k = reserve_first; k < reserve_first + reserve_count; ++k) {
-    status_[static_cast<std::size_t>(k)] = Status::kReserve;
+    status[static_cast<std::size_t>(k)] = Status::kReserve;
   }
 
-  for (std::size_t a = 0; a < hubs_.size(); ++a) {
-    Hub& hub = hubs_[a];
+  std::array<Hub, 2> hubs{};
+  for (std::size_t a = 0; a < hubs.size(); ++a) {
+    Hub& hub = hubs[a];
     const std::string side(kAlliances[a]);
     const int score = Site(model, side + "_hub_score");
     if (model.site_type[score] != mjGEOM_CYLINDER) {
       Refuse("site '" + side + "_hub_score' is not a cylinder");
     }
-    std::copy_n(At(data.site_xpos, 3, score), 3, hub.score_at.begin());
-    std::copy_n(At(data.site_xmat, 9, score), 9, hub.score_axes.begin());
+    const mjtNum* score_xpos = At(data.site_xpos, 3, score);
+    const mjtNum* score_xmat = At(data.site_xmat, 9, score);
+    if (!AllFinite(score_xpos, 3) || !AllFinite(score_xmat, 9)) {
+      Refuse("site '" + side + "_hub_score' has a non-finite pose");
+    }
+    std::copy_n(score_xpos, 3, hub.score_at.begin());
+    std::copy_n(score_xmat, 9, hub.score_axes.begin());
     hub.score_radius_m = At(model.site_size, 3, score)[0];
     hub.score_half_height_m = At(model.site_size, 3, score)[1];
+    if (!(hub.score_radius_m > 0.0) || !std::isfinite(hub.score_radius_m) ||
+        !(hub.score_half_height_m > 0.0) ||
+        !std::isfinite(hub.score_half_height_m)) {
+      Refuse("site '" + side +
+             "_hub_score' has non-positive or non-finite size");
+    }
     for (int e = 0; e < kExits; ++e) {
       const std::string name = side + "_hub_exit_" + std::to_string(e);
       const int exit = Site(model, name);
       const mjtNum* at = At(data.site_xpos, 3, exit);
       const mjtNum* axes = At(data.site_xmat, 9, exit);
+      if (!AllFinite(at, 3) || !AllFinite(axes, 9)) {
+        Refuse("site '" + name + "' has a non-finite pose");
+      }
       const double hx = axes[0];
       const double hy = axes[3];
       const double norm = std::hypot(hx, hy);
-      if (!(norm > 1e-6)) Refuse("site '" + name + "' has a vertical +x axis");
+      if (!(norm > 1e-6) || !std::isfinite(norm)) {
+        Refuse("site '" + name + "' has a vertical +x axis");
+      }
       const auto index = static_cast<std::size_t>(e);
       hub.exit_at[index] = {at[0], at[1], at[2]};
       hub.exit_heading[index] = {hx / norm, hy / norm};
     }
-    hub.waiting.assign(fuel_.size(), 0);
+    hub.waiting.assign(fuel.size(), 0);
   }
   const double step_s = model.opt.timestep;
-  delay_steps_ =
-      static_cast<uint64_t>(std::ceil(kReleaseDelayS / step_s - 1e-9));
+  if (!(step_s > 0.0) || !std::isfinite(step_s)) {
+    Refuse("model timestep is not positive and finite");
+  }
+  const double raw_delay = kReleaseDelayS / step_s;
+  constexpr double kMaxDelaySteps = 1e15;
+  if (!std::isfinite(raw_delay) || raw_delay > kMaxDelaySteps) {
+    Refuse("model timestep is too small for the release delay");
+  }
+  const uint64_t delay_steps =
+      static_cast<uint64_t>(std::max(1.0, std::ceil(raw_delay - 1e-9)));
 
-  // Preloads: reserve FUEL, in order, at the robot's preload_0..7, at rest.
-  int placed = 0;
-  for (int i = 0; i < kMaxPreloads && placed < reserve_count; ++i) {
+  // Validate preload sites before mutating data or rules state.
+  std::vector<int> preload_sites;
+  preload_sites.reserve(static_cast<std::size_t>(
+      std::min(kMaxPreloads, std::max(0, reserve_count))));
+  for (int i = 0; i < kMaxPreloads &&
+                  static_cast<int>(preload_sites.size()) < reserve_count;
+       ++i) {
     const std::string name = "preload_" + std::to_string(i);
     const int site = mj_name2id(&model, mjOBJ_SITE, name.c_str());
     if (site < 0) continue;
-    const auto k = static_cast<std::size_t>(reserve_first) +
-                   static_cast<std::size_t>(placed);
-    mjtNum* q = data.qpos + fuel_[k].qpos;
-    const mjtNum* at = At(data.site_xpos, 3, site);
+    if (!AllFinite(At(data.site_xpos, 3, site), 3)) {
+      Refuse("site '" + name + "' has a non-finite position");
+    }
+    preload_sites.push_back(site);
+  }
+
+  // Preloads: reserve FUEL, in order, at the robot's preload_0..7, at rest.
+  for (std::size_t placed = 0; placed < preload_sites.size(); ++placed) {
+    const auto k = static_cast<std::size_t>(reserve_first) + placed;
+    mjtNum* q = data.qpos + fuel[k].qpos;
+    const mjtNum* at = At(data.site_xpos, 3, preload_sites[placed]);
     std::copy_n(at, 3, q);
     q[3] = 1.0;
     q[4] = q[5] = q[6] = 0.0;
-    std::fill_n(data.qvel + fuel_[k].dof, 6, 0.0);
-    status_[k] = Status::kInPlay;
-    ++placed;
+    std::fill_n(data.qvel + fuel[k].dof, 6, 0.0);
+    status[k] = Status::kInPlay;
   }
+
+  // Commit and reset all per-run state.
+  random_ = SplitMix64(seed_);
+  fuel_ = std::move(fuel);
+  status_ = std::move(status);
+  fuel_of_body_ = std::move(fuel_of_body);
+  scored_step_ = std::move(scored_step);
+  hubs_ = std::move(hubs);
+  radius_m_ = radius_m;
+  delay_steps_ = delay_steps;
   in_play_ = static_cast<uint32_t>(
       std::count(status_.begin(), status_.end(), Status::kInPlay));
   held_ = 0;
+  phase_ = Phase::kBefore;
+  now_us_ = 0;
+  auto_start_us_ = 0;
+  auto_end_us_ = 0;
+  teleop_start_us_ = 0;
+  teleop_end_us_ = 0;
+  teleop_started_ = false;
+  blue_inactive_first_ = false;
+  tie_drawn_ = false;
 }
 
 bool Rebuilt2026Rules::InScoringSite(const Hub& hub,
                                      const mjtNum* centre) const {
+  if (!AllFinite(centre, 3)) return false;
   const std::array<double, 3> d = {centre[0] - hub.score_at[0],
                                    centre[1] - hub.score_at[1],
                                    centre[2] - hub.score_at[2]};
@@ -276,7 +352,8 @@ bool Rebuilt2026Rules::InScoringSite(const Hub& hub,
   const double x = r[0] * d[0] + r[3] * d[1] + r[6] * d[2];
   const double y = r[1] * d[0] + r[4] * d[1] + r[7] * d[2];
   const double z = r[2] * d[0] + r[5] * d[1] + r[8] * d[2];
-  return std::fabs(z) <= hub.score_half_height_m &&
+  return std::isfinite(x) && std::isfinite(y) && std::isfinite(z) &&
+         std::fabs(z) <= hub.score_half_height_m &&
          x * x + y * y < hub.score_radius_m * hub.score_radius_m;
 }
 
@@ -296,7 +373,9 @@ void Rebuilt2026Rules::StartTeleop(uint64_t now_us) {
 }
 
 void Rebuilt2026Rules::Advance(const MatchInput& input) {
-  now_us_ = input.schedule_us;
+  if (input.scheduled && input.schedule_us > now_us_) {
+    now_us_ = input.schedule_us;
+  }
   const bool starts = input.scheduled && input.enabled;
   using Mode = MatchInput::Mode;
   switch (phase_) {
@@ -308,19 +387,23 @@ void Rebuilt2026Rules::Advance(const MatchInput& input) {
         StartTeleop(now_us_);
       }
       break;
-    case Phase::kAuto:
-      if (input.mode != Mode::kAutonomous ||
-          now_us_ >= auto_start_us_ + kAutoUs) {
-        auto_end_us_ = std::min(now_us_, auto_start_us_ + kAutoUs);
+    case Phase::kAuto: {
+      const uint64_t elapsed = now_us_ - auto_start_us_;
+      if (input.mode != Mode::kAutonomous || elapsed >= kAutoUs) {
+        auto_end_us_ = elapsed >= kAutoUs ? auto_start_us_ + kAutoUs : now_us_;
         phase_ = Phase::kBetween;
         if (starts && input.mode == Mode::kTeleop) StartTeleop(now_us_);
       }
       break;
+    }
     case Phase::kBetween:
       if (starts && input.mode == Mode::kTeleop) StartTeleop(now_us_);
       break;
     case Phase::kTeleop:
-      if (now_us_ >= teleop_start_us_ + kTeleopUs) phase_ = Phase::kEnded;
+      if (now_us_ - teleop_start_us_ >= kTeleopUs) {
+        teleop_end_us_ = teleop_start_us_ + kTeleopUs;
+        phase_ = Phase::kEnded;
+      }
       break;
     case Phase::kEnded:
       break;
@@ -343,19 +426,22 @@ bool Rebuilt2026Rules::Counts(std::size_t alliance) const {
     case Phase::kAuto:
       return true;
     case Phase::kBetween:
-      return now_us_ < auto_end_us_ + kGraceUs;
+      return now_us_ >= auto_end_us_ && now_us_ - auto_end_us_ < kGraceUs;
     case Phase::kTeleop: {
+      const uint64_t elapsed =
+          now_us_ >= teleop_start_us_ ? now_us_ - teleop_start_us_ : 0;
       const int stage = Stage(now_us_);
       const bool inactive = stage >= 1 && stage <= kShifts &&
                             (stage % 2 == 1) == InactiveFirst(alliance);
       if (!inactive) return true;
       // The HUB deactivated when this shift began, active before it.
-      const uint64_t deactivated = teleop_start_us_ + kTransitionUs +
-                                   static_cast<uint64_t>(stage - 1) * kShiftUs;
-      return now_us_ < deactivated + kGraceUs;
+      const uint64_t shift_start_elapsed =
+          kTransitionUs + static_cast<uint64_t>(stage - 1) * kShiftUs;
+      return elapsed >= shift_start_elapsed &&
+             elapsed - shift_start_elapsed < kGraceUs;
     }
     case Phase::kEnded:
-      return now_us_ < teleop_start_us_ + kTeleopUs + kGraceUs;
+      return now_us_ >= teleop_end_us_ && now_us_ - teleop_end_us_ < kGraceUs;
   }
   return false;
 }
@@ -396,7 +482,7 @@ void Rebuilt2026Rules::Score(mjData& data, std::size_t alliance,
   }
   Park(data, fuel);
   SetStatus(fuel, Status::kHeld);
-  release_step_[fuel] = step + delay_steps_;
+  scored_step_[fuel] = step;
   hub.waiting[(hub.head + hub.size) % hub.waiting.size()] =
       static_cast<uint16_t>(fuel);
   ++hub.size;
@@ -407,6 +493,7 @@ uint32_t Rebuilt2026Rules::Occupied(const Hub& hub, const mjData& data) const {
   uint32_t occupied = 0;
   for (const Fuel& fuel : fuel_) {
     const mjtNum* p = data.qpos + fuel.qpos;
+    if (!AllFinite(p, 3)) continue;
     for (int e = 0; e < kExits; ++e) {
       const auto& at = hub.exit_at[static_cast<std::size_t>(e)];
       const double dx = p[0] - at[0];
@@ -421,7 +508,11 @@ uint32_t Rebuilt2026Rules::Occupied(const Hub& hub, const mjData& data) const {
 void Rebuilt2026Rules::Release(Hub& hub, mjData& data, uint64_t step) {
   uint32_t occupied = 0;
   bool looked = false;
-  while (hub.size > 0 && release_step_[hub.waiting[hub.head]] <= step) {
+  while (hub.size > 0) {
+    const std::size_t fuel = hub.waiting[hub.head];
+    if (step < scored_step_[fuel] || step - scored_step_[fuel] < delay_steps_) {
+      break;
+    }
     if (!looked) {
       occupied = Occupied(hub, data);
       looked = true;
@@ -441,7 +532,6 @@ void Rebuilt2026Rules::Release(Hub& hub, mjData& data, uint64_t step) {
         kMinReleaseMps + (kMaxReleaseMps - kMinReleaseMps) * random_.Uniform();
     const double yaw = (2.0 * random_.Uniform() - 1.0) * kMaxReleaseYawRad;
 
-    const std::size_t fuel = hub.waiting[hub.head];
     hub.head = (hub.head + 1) % hub.waiting.size();
     --hub.size;
     const auto e = static_cast<std::size_t>(exit);
@@ -471,11 +561,13 @@ bool Rebuilt2026Rules::AfterStep(mjModel& /*model*/, mjData& data,
   // and StartTeleop's draw happens only on that change), so this is a no-op
   // there and keeps AfterStep whole for a caller that steps without it.
   Advance(input);
-  // Scoring: a FUEL not held whose centre is in a scoring site, moving down,
-  // in FUEL index order; the qpos and qvel a rule before this one wrote.
+  // Scoring: a FUEL in play whose centre is in a scoring site, moving down
+  // with finite kinematics, in FUEL index order; the qpos and qvel a rule
+  // before this one wrote.
   for (std::size_t k = 0; k < fuel_.size(); ++k) {
-    if (status_[k] == Status::kHeld) continue;
-    if (!(data.qvel[fuel_[k].dof + 2] < 0.0)) continue;
+    if (status_[k] != Status::kInPlay) continue;
+    const mjtNum* velocity = data.qvel + fuel_[k].dof;
+    if (!AllFinite(velocity, 6) || !(velocity[2] < 0.0)) continue;
     const mjtNum* centre = data.qpos + fuel_[k].qpos;
     for (std::size_t a = 0; a < hubs_.size(); ++a) {
       if (InScoringSite(hubs_[a], centre)) {
@@ -495,14 +587,20 @@ void Rebuilt2026Rules::Report(::sim::MatchState& match) const {
     case Phase::kBefore:
     case Phase::kBetween:
       break;
-    case Phase::kAuto:
+    case Phase::kAuto: {
       period = ::sim::MatchPeriod::Autonomous;
-      remaining_us = auto_start_us_ + kAutoUs - now_us_;
+      const uint64_t elapsed =
+          now_us_ >= auto_start_us_ ? now_us_ - auto_start_us_ : 0;
+      remaining_us = elapsed < kAutoUs ? kAutoUs - elapsed : 0;
       break;
-    case Phase::kTeleop:
+    }
+    case Phase::kTeleop: {
       period = ::sim::MatchPeriod::Teleop;
-      remaining_us = teleop_start_us_ + kTeleopUs - now_us_;
+      const uint64_t elapsed =
+          now_us_ >= teleop_start_us_ ? now_us_ - teleop_start_us_ : 0;
+      remaining_us = elapsed < kTeleopUs ? kTeleopUs - elapsed : 0;
       break;
+    }
     case Phase::kEnded:
       period = ::sim::MatchPeriod::Ended;
       break;
