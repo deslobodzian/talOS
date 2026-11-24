@@ -265,7 +265,8 @@ void SetThreadPolicy(const LoopPolicy& loop, Problems& problems) {
   thread_time_constraint_policy_data_t policy{};
   policy.period = to_abs(loop.period);
   policy.computation = to_abs(loop.computation);
-  policy.constraint = to_abs(loop.constraint);
+  policy.constraint = std::max(to_abs(loop.constraint), policy.computation);
+  policy.period = std::max(policy.period, policy.constraint);
   policy.preemptible = TRUE;
   const kern_return_t result = ::thread_policy_set(
       ::pthread_mach_thread_np(::pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
@@ -319,19 +320,22 @@ bool HasTimeConstraint() {
 }
 
 void SetBackground(Problems& problems) {
+  // The kernel refuses a QoS for a thread under an explicit Mach policy, so
+  // drop any time-constraint policy before setting QOS_CLASS_UTILITY.
+  if (HasTimeConstraint()) {
+    thread_standard_policy_data_t standard{};
+    const kern_return_t dropped = ::thread_policy_set(
+        ::pthread_mach_thread_np(::pthread_self()), THREAD_STANDARD_POLICY,
+        reinterpret_cast<thread_policy_t>(&standard),
+        THREAD_STANDARD_POLICY_COUNT);
+    if (dropped != KERN_SUCCESS) {
+      problems.add(kStepPolicy, "standard policy",
+                   ::mach_error_string(dropped));
+    }
+  }
   const int result = ::pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
-  if (result == 0) return;
-  problems.add(kStepPolicy, "QOS_CLASS_UTILITY", std::strerror(result));
-  // The kernel refuses a QoS for a thread under an explicit Mach policy;
-  // leaving the time-constraint policy at least stops it preempting loops.
-  if (!HasTimeConstraint()) return;
-  thread_standard_policy_data_t standard{};
-  const kern_return_t dropped = ::thread_policy_set(
-      ::pthread_mach_thread_np(::pthread_self()), THREAD_STANDARD_POLICY,
-      reinterpret_cast<thread_policy_t>(&standard),
-      THREAD_STANDARD_POLICY_COUNT);
-  if (dropped != KERN_SUCCESS) {
-    problems.add(kStepPolicy, "standard policy", ::mach_error_string(dropped));
+  if (result != 0) {
+    problems.add(kStepPolicy, "QOS_CLASS_UTILITY", std::strerror(result));
   }
 }
 
@@ -449,13 +453,22 @@ LoopPolicy PolicyFor(const RealtimeOptions& options) noexcept {
     policy.fifo_priority = kObserverFifoPriority;
     return policy;
   }
-  // Up to half the period of work, which must finish within the period.
+  // Up to half the period of work, which must finish within the period,
+  // clamped to XNU's admissible RT quantum bounds [50 us, 50 ms] while keeping
+  // computation <= constraint <= period.
+  constexpr std::chrono::nanoseconds kMinRtQuantum{
+      std::chrono::microseconds{50}};
+  constexpr std::chrono::nanoseconds kMaxRtQuantum{
+      std::chrono::milliseconds{50}};
   policy.time_constraint = true;
-  policy.period = options.period.count() > 0
-                      ? options.period
-                      : std::chrono::nanoseconds{std::chrono::milliseconds{1}};
-  policy.computation = policy.period / 2;
-  policy.constraint = policy.period;
+  const std::chrono::nanoseconds requested_period =
+      options.period.count() > 0
+          ? options.period
+          : std::chrono::nanoseconds{std::chrono::milliseconds{1}};
+  policy.period = std::max(requested_period, kMinRtQuantum);
+  policy.computation =
+      std::clamp(policy.period / 2, kMinRtQuantum, kMaxRtQuantum);
+  policy.constraint = std::max(policy.period, policy.computation);
   return policy;
 }
 
