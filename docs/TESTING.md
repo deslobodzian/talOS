@@ -221,7 +221,7 @@ Where RULES.md 12 is read too broadly or too narrowly:
    graph's CPU demand fits the cores. A test that cannot hold its bound on a
    host fails as unqualified, distinctly from a product failure
    (`//talOS/bridge:run_timing_test` and
-   `//bench/main_processor:update_p99_perf_test` — the latter using the shared
+   `//bench/main_processor:update_p99_perf_test` — both using the shared
    `StallMeter` helper in `//talOS/process:host_qualification` — record the
    gtest property `host_unqualified="true"` and `[HOST_UNQUALIFIED]` in their
    failure message). **[enforced: `tools/check_testing_rules.py` (CI lint job

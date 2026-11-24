@@ -38,7 +38,8 @@ class RioGradlewFromDependentRepoTest(unittest.TestCase):
     def test_stages_from_external_talos_and_forwards_robot_preferences(self):
         gradlew = runfiles.Create().Rlocation(os.environ["RIO_GRADLEW"])
         self.assertTrue(gradlew and os.path.isfile(gradlew), gradlew)
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(
+                dir=os.environ.get("TEST_TMPDIR")) as tmp:
             jdk = _make_fake_jdk(tmp)
             cache = os.path.join(tmp, "cache")
             out_json = os.path.join(tmp, "out.json")
@@ -51,8 +52,18 @@ class RioGradlewFromDependentRepoTest(unittest.TestCase):
             ) as f:
                 json.dump({"projectYear": "2026", "teamNumber": 4321}, f)
 
-            env = dict(
-                os.environ,
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k
+                not in (
+                    "ORG_GRADLE_PROJECT_talosRevision",
+                    "ORG_GRADLE_PROJECT_talosDirty",
+                    "GRADLE_OPTS",
+                    "JAVA_OPTS",
+                )
+            }
+            env.update(
                 JAVA_HOME=jdk,
                 FAKE_JAVA_OUT=out_json,
                 TALOS_RIO_CACHE_DIR=cache,
@@ -64,6 +75,7 @@ class RioGradlewFromDependentRepoTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=60,
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             with open(out_json, encoding="utf-8") as f:
@@ -88,8 +100,19 @@ class RioGradlewFromDependentRepoTest(unittest.TestCase):
                 encoding="utf-8",
             ) as f:
                 self.assertEqual(json.load(f)["teamNumber"], 4321)
-            self.assertIn("deploy", result["gradle_args"])
-            self.assertIn("-Pcompanion=10.43.21.11", result["gradle_args"])
+            gargs = result["gradle_args"]
+            self.assertIn("deploy", gargs)
+            self.assertIn("-Pcompanion=10.43.21.11", gargs)
+            rev_args = [a for a in gargs if a.startswith("-PtalosRevision=")]
+            dirty_args = [a for a in gargs if a.startswith("-PtalosDirty=")]
+            self.assertEqual(len(rev_args), len(dirty_args), gargs)
+            if rev_args:
+                self.assertRegex(
+                    rev_args[0], r"^-PtalosRevision=[0-9a-f]{16}$"
+                )
+                self.assertIn(
+                    dirty_args[0], ("-PtalosDirty=true", "-PtalosDirty=false")
+                )
 
 
 if __name__ == "__main__":
