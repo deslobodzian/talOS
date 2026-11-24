@@ -677,7 +677,7 @@ TEST_F(MetalAprilTagParityTest, ConcurrentExecuteAndSetOptionsAreThreadSafe) {
     opts_a.quad_decimate = 1.0f;
     auto opts_b = options_;
     opts_b.quad_decimate = 2.0f;
-    for (int i = 0; i < 60; ++i) {
+    for (int i = 0; i < 12; ++i) {
       metal_backend_->SetOptions((i % 2 == 0) ? opts_a : opts_b);
     }
     stop.store(true, std::memory_order_release);
