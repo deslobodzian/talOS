@@ -25,8 +25,8 @@ is tagged `external` (never cached). Every `--workspace_status_command` the
 `.bazelrc` names must also exist, so `--config=release` can stamp a bundle.
 """
 
+import ast
 import os
-import re
 import shlex
 import unittest
 
@@ -47,11 +47,22 @@ def read(path):
 
 def default_python(module):
     """python_version of the module's `python.toolchain(...)` call that sets
-    is_default = True, or None."""
-    for call in re.finditer(r"python\.toolchain\(([^)]*)\)", module):
-        if re.search(r"is_default\s*=\s*True", call[1]):
-            version = re.search(r'python_version\s*=\s*"([^"]+)"', call[1])
-            return version and version[1]
+    is_default = True, or None (parsed via AST so comments are ignored)."""
+    tree = ast.parse(module)
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "toolchain"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "python"):
+            kws = {kw.arg: kw.value for kw in node.keywords}
+            is_default = kws.get("is_default")
+            version = kws.get("python_version")
+            if (isinstance(is_default, ast.Constant)
+                    and is_default.value is True
+                    and isinstance(version, ast.Constant)
+                    and isinstance(version.value, str)):
+                return version.value
     return None
 
 
@@ -121,12 +132,21 @@ class TalosPinTest(unittest.TestCase):
 
     def test_workspace_status_command_exists(self):
         for args in rc_lines(read(self.bazelrc)):
-            for arg in args[1:]:
+            i = 1
+            while i < len(args):
+                arg = args[i]
+                raw = None
                 if arg.startswith("--workspace_status_command="):
-                    command = self.resolve(arg.split("=", 1)[1])
-                    self.assertTrue(os.access(command, os.X_OK),
-                                    f"{arg}: {command} is not an executable "
-                                    "file")
+                    raw = arg.split("=", 1)[1]
+                elif arg == "--workspace_status_command" and i + 1 < len(args):
+                    raw = args[i + 1]
+                    i += 1
+                if raw is not None:
+                    command = self.resolve(raw)
+                    self.assertTrue(
+                        os.path.isfile(command) and os.access(command, os.X_OK),
+                        f"{arg}: {command} is not an executable file")
+                i += 1
 
 
 if __name__ == "__main__":
