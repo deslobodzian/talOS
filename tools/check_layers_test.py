@@ -95,7 +95,39 @@ GRAPH = {
     "//talOS/python:talos": (None, ["//talOS/node_api:libtalos_node.so",
                                     "//talOS/teleop:libteleop.so"]),
     "//talOS/geometry:geometry": (None, []),
+    "//talOS/trajectory:trajectory": (None, ["//talOS/geometry:geometry"]),
+    "//talOS/aiming:aiming": (None, ["//talOS/geometry:geometry",
+                                     "//talOS/msgs:geometry"]),
+    "//talOS/msgs:geometry": (None, []),
     "//talOS/vision:vision": (None, ["//talOS/geometry:geometry"]),
+    "//talOS/simulation/mujoco:world_rules": (None, []),
+    "//talOS/simulation/mujoco:plant": (None, ["//talOS/simulation/mujoco:world_rules",
+                                               "//talOS/hardware:hardware",
+                                               "//talOS/hardware:codecs"]),
+    "//talOS/simulation/mujoco:sim_gateway": (
+        None, ["//talOS/simulation/mujoco:plant"]),
+    "//examples/mujoco_rig/main_processor/feeder:messages": (
+        "talos_messages", []),
+    "//examples/mujoco_rig/main_processor/feeder:feeder": (
+        None, ["//examples/mujoco_rig/main_processor/feeder:messages",
+               "//talOS/devices:devices", "//talOS/node:node"]),
+    "//examples/mujoco_rig/main_processor/feeder:node": (
+        "talos_cc_node",
+        ["//examples/mujoco_rig/main_processor/feeder:feeder",
+         "//talOS/node:node"]),
+    "//examples/mujoco_rig/main_processor/flywheel:messages": (
+        "talos_messages", []),
+    "//examples/mujoco_rig/main_processor/flywheel:flywheel": (
+        None, ["//examples/mujoco_rig/main_processor/flywheel:messages",
+               "//talOS/devices:devices", "//talOS/node:node"]),
+    "//examples/mujoco_rig/main_processor/flywheel:node": (
+        "talos_cc_node",
+        ["//examples/mujoco_rig/main_processor/flywheel:flywheel",
+         "//talOS/node:node"]),
+    "//examples/mujoco_rig:sim": (
+        None, ["//examples/mujoco_rig/main_processor/feeder:node",
+               "//examples/mujoco_rig/main_processor/flywheel:node",
+               "//talOS/simulation/mujoco:sim_gateway"]),
     "//bench/main_processor/swerve_module:messages": ("talos_messages", []),
     "//bench/main_processor/swerve_module:swerve_module": (
         None, ["//bench/main_processor/swerve_module:messages",
@@ -156,6 +188,10 @@ KINDS = {
     "//examples/superstructure/cpp:libmechanisms.so": "cc_shared_library",
     "//examples/superstructure/py:elevator": "talos_node",
     "//tools/scaffold_testdata/gripper:node": "talos_node",
+    "//talOS/simulation/mujoco:sim_gateway": "cc_binary",
+    "//examples/mujoco_rig/main_processor/feeder:node": "talos_node",
+    "//examples/mujoco_rig/main_processor/flywheel:node": "talos_node",
+    "//examples/mujoco_rig:sim": "talos_sim",
 }
 
 # What `attr(testonly, 1, ...)` returns: every test rule and testonly helper.
@@ -245,6 +281,10 @@ VISIBILITY = {
         "//bench/main_processor:__pkg__", "//studio:__subpackages__",
         "//talOS:__subpackages__", "//tools:__pkg__",
     ),
+    "//talOS/hardware:codecs": (
+        "//studio:__subpackages__", "//talOS:__subpackages__",
+        "//tools:__pkg__",
+    ),
     "//talOS/hardware:hardware": (
         "//bench/main_processor/swerve_module:__pkg__",
         "//controller_processor/rio:__pkg__",
@@ -255,6 +295,12 @@ VISIBILITY = {
         "//bench/main_processor/swerve_module:__pkg__",
         "//studio:__subpackages__", "//talOS:__subpackages__",
         "//tools:__pkg__",
+    ),
+    "//talOS/simulation/mujoco:world_rules": (
+        "//talOS/simulation/mujoco:__subpackages__",
+    ),
+    "//talOS/simulation/mujoco:plant": (
+        "//talOS/simulation/mujoco:__subpackages__",
     ),
 }
 
@@ -272,6 +318,8 @@ def visibility_allows(vis_list, target_label, viewer_label):
         if entry.endswith(":__pkg__"):
             if viewer_pkg == entry[2:-len(":__pkg__")]:
                 return True
+        elif entry == "//:__subpackages__":
+            return True
         elif entry.endswith(":__subpackages__"):
             root = entry[2:-len(":__subpackages__")]
             if viewer_pkg == root or viewer_pkg.startswith(root + "/"):
@@ -324,9 +372,18 @@ class FakeBazel:
         out = []
         for t in targets:
             label = "//" + t
-            if "//visibility:public" in self.visibility.get(label, ()):
+            vis = self.visibility.get(label, ())
+            if "//visibility:public" in vis or "//:__subpackages__" in vis:
                 out.append(label)
         return sorted(out)
+
+    def mujoco_cc_libraries(self):
+        out = []
+        for label in sorted(self.graph):
+            if (matches(label, "talOS/simulation/mujoco/...") and
+                    self.kinds.get(label, "cc_library") == "cc_library"):
+                out.append(label)
+        return out
 
     def visible_to(self, target_label, targets):
         out = []
@@ -636,6 +693,163 @@ class CheckLayersTest(unittest.TestCase):
                                           io.StringIO()), \
                         self.assertRaises(RuntimeError):
                     bazel.query("somepath(//talOS/..., //bench/...)")
+
+    # REQ-CONTRACT-16, REQ-SAFE-27
+    def test_empty_node_packages_fails_closed(self):
+        # Clear node generator macros under NODE_ROOTS so node_sample_targets()
+        # returns empty without leaving dangling graph edges.
+        graph = {
+            label: (
+                None if (package(label).split("/")[0] in check_layers.NODE_ROOTS
+                         and val[0] in check_layers.NODE_GENERATORS)
+                else val[0],
+                val[1],
+            )
+            for label, val in GRAPH.items()
+        }
+        failures, out = run(graph)
+        self.assertGreaterEqual(failures, 1, out)
+        self.assertIn("no node packages", out.lower())
+
+    # REQ-CONTRACT-16, REQ-SAFE-27
+    def test_repo_wide_subpackages_visibility_and_codecs_are_refused(self):
+        # //:__subpackages__ grants repo-wide visibility just like //visibility:public.
+        bazel = check_layers.Bazel()
+        with mock.patch.object(
+                bazel, "query", return_value=["//talOS/node:access"]) as q:
+            bazel.public_targets(("talOS/node:access",))
+            expr = q.call_args.args[0]
+            self.assertIn("//:__subpackages__", expr)
+            self.assertIs(q.call_args.kwargs.get("allow_external_exit_3"), False)
+
+        # //talOS/hardware:codecs is restricted and forbidden as a node dep.
+        self.assertIn("talOS/hardware:codecs",
+                      check_layers.RESTRICTED_INTERNAL_TARGETS)
+        self.assertIn("talOS/hardware:codecs",
+                      check_layers.FORBIDDEN_NODE_DEPS)
+        failures, out = run(with_edge(
+            "//bench/main_processor/motor:motor", "//talOS/hardware:codecs"))
+        self.assertGreaterEqual(failures, 1, out)
+        self.assertIn("  //talOS/hardware:codecs\n", out)
+
+        vis = dict(VISIBILITY)
+        vis["//talOS/hardware:codecs"] = ("//:__subpackages__",)
+        failures, out = run(GRAPH, visibility=vis)
+        self.assertGreaterEqual(failures, 1, out)
+        self.assertIn("  //talOS/hardware:codecs\n", out)
+
+    # REQ-CONTRACT-16, REQ-SAFE-27
+    def test_geometry_trajectory_aiming_and_mujoco_library_confinement(self):
+        # Geometry never depends on trajectory or aiming; non-testonly
+        # trajectory depends only on geometry; non-testonly aiming depends only
+        # on geometry and msgs; mujoco_rig nodes share only messages.
+        for frm, to in (
+                ("//talOS/geometry:geometry", "//talOS/trajectory:trajectory"),
+                ("//talOS/geometry:geometry", "//talOS/aiming:aiming"),
+                ("//talOS/trajectory:trajectory", "//talOS/node:node"),
+                ("//talOS/trajectory:trajectory", "//talOS/msgs:geometry"),
+                ("//talOS/aiming:aiming", "//talOS/node:node"),
+                ("//talOS/aiming:aiming", "//talOS/devices:devices"),
+                ("//examples/mujoco_rig/main_processor/feeder:feeder",
+                 "//examples/mujoco_rig/main_processor/flywheel:flywheel"),
+                # A newly added cc_library wrapper under talOS/simulation/mujoco
+                # cannot be linked outside talOS/simulation/mujoco/...
+                ("//talOS/simulation:gateway_main",
+                 "//talOS/simulation/mujoco:wrapper"),
+                ("//examples/mujoco_rig/main_processor/feeder:feeder",
+                 "//talOS/simulation/mujoco:wrapper")):
+            with self.subTest(frm=frm, to=to):
+                failures, out = run(with_edge(frm, to))
+                self.assertGreaterEqual(failures, 1, out)
+                self.assertIn(f"  {to}\n", out)
+
+        # A newly added cc_library wrapper under talOS/simulation/mujoco that
+        # is public, repo-wide visible, or visible outside mujoco fails closed
+        # even if not hardcoded in RESTRICTED_INTERNAL_TARGETS.
+        for case, wrapper_vis in (
+                ("public_wrapper", ("//visibility:public",)),
+                ("repo_wide_wrapper", ("//:__subpackages__",)),
+                ("visible_to_talos_node", ("//talOS/node:__pkg__",)),
+                ("visible_to_mujoco_rig_node",
+                 ("//examples/mujoco_rig/main_processor/feeder:__pkg__",))):
+            with self.subTest(case=case):
+                graph = {k: (g, list(d)) for k, (g, d) in GRAPH.items()}
+                graph["//talOS/simulation/mujoco:wrapper"] = (
+                    None, ["//talOS/simulation/mujoco:plant"])
+                vis = dict(VISIBILITY)
+                vis["//talOS/simulation/mujoco:wrapper"] = wrapper_vis
+                failures, out = run(graph, visibility=vis)
+                self.assertGreaterEqual(failures, 1, out)
+                self.assertIn("//talOS/simulation/mujoco:wrapper", out)
+
+    # REQ-CONTRACT-16, REQ-SAFE-27
+    def test_bazel_query_exit_3_and_partial_results_fail_closed(self):
+        bazel = check_layers.Bazel()
+        external_ok = (
+            "ERROR: /cache/_bazel/external/opencv+/BUILD.bazel:1:1: "
+            "no such package '@@androidndk//': missing\n"
+            'ERROR: Evaluation of query "somepath(//talOS/..., //bench/...)" '
+            "failed: errors were encountered while computing transitive closure\n"
+        )
+        # Main-repo names, single-@ workspace refs, multiline continuation
+        # workspace refs, path traversal in external paths, and FATAL lines
+        # must all fail closed on exit 3.
+        bad_exit_3 = (
+            ("apparent_main_repo_talos",
+             "ERROR: error loading package '@talos//bench/arm': syntax error\n"),
+            ("canonical_main_repo_underscored",
+             "ERROR: Skipping '@@_main//bench/arm': error loading package\n"),
+            ("apparent_main_repo_underscored",
+             "ERROR: no such package '@_main//bench/arm': missing\n"),
+            ("single_at_workspace_ref",
+             "ERROR: /cache/_bazel/external/foo+/BUILD.bazel:1:1: "
+             "no such package '@@bar//': missing and referenced by "
+             "'@//bench/arm:node'\n"),
+            ("talos_at_workspace_ref",
+             "ERROR: /cache/_bazel/external/foo+/BUILD.bazel:1:1: "
+             "no such package '@@bar//': missing and referenced by "
+             "'@talos//bench/arm:node'\n"),
+            ("multiline_continuation_workspace_ref",
+             "ERROR: /cache/_bazel/external/foo+/BUILD.bazel:1:1: "
+             "no such package '@@bar//': missing\n"
+             "  and referenced by '//bench/arm:node'\n"),
+            ("external_path_dotdot_traversal",
+             "ERROR: /cache/_bazel/external/foo+/../../repo/bench/arm/BUILD:1:1: "
+             "syntax error\n"),
+            ("fatal_error_with_external_error",
+             external_ok + "FATAL: bazel crashed during query\n"),
+        )
+        for name, stderr in bad_exit_3:
+            with self.subTest(rejected=name):
+                proc = subprocess.CompletedProcess(
+                    [], 3, stdout="", stderr=stderr)
+                with mock.patch.object(check_layers.subprocess, "run",
+                                       return_value=proc), \
+                        mock.patch.object(check_layers.sys, "stderr",
+                                          io.StringIO()), \
+                        self.assertRaises(RuntimeError):
+                    bazel.query("somepath(//talOS/..., //bench/...)")
+
+        # Local workspace discovery and visibility queries never traverse
+        # external repos and must reject exit 3 even with external-only stderr.
+        proc = subprocess.CompletedProcess(
+            [], 3, stdout="//bench/main_processor/motor:node\n",
+            stderr=external_ok)
+        for name, fn in (
+                ("node_sample_targets", lambda: bazel.node_sample_targets()),
+                ("public_targets", lambda: bazel.public_targets(
+                    ("talOS/node:access",))),
+                ("visible_to", lambda: bazel.visible_to(
+                    "//bench/main_processor/motor:node",
+                    ("talOS/node:access",))),
+                ("mujoco_cc_libraries", lambda: bazel.mujoco_cc_libraries())):
+            with self.subTest(strict_query=name):
+                with mock.patch.object(check_layers.subprocess, "run",
+                                       return_value=proc), \
+                        mock.patch.object(check_layers.sys, "stderr",
+                                          io.StringIO()), \
+                        self.assertRaises(RuntimeError):
+                    fn()
 
 
 class CheckNodeSourcesTest(unittest.TestCase):
@@ -2027,6 +2241,215 @@ class CheckNodeSourcesTest(unittest.TestCase):
                 failures, out = run_sources(files)
                 self.assertEqual(failures, 0, f"{name}: {out}")
 
+    # REQ-SAFE-27, REQ-CONTRACT-16: raw-string backslash-newline desync,
+    # multiline block comments before #include, bare CR line terminators,
+    # spliced header paths, and PR #42 mujoco/hardware headers must be caught.
+    def test_raw_string_splice_multiline_comment_and_cr_include_bypasses(self):
+        cases = (
+            ("raw_string_backslash_newline_desync_include",
+             'const char* s = R"(\n'
+             ')\\\n'
+             '" /*\n'
+             ')";\n'
+             '#include "talOS/node/access.h"\n'
+             '// */\n'),
+            ("raw_string_backslash_newline_desync_symbol",
+             'const char* s = R"(\n'
+             ')\\\n'
+             '" /*\n'
+             ')";\n'
+             'void f() { talos::detail::NodeAccess::add_hardware_request(); }\n'
+             '// */\n'),
+            ("raw_string_spliced_prefix_u8R_desync",
+             'const char* s = u8\\\n'
+             'R"(\n'
+             ')\\\n'
+             '" /*\n'
+             ')";\n'
+             '#include <talOS/rtms/rtms.h>\n'
+             '// */\n'),
+            ("multiline_block_comment_after_code_before_quote_include",
+             'int ok = 1; /*\n'
+             '*/ #include "talOS/node/access.h"\n'),
+            ("multiline_block_comment_after_code_before_angle_include",
+             'int ok = 1; /*\n'
+             '*/ #include <talOS/rtms/rtms.h>\n'),
+            ("multiline_block_comment_before_and_inside_include",
+             'int ok = 1; /*\n'
+             '*/ # /*\n'
+             '*/ include "talOS/devices/access.h"\n'),
+            ("bare_cr_ends_line_comment_before_symbol",
+             '// comment\rtalos::detail::NodeAccess::add_hardware_request();\n'),
+            ("bare_cr_before_include",
+             'int ok = 1;\r#include "talOS/node/access.h"\n'),
+            ("bare_cr_line_continuation_include",
+             '#inc\\\rlude "talOS/node/access.h"\n'),
+            ("spliced_newline_inside_quote_include_path",
+             '#include "talOS/node/\\\naccess.h"\n'),
+            ("spliced_newline_inside_angle_include_path",
+             '#include <talOS/node/\\\naccess.h>\n'),
+            ("mujoco_plant_quote_include",
+             '#include "talOS/simulation/mujoco/plant.h"\n'),
+            ("mujoco_rules_angle_include",
+             '#include <talOS/simulation/mujoco/fields/rebuilt_2026/rules.h>\n'),
+            ("hardware_sim_plant_include",
+             '#include "talOS/hardware/sim_plant.h"\n'),
+            ("hardware_feedback_include",
+             '#include "talOS/hardware/feedback.h"\n'),
+            ("hardware_gate_include",
+             '#include <talOS/hardware/gate.h>\n'),
+            ("hardware_config_error_include",
+             '#include "talOS/hardware/config_error.h"\n'),
+        )
+        for name, body in cases:
+            with self.subTest(name=name):
+                files = {
+                    "bench/arm/BUILD": self.NODE_BUILD,
+                    "bench/arm/arm.cc": body,
+                }
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn("bench/arm/arm.cc:", out)
+
+    # REQ-SAFE-27, REQ-CONTRACT-16: symlinks under scanned trees (including
+    # disguised non-C++ directory symlinks and file symlinks to leaf headers)
+    # and empty tracked_files() must fail closed.
+    def test_symlinks_and_empty_tracked_files_fail_closed(self):
+        # Disguised non-C++ directory symlink (bench/arm/inc.md -> ../../talOS/node)
+        # and file symlink to a leaf header (bench/arm/wire.h -> packet.h).
+        for link_path in (
+                "bench/arm/inc.md",
+                "bench/arm/README",
+                "bench/arm/wire.h"):
+            with self.subTest(symlink=link_path):
+                files = {
+                    "bench/arm/BUILD": self.NODE_BUILD,
+                    "bench/arm/arm.cc": "int ok = 1;\n",
+                    link_path: "int ok = 1;\n",
+                }
+                out = io.StringIO()
+                failures = check_layers.run_source_checks(
+                    sorted(files.keys()),
+                    lambda p: files[p],
+                    exempt_cli_files={},
+                    out=out,
+                    is_symlink=lambda p: p == link_path,
+                )
+                self.assertGreaterEqual(failures, 1, out.getvalue())
+                self.assertIn("symlink", out.getvalue().lower())
+                self.assertIn(link_path, out.getvalue())
+
+        # Real on-disk symlink checks: file symlink, symlinked parent dir,
+        # and read_source_file refusal.
+        with tempfile.TemporaryDirectory(
+                dir=os.environ.get("TEST_TMPDIR")) as root:
+            target = os.path.join(root, "real.h")
+            with open(target, "w", encoding="utf-8") as f:
+                f.write("int ok = 1;\n")
+            file_link = os.path.join(root, "link.h")
+            os.symlink(target, file_link)
+            self.assertTrue(check_layers._has_symlink_component(file_link))
+            with self.assertRaises(OSError):
+                check_layers.read_source_file(file_link)
+
+            real_dir = os.path.join(root, "real_dir")
+            os.mkdir(real_dir)
+            nested = os.path.join(real_dir, "arm.cc")
+            with open(nested, "w", encoding="utf-8") as f:
+                f.write("int ok = 1;\n")
+            dir_link = os.path.join(root, "dir_link")
+            os.symlink(real_dir, dir_link)
+            nested_via_link = os.path.join(dir_link, "arm.cc")
+            self.assertTrue(
+                check_layers._has_symlink_component(
+                    nested_via_link, root=root))
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                self.assertTrue(
+                    check_layers._has_symlink_component("dir_link/arm.cc"))
+                with self.assertRaises(OSError):
+                    check_layers.read_source_file("dir_link/arm.cc")
+            finally:
+                os.chdir(old_cwd)
+
+        # Symlinked Starlark / MODULE.bazel file fails closed in MuJoCo checks.
+        for link_path in ("bench/arm/BUILD", "MODULE.bazel"):
+            with self.subTest(mujoco_symlink=link_path):
+                out = io.StringIO()
+                failures = check_layers.run_mujoco_checks(
+                    [link_path],
+                    lambda p: 'cc_library(name = "ok")\n',
+                    out=out,
+                    is_symlink=lambda p: p == link_path,
+                )
+                self.assertGreaterEqual(failures, 1, out.getvalue())
+                self.assertIn("symlink", out.getvalue().lower())
+
+        # Empty git ls-files result fails closed.
+        empty_proc = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(check_layers.subprocess, "run",
+                               return_value=empty_proc), \
+                self.assertRaises(RuntimeError):
+            check_layers.tracked_files()
+
+    # REQ-SAFE-27, REQ-CONTRACT-16: Starlark UCN defines, "".join(VAR), and
+    # sysroot/iprefix/iframework/-ansi compiler flags must be refused.
+    def test_starlark_ucn_join_var_and_sysroot_copt_bypasses_are_refused(self):
+        cases = (
+            ("ucn_in_local_defines",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'local_defines = ["MY=talos::detail::Node\\\\u0041ccess"])\n'),
+            ("join_over_list_variable",
+             'PARTS = ["Node", "Access"]\n'
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'defines = ["X=" + "".join(PARTS)])\n'),
+            ("join_over_concat_list_variables",
+             'A = ["talOS", "node"]\n'
+             'B = ["access.h"]\n'
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'defines = ["H=" + "/".join(A + B)])\n'),
+            ("copts_isysroot",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-isysroot", "/tmp/fake"])\n'),
+            ("copts_sysroot_equals",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["--sysroot=/tmp/fake"])\n'),
+            ("copts_iprefix",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-iprefix", "talOS/"])\n'),
+            ("copts_iframework",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-iframework", "talOS"])\n'),
+            ("copts_ansi_enables_trigraphs",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-ansi"])\n'),
+            ("starlark_mujoco_header_in_defines",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'defines = ["H=\\"talOS/simulation/mujoco/plant.h\\""])\n'),
+        )
+        for name, build in cases:
+            with self.subTest(name=name):
+                files = {
+                    "bench/arm/BUILD": build,
+                    "bench/arm/arm.cc": "int ok = 1;\n",
+                }
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn("bench/arm/BUILD:", out)
+
+        # Legitimate MJCF `.xml` data label under talOS/simulation/mujoco stays
+        # allowed in Starlark (as examples/mujoco_rig:model_twin_test uses).
+        ok_xml = {
+            "examples/mujoco_rig/BUILD": (
+                'py_test(name = "twin", srcs = ["twin.py"], '
+                'data = ["//talOS/simulation/mujoco/robots:testdata/mujoco_rig/robot.xml"])\n'
+            ),
+            "examples/mujoco_rig/twin.py": "pass\n",
+        }
+        failures, out = run_sources(ok_xml)
+        self.assertEqual(failures, 0, out)
+
 
 def run_mujoco(file_map):
     out = io.StringIO()
@@ -2093,6 +2516,97 @@ class CheckMujocoLabelsTest(unittest.TestCase):
         failures, out = run_mujoco({"talOS/node/BUILD": "cc_library(\n"})
         self.assertEqual(failures, 1, out)
         self.assertIn("fail closed", out)
+
+    # REQ-CONTRACT-16: load("@mujoco//..."), main-repo @// / @@// loads,
+    # Bzlmod versioned canonical labels, "".join(VAR), and MODULE.bazel
+    # positional/concat/nested/segment/use_repo bypasses must all fail closed.
+    def test_mujoco_load_canonical_module_and_join_var_bypasses_fail(self):
+        refused = [
+            ("load_from_at_mujoco", "bench/arm/BUILD",
+             'load("@mujoco//:defs.bzl", "FOO")\n'),
+            ("load_from_double_at_main_repo", "bench/arm/BUILD",
+             'load("@@//talOS/simulation/mujoco:defs.bzl", "PHYSICS")\n'),
+            ("load_from_single_at_main_repo", "bench/arm/BUILD",
+             'load("@//talOS/simulation/mujoco:defs.bzl", "PHYSICS")\n'),
+            ("load_from_canonical_main_repo", "bench/arm/BUILD",
+             'load("@@_main//talOS/simulation/mujoco:defs.bzl", "PHYSICS")\n'),
+            ("canonical_tilde_version_label", "talOS/node/BUILD",
+             'cc_library(name = "n", deps = ["@@mujoco~3.17.0//:mujoco"])\n'),
+            ("canonical_plus_version_label", "talOS/node/BUILD",
+             'cc_library(name = "n", deps = ["@@mujoco+3.17.0//:mujoco"])\n'),
+            ("canonical_extension_label", "talOS/node/BUILD",
+             'cc_library(name = "n", deps = ["@@+ext+mujoco//:mujoco"])\n'),
+            ("join_variable_label", "talOS/node/BUILD",
+             'PARTS = ["@", "mujoco"]\n'
+             'cc_library(name = "n", deps = ["".join(PARTS)])\n'),
+            ("module_positional_repo_name", "MODULE.bazel",
+             'bazel_dep("mujoco", "3.17.0", repo_name = "physics")\n'),
+            ("module_concat_name_repo_name", "MODULE.bazel",
+             'bazel_dep(name = "mu" + "joco", version = "3.17.0", '
+             'repo_name = "physics")\n'),
+            ("module_var_name_repo_name", "MODULE.bazel",
+             'M = "mujoco"\n'
+             'bazel_dep(name = M, version = "3.17.0", repo_name = "physics")\n'),
+            ("module_kwargs_splat_bazel_dep", "MODULE.bazel",
+             'OPTS = {"name": "mujoco", "repo_name": "physics"}\n'
+             'bazel_dep(**OPTS)\n'),
+            ("module_use_repo_alias", "MODULE.bazel",
+             'use_repo(ext, physics = "mujoco")\n'),
+            ("module_syntax_error_fails_closed", "MODULE.bazel",
+             'bazel_dep(\n'),
+            ("nested_module_bazel_repo_name", "examples/robot_repo/MODULE.bazel",
+             'bazel_dep(name = "mujoco", version = "3.17.0", '
+             'repo_name = "physics")\n'),
+            ("included_module_segment_repo_name", "deps.MODULE.bazel",
+             'bazel_dep(name = "mujoco", version = "3.17.0", '
+             'repo_name = "physics")\n'),
+        ]
+        for name, path, text in refused:
+            with self.subTest(name=name):
+                failures, out = run_mujoco({path: text})
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn(f"VIOLATION {path}", out)
+
+
+class CheckLayerMappingTest(unittest.TestCase):
+    # REQ-CONTRACT-16: unmapped talOS packages or unmapped top-level roots
+    # outside talOS/ must fail closed rather than silently escaping checks.
+    def test_unmapped_talos_package_and_top_level_root_fail_closed(self):
+        base_files = [
+            "BUILD.bazel",
+            "talOS/node/BUILD",
+            "talOS/simulation/mujoco/BUILD",
+            "examples/mujoco_rig/BUILD",
+            "bench/main_processor/BUILD",
+            "studio/BUILD.bazel",
+            "controller_processor/rio/BUILD.bazel",
+            "third_party/BUILD",
+            "tools/BUILD",
+        ]
+        out = io.StringIO()
+        self.assertEqual(
+            check_layers.run_layer_mapping_checks(base_files, out=out),
+            0, out.getvalue())
+
+        for name, extra in (
+                ("unmapped_talos_pkg", "talOS/mystery/BUILD"),
+                ("unmapped_talos_pkg_bazel", "talOS/mystery/BUILD.bazel"),
+                ("unmapped_talos_root_build", "talOS/BUILD"),
+                ("unmapped_outside_root", "robot_2026/arm/BUILD"),
+                ("unmapped_outside_root_bazel", "robot_2026/BUILD.bazel")):
+            with self.subTest(name=name):
+                out = io.StringIO()
+                failures = check_layers.run_layer_mapping_checks(
+                    base_files + [extra], out=out)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out.getvalue()}")
+                self.assertIn(extra, out.getvalue())
+
+        # Standalone robot repository without a talOS/ tree allows root packages.
+        standalone = ["BUILD.bazel", "arm/BUILD", "intake/BUILD.bazel"]
+        out = io.StringIO()
+        self.assertEqual(
+            check_layers.run_layer_mapping_checks(standalone, out=out),
+            0, out.getvalue())
 
 
 if __name__ == "__main__":
