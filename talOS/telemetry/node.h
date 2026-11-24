@@ -228,6 +228,11 @@ class Telemetry {
                 [&node](std::string_view key) {
                   static_cast<void>(node.param<std::string>(key, ""));
                 },
+            .on_own_string_list =
+                [&node](std::string_view key) {
+                  static_cast<void>(
+                      node.param<std::vector<std::string>>(key, {}));
+                },
             .on_from_string_list =
                 [&node](std::string_view subsystem, std::string_view key) {
                   static_cast<void>(
@@ -285,11 +290,13 @@ class Telemetry {
   }
 
   // Pages the dictionary once, which throws, naming the channel, when one
-  // channel's entry cannot fit a dictionary page alone. For a graph-built
-  // dictionary (the launcher's --describe-only and every launch) it reports
-  // the pages a tick takes, so a config author sees the cost of a channel.
+  // channel's entry cannot fit a dictionary page alone, and refuses a
+  // dictionary-resend tick that would exceed the `/talos/telemetry` ring. For
+  // a graph-built dictionary (the launcher's --describe-only and every launch)
+  // it reports the pages a tick takes, so a config author sees the cost of a
+  // channel.
   void ReportPages(bool report) const {
-    const PageBudget budget = MeasurePages(dictionary_);
+    const PageBudget budget = CheckDictionaryPageBudget(dictionary_);
     if (!report) return;
     std::cerr << "telemetry: " << dictionary_.size() << " channels; "
               << budget.value_pages << " value page(s) per tick, "
@@ -368,7 +375,9 @@ class Telemetry {
           "'");
     }
     const reflection::Object* object =
-        schema->objects()->LookupByKey(source.schema.c_str());
+        schema->objects() != nullptr
+            ? schema->objects()->LookupByKey(source.schema.c_str())
+            : nullptr;
     if (!object || !object->is_struct() || object->fields() == nullptr) {
       throw std::invalid_argument("telemetry: schema object '" + source.schema +
                                   "' for pose topic '" + source.name +
@@ -378,18 +387,20 @@ class Telemetry {
     auto read_double_offset = [&](const reflection::Field& sub_field,
                                   std::size_t pose_offset,
                                   std::size_t& out) -> void {
+      const std::string field_name =
+          sub_field.name() != nullptr ? sub_field.name()->str() : "";
       if (sub_field.type() == nullptr ||
           sub_field.type()->base_type() != reflection::BaseType::Double) {
-        throw std::invalid_argument(
-            "telemetry: pose topic '" + source.name + "' geometry.Pose2d." +
-            sub_field.name()->str() + " must be a double");
+        throw std::invalid_argument("telemetry: pose topic '" + source.name +
+                                    "' geometry.Pose2d." + field_name +
+                                    " must be a double");
       }
       const std::size_t offset = pose_offset + sub_field.offset();
       if (offset > source.message_bytes ||
           sizeof(double) > source.message_bytes - offset) {
-        throw std::invalid_argument(
-            "telemetry: pose topic '" + source.name + "' geometry.Pose2d." +
-            sub_field.name()->str() + " exceeds message_bytes");
+        throw std::invalid_argument("telemetry: pose topic '" + source.name +
+                                    "' geometry.Pose2d." + field_name +
+                                    " exceeds message_bytes");
       }
       out = offset;
     };
@@ -406,14 +417,14 @@ class Telemetry {
         const auto* sub_obj = schema->objects()->Get(
             static_cast<flatbuffers::uoffset_t>(type.index()));
         if (sub_obj != nullptr && sub_obj->is_struct() &&
-            sub_obj->fields() != nullptr &&
+            sub_obj->fields() != nullptr && sub_obj->name() != nullptr &&
             sub_obj->name()->string_view() == "geometry.Pose2d") {
           const std::size_t pose_offset = field->offset();
           bool found_x = false;
           bool found_y = false;
           bool found_yaw = false;
           for (const auto* sub_field : *sub_obj->fields()) {
-            if (sub_field == nullptr) continue;
+            if (sub_field == nullptr || sub_field->name() == nullptr) continue;
             const std::string_view sub_name = sub_field->name()->string_view();
             if (sub_name == "x_m") {
               read_double_offset(*sub_field, pose_offset, x_offset);
@@ -442,7 +453,10 @@ class Telemetry {
     bool has_valid_field = false;
     std::size_t valid_offset = 0;
     for (const auto* field : *object->fields()) {
-      if (field == nullptr || field->type() == nullptr) continue;
+      if (field == nullptr || field->type() == nullptr ||
+          field->name() == nullptr) {
+        continue;
+      }
       if (field->name()->string_view() == "valid" &&
           field->type()->base_type() == reflection::BaseType::Bool) {
         const std::size_t offset = field->offset();
@@ -507,9 +521,7 @@ class Telemetry {
     std::vector<Channel> channels =
         FlattenTopic(source.name, source.schema, source.bfbs, options, &kept);
     if (kept > channels.size()) {
-      std::string_view owner = source.name;
-      if (owner.starts_with('/')) owner.remove_prefix(1);
-      uncounted_[std::string{owner}] += kept - channels.size();
+      uncounted_[ChannelSourceBucket(source.name)] += kept - channels.size();
     }
 
     std::size_t sub_idx = 0;
