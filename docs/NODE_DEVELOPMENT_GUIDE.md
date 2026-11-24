@@ -181,8 +181,10 @@ and `session_report --strict` fails the session
 `TALOS_REALTIME=0` in the environment turns all of this off;
 `TALOS_REALTIME=1` turns it on under `--sim` as well, so a host without a
 RoboRIO runs the actuated control path, its nodes and bridge under the
-production policy, against a simulated gateway (which itself never runs
-realtime) (`talOS/process` `RealtimeRequested`). Nodes and the bridge
+production policy, alongside a simulated gateway (`sim_gateway` also honours
+`TALOS_REALTIME=1` at `LoopTier::kBridge` for `[robot] period_us`, see
+[simulator realtime scheduling](../talOS/simulation/README.md#realtime-scheduling))
+(`talOS/process` `RealtimeRequested`). Nodes, the bridge and `sim_gateway`
 inherit the variable from the launcher.
 
 A thread the node starts must not run at the loop's priority. On Linux
@@ -331,9 +333,11 @@ enabled switch on the TalonFX's own forward or reverse limit input
 holds output that way neutral; homing can drive toward a switch until it reads
 true. Unlike the numeric getters they read false unless `connected()`; while
 connected, the RoboRIO reports them only from a TalonFX FaultField signal under
-50 ms old (2.5 periods at its 50 Hz rate) and reports them clear once that
-signal is staler. SimHardware `set_limit_switches(node, device, forward,
-reverse)` asserts them; it does not stop the request or the ideal motor.
+`DiagnosticMaxAgeUs(status_hz)` old (50 ms at `status_hz >= 50` Hz, scaling to
+2.5 periods of `min(status_hz, 50)` Hz for slower configs) and reports them
+clear once that signal is staler. SimHardware `set_limit_switches(node, device,
+forward, reverse)` asserts them (keeping the fixed 50 ms baseline); it does not
+stop the request or the ideal motor.
 
 ### Rezero and position frames
 
