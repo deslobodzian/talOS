@@ -471,6 +471,67 @@ TEST_F(MotorTest, FutureClockMappedAcquisitionClampsAgeToZero) {
   EXPECT_EQ(s.velocity_age_us(), 0u);
 }
 
+// REQ-CONTRACT-08, REQ-DEV-04: /motor/state.fault masks /hw/status
+// motor_fault_mask to kraken's own Motor::hardware_index() bit so another
+// motor's fault never raises kraken's fault, even when kraken is not at slot 0.
+TEST(MotorFaultMask, ReportsOnlyKrakenHardwareIndexBit) {
+  constexpr const char* kTwoMotorToml = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.alpha.motors.other]
+type = "TalonFX"
+can_id = 10
+
+[subsystems.motor.motors.kraken]
+type = "TalonFX"
+can_id = 1
+)";
+  auto sim = talos::testing::Sim::FromToml(kTwoMotorToml);
+  sim.add<BenchMotor>("motor");
+  talos::testing::SimHardware hw{sim};
+  hw.enable();
+  sim.step(20ms);
+
+  const auto& motors = sim.node("motor")
+                           .extension<talos::HardwareLink>()
+                           .config()
+                           .hardware.motors;
+  ASSERT_EQ(motors.size(), 2u);
+  std::uint8_t kraken_slot = 0;
+  std::uint8_t other_slot = 0;
+  for (std::size_t i = 0; i < motors.size(); ++i) {
+    if (motors[i].name == "kraken") kraken_slot = static_cast<std::uint8_t>(i);
+    if (motors[i].name == "other") other_slot = static_cast<std::uint8_t>(i);
+  }
+  ASSERT_NE(kraken_slot, other_slot);
+  ASSERT_GT(kraken_slot, 0u);  // proves non-zero hardware_index masking
+
+  auto publish_fault_mask = [&](std::uint32_t mask) {
+    auto status = sim.latest<bridge::BridgeStatus>("/hw/status");
+    ASSERT_TRUE(status.has_value());
+    bridge::BridgeStatus injected = *status;
+    injected.mutate_health_valid(true);
+    injected.mutate_motor_fault_mask(mask);
+    hw.lose_states(2);
+    sim.publish("/hw/status", injected);
+    sim.step(5ms);
+  };
+
+  publish_fault_mask(std::uint32_t{1} << other_slot);
+  const MotorState other_faulted =
+      sim.latest<MotorState>(topics::kState).value();
+  EXPECT_TRUE(other_faulted.fault_valid());
+  EXPECT_FALSE(other_faulted.fault());
+
+  publish_fault_mask(std::uint32_t{1} << kraken_slot);
+  const MotorState kraken_faulted =
+      sim.latest<MotorState>(topics::kState).value();
+  EXPECT_TRUE(kraken_faulted.fault_valid());
+  EXPECT_TRUE(kraken_faulted.fault());
+}
+
 // The bench config binds the swerve module's lane too, and teleop needs a
 // reader of every bound lane; this stands in for the swerve module node,
 // whose package this one may not depend on.
