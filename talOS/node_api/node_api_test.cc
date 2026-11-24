@@ -1377,15 +1377,26 @@ TEST_F(NodeApi, IndexedTargetLookupsValidateIndexAndLoopThread) {
 }
 
 TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {
-  Roller roller;
-  TalosNode* node = talos_sim_add(sim_, "roller", &BuildRoller, &roller);
+  struct ClockRoller {
+    Roller roller;
+    int32_t gyro = -1;
+    int32_t cc = -1;
+  } state;
+  auto build = [](TalosNode* n, void* user) -> int32_t {
+    auto& s = *static_cast<ClockRoller*>(user);
+    if (BuildRoller(n, &s.roller) != TALOS_OK) return TALOS_ERR;
+    s.gyro = talos_device(n, TALOS_DEVICE_GYRO, "gyro");
+    s.cc = talos_device(n, TALOS_DEVICE_CANCODER, "cc");
+    return (s.gyro >= 0 && s.cc >= 0) ? TALOS_OK : TALOS_ERR;
+  };
+  TalosNode* node = talos_sim_add(sim_, "roller", build, &state);
   ASSERT_NE(node, nullptr) << talos_last_error();
   TalosSimHardware* hw = talos_sim_hardware_create(sim_);
   ASSERT_NE(hw, nullptr) << talos_last_error();
-  const auto gyro = talos_device(node, TALOS_DEVICE_GYRO, "gyro");
-  ASSERT_GE(gyro, 0);
-  const auto cc = talos_device(node, TALOS_DEVICE_CANCODER, "cc");
-  ASSERT_GE(cc, 0);
+  const auto gyro = state.gyro;
+  const auto cc = state.cc;
+  const auto& roller = state.roller;
+  (void)roller;
   ASSERT_EQ(talos_sim_hardware_set_motor(hw, "roller", "wheel", 3, 2, 1000,
                                          3000, 0, 0, 0),
             TALOS_OK);

@@ -1704,8 +1704,9 @@ TEST(Devices, HardwareStateFollowsAGatewayRebootAndIgnoresRetiredBoots) {
 
 TEST(Devices, FirstDrainCannotReviveOldHardwareOrDriverStationState) {
   struct PeriodicWatcher : Watcher {
-    using Watcher::Watcher;
+    explicit PeriodicWatcher(Node& node) : Watcher{node}, station{node} {}
     void update() {}
+    DriverStation station;
   };
   auto sim = Sim::FromToml(R"(
 [robot]
@@ -1718,10 +1719,9 @@ dio = 3
 [subsystems.mech.motors.m]
 can_id = 1
 )");
-  sim.add<PeriodicWatcher>("watcher");
+  auto& watcher = sim.add<PeriodicWatcher>("watcher");
   Node& node = sim.node("watcher");
   auto& link = node.extension<HardwareLink>();
-  DriverStation station{node};
   const auto id = hardware::ConfigurationId(link.config().hardware);
 
   sim.step(10ms);
@@ -1737,8 +1737,8 @@ can_id = 1
   EXPECT_EQ(link.age(), 190ms);
   EXPECT_FALSE(link.fresh());
   EXPECT_FALSE(robot_enabled(node));
-  EXPECT_FALSE(station.connected());
-  EXPECT_FALSE(station.enabled());
+  EXPECT_FALSE(watcher.station.connected());
+  EXPECT_FALSE(watcher.station.enabled());
 }
 
 // The bridge's clock mapping as /hw/status carries it, for gateway boot
