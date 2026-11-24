@@ -519,18 +519,31 @@ def _strip_c_comments(text, is_ts=False, strip_strings=False):
         text, is_ts=is_ts, strip_strings=strip_strings)[0]
 
 
-def _strip_hash_comments(text, python_strings=True, strip_strings=False):
+def _strip_hash_comments_with_lines(text, python_strings=True,
+                                    strip_strings=False):
     """Replaces `# ...` comments (and, when `strip_strings` is set, non-f-string
-    Python string literal interiors) with spaces, preserving newlines."""
+    Python string literal interiors) with spaces, splicing Python explicit `\\`
+    line continuations while returning a per-character 1-based original line map."""
     out = []
+    out_lines = []
+    line = 1
     i = 0
     n = len(text)
+
+    def emit(ch, ln):
+        out.append(ch)
+        out_lines.append(ln)
+
+    def emit_str(s, ln):
+        for c in s:
+            emit(c, ln)
+
     while i < n:
         ch = text[i]
         if ch == "#" and (
                 python_strings or i == 0 or text[i - 1] in (" ", "\t", "\n")):
             while i < n and text[i] != "\n":
-                out.append(" ")
+                emit(" ", line)
                 i += 1
             continue
         if ch in ('"', "'"):
@@ -549,36 +562,106 @@ def _strip_hash_comments(text, python_strings=True, strip_strings=False):
                 blank = not is_fstring
             if python_strings and text[i:i + 3] == ch * 3:
                 quote = ch * 3
-                out.append(quote)
+                emit_str(quote, line)
                 i += 3
                 while i < n:
                     if text[i] == "\\" and i + 1 < n:
                         escaped = text[i + 1]
-                        if blank:
-                            out.append("\n" if escaped == "\n" else "  ")
+                        if escaped == "\n":
+                            if blank:
+                                emit("\n", line)
+                            else:
+                                emit("\\", line)
+                                emit("\n", line)
+                            line += 1
                         else:
-                            out.append(text[i:i + 2])
+                            if blank:
+                                emit(" ", line)
+                                emit(" ", line)
+                            else:
+                                emit(text[i], line)
+                                emit(escaped, line)
                         i += 2
                         continue
                     if text[i:i + 3] == quote:
-                        out.append(quote)
+                        emit_str(quote, line)
                         i += 3
                         break
                     c = text[i]
-                    out.append(("\n" if c == "\n" else " ") if blank else c)
+                    if c == "\n":
+                        emit("\n", line)
+                        line += 1
+                    else:
+                        emit(" " if blank else c, line)
                     i += 1
                 continue
-            out.append(ch)
-            i = _copy_quoted(text, i + 1, ch, out, blank,
-                             escapes=python_strings or ch == '"')
+            emit(ch, line)
+            i += 1
+            escapes = python_strings or ch == '"'
+            while i < n:
+                c = text[i]
+                if escapes and c == "\\" and i + 1 < n:
+                    escaped = text[i + 1]
+                    if escaped == "\n":
+                        if blank:
+                            emit("\n", line)
+                        else:
+                            emit("\\", line)
+                            emit("\n", line)
+                        line += 1
+                    else:
+                        if blank:
+                            emit(" ", line)
+                            emit(" ", line)
+                        else:
+                            emit(c, line)
+                            emit(escaped, line)
+                    i += 2
+                    continue
+                if c == ch:
+                    emit(c, line)
+                    i += 1
+                    break
+                if c == "\n":
+                    emit("\n", line)
+                    line += 1
+                    i += 1
+                    break
+                emit(" " if blank else c, line)
+                i += 1
             continue
         if ch == "\\" and _is_line_continuation(text, i):
-            out.append(" ")
+            if python_strings:
+                # Splice explicit Python line continuations (`\` [ws] `\r?\n`)
+                # into a single space while tracking original line numbers so
+                # `from mod import \` / `import \` across lines cannot bypass
+                # single-line import regexes.
+                emit(" ", line)
+                i += 1
+                while i < n and text[i] in (" ", "\t", "\r"):
+                    i += 1
+                if i < n and text[i] == "\n":
+                    line += 1
+                    i += 1
+                continue
+            emit(" ", line)
             i += 1
             continue
-        out.append(ch)
+        if ch == "\n":
+            emit("\n", line)
+            line += 1
+            i += 1
+            continue
+        emit(ch, line)
         i += 1
-    return "".join(out)
+    return "".join(out), out_lines
+
+
+def _strip_hash_comments(text, python_strings=True, strip_strings=False):
+    """Replaces `# ...` comments (and, when `strip_strings` is set, non-f-string
+    Python string literal interiors) with spaces."""
+    return _strip_hash_comments_with_lines(
+        text, python_strings=python_strings, strip_strings=strip_strings)[0]
 
 
 def _strip_comments_with_lines(text, path, strip_strings=False):
@@ -590,8 +673,8 @@ def _strip_comments_with_lines(text, path, strip_strings=False):
     name = os.path.basename(path)
     python_strings = (path.endswith(PY_COMMENT_SUFFIXES) or
                       name in PY_COMMENT_NAMES)
-    return _strip_hash_comments(text, python_strings=python_strings,
-                                strip_strings=strip_strings), None
+    return _strip_hash_comments_with_lines(
+        text, python_strings=python_strings, strip_strings=strip_strings)
 
 
 def strip_comments(text, path, strip_strings=False):

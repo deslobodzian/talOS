@@ -800,6 +800,16 @@ class LintTestTimeTest(unittest.TestCase):
              "from uuid import uu" + "id4 as u4\n", "random", 1),
             ("py_from_uuid_star", *py_node,
              "from uuid import *\n", "random", 1),
+            ("py_from_datetime_backslash_cont", *py_node,
+             "from datetime import \\\n    datetime as dt\n", "clock", 1),
+            ("py_from_os_backslash_cont", *py_node,
+             "from os import \\\n    get" + "random as gr\n", "random", 1),
+            ("py_from_uuid_backslash_cont", *py_node,
+             "from uuid import \\\n    uu" + "id4 as u4\n", "random", 1),
+            ("py_from_numpy_backslash_cont", *py_node,
+             "from numpy import \\\n    random as nr\n", "random", 1),
+            ("py_from_threading_backslash_cont", *py_node,
+             "from threading import \\\n    Lock as L\n", "lock", 1),
         )
         for name, path, extra, text, kind, expected_line in cases:
             with self.subTest(name=name):
