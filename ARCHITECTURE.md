@@ -101,7 +101,7 @@ Allowed dependencies:
   `//talOS/telemetry:{telemetry,channels}`, `//talOS/teleop:teleop`,
   `//talOS/node_api:node_api`, `//talOS/bridge:node_lib`,
   `//talOS/introspection:{registry,reporter}`,
-  `//talOS/launcher:launcher_lib`, `//talOS/simulation:schedules`,
+  `//talOS/launcher:launcher_lib`, `//talOS/simulation:{schedules,gateway_main}`,
   `//talOS/vision/capture:avfoundation`) are non-public in Bazel, and internal
   transport/wire/access deps of `//talOS/node:node` and
   `//talOS/devices:devices` live in `implementation_deps`, so robot node code

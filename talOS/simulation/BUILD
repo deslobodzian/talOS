@@ -10,6 +10,17 @@ cc_binary(
     name = "sim_gateway",
     srcs = ["sim_gateway.cc"],
     visibility = ["//visibility:public"],
+    deps = [":gateway_main"],
+)
+
+# The simulator's program (flags, --describe, the loop) behind
+# RunSimGateway. A program that calls it with an extension can configure the
+# physics backend before the first Reconfigure and run after each tick.
+cc_library(
+    name = "gateway_main",
+    srcs = ["gateway_main.cc"],
+    hdrs = ["gateway_main.h"],
+    visibility = ["//talOS/simulation:__subpackages__"],
     deps = [
         ":ports",
         ":schedules",
