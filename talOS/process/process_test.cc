@@ -517,7 +517,10 @@ TEST(ProcessTest, LongControlPeriodsGrantTimeConstraintOnMacOs) {
 // Calling ConfigureBackgroundThread on a thread that is already realtime (for
 // instance, after ConfigureRealtime(kControl) on macOS where child threads do
 // not inherit THREAD_TIME_CONSTRAINT_POLICY) must leave the realtime policy
-// first and apply the background priority/QoS cleanly.
+// first and apply the background priority/QoS cleanly. On macOS, XNU
+// permanently opts a formerly time-constraint thread out of POSIX QoS, so
+// ConfigureBackgroundThread lowers its Mach precedence below default timeshare
+// priority instead.
 // REQ-RT-10
 TEST(ProcessTest, BackgroundThreadDropsRealtimeOnSameThread) {
   ::unsetenv("TALOS_REALTIME");
@@ -568,16 +571,25 @@ TEST(ProcessTest, BackgroundThreadRunsBelowTheDefaultPriority) {
   bool before = true;
   bool returned = false;
   bool after = false;
+#if defined(__APPLE__)
+  qos_class_t after_qos = QOS_CLASS_UNSPECIFIED;
+#endif
   std::thread worker{[&] {
     before = ThreadIsBackground();
     returned = ConfigureBackgroundThread();
     after = ThreadIsBackground();
+#if defined(__APPLE__)
+    after_qos = ::qos_class_self();
+#endif
   }};
   worker.join();
 
   EXPECT_FALSE(before);
   EXPECT_TRUE(returned);
   EXPECT_TRUE(after);
+#if defined(__APPLE__)
+  EXPECT_EQ(after_qos, QOS_CLASS_UTILITY);
+#endif
 }
 
 // A thread created by a realtime thread that did not set SCHED_RESET_ON_FORK

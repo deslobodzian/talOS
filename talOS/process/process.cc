@@ -309,7 +309,14 @@ void SetThreadPolicy(const LoopPolicy& loop, Problems& problems) {
 
 #if defined(__APPLE__)
 
-bool HasTimeConstraint() {
+// Precedence delta applied when a thread that previously ran under
+// THREAD_TIME_CONSTRAINT_POLICY drops back to THREAD_STANDARD_POLICY: XNU
+// permanently opts such a thread out of POSIX QoS
+// (pthread_set_qos_class_self_np returns EPERM), so lowering Mach precedence
+// puts it below default timeshare priority.
+constexpr integer_t kBackgroundPrecedence = -16;
+
+bool HasTimeConstraint() noexcept {
   thread_time_constraint_policy_data_t policy{};
   mach_msg_type_number_t count = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
   boolean_t get_default = FALSE;
@@ -319,10 +326,22 @@ bool HasTimeConstraint() {
   return result == KERN_SUCCESS && get_default == FALSE;
 }
 
+bool HasBackgroundPrecedence() noexcept {
+  thread_precedence_policy_data_t policy{};
+  mach_msg_type_number_t count = THREAD_PRECEDENCE_POLICY_COUNT;
+  boolean_t get_default = FALSE;
+  const kern_return_t result = ::thread_policy_get(
+      ::pthread_mach_thread_np(::pthread_self()), THREAD_PRECEDENCE_POLICY,
+      reinterpret_cast<thread_policy_t>(&policy), &count, &get_default);
+  return result == KERN_SUCCESS && get_default == FALSE &&
+         policy.importance < 0;
+}
+
 void SetBackground(Problems& problems) {
   // The kernel refuses a QoS for a thread under an explicit Mach policy, so
   // drop any time-constraint policy before setting QOS_CLASS_UTILITY.
-  if (HasTimeConstraint()) {
+  const bool was_rt = HasTimeConstraint();
+  if (was_rt) {
     thread_standard_policy_data_t standard{};
     const kern_return_t dropped = ::thread_policy_set(
         ::pthread_mach_thread_np(::pthread_self()), THREAD_STANDARD_POLICY,
@@ -335,7 +354,23 @@ void SetBackground(Problems& problems) {
   }
   const int result = ::pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
   if (result != 0) {
-    problems.add(kStepPolicy, "QOS_CLASS_UTILITY", std::strerror(result));
+    if ((was_rt || HasBackgroundPrecedence()) && result == EPERM) {
+      // Once a thread has held THREAD_TIME_CONSTRAINT_POLICY, XNU permanently
+      // opts it out of POSIX QoS even after THREAD_STANDARD_POLICY; lower its
+      // Mach precedence instead so it runs below default timeshare priority.
+      thread_precedence_policy_data_t precedence{};
+      precedence.importance = kBackgroundPrecedence;
+      const kern_return_t lowered = ::thread_policy_set(
+          ::pthread_mach_thread_np(::pthread_self()), THREAD_PRECEDENCE_POLICY,
+          reinterpret_cast<thread_policy_t>(&precedence),
+          THREAD_PRECEDENCE_POLICY_COUNT);
+      if (lowered != KERN_SUCCESS) {
+        problems.add(kStepPolicy, "precedence policy",
+                     ::mach_error_string(lowered));
+      }
+    } else {
+      problems.add(kStepPolicy, "QOS_CLASS_UTILITY", std::strerror(result));
+    }
   }
 }
 
@@ -504,9 +539,10 @@ bool ConfigureBackgroundThread() noexcept {
 
 bool ThreadIsBackground() noexcept {
 #if defined(__APPLE__)
+  if (HasTimeConstraint()) return false;
   const qos_class_t qos = ::qos_class_self();
-  return !HasTimeConstraint() && qos != QOS_CLASS_UNSPECIFIED &&
-         qos <= QOS_CLASS_UTILITY;
+  if (qos != QOS_CLASS_UNSPECIFIED && qos <= QOS_CLASS_UTILITY) return true;
+  return HasBackgroundPrecedence();
 #elif defined(__linux__)
   const int policy = ::sched_getscheduler(0);
   if (policy < 0 || IsRealtimePolicy(policy)) {
