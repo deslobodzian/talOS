@@ -1337,6 +1337,126 @@ TEST_F(OperatorArmingTest, InputHeldThroughANewBootOfTheSameGenerationWaits) {
   EXPECT_NE(lift.seen, std::nullopt);
 }
 
+// REQ-SAFE-13: e-stop disarms even while kEnabled | kTeleop remain set, and a
+// button held through recovery waits for neutral before driving again.
+TEST_F(OperatorArmingTest, InputHeldThroughAnEStopWaitsForNeutral) {
+  ASSERT_NO_FATAL_FAILURE(ArmAndHold());
+  Packet(kTeleop | ds::kEStop, true);
+  sim.step(40ms);
+  EXPECT_FALSE(op.arming.armed());
+  EXPECT_FALSE(Active());
+  EXPECT_EQ(lift.seen, std::nullopt);
+  Packet(kTeleop, true);
+  ExpectReleasedUntilNeutralThenDriving();
+}
+
+// REQ-SAFE-13: detaching the Driver Station (!kDsAttached) disarms even if the
+// packet still carries kEnabled | kTeleop and the same mode generation; once
+// reattached with the button still held, it waits for neutral.
+TEST_F(OperatorArmingTest, InputHeldThroughADsDetachWaitsForNeutral) {
+  ASSERT_NO_FATAL_FAILURE(ArmAndHold());
+  const auto last = sim.latest<hardware::Packet>(hardware::kDriverStationTopic);
+  ASSERT_TRUE(last.has_value());
+  ds::DriverStationData data{};
+  ASSERT_TRUE(ds::Decode(last->bytes(), data));
+  ASSERT_NE(data.mode_since_us, 0u);
+  hw.stop_driver_station();
+  const auto publish = [&](std::uint32_t flags, bool held,
+                           std::chrono::milliseconds d) {
+    data.fms.flags = flags;
+    data.joysticks[0].buttons = held ? 1u : 0u;
+    for (auto t = 0ms; t < d; t += 5ms) {
+      data.sample_time_us += 5000;
+      hardware::Packet packet{};
+      packet.size = static_cast<std::uint32_t>(ds::Encode(data, packet.data));
+      sim.publish(hardware::kDriverStationTopic, packet);
+      sim.step(5ms);
+    }
+  };
+  // Detached packet with kEnabled | kTeleop still set and unchanged generation.
+  publish(kTeleop, true, 40ms);
+  EXPECT_FALSE(op.arming.armed());
+  EXPECT_FALSE(Active());
+  EXPECT_EQ(lift.seen, std::nullopt);
+  // Reattach with button still held: stays disarmed until a neutral evaluation.
+  publish(ds::kDsAttached | kTeleop, true, 60ms);
+  EXPECT_FALSE(op.arming.armed());
+  EXPECT_FALSE(Active());
+  EXPECT_EQ(lift.seen, std::nullopt);
+  publish(ds::kDsAttached | kTeleop, false, 40ms);
+  publish(ds::kDsAttached | kTeleop, true, 40ms);
+  EXPECT_TRUE(op.arming.armed());
+  EXPECT_TRUE(Active());
+  EXPECT_NE(lift.seen, std::nullopt);
+}
+
+// REQ-SAFE-13: switching enabled modes (teleop -> auto -> teleop) without ever
+// disabling disarms; a button held across the switch waits for neutral.
+TEST_F(OperatorArmingTest, InputHeldThroughAnEnabledModeSwitchWaitsForNeutral) {
+  ASSERT_NO_FATAL_FAILURE(ArmAndHold());
+  op.saw_disabled = false;
+  Packet(kAuto, true);
+  sim.step(40ms);
+  EXPECT_FALSE(op.saw_disabled);
+  EXPECT_FALSE(op.arming.armed());
+  EXPECT_FALSE(Active());
+  EXPECT_EQ(lift.seen, std::nullopt);
+  Packet(kTeleop, true);
+  ExpectReleasedUntilNeutralThenDriving();
+  EXPECT_FALSE(op.saw_disabled);
+}
+
+// REQ-SAFE-13: an evaluation gap of command_timeout_us - 1 us stays armed and
+// publishes active targets, while an evaluation gap of exactly
+// command_timeout_us disarms and releases the lane.
+TEST(OperatorArmingBoundary, EvaluationGapDisarmsAtExactCommandTimeout) {
+  struct TimedOp {
+    explicit TimedOp(Node& node)
+        : arming{node}, lane{node, "lift", "teleop", arming} {}
+    OperatorArming arming;
+    TargetLane<Goal> lane;
+  };
+  auto sim = Sim::FromToml(std::string{kRobotToml} +
+                           "[subsystems.operator]\nperiod_us = 20000\n");
+  auto& op = sim.add<TimedOp>("operator");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(20ms);
+
+  // Neutral evaluation arms the lane.
+  EXPECT_FALSE(op.arming.evaluate(true));
+  ASSERT_TRUE(op.arming.armed());
+
+  // Gap = command_timeout_us - 1 us (99999 us): stays armed and sends active.
+  sim.step(99999us);
+  EXPECT_TRUE(op.arming.armed());
+  EXPECT_TRUE(op.lane.send(Goal{0.5}));
+  const auto active_before = LatestTarget<Goal>(sim, "lift", "teleop");
+  ASSERT_TRUE(active_before.has_value());
+  EXPECT_NE(active_before->active, 0);
+  // Evaluating at 99999 us succeeds while armed and resets the evaluation
+  // clock.
+  EXPECT_TRUE(op.arming.evaluate(false));
+  EXPECT_TRUE(op.arming.armed());
+
+  // Gap = command_timeout_us (100000 us): disarms at the exact bound.
+  sim.step(99999us);
+  ASSERT_TRUE(op.arming.armed());
+  sim.step(1us);
+  EXPECT_FALSE(op.arming.armed());
+  EXPECT_FALSE(op.lane.send(Goal{0.5}));
+  const auto released_at = LatestTarget<Goal>(sim, "lift", "teleop");
+  ASSERT_TRUE(released_at.has_value());
+  EXPECT_EQ(released_at->active, 0);
+  EXPECT_FALSE(op.arming.evaluate(false));
+  EXPECT_FALSE(op.arming.armed());
+
+  // A subsequent neutral evaluation re-arms.
+  EXPECT_FALSE(op.arming.evaluate(true));
+  EXPECT_TRUE(op.arming.armed());
+}
+
 // REQ-OPS-55: OperatorArming records the blocking input while disarmed and
 // clears it to {kNone, -1, -1} once armed, neutral, or disarmed.
 TEST(OperatorArmingBlocker, RecordsBlockingInputWhileDisarmedAndClearsOnArm) {

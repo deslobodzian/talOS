@@ -67,6 +67,8 @@ cc_test(
     }),
 )
 
+# Deterministic HD render-and-detect GPU vs CPU parity test (no wall-clock
+# bound; belongs in the heavy lane, docs/TESTING.md §2 and §9).
 cc_test(
     name = "metal_apriltag_perf_test",
     size = "medium",
@@ -75,10 +77,7 @@ cc_test(
         "//talOS/vision/testdata",
         "@apriltag//:test_data",
     ],
-    tags = [
-        "exclusive",
-        "perf",
-    ],
+    tags = ["heavy"],
     deps = [
         ":metal_apriltag_backend",
         "//talOS/geometry",
