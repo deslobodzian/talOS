@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -37,6 +38,28 @@ uint64_t SaturatingAdd(uint64_t a, uint64_t b) {
   return b > std::numeric_limits<uint64_t>::max() - a
              ? std::numeric_limits<uint64_t>::max()
              : a + b;
+}
+
+int ParseIntFlag(std::string_view flag, std::string_view value, int min_value) {
+  int parsed = 0;
+  const char* const end = value.data() + value.size();
+  const auto [ptr, ec] = std::from_chars(value.data(), end, parsed);
+  if (value.empty() || ec != std::errc{} || ptr != end || parsed < min_value) {
+    throw std::invalid_argument("invalid value for " + std::string{flag} +
+                                ": " + std::string{value});
+  }
+  return parsed;
+}
+
+uint64_t ParseUint64Flag(std::string_view flag, std::string_view value) {
+  uint64_t parsed = 0;
+  const char* const end = value.data() + value.size();
+  const auto [ptr, ec] = std::from_chars(value.data(), end, parsed);
+  if (value.empty() || ec != std::errc{} || ptr != end) {
+    throw std::invalid_argument("invalid value for " + std::string{flag} +
+                                ": " + std::string{value});
+  }
+  return parsed;
 }
 
 const char* ConfigAckStatusName(ConfigAckStatus status) {
@@ -873,13 +896,20 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
     state_decode_failure_logged_ = false;
 
     ++states_received_;
-    // Ordering first, before anything is touched: the clock mapping takes
-    // a State only when it is newer than the last one of its gateway boot
-    // or opens a boot never seen. A duplicate, a reordered frame (with
-    // whatever older epoch or enable edge it carries) or a datagram delayed
-    // from a retired boot is dropped whole, counted in
-    // clock_ignored_count: it must not roll back the identity, refresh
-    // freshness, invalidate healthy requests or trigger a config push.
+    // Ordering and forward-jump gate first, before anything is touched: the
+    // clock mapping takes a State only when it opens a boot never seen or is
+    // strictly newer than the last accepted one of its gateway boot without an
+    // unconfirmed jump past elapsed bridge time + ClockOffsetEstimator's jitter
+    // and drift bound (a subsequent State past the bound that is physically
+    // consistent with the pending candidate re-syncs the anchor to recover
+    // from unseen-boot stall/tail-drop; duplicates and reordered frames return
+    // early without clearing the candidate, while normal accepted frames or a
+    // boot change clear it). A
+    // duplicate, a reordered frame (with whatever older epoch or enable edge it
+    // carries), an isolated or inconsistent corrupt far-future timestamp, or a
+    // datagram delayed from a retired boot is dropped whole, counted in
+    // clock_ignored_count: it must not advance or roll back the identity,
+    // refresh freshness, invalidate healthy requests or trigger a config push.
     if (!clock_.Observe(state.boot_id, state.sample_time_us, now_us)) {
       return;
     }
@@ -918,12 +948,12 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
     // ack may precede) or a State naming another config voids it until the
     // next kOk ack; a State naming ours does not restore it, since the
     // gateway reports that id even when applying the config failed.
-    if ((last_boot_id_ != 0 && state.boot_id != last_boot_id_) ||
-        state.config_id != config_id_) {
+    const bool boot_changed =
+        last_boot_id_ != 0 && state.boot_id != last_boot_id_;
+    if (boot_changed || state.config_id != config_id_) {
       is_configured_ = false;
     }
-    if (state.boot_id != last_boot_id_ || state.config_id != config_id_ ||
-        !is_configured_) {
+    if (boot_changed || state.config_id != config_id_ || !is_configured_) {
       if (ElapsedUs(now_us, last_push_time_us_) >= config_push_backoff_us_ ||
           state.boot_id != last_boot_id_) {
         PushConfig(now_us);
@@ -1060,8 +1090,7 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       static_cast<uint32_t>(subsystems_.size()),
       is_configured_,
       config_.commissioned,
-      /*alert_error_link_lost=*/!state_accepted_ ||
-          state_age_us > config_.command_timeout_us,
+      /*alert_error_link_lost=*/!state_fresh,
       /*alert_error_not_configured=*/!is_configured_,
       /*alert_error_uncommissioned=*/!config_.commissioned,
       /*alert_error_motor_fault=*/motor_fault_mask != 0,
@@ -1654,6 +1683,123 @@ void HardwareNode::InvalidateRequests(uint64_t now_us) {
   // heartbeat timer must not get a vote on the first post-transition send.
   have_last_sent_ = false;
   last_sent_had_active_subsystem_ = false;
+}
+
+int RunHardwareNodeMain(int argc, char** argv) {
+  try {
+    // No default: the framework names no robot (ARCHITECTURE.md Rule 1), so
+    // --config is required. Empty means missing. Controller addressing is
+    // config-driven: an explicit CLI flag wins, otherwise [robot]
+    // controller_address / local_address / controller_port / local_port apply.
+    std::string config_path;
+    std::string remote_cli;
+    std::string local_address_cli;
+    uint16_t remote_port_cli = 0;
+    uint16_t local_port_cli = 0;
+    int duration_s = 0;
+    bool simulation = false;
+    uint64_t session_id = 0;
+    bool describe = false;
+    std::string log_path;
+    uint64_t log_max_bytes = 0;
+    std::chrono::nanoseconds log_window{0};
+
+    for (int i = 1; i < argc; ++i) {
+      const std::string arg = argv[i];
+      if (arg == "--config" && i + 1 < argc) {
+        config_path = argv[++i];
+      } else if (arg == "--remote" && i + 1 < argc) {
+        remote_cli = argv[++i];
+      } else if (arg == "--local-address" && i + 1 < argc) {
+        local_address_cli = argv[++i];
+      } else if (arg == "--remote-port" && i + 1 < argc) {
+        remote_port_cli = talos::config::ParsePortFlag(arg, argv[++i]);
+      } else if (arg == "--local-port" && i + 1 < argc) {
+        local_port_cli = talos::config::ParsePortFlag(arg, argv[++i]);
+      } else if (arg == "--duration-s" && i + 1 < argc) {
+        duration_s = ParseIntFlag(arg, argv[++i], 0);
+      } else if (arg == "--sim") {
+        simulation = true;
+      } else if (arg == "--describe") {
+        describe = true;
+      } else if (arg == "--log" && i + 1 < argc) {
+        log_path = argv[++i];
+      } else if (arg == "--log-max-bytes" && i + 1 < argc) {
+        log_max_bytes = ParseUint64Flag(arg, argv[++i]);
+      } else if (arg == "--log-window-us" && i + 1 < argc) {
+        log_window = talos::event::log::ParseLogWindowUs(argv[++i]);
+      } else if (arg == "--session-id" && i + 1 < argc) {
+        session_id = ParseUint64Flag(arg, argv[++i]);
+      } else {
+        throw std::invalid_argument(
+            "usage: hardware_node --config PATH [--remote IP] "
+            "[--local-address IP] [--remote-port PORT] [--local-port PORT] "
+            "[--duration-s N] [--sim] [--log PATH] [--log-max-bytes N] "
+            "[--log-window-us N] [--session-id ID] [--describe]");
+      }
+    }
+
+    if (config_path.empty()) {
+      throw std::invalid_argument(
+          "usage: hardware_node --config PATH [--remote IP] "
+          "[--local-address IP] [--remote-port PORT] [--local-port PORT] "
+          "[--duration-s N] [--sim] [--log PATH] [--log-max-bytes N] "
+          "[--log-window-us N] [--session-id ID] [--describe]");
+    }
+
+    auto robot_config = talos::config::ParseRobotConfig(config_path);
+    // A simulation config (its gains, bindings and travel) never reaches a
+    // controller, whoever started this bridge (REQ-SAFE-40): refused before a
+    // socket opens. --describe opens nothing, so the launcher's
+    // --describe-only probe without --sim still answers.
+    if (robot_config.simulation_only && !simulation && !describe) {
+      throw std::invalid_argument(
+          config_path +
+          " sets [robot] simulation_only = true; hardware_node runs it only "
+          "with --sim");
+    }
+    const std::string remote_ip =
+        talos::config::ResolveControllerAddress(robot_config, remote_cli);
+    const std::string resolved_local =
+        talos::config::ResolveLocalAddress(robot_config, local_address_cli);
+    const std::string local_ip =
+        resolved_local.empty() ? std::string{"0.0.0.0"} : resolved_local;
+    const uint16_t remote_port =
+        talos::config::ResolveControllerPort(robot_config, remote_port_cli);
+    const uint16_t local_port =
+        talos::config::ResolveLocalPort(robot_config, local_port_cli);
+    talos::hardware::HardwareNode node{std::move(robot_config),
+                                       remote_ip,
+                                       remote_port,
+                                       local_port,
+                                       simulation,
+                                       session_id,
+                                       std::move(log_path),
+                                       log_max_bytes,
+                                       log_window,
+                                       local_ip};
+
+    // --describe answers out of the constructor alone: no socket, no shared
+    // memory, no registry slot, nothing the real node holds. That is what lets
+    // the launcher ask every binary in a config what it would connect to
+    // before it has started any of them, and refuse a graph whose ends do not
+    // meet rather than discover it from a robot that does not move.
+    if (describe) {
+      std::fputs(talos::introspect::DescribeToJson(node.Describe()).c_str(),
+                 stdout);
+      return 0;
+    }
+
+    if (!node.Open()) {
+      throw std::runtime_error(
+          "failed to open hardware node network/ipc resources");
+    }
+
+    return node.Run(duration_s);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "hardware_node error: %s\n", e.what());
+    return 1;
+  }
 }
 
 }  // namespace talos::hardware

@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -330,6 +332,26 @@ TEST(DashboardLayoutTest, WorstCaseBudgetIsHeldAtItsBoundary) {
   // added to the one the layout names.
   EXPECT_NO_THROW(CheckDashboardBudget(fits, 1));
   EXPECT_THROW(CheckDashboardBudget(fits, 2), DashboardLayoutError);
+}
+
+// REQ-OPS-39: ParseDashboardLayout(path) must refuse a directory path with the
+// same "cannot open the dashboard layout" error as a missing file rather than
+// reading 0 bytes via std::ifstream on Linux.
+TEST(DashboardLayoutTest, ParseDashboardLayoutRefusesDirectoryPath) {
+  const char* tmp = std::getenv("TEST_TMPDIR");
+  ASSERT_NE(tmp, nullptr);
+  const std::filesystem::path dir =
+      std::filesystem::path{tmp} / "dashboard_layout_dir";
+  std::filesystem::create_directories(dir);
+  try {
+    static_cast<void>(ParseDashboardLayout(dir));
+    ADD_FAILURE() << "accepted a directory as a dashboard layout";
+  } catch (const DashboardLayoutError& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find("cannot open the dashboard layout"), std::string::npos)
+        << what;
+  }
+  std::filesystem::remove_all(dir);
 }
 
 }  // namespace

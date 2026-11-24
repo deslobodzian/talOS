@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -17,15 +18,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "talOS/memory/residency.h"
+#include "talOS/process/durable_sync.h"
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <mach/thread_policy.h>
 #include <pthread/qos.h>
 #else
@@ -294,6 +298,37 @@ TEST(ProcessTest, TiersMapToOrderedPolicies) {
     EXPECT_EQ(fallback.computation, 500us);
     EXPECT_EQ(fallback.constraint, 1ms);
   }
+
+  // XNU enforces min_rt_quantum (50 us) <= computation <= max_rt_quantum
+  // (50 ms) and computation <= constraint <= period. Valid kControl periods
+  // above 100 ms (e.g. 125 ms, 200 ms) and tiny positive periods stay within
+  // those bounds instead of failing thread_policy_set with
+  // KERN_INVALID_ARGUMENT.
+  for (const std::chrono::nanoseconds long_period : {125ms, 200ms}) {
+    SCOPED_TRACE(long_period.count());
+    const LoopPolicy policy =
+        PolicyFor({.period = long_period, .tier = LoopTier::kControl});
+    EXPECT_TRUE(policy.time_constraint);
+    EXPECT_EQ(policy.period, long_period);
+    EXPECT_EQ(policy.computation, 50ms);
+    EXPECT_EQ(policy.constraint, long_period);
+    EXPECT_LE(policy.computation, policy.constraint);
+    EXPECT_LE(policy.constraint, policy.period);
+  }
+  {
+    const LoopPolicy short_policy =
+        PolicyFor({.period = 60us, .tier = LoopTier::kControl});
+    EXPECT_EQ(short_policy.period, 60us);
+    EXPECT_EQ(short_policy.computation, 50us);
+    EXPECT_EQ(short_policy.constraint, 60us);
+  }
+  {
+    const LoopPolicy tiny_policy =
+        PolicyFor({.period = 1ns, .tier = LoopTier::kControl});
+    EXPECT_EQ(tiny_policy.period, 50us);
+    EXPECT_EQ(tiny_policy.computation, 50us);
+    EXPECT_EQ(tiny_policy.constraint, 50us);
+  }
 }
 
 #if defined(__APPLE__)
@@ -325,11 +360,41 @@ bool ThreadIsRealtime() {
 }
 
 // Whether the calling thread runs under exactly the policy PolicyFor gives
-// `tier`.
-bool ThreadHasTierPolicy(LoopTier tier) {
-  const LoopPolicy expected = PolicyFor({.period = 10ms, .tier = tier});
+// `tier` and `period`.
+bool ThreadHasTierPolicy(LoopTier tier,
+                         std::chrono::nanoseconds period = 10ms) {
+  const LoopPolicy expected = PolicyFor({.period = period, .tier = tier});
 #if defined(__APPLE__)
-  if (expected.time_constraint) return HasTimeConstraint();
+  if (expected.time_constraint) {
+    thread_time_constraint_policy_data_t actual{};
+    mach_msg_type_number_t count = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+    boolean_t get_default = FALSE;
+    if (::thread_policy_get(::pthread_mach_thread_np(::pthread_self()),
+                            THREAD_TIME_CONSTRAINT_POLICY,
+                            reinterpret_cast<thread_policy_t>(&actual), &count,
+                            &get_default) != KERN_SUCCESS ||
+        get_default != FALSE) {
+      return false;
+    }
+    mach_timebase_info_data_t timebase{};
+    if (::mach_timebase_info(&timebase) != KERN_SUCCESS ||
+        timebase.numer == 0) {
+      return false;
+    }
+    const auto to_abs = [&](std::chrono::nanoseconds duration) {
+      const __int128 scaled = static_cast<__int128>(duration.count()) *
+                              timebase.denom / timebase.numer;
+      return static_cast<std::uint32_t>(std::clamp<__int128>(
+          scaled, 0, std::numeric_limits<std::uint32_t>::max()));
+    };
+    const auto within_tick = [](std::uint32_t got, std::uint32_t want) {
+      return got >= want ? (got - want) <= 1u : (want - got) <= 1u;
+    };
+    return within_tick(actual.period, to_abs(expected.period)) &&
+           within_tick(actual.computation, to_abs(expected.computation)) &&
+           within_tick(actual.constraint, to_abs(expected.constraint)) &&
+           actual.preemptible == TRUE;
+  }
   return !HasTimeConstraint() &&
          ::qos_class_self() == QOS_CLASS_USER_INTERACTIVE;
 #elif defined(__linux__)
@@ -353,11 +418,12 @@ struct Outcome {
   RealtimeOutcome returned;
   bool applied = false;
 };
-Outcome ConfigureOnFreshThread(LoopTier tier) {
+Outcome ConfigureOnFreshThread(LoopTier tier,
+                               std::chrono::nanoseconds period = 10ms) {
   Outcome outcome;
-  std::thread worker{[&outcome, tier] {
-    outcome.returned = ConfigureRealtime({.period = 10ms, .tier = tier});
-    outcome.applied = ThreadHasTierPolicy(tier);
+  std::thread worker{[&outcome, tier, period] {
+    outcome.returned = ConfigureRealtime({.period = period, .tier = tier});
+    outcome.applied = ThreadHasTierPolicy(tier, period);
   }};
   worker.join();
   return outcome;
@@ -416,12 +482,84 @@ TEST(ProcessTest, RealtimeReportsWhatTheOsGrantedForEveryTier) {
     const RealtimeOutcome& returned = outcome.returned;
     EXPECT_EQ(returned.tier, tier);
     EXPECT_TRUE(returned.requested);
-    EXPECT_EQ(returned.grant() == RealtimeGrant::kFull, outcome.applied)
+    EXPECT_EQ((returned.refused & kStepPolicy) == 0, outcome.applied)
         << TierName(tier) << ": " << RefusedStepNames(returned.refused);
     EXPECT_EQ(returned.grant() == RealtimeGrant::kRefused, !outcome.applied)
         << TierName(tier) << ": " << RefusedStepNames(returned.refused);
+    if (outcome.applied) {
+      EXPECT_TRUE(returned.grant() == RealtimeGrant::kFull ||
+                  returned.grant() == RealtimeGrant::kPartial)
+          << TierName(tier) << ": " << RefusedStepNames(returned.refused);
+    }
   }
   EXPECT_TRUE(memory::MappingsKeptResident());
+}
+
+#if defined(__APPLE__)
+// Control loops with valid periods above 100 ms (computation = period / 2 >
+// XNU's 50 ms max_rt_quantum) must still be granted the time-constraint policy
+// with clamped computation rather than failing KERN_INVALID_ARGUMENT.
+// REQ-RT-08
+TEST(ProcessTest, LongControlPeriodsGrantTimeConstraintOnMacOs) {
+  ::unsetenv("TALOS_REALTIME");
+  for (const std::chrono::nanoseconds period : {125ms, 200ms}) {
+    SCOPED_TRACE(period.count());
+    const Outcome outcome = ConfigureOnFreshThread(LoopTier::kControl, period);
+    EXPECT_EQ((outcome.returned.refused & kStepPolicy) == 0, outcome.applied)
+        << RefusedStepNames(outcome.returned.refused);
+    EXPECT_NE(outcome.returned.grant(), RealtimeGrant::kRefused)
+        << RefusedStepNames(outcome.returned.refused);
+    EXPECT_TRUE(outcome.applied);
+  }
+}
+#endif
+
+// Calling ConfigureBackgroundThread on a thread that is already realtime (for
+// instance, after ConfigureRealtime(kControl) on macOS where child threads do
+// not inherit THREAD_TIME_CONSTRAINT_POLICY) must leave the realtime policy
+// first and apply the background priority/QoS cleanly. On macOS, XNU
+// permanently opts a formerly time-constraint thread out of POSIX QoS, so
+// ConfigureBackgroundThread lowers its Mach precedence below default timeshare
+// priority instead.
+// REQ-RT-10
+TEST(ProcessTest, BackgroundThreadDropsRealtimeOnSameThread) {
+  ::unsetenv("TALOS_REALTIME");
+  bool entered_realtime = false;
+  bool returned = false;
+  bool after_realtime = true;
+  bool after_background = false;
+  std::thread worker{[&] {
+    (void)ConfigureRealtime({.period = 10ms, .tier = LoopTier::kControl});
+    entered_realtime = ThreadIsRealtime();
+    if (!entered_realtime) return;
+    returned = ConfigureBackgroundThread();
+    after_realtime = ThreadIsRealtime();
+    after_background = ThreadIsBackground();
+  }};
+  worker.join();
+  if (!entered_realtime) GTEST_SKIP() << "realtime refused on this host";
+
+  EXPECT_TRUE(returned);
+  EXPECT_FALSE(after_realtime);
+  EXPECT_TRUE(after_background);
+}
+
+// DurableSync returns -1 with EBADF on an invalid file descriptor without
+// masking the error, and succeeds on an open regular file.
+// REQ-OPS-12
+TEST(ProcessTest, DurableSyncPreservesBadFdErrorAndSyncsOpenFile) {
+  errno = 0;
+  EXPECT_EQ(DurableSync(-1), -1);
+  EXPECT_EQ(errno, EBADF);
+
+  std::string path = ::testing::TempDir() + "/talos_durable_sync_XXXXXX";
+  const int fd = ::mkstemp(path.data());
+  ASSERT_GE(fd, 0);
+  ::unlink(path.c_str());
+  const char payload = 'x';
+  ASSERT_EQ(::write(fd, &payload, 1), 1);
+  EXPECT_EQ(DurableSync(fd), 0);
+  ::close(fd);
 }
 
 // A helper thread doing unbounded work (camera capture, detection) must run
@@ -433,16 +571,25 @@ TEST(ProcessTest, BackgroundThreadRunsBelowTheDefaultPriority) {
   bool before = true;
   bool returned = false;
   bool after = false;
+#if defined(__APPLE__)
+  qos_class_t after_qos = QOS_CLASS_UNSPECIFIED;
+#endif
   std::thread worker{[&] {
     before = ThreadIsBackground();
     returned = ConfigureBackgroundThread();
     after = ThreadIsBackground();
+#if defined(__APPLE__)
+    after_qos = ::qos_class_self();
+#endif
   }};
   worker.join();
 
   EXPECT_FALSE(before);
   EXPECT_TRUE(returned);
   EXPECT_TRUE(after);
+#if defined(__APPLE__)
+  EXPECT_EQ(after_qos, QOS_CLASS_UTILITY);
+#endif
 }
 
 // A thread created by a realtime thread that did not set SCHED_RESET_ON_FORK

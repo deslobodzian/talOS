@@ -62,8 +62,10 @@ maps the block's phase to its own status enum.
   stale, it releases **both** mechanism lanes instead of renewing a high
   elevator goal or EJECT. The mechanisms then have no target and are neutral;
   this is not a gravity-compensating elevator hold. The reported sequence falls
-  back to HOLDING only when a fresh intake status still sees a piece, otherwise
-  STOWED. Once both statuses return, sequencing starts from those observations
+  back to HOLDING only when a fresh intake status with `sensor_connected` still
+  sees a piece, otherwise STOWED; a disconnected beam break does not hold or
+  score on `RollerWithSensor`'s latched `has_piece`. Once both statuses return,
+  sequencing starts from those observations
   and the current command, not the interrupted step: a piece that left during
   the outage is not scored again. Normal sequencing republishes both lanes
   every tick.
@@ -227,7 +229,7 @@ to, lints the whole graph, and exits:
 
 ```sh
 bazel build //talOS/launcher //talOS/bridge:hardware_node \
-  //talOS/simulation:sim_gateway \
+  //talOS/simulation:sim_gateway //talOS/telemetry:node \
   //examples/superstructure/cpp:all //examples/superstructure/py:all
 ./bazel-bin/talOS/launcher/launcher --config examples/superstructure/config/robot.toml --describe-only
 ```

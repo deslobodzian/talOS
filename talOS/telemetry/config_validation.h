@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <functional>
 #include <map>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -44,6 +45,7 @@ struct LabelSpec {
 // reads for `--describe` (`LintParameterKeys`).
 struct LabelParamHooks {
   std::function<void(std::string_view key)> on_own_string;
+  std::function<void(std::string_view key)> on_own_string_list;
   std::function<void(std::string_view subsystem, std::string_view key)>
       on_from_string_list;
 };
@@ -95,19 +97,32 @@ std::size_t AppendValidatedChannel(
     std::vector<std::string> labels = {},
     AlertLevel alert = Talos::Telemetry::AlertLevel_None);
 
+// The 2-segment `owner/role` bucket (without a leading `/`) used to group both
+// built dictionary channels and uncounted excess channels in cap refusals.
+std::string ChannelSourceBucket(std::string_view name);
+
 // Refuses a dictionary past `telemetry_wire::kMaxChannels` (including any
-// `uncounted` excess channels per topic), throwing `std::runtime_error` naming
-// the largest sources.
+// `uncounted` excess channels per source bucket), throwing `std::runtime_error`
+// naming the largest sources.
 void CheckDictionaryChannelCap(
     const std::vector<ChannelDef>& dictionary,
     const std::map<std::string, std::size_t>& uncounted = {});
 
+// Measures the wire pages of `dictionary` and refuses a dictionary-resend tick
+// whose combined `dictionary_pages + value_pages` exceeds
+// `telemetry_wire::slot_count`, throwing `std::runtime_error` naming the page
+// counts and `slot_count`.
+PageBudget CheckDictionaryPageBudget(std::span<const ChannelDef> dictionary);
+
 // Builds the telemetry dictionary that `Telemetry::BuildFromGraph` constructs
 // from `graph` under `include_globs` and `exclude_globs` (excluding
-// subscriptions and pose extraction).
+// subscriptions and pose extraction). When `uncounted` is non-null, clears it
+// and accumulates excess channels past the per-topic flattening cap bucketed
+// by `ChannelSourceBucket`.
 std::vector<ChannelDef> BuildTelemetryDictionary(
     const introspect::DeclaredGraph& graph,
     const std::vector<std::string>& include_globs,
-    const std::vector<std::string>& exclude_globs);
+    const std::vector<std::string>& exclude_globs,
+    std::map<std::string, std::size_t>* uncounted = nullptr);
 
 }  // namespace talos::telemetry

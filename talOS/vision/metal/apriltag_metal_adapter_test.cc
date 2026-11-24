@@ -462,6 +462,69 @@ TEST_F(AprilTagMetalAdapterTest,
   image_u8_destroy(im);
 }
 
+TEST_F(AprilTagMetalAdapterTest, RejectsUnsupportedImageDimensions) {
+  auto expect_empty_detect = [&](image_u8_t* im) {
+    zarray_t* dets = apriltag_detector_detect_with_threshim(td_, im, nullptr);
+    ASSERT_NE(dets, nullptr);
+    EXPECT_EQ(zarray_size(dets), 0);
+    apriltag_detections_destroy(dets);
+
+    zarray_t* label_dets = apriltag_detector_detect_with_gpu_labels(
+        td_, im, nullptr, nullptr, nullptr);
+    ASSERT_NE(label_dets, nullptr);
+    EXPECT_EQ(zarray_size(label_dets), 0);
+    apriltag_detections_destroy(label_dets);
+
+    zarray_t* empty_clusters = zarray_create(sizeof(zarray_t*));
+    zarray_t* cluster_dets = apriltag_detector_detect_with_gpu_clusters(
+        td_, im, nullptr, empty_clusters);
+    ASSERT_NE(cluster_dets, nullptr);
+    EXPECT_EQ(zarray_size(cluster_dets), 0);
+    apriltag_detections_destroy(cluster_dets);
+  };
+
+  // 3x3 at decimate=1: below threshold() 4x4 tile minimum.
+  td_->quad_decimate = 1.0f;
+  image_u8_t* im3 = image_u8_create(3, 3);
+  ASSERT_NE(im3, nullptr);
+  std::memset(im3->buf, 128, static_cast<size_t>(im3->stride) * 3);
+  EXPECT_EQ(apriltag_threshold_cpu(td_, im3), nullptr);
+  EXPECT_EQ(apriltag_quad_thresh_from_threshim(td_, im3, im3), nullptr);
+  expect_empty_detect(im3);
+  image_u8_destroy(im3);
+
+  // 6x6 at decimate=2 -> 3x3 decimated dims: below 4x4 minimum.
+  td_->quad_decimate = 2.0f;
+  image_u8_t* im6 = image_u8_create(6, 6);
+  ASSERT_NE(im6, nullptr);
+  std::memset(im6->buf, 128, static_cast<size_t>(im6->stride) * 6);
+  expect_empty_detect(im6);
+  image_u8_destroy(im6);
+
+  // 5x5 at decimate=1.5 -> 2x2 decimated dims: below 4x4 minimum.
+  td_->quad_decimate = 1.5f;
+  image_u8_t* im5 = image_u8_create(5, 5);
+  ASSERT_NE(im5, nullptr);
+  std::memset(im5->buf, 128, static_cast<size_t>(im5->stride) * 5);
+  expect_empty_detect(im5);
+  image_u8_destroy(im5);
+
+  // >= 32768 overflows uint16_t 2x coordinates in struct pt: must reject
+  // before dereferencing pixels or allocating.
+  td_->quad_decimate = 1.0f;
+  uint8_t dummy = 0;
+  image_u8_t wide_im{
+      .width = 32768, .height = 4, .stride = 32768, .buf = &dummy};
+  EXPECT_EQ(apriltag_threshold_cpu(td_, &wide_im), nullptr);
+  EXPECT_EQ(apriltag_quad_thresh_from_threshim(td_, &wide_im, &wide_im),
+            nullptr);
+  expect_empty_detect(&wide_im);
+
+  image_u8_t tall_im{.width = 4, .height = 32768, .stride = 4, .buf = &dummy};
+  EXPECT_EQ(apriltag_threshold_cpu(td_, &tall_im), nullptr);
+  expect_empty_detect(&tall_im);
+}
+
 #if defined(__APPLE__)
 TEST_F(AprilTagMetalAdapterTest, GpuGeneratedThreshimDetection) {
   MTL::Device* device = MTL::CreateSystemDefaultDevice();

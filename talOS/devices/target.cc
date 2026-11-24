@@ -211,6 +211,7 @@ std::size_t TargetAccess::open_target(Node& node, std::size_t bytes,
 
 const void* TargetAccess::target_get(Node& node, std::size_t target,
                                      std::int32_t& source) {
+  NodeAccess::require_loop_thread(node, "Target::get");
   source = -1;
   TargetState& state = TargetAt(node, target);
   const ReportSelection report{node, state.selection, source};

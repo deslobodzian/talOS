@@ -170,85 +170,101 @@ class StallHomingSimTest(unittest.TestCase):
             for arg in gateway_args:
                 args += ["--sim-gateway-arg", arg]
 
-            with open(log, "wb") as out, \
-                    sim_check.Launch(args, out, cwd=work, env=env) as launch:
-                unready = sim_check.wait_ready(launch, output, READY_TIMEOUT_S)
-                ended = launch.process.poll()
-                if not unready and ended is None:
-                    start_schedule(start_file)
-                    try:
-                        ended = launch.process.wait(timeout=SESSION_DURATION_S)
-                    except subprocess.TimeoutExpired:
-                        pass
-                in_order, killed = launch.finish(STOP_WAIT_S, EXIT_WAIT_S)
+            failed = True
+            try:
+                with open(log, "wb") as out, \
+                        sim_check.Launch(args, out, cwd=work, env=env) as launch:
+                    unready = sim_check.wait_ready(
+                        launch, output, READY_TIMEOUT_S)
+                    ended = launch.process.poll()
+                    if not unready and ended is None:
+                        start_schedule(start_file)
+                        try:
+                            ended = launch.process.wait(
+                                timeout=SESSION_DURATION_S)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    in_order, killed = launch.finish(STOP_WAIT_S, EXIT_WAIT_S)
 
-            with open(log, encoding="utf-8", errors="replace") as f:
-                diagnostics = f.read()
-            self.assertEqual(unready, "", diagnostics)
-            self.assertIsNone(ended, f"launch exited early ({ended}): "
-                              f"{diagnostics}")
-            self.assertTrue(in_order, f"launch did not stop in order: "
-                            f"{diagnostics}")
-            self.assertEqual(killed, [], diagnostics)
-            self.assertEqual(launch.process.returncode, 0, diagnostics)
+                with open(log, encoding="utf-8", errors="replace") as f:
+                    diagnostics = f.read()
+                self.assertEqual(unready, "", diagnostics)
+                self.assertIsNone(ended, f"launch exited early ({ended}): "
+                                  f"{diagnostics}")
+                self.assertTrue(in_order, f"launch did not stop in order: "
+                                f"{diagnostics}")
+                self.assertEqual(killed, [], diagnostics)
+                self.assertEqual(launch.process.returncode, 0, diagnostics)
 
-            sessions = [d for d in os.listdir(output)
-                        if os.path.isdir(os.path.join(output, d))]
-            self.assertEqual(len(sessions), 1, os.listdir(output))
-            session = os.path.join(output, sessions[0])
+                sessions = [d for d in os.listdir(output)
+                            if os.path.isdir(os.path.join(output, d))]
+                self.assertEqual(len(sessions), 1, os.listdir(output))
+                session = os.path.join(output, sessions[0])
 
-            with open(os.path.join(session, "manifest.json"),
-                      encoding="utf-8") as f:
-                nodes = json.load(f)["nodes"]
-            for node in nodes:
-                self.assertEqual(len(node["runs"]), 1,
-                                 f"{node['name']} restarted: {diagnostics}")
-                run = node["runs"][0]
-                self.assertEqual((run["exit_code"], run["exit_signal"]),
-                                 (0, 0), f"{node['name']}: {run}\n{diagnostics}")
+                with open(os.path.join(session, "manifest.json"),
+                          encoding="utf-8") as f:
+                    nodes = json.load(f)["nodes"]
+                for node in nodes:
+                    self.assertEqual(len(node["runs"]), 1,
+                                     f"{node['name']} restarted: {diagnostics}")
+                    run = node["runs"][0]
+                    self.assertEqual(
+                        (run["exit_code"], run["exit_signal"]),
+                        (0, 0), f"{node['name']}: {run}\n{diagnostics}")
 
-            statuses = decoded_records(log_dump, session, "/hw/status")
-            self.assertTrue(statuses, f"no /hw/status logged: {diagnostics}")
-            last_status = statuses[-1][1]
-            self.assertEqual(last_status["configured"], "true", last_status)
-            for field, value in last_status.items():
-                if field.startswith("alert_"):
-                    self.assertEqual(value, "false", f"{field}: {last_status}")
-                if field in ("motor_fault_mask",
-                             "gateway_rejected_command_count",
-                             "gateway_neutralized_motor_count",
-                             "gateway_apply_failure_count",
-                             "gateway_device_reset_count"):
-                    self.assertEqual(value, "0", f"{field}: {last_status}")
+                statuses = decoded_records(log_dump, session, "/hw/status")
+                self.assertTrue(
+                    statuses, f"no /hw/status logged: {diagnostics}")
+                last_status = statuses[-1][1]
+                self.assertEqual(last_status["configured"], "true", last_status)
+                for field, value in last_status.items():
+                    if field.startswith("alert_"):
+                        self.assertEqual(
+                            value, "false", f"{field}: {last_status}")
+                    if field in ("motor_fault_mask",
+                                 "gateway_rejected_command_count",
+                                 "gateway_neutralized_motor_count",
+                                 "gateway_apply_failure_count",
+                                 "gateway_device_reset_count"):
+                        self.assertEqual(value, "0", f"{field}: {last_status}")
 
-            rows = decoded_records(log_dump, session, "/lift/state", "lift")
-            driven = [fields for _, fields in rows
-                      if fields["enabled"] == "true"]
-            self.assertTrue(driven, f"lift never drove: {diagnostics}")
+                rows = decoded_records(log_dump, session, "/lift/state", "lift")
+                driven = [fields for _, fields in rows
+                          if fields["enabled"] == "true"]
+                self.assertTrue(driven, f"lift never drove: {diagnostics}")
 
-            # While homing, PositionMechanism drives with goal_rot == 0 and
-            # travels down to the physical hard stop at HARD_STOP_MIN_ROT.
-            homing_positions = [float(f["position_rot"]) for f in driven
-                                if float(f["goal_rot"]) == 0.0]
-            self.assertTrue(homing_positions,
-                            f"lift never entered homing push: {driven[:10]}")
-            self.assertAlmostEqual(min(homing_positions), HARD_STOP_MIN_ROT,
-                                   places=3)
+                # While homing, PositionMechanism drives with goal_rot == 0 and
+                # travels down to the physical hard stop at HARD_STOP_MIN_ROT.
+                homing_positions = [float(f["position_rot"]) for f in driven
+                                    if float(f["goal_rot"]) == 0.0]
+                self.assertTrue(
+                    homing_positions,
+                    f"lift never entered homing push: {driven[:10]}")
+                self.assertAlmostEqual(min(homing_positions), HARD_STOP_MIN_ROT,
+                                       places=3)
 
-            # After stall homing zeroes the frame at the hard stop, lift drives
-            # to GOAL_ROT and reports at_goal within tolerance.
-            at_goal = [f for f in driven
-                       if f["at_goal"] == "true"
-                       and abs(float(f["goal_rot"]) - GOAL_ROT) < 1e-6]
-            self.assertTrue(
-                at_goal,
-                f"lift never reached {GOAL_ROT} rot after stall homing; "
-                f"goals={sorted({float(f['goal_rot']) for f in driven})}, "
-                f"positions={min(float(f['position_rot']) for f in driven)}.."
-                f"{max(float(f['position_rot']) for f in driven)}")
-            self.assertLessEqual(
-                abs(float(at_goal[0]["position_rot"]) - GOAL_ROT),
-                TOLERANCE_ROT)
+                # After stall homing zeroes the frame at the hard stop, lift
+                # drives to GOAL_ROT and reports at_goal within tolerance.
+                at_goal = [f for f in driven
+                           if f["at_goal"] == "true"
+                           and abs(float(f["goal_rot"]) - GOAL_ROT) < 1e-6]
+                self.assertTrue(
+                    at_goal,
+                    f"lift never reached {GOAL_ROT} rot after stall homing; "
+                    f"goals={sorted({float(f['goal_rot']) for f in driven})}, "
+                    f"positions={min(float(f['position_rot']) for f in driven)}"
+                    f"..{max(float(f['position_rot']) for f in driven)}")
+                self.assertLessEqual(
+                    abs(float(at_goal[0]["position_rot"]) - GOAL_ROT),
+                    TOLERANCE_ROT)
+                failed = False
+            finally:
+                if failed:
+                    kept = sim_check.preserve_failure_artifacts(
+                        log, output, subdir="stall_homing_sim_failure")
+                    if kept:
+                        print(f"failure artifacts preserved: {kept}",
+                              file=sys.stderr)
 
 
 if __name__ == "__main__":

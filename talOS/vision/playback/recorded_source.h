@@ -5,6 +5,7 @@
 // footage. Frames are stamped on the node clock: the instant playback starts
 // plus the frame's presentation time on the recording's own timeline.
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -26,6 +27,18 @@ namespace talos::vision::playback {
 
 // `camera.device` prefix that selects a recording instead of a camera.
 inline constexpr std::string_view kRecordingDevicePrefix = "recording:";
+
+// Maximum duration of a single condition_variable::wait_for slice so a large
+// due timestamp (e.g. INT64_MAX) never overflows steady_clock::now() + rel.
+inline constexpr std::int64_t kMaxWaitSliceNs = 3'600'000'000'000LL;
+
+inline std::int64_t WaitSliceNs(std::int64_t now_ns, std::int64_t due_ns) {
+  if (now_ns >= due_ns) return 0;
+  const std::uint64_t remaining =
+      static_cast<std::uint64_t>(due_ns) - static_cast<std::uint64_t>(now_ns);
+  return static_cast<std::int64_t>(
+      std::min<std::uint64_t>(remaining, kMaxWaitSliceNs));
+}
 
 class RecordedCameraSource final : public CameraSource {
  public:
@@ -110,6 +123,7 @@ class RecordedCameraSource final : public CameraSource {
   std::int64_t end_ns_ = 0;
   // kRealtime playback thread.
   std::thread thread_;
+  std::vector<std::thread> retired_threads_;
   std::mutex stop_mutex_;
   std::condition_variable stop_cv_;
   bool stop_ = false;

@@ -1,5 +1,6 @@
 #include "talOS/aiming/target_solver.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <stdexcept>
@@ -16,6 +17,10 @@ using talos::geometry::SO2;
 constexpr double kTau = 6.28318530717958647692;
 // Below this the shooter is on its aim point and no direction exists.
 constexpr double kMinDistance_m = 1e-6;
+// Virtual target agreement required alongside time_of_flight_tolerance_s so an
+// offset fixed shooter with nonzero yaw rate cannot stop early while its exit
+// point velocity is still rotating.
+constexpr double kVirtualTargetTolerance_m = 1e-4;
 
 double Wrap(double angle_rad) { return SO2<double>(angle_rad).angle(); }
 
@@ -41,9 +46,20 @@ struct TurretChoice {
 TurretChoice ChooseTurret(double needed_rad, double measured_rad,
                           const TurretTravel& travel) {
   const double nearest = measured_rad + AngleDiff(needed_rad, measured_rad);
-  if (std::isfinite(nearest) && nearest >= travel.min_rad &&
-      nearest <= travel.max_rad) {
-    return {nearest, true};
+  if (std::isfinite(nearest)) {
+    if (nearest >= travel.min_rad && nearest <= travel.max_rad) {
+      return {nearest, true};
+    }
+    // Clamp floating-point rounding overshoot right at an exact travel limit so
+    // it does not trip seam_hysteresis_rad as unreachable.
+    const double limit_eps_rad =
+        std::min(1e-12 * std::max(1.0, std::abs(measured_rad)), 1e-6);
+    if (nearest > travel.max_rad && nearest - travel.max_rad <= limit_eps_rad) {
+      return {travel.max_rad, true};
+    }
+    if (nearest < travel.min_rad && travel.min_rad - nearest <= limit_eps_rad) {
+      return {travel.min_rad, true};
+    }
   }
   // Seam hysteresis: a needed angle that has only just crossed a limit holds
   // that limit rather than jumping to the far side of the travel.
@@ -246,22 +262,27 @@ Solution TargetSolver::SolveWithFieldVelocity(
     aim = AimAt(field_to_robot, virtual_target_m);
     if (!aim.valid) return out;
     shot = table_.at(aim.distance_m);
-    if (k > 1 && std::abs(shot.time_of_flight_s - previous_time_of_flight_s) <=
-                     config_.time_of_flight_tolerance_s) {
-      converged = true;
-      break;
-    }
-    if (k == config_.max_iteration_count) break;
     // The exit point's field velocity: the robot's, plus omega x r for the
     // exit point's offset r from the robot origin (the tangential lead).
     const Eigen::Vector2d offset_m = aim.shooter_m - robot_m;
     const Eigen::Vector2d shooter_velocity_mps =
         velocity_mps +
         omega_radps * Eigen::Vector2d(-offset_m.y(), offset_m.x());
+    const Eigen::Vector2d next_virtual_target_m =
+        field_target_m - shooter_velocity_mps * shot.time_of_flight_s;
+    if (!Finite(next_virtual_target_m)) return out;
+    if (k > 1 &&
+        std::abs(shot.time_of_flight_s - previous_time_of_flight_s) <=
+            config_.time_of_flight_tolerance_s &&
+        (next_virtual_target_m - virtual_target_m).norm() <=
+            kVirtualTargetTolerance_m) {
+      virtual_target_m = next_virtual_target_m;
+      converged = true;
+      break;
+    }
+    if (k == config_.max_iteration_count) break;
     previous_time_of_flight_s = shot.time_of_flight_s;
-    virtual_target_m =
-        field_target_m - shooter_velocity_mps * previous_time_of_flight_s;
-    if (!Finite(virtual_target_m)) return out;
+    virtual_target_m = next_virtual_target_m;
   }
 
   out.valid = true;

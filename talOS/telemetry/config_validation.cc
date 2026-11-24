@@ -71,19 +71,27 @@ std::size_t AppendValidatedChannel(
   return dictionary.size() - 1;
 }
 
+std::string ChannelSourceBucket(std::string_view name) {
+  if (name.starts_with('/')) name.remove_prefix(1);
+  const std::size_t owner = name.find('/');
+  const std::size_t role = owner == std::string_view::npos
+                               ? std::string_view::npos
+                               : name.find('/', owner + 1);
+  return std::string{name.substr(0, role)};
+}
+
 void CheckDictionaryChannelCap(
     const std::vector<ChannelDef>& dictionary,
     const std::map<std::string, std::size_t>& uncounted) {
   std::size_t total = dictionary.size();
   for (const auto& [topic, count] : uncounted) total += count;
   if (total <= telemetry_wire::kMaxChannels) return;
-  std::map<std::string, std::size_t> per_topic = uncounted;
+  std::map<std::string, std::size_t> per_topic;
+  for (const auto& [topic, count] : uncounted) {
+    per_topic[ChannelSourceBucket(topic)] += count;
+  }
   for (const ChannelDef& channel : dictionary) {
-    const std::size_t owner = channel.name.find('/');
-    const std::size_t role = owner == std::string::npos
-                                 ? std::string::npos
-                                 : channel.name.find('/', owner + 1);
-    ++per_topic[channel.name.substr(0, role)];
+    ++per_topic[ChannelSourceBucket(channel.name)];
   }
   std::vector<std::pair<std::size_t, std::string>> largest;
   largest.reserve(per_topic.size());
@@ -101,6 +109,22 @@ void CheckDictionaryChannelCap(
       std::to_string(telemetry_wire::kMaxChannels) +
       "-channel cap; largest sources: " + names +
       "; exclude channels in telemetry.toml" + std::string{kReadmeHint});
+}
+
+PageBudget CheckDictionaryPageBudget(std::span<const ChannelDef> dictionary) {
+  const PageBudget budget = MeasurePages(dictionary);
+  const std::size_t combined = budget.dictionary_pages + budget.value_pages;
+  if (combined > telemetry_wire::slot_count) {
+    throw std::runtime_error(
+        "telemetry: a dictionary-resend tick needs " +
+        std::to_string(combined) + " pages (" +
+        std::to_string(budget.dictionary_pages) + " dictionary + " +
+        std::to_string(budget.value_pages) + " value), over the " +
+        std::to_string(telemetry_wire::slot_count) +
+        "-slot /talos/telemetry ring; exclude channels in telemetry.toml" +
+        std::string{kReadmeHint});
+  }
+  return budget;
 }
 
 bool MatchesAnyGlob(std::string_view name,
@@ -143,6 +167,9 @@ std::vector<LabelSpec> ParseLabelSpecs(const config::RobotConfig& config,
                                 std::string{kReadmeHint});
   }
   if (labels_array->empty()) {
+    if (hooks.on_own_string_list) {
+      hooks.on_own_string_list("labels");
+    }
     if (hooks.on_own_string) {
       hooks.on_own_string("labels[0].channel");
       hooks.on_own_string("labels[0].from");
@@ -349,7 +376,9 @@ std::vector<std::string> ReadTelemetryGlobParam(
 std::vector<ChannelDef> BuildTelemetryDictionary(
     const introspect::DeclaredGraph& graph,
     const std::vector<std::string>& include_globs,
-    const std::vector<std::string>& exclude_globs) {
+    const std::vector<std::string>& exclude_globs,
+    std::map<std::string, std::size_t>* uncounted) {
+  if (uncounted != nullptr) uncounted->clear();
   std::vector<ChannelDef> dictionary;
   AppendValidatedChannel(dictionary, exclude_globs, "pose/valid",
                          Talos::Telemetry::ChannelKind_Bool);
@@ -379,8 +408,13 @@ std::vector<ChannelDef> BuildTelemetryDictionary(
         };
         options.max_channels = telemetry_wire::kMaxChannels + 1;
         options.truncate = true;
-        std::vector<Channel> channels =
-            FlattenTopic(source.name, source.schema, source.bfbs, options);
+        std::size_t kept = 0;
+        std::vector<Channel> channels = FlattenTopic(
+            source.name, source.schema, source.bfbs, options, &kept);
+        if (uncounted != nullptr && kept > channels.size()) {
+          (*uncounted)[ChannelSourceBucket(source.name)] +=
+              kept - channels.size();
+        }
         for (Channel& channel : channels) {
           AppendValidatedChannel(dictionary, exclude_globs,
                                  std::move(channel.name), channel.kind,

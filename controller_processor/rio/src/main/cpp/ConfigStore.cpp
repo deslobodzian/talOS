@@ -176,7 +176,12 @@ void ConfigPersister::Acknowledged(const hardware::Config& config) {
   // neither thread allocates or frees.
   Persisted& slot = (*slots_)[unsaved_slot_];
   const std::size_t size = hardware::PersistedConfigInto(config, slot.bytes);
-  if (size == 0) return;
+  if (size == 0) {
+    // PersistedConfigInto writes into slot.bytes in place, so any previously
+    // unsaved configuration in this slot is no longer intact.
+    has_unsaved_ = false;
+    return;
+  }
   slot.id = id;
   slot.size = size;
   has_unsaved_ = true;
@@ -238,6 +243,9 @@ void ConfigPersister::Run() {
     if (ok) {
       saved_id_ = saving.id;
     } else {
+      // A save can fail after renaming the temporary file over the path (for
+      // example if SyncDirectory fails), so the file's contents are unknown.
+      saved_id_ = 0;
       ++failed_;
     }
   }

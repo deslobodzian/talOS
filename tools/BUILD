@@ -197,7 +197,7 @@ py_library(
 
 # ./sim.sh --config: which file a path names, and its refusals (missing,
 # outside the repository, ambiguous, stale manifest), with a stub bazel and
-# resolver so nothing builds or starts. Sharded across 2 actions to stay well
+# resolver so nothing builds or starts. Sharded across 4 actions to stay well
 # under the fast lane's 5 s budget on CI.
 py_test(
     name = "sim_sh_test",
@@ -205,7 +205,7 @@ py_test(
     srcs = ["sim_sh_test.py"],
     data = ["//:sim.sh"],
     legacy_create_init = False,
-    shard_count = 2,
+    shard_count = 4,
     deps = [
         ":sharded_test_loader",
         ":sync_manifest_lib",
@@ -302,6 +302,22 @@ py_test(
     ],
     legacy_create_init = False,
     main = "lint_test_time_test.py",
+)
+
+# python3 tools/check_testing_rules.py (CI: the lint job)
+# Enforces docs/TESTING.md §6.7 (perf targets depend unconditionally on
+# //talOS/process:host_qualification, use StallMeter, and record
+# host_unqualified/[HOST_UNQUALIFIED]) and §8.2 (e2e/soak targets and
+# talos_sim_test preserve failure artifacts under TEST_UNDECLARED_OUTPUTS_DIR).
+py_test(
+    name = "check_testing_rules_test",
+    size = "small",
+    srcs = [
+        "check_testing_rules.py",
+        "check_testing_rules_test.py",
+    ],
+    legacy_create_init = False,
+    main = "check_testing_rules_test.py",
 )
 
 # tools/format.sh --check (tools/prepush.sh; CI: the clang-format job)
@@ -613,6 +629,17 @@ py_test(
     ],
     legacy_create_init = False,
     main = "check_runfiles_collisions_test.py",
+)
+
+# tools/deploy.sh argument validation, prefix checks, and rollback safety
+# (REQ-OPS-50, REQ-OPS-54) with stub bundles.
+py_test(
+    name = "deploy_test",
+    size = "small",
+    srcs = ["deploy_test.py"],
+    data = ["deploy.sh"],
+    legacy_create_init = False,
+    deps = ["@rules_python//python/runfiles"],
 )
 
 # tools/setup.sh --check (REQ-DEV-12): syntax check and component detection

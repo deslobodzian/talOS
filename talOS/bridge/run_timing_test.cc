@@ -5,53 +5,18 @@
 
 #include <gtest/gtest.h>
 
-#include <algorithm>
-#include <atomic>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <stop_token>
-#include <thread>
 #include <vector>
 
 #include "talOS/bridge/node.h"
 #include "talOS/bridge/node_test_support.h"
 #include "talOS/hardware/merge.h"
+#include "talOS/process/host_qualification.h"
 
 namespace talos::hardware {
 namespace {
 using namespace bridge_test;  // NOLINT(google-build-using-namespace)
-
-// The host's scheduling noise over a test: the longest a 1 ms sleep of an
-// ordinary thread overran, for a timed test to read before it judges
-// (docs/TESTING.md §6.7), so a stalled host fails as unqualified.
-class StallMeter {
- public:
-  StallMeter()
-      : thread_{[this](const std::stop_token& stop) {
-          while (!stop.stop_requested()) {
-            const auto before = std::chrono::steady_clock::now();
-            std::this_thread::sleep_for(std::chrono::milliseconds{1});
-            const auto over = std::chrono::steady_clock::now() - before -
-                              std::chrono::milliseconds{1};
-            const auto over_us =
-                std::chrono::duration_cast<std::chrono::microseconds>(over)
-                    .count();
-            worst_us_.store(std::max<std::int64_t>(worst_us_.load(), over_us));
-          }
-        }} {}
-
-  // Stops measuring; the worst overrun, in microseconds.
-  uint64_t Stop() {
-    thread_.request_stop();
-    if (thread_.joinable()) thread_.join();
-    return static_cast<uint64_t>(std::max<std::int64_t>(worst_us_.load(), 0));
-  }
-
- private:
-  std::atomic<std::int64_t> worst_us_{0};
-  std::jthread thread_;
-};
 
 // Under Run(), with one request and nothing after it, the heartbeats and the
 // owner timeout's neutral command still go out on their own. The bounds are
@@ -72,7 +37,7 @@ TEST(HardwareNodeTest, RunSendsHeartbeatsAndTheTimeoutNeutralOnItsOwn) {
       RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
   ipc::Publisher<Packet> pub{RequestTopic("intake")};
   std::vector<SentCommand> commands;
-  StallMeter host;
+  talos::process::StallMeter host;
   {
     RunningBridge run{node};
     ASSERT_TRUE(

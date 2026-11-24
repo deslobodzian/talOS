@@ -392,9 +392,13 @@ bool ValidateImpl(const Config& c, bool throw_on_error) {
         return fail("duplicate DIO channel");
       }
       if (!Positive(enc.counts_per_rev)) return fail("invalid counts_per_rev");
+      if (!std::isfinite(enc.offset_rot)) return fail("invalid encoder offset");
     } else {
       if (enc.kind != EncoderKind::kDutyCycle) {
         return fail("unknown encoder kind");
+      }
+      if (!std::isfinite(enc.counts_per_rev)) {
+        return fail("invalid counts_per_rev");
       }
       if (!(std::isfinite(enc.offset_rot) && enc.offset_rot >= -0.5 &&
             enc.offset_rot < 0.5)) {

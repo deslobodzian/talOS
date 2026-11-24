@@ -242,6 +242,80 @@ class MechanismsTest(unittest.TestCase):
         with self.assertRaisesRegex(talos.TalosError, "tolerance_rot"):
             sim.add(Arm, "arm")
 
+    # REQ-SAFE-36, REQ-CONTRACT-14: PositionMechanism.homed queries the live
+    # motor zero state, matching C++ PositionMechanism::homed() even before
+    # arm.update() runs on the tick after a device reset drops the zero.
+    def test_position_mechanism_homed_is_live_before_update_after_reset(self):
+        limit_toml = """
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.arm.motors.arm]
+can_id = 1
+[subsystems.arm.digital_inputs.home_sw]
+dio = 0
+[subsystems.arm.arm]
+min_rot = 0.0
+max_rot = 1.0
+homing = "limit_switch"
+limit_switch = "home_sw"
+limit_switch_closed_reads = true
+homing_v = -1.0
+home_rot = 0.0
+home_samples = 2
+home_margin_rot = 0.2
+homing_timeout_us = 1000000
+homing_stall_rps = 0.05
+homing_stall_us = 200000
+tolerance_rot = 0.01
+"""
+
+        class HomingArm:
+            def __init__(self, node):
+                self.arm = PositionMechanism(node, "arm")
+                self.target = talos.Target(node, PositionTarget)
+                self.homed_pairs = []  # (before_update, after_update)
+
+            def update(self):
+                before = self.arm.homed
+                t = self.target.get()
+                if t is not None:
+                    self.arm.set_goal(t.position_rot, t.feedforward_v)
+                else:
+                    self.arm.stop()
+                self.arm.update()
+                self.homed_pairs.append((before, self.arm.homed))
+
+        sim = Sim.from_toml(limit_toml)
+        node = sim.add(HomingArm, "arm")
+        hw = SimHardware(sim)
+        hw.enable()
+        hw.set_driver_station(enabled=True, teleop=True)
+        sim.step(0.01)
+        self.assertFalse(node.arm.homed)
+
+        # Trigger limit-switch homing to completion.
+        hw.set_digital_input("arm", "home_sw", True)
+        for _ in range(6):
+            sim.publish_target(PositionTarget, "arm", "teleop",
+                               position_rot=0.2, feedforward_v=0.0)
+            sim.step(0.005)
+        self.assertTrue(node.arm.homed)
+        self.assertEqual(node.homed_pairs[-1], (True, True))
+
+        # Reset the motor so HardwareLink drops its zero; on the very first
+        # tick where arm.update() sees homed == False, reading arm.homed BEFORE
+        # arm.update() must ALREADY be False (not stale True from last tick).
+        hw.set_digital_input("arm", "home_sw", False)
+        hw.reset_device("arm", "arm")
+        node.homed_pairs.clear()
+        sim.step(0.025)
+        first_unhomed = next(
+            (pair for pair in node.homed_pairs if not pair[1]), None)
+        self.assertIsNotNone(first_unhomed)
+        self.assertEqual(first_unhomed, (False, False))
+
 
 if __name__ == "__main__":
     unittest.main()

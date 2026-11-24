@@ -18,7 +18,8 @@ bool Positive(double value) { return std::isfinite(value) && value > 0; }
 // `speed` and acceleration limit `accel`.
 double MinimumTime(double distance, double speed, double accel) {
   if (distance <= 0) return 0;
-  if (distance * accel <= speed * speed) return 2 * std::sqrt(distance / accel);
+  if (distance <= speed * (speed / accel))
+    return 2 * std::sqrt(distance / accel);
   return distance / speed + speed / accel;
 }
 
@@ -64,8 +65,9 @@ Profile Fit(double distance, double speed, double accel, double total_s) {
   Profile p{distance, accel, 0, 0, total_s};
   if (distance <= 0 || total_s <= 0) return p;
   if (total_s <= MinimumTime(distance, speed, accel)) {
-    p.cruise =
-        distance * accel <= speed * speed ? std::sqrt(distance * accel) : speed;
+    p.cruise = distance <= speed * (speed / accel)
+                   ? std::sqrt(distance) * std::sqrt(accel)
+                   : speed;
   } else {
     const double at = accel * total_s;
     const double discriminant = std::max(0.0, at * at - 4 * accel * distance);

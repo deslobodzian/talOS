@@ -155,8 +155,10 @@ struct Sim::Impl {
 
   // Runs every node's loop up to `until` in the order the nodes were added,
   // ending a pause that ends by then, and then the periodic hooks due by
-  // then.
+  // then. `now` advances to `until` before node dispatches so callbacks that
+  // read sim.now() or inject via sim.publish() see the frontier instant.
   void Round(Duration until) {
+    now = until;
     const Time at = Time::from_nanos(until.count());
     for (const auto& hosted : nodes) {
       if (hosted->paused_until) {
@@ -166,7 +168,6 @@ struct Sim::Impl {
       }
       hosted->loop->run_until(at);
     }
-    now = until;
     RunPeriodic();
   }
 
@@ -327,6 +328,16 @@ void Sim::pause(std::string_view node_name, Duration duration) {
                               "'");
 }
 
+namespace {
+
+struct Stepping {
+  bool& flag;
+  explicit Stepping(bool& f) : flag{f} { flag = true; }
+  ~Stepping() { flag = false; }
+};
+
+}  // namespace
+
 void Sim::resume(std::string_view node_name) {
   Impl& impl = *impl_;
   if (impl.stepping) {
@@ -336,7 +347,9 @@ void Sim::resume(std::string_view node_name) {
     if (hosted->name == node_name) {
       if (hosted->paused_until) {
         hosted->paused_until.reset();
+        const Stepping stepping{impl.stepping};
         hosted->loop->run_until(now());
+        impl.Settle();
       }
       return;
     }
@@ -369,11 +382,7 @@ void Sim::step(Duration d) {
   if (d > Duration::max() - impl.now) {
     throw std::invalid_argument("Sim: step duration overflows clock");
   }
-  struct Stepping {
-    bool& flag;
-    explicit Stepping(bool& f) : flag{f} { flag = true; }
-    ~Stepping() { flag = false; }
-  } stepping{impl.stepping};
+  const Stepping stepping{impl.stepping};
   const Duration end = impl.now + d;
   impl.RunPeriodic();
   impl.StartLoops();

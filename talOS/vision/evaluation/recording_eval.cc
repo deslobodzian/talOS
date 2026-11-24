@@ -174,6 +174,7 @@ Options Parse(int argc, char** argv) {
       c.cx = kd->arr[2].number;
       c.fy = kd->arr[4].number;
       c.cy = kd->arr[5].number;
+      std::vector<double> opencv_distortion;
       if (dd->arr.size() == 5) {
         c.k1 = dd->arr[0].number;
         c.k2 = dd->arr[1].number;
@@ -183,12 +184,14 @@ Options Parse(int argc, char** argv) {
       } else {
         // The rational model (k4..k6) is beyond the pipeline's
         // Brown-Conrady: rectify with OpenCV instead.
-        for (const auto& v : dd->arr) o.opencv_distortion.push_back(v.number);
+        opencv_distortion.reserve(dd->arr.size());
+        for (const auto& v : dd->arr) opencv_distortion.push_back(v.number);
       }
       if (!c.IsValid()) {
         Die("--photonvision-calibration: invalid cameraIntrinsics");
       }
       o.intrinsics = c;
+      o.opencv_distortion = std::move(opencv_distortion);
     } else if (flag == "--opencv-distortion") {
       o.opencv_distortion = Numbers(value(), 4, 14, "--opencv-distortion");
     } else if (flag == "--hfov-deg") {
@@ -332,10 +335,9 @@ bool ParseInt64Field(const std::string& item, std::int64_t* out) {
 }
 
 bool ParseFiniteDoubleField(const std::string& item, double* out) {
-  errno = 0;
   char* end = nullptr;
   const double value = std::strtod(item.c_str(), &end);
-  if (errno != 0 || end == item.c_str() || !std::isfinite(value)) return false;
+  if (end == item.c_str() || !std::isfinite(value)) return false;
   while (*end != '\0' && std::isspace(static_cast<unsigned char>(*end))) ++end;
   if (*end != '\0') return false;
   *out = value;
@@ -385,26 +387,44 @@ class MocapTrack {
                    sz = qz / scale;
       const double norm = std::sqrt(sw * sw + sx * sx + sy * sy + sz * sz);
       if (!std::isfinite(norm) || norm <= 0.0) continue;
-      times_.push_back(t);
-      positions_.emplace_back(v[0], v[1], v[2]);
-      rotations_.emplace_back(sw / norm, sx / norm, sy / norm, sz / norm);
+      samples_.push_back(
+          {t, Eigen::Vector3d(v[0], v[1], v[2]),
+           Eigen::Quaterniond(sw / norm, sx / norm, sy / norm, sz / norm)});
+    }
+    const auto by_time = [](const Sample& a, const Sample& b) {
+      return a.t < b.t;
+    };
+    if (!std::is_sorted(samples_.begin(), samples_.end(), by_time)) {
+      std::stable_sort(samples_.begin(), samples_.end(), by_time);
     }
   }
   std::optional<SE3<double>> At(std::int64_t t) const {
-    const auto it = std::lower_bound(times_.begin(), times_.end(), t);
-    if (it == times_.begin() || it == times_.end()) return std::nullopt;
-    const auto i = static_cast<std::size_t>(it - times_.begin());
-    const auto t0 = times_[i - 1], t1 = times_[i];
+    const auto it = std::lower_bound(
+        samples_.begin(), samples_.end(), t,
+        [](const Sample& s, std::int64_t value) { return s.t < value; });
+    if (it == samples_.end()) return std::nullopt;
+    if (it->t == t) {
+      if (!it->p.allFinite() || !it->q.coeffs().allFinite() ||
+          !(it->q.squaredNorm() > 0.0)) {
+        return std::nullopt;
+      }
+      const Eigen::Matrix3d rot = it->q.normalized().toRotationMatrix();
+      if (!rot.allFinite()) return std::nullopt;
+      return SE3<double>(SO3<double>::FromMatrixNormalized(rot), it->p);
+    }
+    if (it == samples_.begin()) return std::nullopt;
+    const auto i = static_cast<std::size_t>(it - samples_.begin());
+    const auto t0 = samples_[i - 1].t, t1 = samples_[i].t;
     if (t1 <= t0 || t < t0 || t > t1 ||
         static_cast<std::uint64_t>(t1) - static_cast<std::uint64_t>(t0) >
             20'000'000u) {
       return std::nullopt;
     }
     const double a = static_cast<double>(t - t0) / static_cast<double>(t1 - t0);
-    const Eigen::Vector3d p = (1 - a) * positions_[i - 1] + a * positions_[i];
+    const Eigen::Vector3d p = (1 - a) * samples_[i - 1].p + a * samples_[i].p;
     if (!p.allFinite()) return std::nullopt;
-    const Eigen::Quaterniond& q0 = rotations_[i - 1];
-    const Eigen::Quaterniond& q1 = rotations_[i];
+    const Eigen::Quaterniond& q0 = samples_[i - 1].q;
+    const Eigen::Quaterniond& q1 = samples_[i].q;
     if (!q0.coeffs().allFinite() || !q1.coeffs().allFinite() ||
         !(q0.squaredNorm() > 0.0) || !(q1.squaredNorm() > 0.0)) {
       return std::nullopt;
@@ -419,9 +439,12 @@ class MocapTrack {
   }
 
  private:
-  std::vector<std::int64_t> times_;
-  std::vector<Eigen::Vector3d> positions_;
-  std::vector<Eigen::Quaterniond> rotations_;
+  struct Sample {
+    std::int64_t t = 0;
+    Eigen::Vector3d p = Eigen::Vector3d::Zero();
+    Eigen::Quaterniond q = Eigen::Quaterniond::Identity();
+  };
+  std::vector<Sample> samples_;
 };
 
 // Heading as the node publishes it (geometry::Pose2d yaw).
@@ -435,7 +458,10 @@ double RotationDeg(const SO3<double>& a, const SO3<double>& b) {
 }
 
 struct Projected {
-  std::array<Eigen::Vector2d, 4> corners;
+  std::array<Eigen::Vector2d, 4> corners{
+      Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero(),
+      Eigen::Vector2d::Zero()};
+  bool projected = false;
   bool in_view = false;
 };
 
@@ -462,6 +488,7 @@ Projected Project(const FieldLayout& layout, int id,
              out.corners[c].x() <= k.image_width - 5.0 &&
              out.corners[c].y() <= k.image_height - 5.0;
   }
+  out.projected = true;
   double side = std::numeric_limits<double>::infinity();
   for (int c = 0; c < 4; ++c) {
     side = std::min(side, (out.corners[c] - out.corners[(c + 1) % 4]).norm());
@@ -740,16 +767,18 @@ int Run(const Options& o) {
       if (have_multi) {
         const auto expected =
             Project(field.layout, d.tag_id, T_layout_camera, k, 0);
-        double worst = 0;
-        for (std::size_t c = 0; c < 4; ++c) {
-          worst = std::max(
-              worst,
-              (expected.corners[c] -
-               k.UndistortPoint({d.corners[2 * c], d.corners[2 * c + 1]}))
-                  .norm());
+        if (expected.projected) {
+          double worst = 0;
+          for (std::size_t c = 0; c < 4; ++c) {
+            worst = std::max(
+                worst,
+                (expected.corners[c] -
+                 k.UndistortPoint({d.corners[2 * c], d.corners[2 * c + 1]}))
+                    .norm());
+          }
+          s.corner_vs_multi_px.push_back(worst);
+          if (worst > 0.25 * MinSide(d.corners)) ++s.misplaced;
         }
-        s.corner_vs_multi_px.push_back(worst);
-        if (worst > 0.25 * MinSide(d.corners)) ++s.misplaced;
         // Which planar-ambiguity branch is right, by the multi-tag pose.
         const auto truth_camera_tag =
             T_layout_camera.inverse() * *field.layout.GetTagPose(d.tag_id);
