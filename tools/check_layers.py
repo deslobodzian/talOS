@@ -19,7 +19,14 @@ The table below is ARCHITECTURE.md "Layers" and "Allowed dependencies"
   target in talOS/hardware/...;
 - nothing under talOS/ depends on a robot, an example, the bench, a
   controller processor's program or studio/;
-- talOS/geometry never depends on talOS/vision;
+- talOS/geometry never depends on talOS/vision, talOS/trajectory, or
+  talOS/aiming; non-testonly talOS/trajectory depends within talOS/ only on
+  talOS/geometry; non-testonly talOS/aiming depends within talOS/ only on
+  talOS/geometry and talOS/msgs;
+- only talOS/simulation/mujoco/... links or has visibility to C++ libraries
+  under talOS/simulation/mujoco/...;
+- every tracked `talOS/<pkg>` package and top-level Bazel root is explicitly
+  mapped to a layer (unmapped packages/roots fail closed);
 - talOS/python reaches the rest of talOS only through talOS/node_api's C ABI,
   generated messages and schemas, and C++ nodes exported for talos.cpp_node;
 - a robot, example or bench node package depends directly on no rule of
@@ -47,11 +54,13 @@ The table below is ARCHITECTURE.md "Layers" and "Allowed dependencies"
   `//talOS/rtms:{rtms,wake,process_liveness}`,
   `//talOS/memory:{shared_memory,residency}`,
   `//talOS/events:{events,events_os,input_replay}`,
+  `//talOS/hardware:codecs`,
   `//talOS/telemetry:{telemetry,channels}`, `//talOS/teleop:teleop`,
   `//talOS/node_api:node_api`, `//talOS/bridge:node_lib`,
   `//talOS/introspection:{registry,reporter}`, `//talOS/launcher:launcher_lib`,
-  `//talOS/hardware:hardware`, `//talOS/ipc:ipc`) are never
-  `//visibility:public`, and are not visible to robot/example/bench node
+  `//talOS/hardware:hardware`, `//talOS/ipc:ipc`, and every `cc_library` under
+  `//talOS/simulation/mujoco/...`) are never `//visibility:public` or
+  `//:__subpackages__`, and are not visible to robot/example/bench node
   packages (except `//talOS/hardware:hardware` and `//talOS/ipc:ipc` for
   `//bench/main_processor/swerve_module` which hosts the standalone
   `:send_target` CLI).
@@ -61,17 +70,19 @@ The C++ source scan (also run standalone via `--source-only` in
 `tools/scaffold_testdata/`, and any other robot package outside `talOS/`,
 `third_party/`, `controller_processor/`, `studio/` and `tools/` (skipping only
 an explicit list of non-C++ basenames/suffixes, unless referenced via BUILD
-`hdrs`/`textual_hdrs`, and failing closed on unreadable or non-UTF-8 files),
-plus every `BUILD`, `BUILD.bazel`, and `.bzl` file under the same roots, and
-refuses from the start (RULES.md 2):
+`hdrs`/`textual_hdrs`, and failing closed on symlinks, unreadable, or non-UTF-8
+files), plus every `BUILD`, `BUILD.bazel`, and `.bzl` file under the same
+roots, and refuses from the start (RULES.md 2):
 
 - `#include` (or `#include_next`, quote or angle-bracket, after comment
-  stripping, line-continuation splicing and path normalization) of
+  stripping, line-continuation splicing — reverted inside raw strings per
+  C++11+ — and path normalization) of
   `talOS/node/access.h`, `talOS/node/internal.h`, `talOS/devices/access.h`,
   `talOS/rtms/...`, `talOS/ipc/...`, `talOS/memory/...`,
-  `talOS/hardware/messages.h`, `talOS/hardware/packet.h`,
-  `talOS/hardware/request...`, `talOS/events/{event_loop_base,input_replay,realtime_event_loop,replay_event_loop,simulated_event_loop,wake_channel_wait}.h`,
-  `talOS/events/os/...`, `talOS/telemetry/{channels,node}.h`,
+  `talOS/hardware/{config_error,config_wire,endpoint,feedback,gate,gateway,messages,packet,sim_backend,sim_physics,sim_plant}.h`,
+  `talOS/hardware/request...`, `talOS/events/{event_loop_base,handles,input_replay,realtime_event_loop,replay_event_loop,simulated_event_loop,wake_channel_wait}.h`,
+  `talOS/events/os/...`, `talOS/simulation/{schedules,gateway_main}.h`,
+  `talOS/simulation/mujoco/...`, `talOS/telemetry/{channels,node}.h`,
   `talOS/teleop/node.h`, `talOS/node_api/...`, `talOS/bridge/node.h`,
   `talOS/introspection/{registry,reporter}.h`, non-C++ filenames
   (`NON_CPP_BASENAMES`, `NON_CPP_SUFFIXES`, and `.txt`, case-insensitive) that
@@ -87,20 +98,23 @@ refuses from the start (RULES.md 2):
   flags);
 - Starlark string constants (and constant concatenations) in `BUILD`,
   `BUILD.bazel`, and `.bzl` files that carry those forbidden symbols, token
-  pasting, C++ trigraphs, forbidden header paths, or `-include`/`-imacros`/
-  `-trigraphs`/`-ftrigraphs`/`-fms-extensions`/`-fms-compatibility`/`-I`/
-  `-iquote`/`-isystem`/`-cxx-isystem`/`-idirafter`/`--include-directory`/
-  `-iwithprefix`/`-iwithsysroot` compiler flags (joined, separate, or via
-  `-Wp,`/`-Xclang`), as well as non-empty (or dynamic/mutated) `includes = ...`
-  keyword arguments and dynamic/mutated `**kwargs` splats (outside unmodified
-  `.bzl` macro `**kwargs` pass-through) that can add `-isystem` include search
-  paths.
+  pasting, C++ trigraphs, universal character names (`\\uXXXX`/`\\UXXXXXXXX`),
+  forbidden header paths, or `-include`/`-imacros`/
+  `-trigraphs`/`-ftrigraphs`/`-ansi`/`-fms-extensions`/`-fms-compatibility`/
+  `-I`/`-iquote`/`-isystem`/`-cxx-isystem`/`-idirafter`/`--include-directory`/
+  `-iwithprefix`/`-iwithsysroot`/`-isysroot`/`--sysroot`/`-iprefix`/
+  `-iframework`/`-iframeworkwithsysroot` compiler flags (joined, separate, or
+  via `-Wp,`/`-Xclang`), as well as non-empty (or dynamic/mutated)
+  `includes = ...` keyword arguments and dynamic/mutated `**kwargs` splats
+  (outside unmodified `.bzl` macro `**kwargs` pass-through) that can add
+  `-isystem` include search paths.
 
 It also refuses, in every tracked `BUILD`, `BUILD.bazel` and `.bzl` file
 outside `talOS/simulation/mujoco/` (talOS/ and tools/ included), a string
 constant (or constant concatenation, format or join) that is a `@mujoco`
-label, a `load` from `//talOS/simulation/mujoco`, and a `repo_name` on
-MODULE.bazel's mujoco `bazel_dep`: only that package may depend on MuJoCo
+label (including Bzlmod canonical labels), a `load` from `@mujoco` or
+`//talOS/simulation/mujoco`, and a `repo_name` / `use_repo` alias in any
+`MODULE.bazel` or `*.MODULE.bazel` file: only that package may depend on MuJoCo
 (docs/METHODOLOGY.md §13).
 
 Structural enforcement (ARCH-2 / RULES.md 2): Bazel visibility (checked above
@@ -163,8 +177,37 @@ ON_THE_STACK = (
 HARDWARE = "talOS/hardware"
 HARDWARE_CONFIG = "talOS/hardware:config"
 
+# Reusable / shared talOS packages beside the stack (ARCHITECTURE.md).
+BESIDE_THE_STACK = (
+    "talOS/aiming",
+    "talOS/build",
+    "talOS/configuration",
+    "talOS/driver_station",
+    "talOS/geometry",
+    "talOS/introspection",
+    "talOS/msgs",
+    "talOS/process",
+    "talOS/protocol",
+    "talOS/schema",
+    "talOS/trajectory",
+    "talOS/vision",
+)
+
 # Robot code and what sits beside talOS; talOS never depends on them.
 OUTSIDE_TALOS = ("bench", "controller_processor", "examples", "studio")
+
+# Exhaustive package/root registries so newly added talOS/<pkg> packages or
+# top-level robot roots fail closed until explicitly mapped to a layer.
+KNOWN_TALOS_PACKAGES = (
+    frozenset(p for _, pkgs in STACK for p in pkgs) |
+    frozenset(ON_THE_STACK) |
+    frozenset({HARDWARE}) |
+    frozenset(BESIDE_THE_STACK)
+)
+KNOWN_TOP_LEVEL_BUILD_ROOTS = (
+    frozenset(OUTSIDE_TALOS) |
+    frozenset({"talOS", "third_party", "tools"})
+)
 
 # Where robot, example and bench node packages live.
 NODE_ROOTS = ("bench", "examples")
@@ -182,6 +225,7 @@ _PRIVILEGED_FRAMEWORK_LIBRARIES = (
     "talOS/events:events",
     "talOS/events:events_os",
     "talOS/events:input_replay",
+    "talOS/hardware:codecs",
     "talOS/telemetry:telemetry",
     "talOS/telemetry:channels",
     "talOS/teleop:teleop",
@@ -355,7 +399,8 @@ TRIGRAPH_RE = re.compile(r"\?\?[=/'()!<>-]")
 UCN_RE = re.compile(r"\\(?:u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})")
 FORBIDDEN_COPT_FLAG_RE = re.compile(
     r"^(?:--?(?:include|imacros|f?trigraphs|fms-(?:extensions|compatibility)|"
-    r"iquote|(?:cxx-)?isystem|idirafter|iwithprefix|iwithsysroot)|-I)"
+    r"iquote|(?:cxx-)?isystem|idirafter|iwithprefix|iwithsysroot|"
+    r"isysroot|sysroot|iprefix|iframework(?:withsysroot)?|ansi$)|-I)"
 )
 FORBIDDEN_COPT_ADJACENT_FLAGS = frozenset({
     "-include", "--include",
@@ -367,6 +412,8 @@ FORBIDDEN_COPT_ADJACENT_FLAGS = frozenset({
     "-idirafter", "--idirafter",
     "--include-directory", "--include-directory-after",
     "-iwithprefix", "-iwithprefixbefore", "-iwithsysroot",
+    "-isysroot", "--isysroot", "--sysroot",
+    "-iprefix", "-iframework", "-iframeworkwithsysroot",
 })
 STARLARK_COPT_JOINED_RE = re.compile(r"^--?(?:include|imacros)=?(.+)$")
 STARLARK_PATH_TOKEN_RE = re.compile(r"[^\s\"'<>(),;=]+")
@@ -375,13 +422,17 @@ FORBIDDEN_INCLUDE_EXACT = frozenset({
     "talOS/node/access.h",
     "talOS/node/internal.h",
     "talOS/devices/access.h",
+    "talOS/hardware/config_error.h",
     "talOS/hardware/config_wire.h",
     "talOS/hardware/endpoint.h",
+    "talOS/hardware/feedback.h",
+    "talOS/hardware/gate.h",
     "talOS/hardware/gateway.h",
     "talOS/hardware/messages.h",
     "talOS/hardware/packet.h",
     "talOS/hardware/sim_backend.h",
     "talOS/hardware/sim_physics.h",
+    "talOS/hardware/sim_plant.h",
     "talOS/events/event_loop_base.h",
     "talOS/events/handles.h",
     "talOS/events/input_replay.h",
@@ -406,6 +457,7 @@ FORBIDDEN_INCLUDE_PREFIXES = (
     "talOS/events/os/",
     "talOS/node_api/",
 )
+MUJOCO_INCLUDE_PREFIX_LOWER = "talos/simulation/mujoco/"
 NEVER_EXEMPT_INCLUDES = frozenset({
     "talOS/node/access.h",
     "talOS/node/internal.h",
@@ -477,10 +529,11 @@ class Check:
     rules_only: bool = False
     except_generators: tuple = ()
     source: Set = None
+    only_kinds: tuple = ()
 
     def target_set(self, to):
         return Set(tuple(to), self.exclude, self.rules_only,
-                   self.except_generators)
+                   self.except_generators, only_kinds=self.only_kinds)
 
     def search(self, backend, to):
         """The path or direct dependencies from `frm` to `to`, or []."""
@@ -524,8 +577,35 @@ def checks(node_packages):
     result.append(Check("talOS/ below robots, examples, bench and studio",
                         "talOS/...",
                         tuple(recursive(p) for p in OUTSIDE_TALOS)))
-    result.append(Check("talOS/geometry below talOS/vision",
-                        "talOS/geometry/...", ("talOS/vision/...",)))
+    result.append(Check(
+        "talOS/geometry below talOS/vision, talOS/trajectory and talOS/aiming",
+        "talOS/geometry/...",
+        ("talOS/vision/...", "talOS/trajectory/...", "talOS/aiming/...")))
+    result.append(Check(
+        "talOS/trajectory depends within talOS/ only on talOS/geometry",
+        "talOS/trajectory/...", ("talOS/...",), kind="direct",
+        exclude=("talOS/trajectory/...", "talOS/geometry/..."),
+        source=Set(("talOS/trajectory/...",), rules_only=True,
+                   except_testonly=True)))
+    result.append(Check(
+        "talOS/aiming depends within talOS/ only on talOS/geometry and "
+        "talOS/msgs",
+        "talOS/aiming/...", ("talOS/...",), kind="direct",
+        exclude=("talOS/aiming/...", "talOS/geometry/...", "talOS/msgs/..."),
+        source=Set(("talOS/aiming/...",), rules_only=True,
+                   except_testonly=True)))
+    result.append(Check(
+        "only talOS/simulation/mujoco/... links its C++ libraries",
+        "outside-mujoco",
+        ("talOS/simulation/mujoco/...",),
+        kind="direct",
+        only_kinds=("cc_library",),
+        source=Set(
+            ("talOS/...",) + tuple(recursive(p) for p in OUTSIDE_TALOS),
+            exclude=("talOS/simulation/mujoco/...",),
+            rules_only=True,
+        ),
+    ))
     result.append(Check(
         "talOS/python reaches talOS only through talOS/node_api",
         "talOS/python/...", ("talOS/...",), kind="direct",
@@ -597,13 +677,18 @@ def run(backend, out=sys.stdout):
     """Runs every Bazel check against `backend`; returns the failure count."""
     failures = 0
     used = set()
-    node_pkgs = backend.node_packages()
+    node_samples = backend.node_sample_targets()
+    node_pkgs = sorted(node_samples.keys())
+    if not node_samples:
+        failures += 1
+        print(f"VIOLATION no node packages discovered under NODE_ROOTS "
+              f"({', '.join(NODE_ROOTS)}) (fail closed)", file=out)
     all_checks = checks(node_pkgs)
     for check in all_checks:
         frm = strip_pattern(check.frm)
         allowed = [t for t in check.to if (frm, strip_pattern(t)) in ALLOWLIST]
-        found = check.search(backend,
-                             [t for t in check.to if t not in allowed])
+        unallowed = [t for t in check.to if t not in allowed]
+        found = check.search(backend, unallowed) if unallowed else []
         if found:
             failures += 1
             what = "path" if check.kind == "path" else "direct dependencies"
@@ -622,18 +707,33 @@ def run(backend, out=sys.stdout):
         print(f"STALE allowlist entry {frm} -> {to}: no check covers it",
               file=out)
     # Structural Bazel visibility checks (RULES.md 2 / ARCH-2): none of the
-    # restricted targets may be //visibility:public, and node packages may not
-    # see targets restricted to framework/CLI packages.
-    all_restricted = RESTRICTED_INTERNAL_TARGETS + RESTRICTED_WIRE_TARGETS
+    # restricted targets (including every cc_library under
+    # talOS/simulation/mujoco/...) may be //visibility:public or
+    # //:__subpackages__, and node packages may not see targets restricted to
+    # framework/CLI packages.
+    mujoco_libs = tuple(
+        label.removeprefix("//") for label in backend.mujoco_cc_libraries())
+    restricted_internal = tuple(dict.fromkeys(
+        RESTRICTED_INTERNAL_TARGETS + mujoco_libs))
+    all_restricted = restricted_internal + RESTRICTED_WIRE_TARGETS
     public = backend.public_targets(all_restricted)
     if public:
         failures += 1
         print("VIOLATION restricted internal/transport targets must not be "
-              "//visibility:public (RULES.md 2):", file=out)
+              "//visibility:public or //:__subpackages__ (RULES.md 2):",
+              file=out)
         for label in public:
             print(f"  {label}", file=out)
-    for pkg, target in sorted(backend.node_sample_targets().items()):
-        forbidden = list(RESTRICTED_INTERNAL_TARGETS)
+    if mujoco_libs:
+        exposed_mujoco = backend.visible_to("//talOS/node:node", mujoco_libs)
+        if exposed_mujoco:
+            failures += 1
+            print("VIOLATION talOS/simulation/mujoco C++ libraries must not "
+                  "be visible outside talOS/simulation/mujoco/...:", file=out)
+            for label in exposed_mujoco:
+                print(f"  {label}", file=out)
+    for pkg, target in sorted(node_samples.items()):
+        forbidden = list(restricted_internal)
         if pkg not in WIRE_CLI_PACKAGES:
             forbidden.extend(RESTRICTED_WIRE_TARGETS)
         visible = backend.visible_to(target, forbidden)
@@ -643,7 +743,7 @@ def run(backend, out=sys.stdout):
                   f"//{pkg} ({target}) (RULES.md 2):", file=out)
             for label in visible:
                 print(f"  {label}", file=out)
-    visibility_checks = 1 + len(node_pkgs)
+    visibility_checks = 1 + (1 if mujoco_libs else 0) + len(node_pkgs)
     if failures:
         print(f"{failures} layer check(s) failed (docs/DESIGN.md §3)",
               file=out)
@@ -681,14 +781,53 @@ def render(target_set):
     return expr
 
 
+_ANSI_STRIP_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\r")
+_EXIT3_MAIN_REPO_PKG_RE = re.compile(
+    r"^(?:error loading package|no such package|Skipping)\s+"
+    r"'@@?(?:talos|_main)?//")
+_EXIT3_WORKSPACE_REF_RE = re.compile(
+    r"referenced by '(?:@@?(?:talos|_main)?)?//")
+_EXIT3_DOTDOT_RE = re.compile(r"(?:^|[/\\])\.\.(?:[/\\]|$)")
+_EXIT3_FATAL_RE = re.compile(r"^FATAL:")
+
+
+def _exit_3_is_safe_external_only(stderr):
+    """Fail-closed wrapper over `bazel_query.exit_3_is_external_only`.
+
+    Also rejects main-repo apparent/canonical names (`@talos//`, `@@_main//`,
+    `@_main//`), single-`@` or main-repo `referenced by` clauses on any line
+    (including multiline error continuations), `..` path traversal inside
+    `/external/` paths, and `FATAL:` lines."""
+    if not bazel_query.exit_3_is_external_only(stderr):
+        return False
+    for raw_line in stderr.splitlines():
+        line = _ANSI_STRIP_RE.sub("", raw_line).strip()
+        if not line:
+            continue
+        if _EXIT3_FATAL_RE.match(line):
+            return False
+        if _EXIT3_WORKSPACE_REF_RE.search(line):
+            return False
+        if line.startswith("ERROR:"):
+            body = line[len("ERROR:"):].strip()
+            if _EXIT3_MAIN_REPO_PKG_RE.match(body):
+                return False
+            path_part = body.split(":", 1)[0]
+            if ("external/" in path_part or "external\\" in path_part) and (
+                    _EXIT3_DOTDOT_RE.search(path_part)):
+                return False
+    return True
+
+
 class Bazel:
     """Answers the checks with `bazel query` in the current workspace."""
 
-    def query(self, expr, output="label"):
+    def query(self, expr, output="label", allow_external_exit_3=True):
         # --keep_going: some external packages cannot load on every host
         # (opencv's Android branch); the query then exits 3 with every
         # other edge evaluated (docs/DEVELOPMENT.md §5). Fail closed if any
-        # load/eval error occurs outside allowed external `@` repositories.
+        # load/eval error occurs outside allowed external `@` repositories,
+        # or on any exit 3 for local workspace queries (`allow_external_exit_3=False`).
         proc = subprocess.run(
             ["bazel", "query", "--keep_going", "--noimplicit_deps",
              "--noshow_progress", f"--output={output}", expr],
@@ -697,11 +836,12 @@ class Bazel:
             sys.stderr.write(proc.stderr)
             raise RuntimeError(f"bazel query failed ({proc.returncode}): "
                                f"{expr}")
-        if proc.returncode == 3 and not bazel_query.exit_3_is_external_only(
-                proc.stderr):
+        if proc.returncode == 3 and (
+                not allow_external_exit_3 or
+                not _exit_3_is_safe_external_only(proc.stderr)):
             sys.stderr.write(proc.stderr)
             raise RuntimeError(
-                f"bazel query exited 3 with non-external package error: "
+                f"bazel query exited 3 with disallowed/non-external error: "
                 f"{expr}")
         return [line for line in proc.stdout.splitlines() if line]
 
@@ -711,7 +851,7 @@ class Bazel:
         generators = "|".join(NODE_GENERATORS)
         labels = sorted(self.query(
             f"attr(generator_function, \"^({generators})$\", {roots})",
-            output="label"))
+            output="label", allow_external_exit_3=False))
         samples = {}
         for label in labels:
             pkg = label.removeprefix("//").split(":", 1)[0]
@@ -721,14 +861,28 @@ class Bazel:
     def node_packages(self):
         return sorted(self.node_sample_targets().keys())
 
+    def mujoco_cc_libraries(self):
+        """Every `cc_library` rule under `//talOS/simulation/mujoco/...`."""
+        return sorted(self.query(
+            'kind("^cc_library rule$", //talOS/simulation/mujoco/...)',
+            output="label", allow_external_exit_3=False))
+
     def public_targets(self, targets):
+        if not targets:
+            return []
         expr = " + ".join(f"//{t}" for t in targets)
         return sorted(self.query(
-            f'attr(visibility, "//visibility:public", {expr})'))
+            f'attr(visibility, "//visibility:public|//:__subpackages__", '
+            f'{expr})',
+            allow_external_exit_3=False))
 
     def visible_to(self, target_label, targets):
+        if not targets:
+            return []
         expr = " + ".join(f"//{t}" for t in targets)
-        return sorted(self.query(f"visible({target_label}, {expr})"))
+        return sorted(self.query(
+            f"visible({target_label}, {expr})",
+            allow_external_exit_3=False))
 
     def somepath(self, frm, to):
         return self.query(f"somepath({render(frm)}, {render(to)})")
@@ -759,156 +913,235 @@ def _strip_cpp_comments(text):
     - `errors`: list of `(line, kind, detail)` for fail-closed lex errors
       (unterminated block comment or raw string).
     """
-    # Phase 2: splice backslash-newline continuations (including optional
-    # trailing horizontal whitespace, which GCC/Clang accept).
-    spliced = []
-    spliced_lines = []
-    line = 1
-    i = 0
+    # Normalize CRLF and bare CR line terminators (GCC and Clang treat bare
+    # '\r' as a newline, ending `//` comments and starting `#include` lines).
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     n = len(text)
-    while i < n:
-        ch = text[i]
-        if ch == "\\":
-            j = i + 1
+    line_of = [0] * (n + 1)
+    lineno = 1
+    for idx, ch in enumerate(text):
+        line_of[idx] = lineno
+        if ch == "\n":
+            lineno += 1
+    line_of[n] = lineno
+
+    def peek(pos):
+        """Returns `(ch, next_pos, char_pos)` after C++ phase-2 splicing of
+        backslash-newline continuations (including optional trailing horizontal
+        whitespace). Not used inside raw string bodies, where C++11+ reverts
+        phase-2 splicing."""
+        while pos < n and text[pos] == "\\":
+            j = pos + 1
             while j < n and text[j] in (" ", "\t", "\v", "\f"):
                 j += 1
-            if j < n and text[j] == "\r":
-                j += 1
             if j < n and text[j] == "\n":
-                i = j + 1
-                line += 1
+                pos = j + 1
                 continue
-        spliced.append(ch)
-        spliced_lines.append(line)
-        if ch == "\n":
-            line += 1
-        i += 1
+            break
+        if pos >= n:
+            return "", n, n
+        return text[pos], pos + 1, pos
 
-    src = "".join(spliced)
-    n = len(src)
     with_strings = []
     no_strings = []
     line_map = []
     errors = []
+    # Tracks whether the current output line is at beginning-of-line ("bol"),
+    # inside a preprocessing directive ("directive"), or has non-directive
+    # tokens ("code").
+    line_state = "bol"
 
-    def emit(ch_ws, ch_ns, lineno):
+    def emit(ch_ws, ch_ns, ln):
+        nonlocal line_state
         with_strings.append(ch_ws)
         no_strings.append(ch_ns)
-        line_map.append(lineno)
+        line_map.append(ln)
+        if ch_ws == "\n":
+            line_state = "bol"
+        elif line_state == "bol" and ch_ws not in (" ", "\t", "\v", "\f"):
+            line_state = "directive" if ch_ws == "#" else "code"
 
-    def quoted_literal(start, quote, kind):
-        """Emits the `quote`-delimited literal at `start`, delimiters kept and
-        interior blanked in `no_strings`, and returns the index after it. It
-        ends at its closing quote or an unescaped newline. Refuses `??/`
-        inside it: phase-1 `??/` -> `\\` can escape the closing quote or
-        splice lines under trigraph-enabling flags and desync the lexer."""
-        emit(quote, quote, spliced_lines[start])
-        i = start + 1
-        while i < n:
-            c = src[i]
+    def quoted_literal(start_pos, next_pos, quote, kind):
+        """Emits the `quote`-delimited literal starting at `start_pos`,
+        delimiters kept and interior blanked in `no_strings`, returning the
+        index after it. Refuses `??/` inside it: phase-1 `??/` -> `\\` can
+        escape the closing quote or splice lines under trigraph-enabling flags
+        and desync the lexer."""
+        emit(quote, quote, line_of[start_pos])
+        lit_chars = []
+        lit_positions = []
+        pos = next_pos
+        while True:
+            c, nxt_pos, c_pos = peek(pos)
+            if not c:
+                pos = nxt_pos
+                break
             if c == "\\":
-                emit(c, " ", spliced_lines[i])
-                i += 1
-                if i < n and src[i] != "\n":
-                    emit(src[i], " ", spliced_lines[i])
-                    i += 1
+                emit(c, " ", line_of[c_pos])
+                lit_chars.append(c)
+                lit_positions.append(c_pos)
+                ec, nxt2, ec_pos = peek(nxt_pos)
+                if ec and ec != "\n":
+                    emit(ec, " ", line_of[ec_pos])
+                    lit_chars.append(ec)
+                    lit_positions.append(ec_pos)
+                    pos = nxt2
+                else:
+                    pos = nxt_pos
                 continue
             if c == quote:
-                emit(quote, quote, spliced_lines[i])
-                i += 1
+                emit(quote, quote, line_of[c_pos])
+                pos = nxt_pos
                 break
             if c == "\n":
-                emit("\n", "\n", spliced_lines[i])
-                i += 1
+                emit("\n", "\n", line_of[c_pos])
+                pos = nxt_pos
                 break
-            emit(c, " ", spliced_lines[i])
-            i += 1
-        pos = src.find("??/", start, i)
-        while pos != -1:
+            emit(c, " ", line_of[c_pos])
+            lit_chars.append(c)
+            lit_positions.append(c_pos)
+            pos = nxt_pos
+        lit_text = "".join(lit_chars)
+        found = lit_text.find("??/")
+        while found != -1:
             errors.append((
-                spliced_lines[pos],
+                line_of[lit_positions[found]],
                 "trigraph",
                 f"uses C++ trigraph `??/` in {kind} "
                 "(can escape quotes or splice lines under -trigraphs)",
             ))
-            pos = src.find("??/", pos + 3, i)
-        return i
+            found = lit_text.find("??/", found + 3)
+        return pos
 
-    i = 0
-    while i < n:
-        ch = src[i]
-        nxt = src[i + 1] if i + 1 < n else ""
+    pos = 0
+    while True:
+        ch, nxt_pos, ch_pos = peek(pos)
+        if not ch:
+            break
+        nxt, nxt2_pos, nxt_char_pos = peek(nxt_pos)
         # Line comment: replace with space, leave '\n' intact.
         if ch == "/" and nxt == "/":
-            emit(" ", " ", spliced_lines[i])
-            comment_start = i + 2
-            i += 2
-            while i < n and src[i] != "\n":
-                i += 1
-            for tm in TRIGRAPH_RE.finditer(src[comment_start:i]):
+            emit(" ", " ", line_of[ch_pos])
+            comment_chars = []
+            comment_positions = []
+            pos = nxt2_pos
+            while True:
+                c, c_nxt, c_pos = peek(pos)
+                if not c or c == "\n":
+                    pos = c_pos
+                    break
+                comment_chars.append(c)
+                comment_positions.append(c_pos)
+                pos = c_nxt
+            comment_text = "".join(comment_chars)
+            for tm in TRIGRAPH_RE.finditer(comment_text):
                 errors.append((
-                    spliced_lines[comment_start + tm.start()],
+                    line_of[comment_positions[tm.start()]],
                     "trigraph",
                     f"uses C++ trigraph `{tm.group(0)}` in comment "
                     f"(can splice lines or close comments under -trigraphs)",
                 ))
             continue
-        # Block comment: C++ translation phase 3 replaces the entire comment
-        # (including newlines inside it) with a single space.
+        # Block comment: replace with a single space inside a directive or on a
+        # single line, and with '\n' when it spans a newline outside a
+        # directive (so `int x; /*\n*/ #include ...` starts a directive line as
+        # GCC/Clang do, while `# /*\n*/ include ...` stays on one line).
         if ch == "/" and nxt == "*":
-            end = src.find("*/", i + 2)
-            if end == -1:
-                errors.append((spliced_lines[i], "unterminated-comment",
+            comment_chars = []
+            comment_positions = []
+            saw_newline = False
+            closed = False
+            end_pos = nxt2_pos
+            scan = nxt2_pos
+            while True:
+                c, c_nxt, c_pos = peek(scan)
+                if not c:
+                    break
+                if c == "*":
+                    c2, c2_nxt, _ = peek(c_nxt)
+                    if c2 == "/":
+                        closed = True
+                        end_pos = c2_nxt
+                        break
+                if c == "\n":
+                    saw_newline = True
+                comment_chars.append(c)
+                comment_positions.append(c_pos)
+                scan = c_nxt
+            if not closed:
+                errors.append((line_of[ch_pos], "unterminated-comment",
                                "unterminated block comment"))
                 break
-            for tm in TRIGRAPH_RE.finditer(src[i + 2:end]):
+            comment_text = "".join(comment_chars)
+            for tm in TRIGRAPH_RE.finditer(comment_text):
                 errors.append((
-                    spliced_lines[i + 2 + tm.start()],
+                    line_of[comment_positions[tm.start()]],
                     "trigraph",
                     f"uses C++ trigraph `{tm.group(0)}` in comment "
                     f"(can splice lines or close comments under -trigraphs)",
                 ))
-            emit(" ", " ", spliced_lines[i])
-            i = end + 2
+            if saw_newline and line_state != "directive":
+                emit("\n", "\n", line_of[end_pos])
+            else:
+                emit(" ", " ", line_of[ch_pos])
+            pos = end_pos
+            continue
+        # Digraph `%:` at beginning of line starts a preprocessing directive.
+        if line_state == "bol" and ch == "%" and nxt == ":":
+            emit("%", "%", line_of[ch_pos])
+            emit(":", ":", line_of[nxt_char_pos])
+            line_state = "directive"
+            pos = nxt2_pos
             continue
         # Identifier, or raw string literal: [u8|u|U|L]R"delim(...)delim".
         if ch == "_" or ch.isalpha():
-            j = i + 1
-            while j < n and _is_ident_char(src[j]):
-                j += 1
-            ident = src[i:j]
-            if (ident in ("R", "u8R", "uR", "UR", "LR") and
-                    j < n and src[j] == '"'):
-                paren = src.find("(", j + 1)
-                delim = src[j + 1:paren] if paren != -1 else ""
+            ident_chars = [ch]
+            ident_positions = [ch_pos]
+            scan = nxt_pos
+            while True:
+                c, c_nxt, c_pos = peek(scan)
+                if c and _is_ident_char(c):
+                    ident_chars.append(c)
+                    ident_positions.append(c_pos)
+                    scan = c_nxt
+                else:
+                    break
+            ident = "".join(ident_chars)
+            q_ch, _, q_pos = peek(scan)
+            if ident in ("R", "u8R", "uR", "UR", "LR") and q_ch == '"':
+                # C++11+ [lex.phases]: revert phase-2 line splicing inside raw
+                # string delimiters and bodies by scanning raw `text`.
+                paren = text.find("(", q_pos + 1)
+                delim = text[q_pos + 1:paren] if paren != -1 else ""
                 if (paren == -1 or len(delim) > 16 or
                         any(c in (" ", "\t", "\v", "\f", "\r", "\n", "\\", ")")
                             for c in delim)):
-                    errors.append((spliced_lines[i], "unterminated-string",
+                    errors.append((line_of[ch_pos], "unterminated-string",
                                    "malformed raw string literal"))
                     break
                 for tm in TRIGRAPH_RE.finditer(delim):
                     errors.append((
-                        spliced_lines[j + 1 + tm.start()],
+                        line_of[q_pos + 1 + tm.start()],
                         "trigraph",
                         f"uses C++ trigraph `{tm.group(0)}` in raw string "
                         f"delimiter",
                     ))
                 closing = ")" + delim + '"'
-                end = src.find(closing, paren + 1)
+                end = text.find(closing, paren + 1)
                 if end == -1:
-                    errors.append((spliced_lines[i], "unterminated-string",
+                    errors.append((line_of[ch_pos], "unterminated-string",
                                    "unterminated raw string literal"))
                     break
                 stop = end + len(closing)
-                for k in range(i, stop):
-                    c = "\n" if src[k] == "\n" else " "
-                    emit(c, c, spliced_lines[k])
-                i = stop
+                for k in range(ch_pos, stop):
+                    c = "\n" if text[k] == "\n" else " "
+                    emit(c, c, line_of[k])
+                line_state = "code"
+                pos = stop
                 continue
-            for k in range(i, j):
-                emit(src[k], src[k], spliced_lines[k])
-            i = j
+            for c, c_pos in zip(ident_chars, ident_positions):
+                emit(c, c, line_of[c_pos])
+            pos = scan
             continue
         # pp-number (C++14+ [lex.ppnumber]): starts with an ASCII digit or
         # '.' followed by an ASCII digit. Only here is '\'' a digit separator,
@@ -916,26 +1149,31 @@ def _strip_cpp_comments(text):
         # literal rather than opening a fake string.
         if _is_ascii_digit(ch) or (ch == "." and _is_ascii_digit(nxt)):
             if ch == ".":
-                emit(ch, ch, spliced_lines[i])
-                i += 1
-            emit(src[i], src[i], spliced_lines[i])
-            i += 1
-            while i < n:
-                c = src[i]
-                c_next = src[i + 1] if i + 1 < n else ""
+                emit(ch, ch, line_of[ch_pos])
+                emit(nxt, nxt, line_of[nxt_char_pos])
+                pos = nxt2_pos
+            else:
+                emit(ch, ch, line_of[ch_pos])
+                pos = nxt_pos
+            while True:
+                c, c_nxt, c_pos = peek(pos)
+                if not c:
+                    pos = c_nxt
+                    break
+                c_next, c_nxt2, c_next_pos = peek(c_nxt)
                 if c == "'" and c_next and _is_ident_char(c_next):
-                    emit(c, c, spliced_lines[i])
-                    emit(c_next, c_next, spliced_lines[i + 1])
-                    i += 2
+                    emit(c, c, line_of[c_pos])
+                    emit(c_next, c_next, line_of[c_next_pos])
+                    pos = c_nxt2
                     continue
                 if c in ("e", "E", "p", "P") and c_next in ("+", "-"):
-                    emit(c, c, spliced_lines[i])
-                    emit(c_next, c_next, spliced_lines[i + 1])
-                    i += 2
+                    emit(c, c, line_of[c_pos])
+                    emit(c_next, c_next, line_of[c_next_pos])
+                    pos = c_nxt2
                     continue
                 if _is_ident_char(c) or c == ".":
-                    emit(c, c, spliced_lines[i])
-                    i += 1
+                    emit(c, c, line_of[c_pos])
+                    pos = c_nxt
                     continue
                 break
             continue
@@ -943,13 +1181,13 @@ def _strip_cpp_comments(text):
         # blank interior in `no_strings`. Character literal likewise
         # (pp-number digit separators were already consumed).
         if ch == '"':
-            i = quoted_literal(i, '"', "string literal")
+            pos = quoted_literal(ch_pos, nxt_pos, '"', "string literal")
             continue
         if ch == "'":
-            i = quoted_literal(i, "'", "character literal")
+            pos = quoted_literal(ch_pos, nxt_pos, "'", "character literal")
             continue
-        emit(ch, ch, spliced_lines[i])
-        i += 1
+        emit(ch, ch, line_of[ch_pos])
+        pos = nxt_pos
 
     return "".join(with_strings), "".join(no_strings), line_map, errors
 
@@ -968,11 +1206,19 @@ def _normalize_include(header):
     return norm
 
 
-def _is_forbidden_include(norm):
+def _is_forbidden_include(norm, *, starlark=False):
     lower = norm.lower()
     if lower in FORBIDDEN_INCLUDE_EXACT_LOWER:
         return True
-    return lower.startswith(FORBIDDEN_INCLUDE_PREFIXES_LOWER)
+    if lower.startswith(FORBIDDEN_INCLUDE_PREFIXES_LOWER):
+        return True
+    if lower.startswith(MUJOCO_INCLUDE_PREFIX_LOWER):
+        # C++ code outside talOS/ may never include anything under
+        # talOS/simulation/mujoco/; Starlark data/env labels to MJCF `.xml`
+        # models (e.g. examples/mujoco_rig:model_twin_test) stay allowed.
+        if not starlark or not lower.endswith(".xml"):
+            return True
+    return False
 
 
 def _is_non_cpp_include(norm):
@@ -1651,6 +1897,28 @@ def _is_safe_starlark_kwargs_dict(node, safe_bindings, str_bindings,
     return True
 
 
+def _eval_starlark_str_seq(node, bindings, seen=frozenset()):
+    """Evaluates a Starlark list/tuple of constant strings (including variable
+    references and `+` list/tuple concatenations)."""
+    if isinstance(node, ast.Name) and node.id in bindings and node.id not in seen:
+        return _eval_starlark_str_seq(
+            bindings[node.id], bindings, seen | {node.id})
+    if isinstance(node, (ast.List, ast.Tuple)):
+        parts = []
+        for elt in node.elts:
+            val = _eval_starlark_str(elt, bindings, seen)
+            if val is None:
+                return None
+            parts.append(val)
+        return parts
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _eval_starlark_str_seq(node.left, bindings, seen)
+        right = _eval_starlark_str_seq(node.right, bindings, seen)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
 def _eval_starlark_str(node, bindings, seen=frozenset()):
     """Evaluates a Starlark string constant, constant `+` concat, `%` format,
     `.format(...)`, or `.join(...)`."""
@@ -1723,17 +1991,13 @@ def _eval_starlark_str(node, bindings, seen=frozenset()):
             return None
     if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and
             node.func.attr == "join" and len(node.args) == 1 and
-            not node.keywords and
-            isinstance(node.args[0], (ast.List, ast.Tuple))):
+            not node.keywords):
         sep = _eval_starlark_str(node.func.value, bindings, seen)
         if sep is None:
             return None
-        parts = []
-        for elt in node.args[0].elts:
-            val = _eval_starlark_str(elt, bindings, seen)
-            if val is None:
-                return None
-            parts.append(val)
+        parts = _eval_starlark_str_seq(node.args[0], bindings, seen)
+        if parts is None:
+            return None
         return sep.join(parts)
     return None
 
@@ -1906,6 +2170,12 @@ def scan_starlark_ast(path, tree):
                 f"Starlark string uses C++ trigraph `{m.group(0)}` (can "
                 f"assemble token pasting or directives in compiler defines)")
 
+        for m in UCN_RE.finditer(val):
+            add(lineno, "starlark-ucn-identifier",
+                f"Starlark string uses C++ universal character name "
+                f"`{m.group(0)}` (can spell forbidden framework internals in "
+                f"compiler defines)")
+
         if id(node) not in reported_flag_nodes:
             for tok in re.findall(r"[^\s,]+", val):
                 if FORBIDDEN_COPT_FLAG_RE.match(tok):
@@ -1914,7 +2184,7 @@ def scan_starlark_ast(path, tree):
 
         for cand in _extract_starlark_header_candidates(val):
             norm = _normalize_include(cand)
-            if _is_forbidden_include(norm):
+            if _is_forbidden_include(norm, starlark=True):
                 add(lineno, "starlark-forbidden-include",
                     f"Starlark string references forbidden header `{norm}`",
                     header=norm)
@@ -2020,8 +2290,11 @@ def _extract_build_referenced_files(build_path, tree, tracked_set, pkg_files):
 # links it. Every tracked BUILD, BUILD.bazel and `.bzl` file elsewhere is
 # scanned, talOS/ and tools/ included.
 MUJOCO_PACKAGE = "talOS/simulation/mujoco/"
-MUJOCO_LABEL_RE = re.compile(r"^@{1,2}mujoco\+?(?://|:|$)")
-MUJOCO_LOAD_RE = re.compile(r"^(?:@{1,2}talos\+?)?//talOS/simulation/mujoco(?:[/:]|$)")
+MUJOCO_LABEL_RE = re.compile(
+    r"^@{1,2}(?:[^/@:]*[+~])?mujoco(?:[+~][^/:]*)?(?://|:|$)")
+MUJOCO_LOAD_RE = re.compile(
+    r"^(?:@{1,2}(?:(?:talos|_main)(?:[+~][^/]*)?)?)?"
+    r"//talOS/simulation/mujoco(?:[/:]|$)")
 
 
 def _statement_context(stmt):
@@ -2041,23 +2314,80 @@ def _statement_context(stmt):
     return "top level"
 
 
+def _is_module_bazel_file(path):
+    base = os.path.basename(path)
+    return base == "MODULE.bazel" or base.endswith(".MODULE.bazel")
+
+
+def _scan_module_bazel(path, tree):
+    """Refuses a `repo_name` alias or dynamic `bazel_dep` / `use_repo` alias
+    for `mujoco` in any `MODULE.bazel` or `*.MODULE.bazel` file."""
+    bindings = _collect_starlark_bindings(tree)
+    found = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_id = getattr(node.func, "id", "")
+        if func_id == "bazel_dep":
+            if any(k.arg is None for k in node.keywords):
+                found.setdefault(
+                    node.lineno,
+                    "bazel_dep uses **kwargs splat; cannot verify statically "
+                    "that mujoco has no repo_name alias (fail closed)")
+                continue
+            kw = {k.arg: k.value for k in node.keywords}
+            name_node = kw.get("name", node.args[0] if node.args else None)
+            repo_node = kw.get(
+                "repo_name", node.args[3] if len(node.args) > 3 else None)
+            if repo_node is None:
+                continue
+            name_val = (
+                _eval_starlark_str(name_node, bindings)
+                if name_node is not None else None)
+            repo_val = _eval_starlark_str(repo_node, bindings)
+            if name_val is None or (name_val == "mujoco" and
+                                    repo_val != "mujoco"):
+                found.setdefault(
+                    node.lineno,
+                    "mujoco's bazel_dep sets a repo_name (or dynamic name); "
+                    "the @mujoco check would not see its labels")
+        elif func_id == "use_repo":
+            for k in node.keywords:
+                if k.arg is None:
+                    found.setdefault(
+                        node.lineno,
+                        "use_repo uses **kwargs splat; cannot verify "
+                        "statically that mujoco is not aliased (fail closed)")
+                    continue
+                val = _eval_starlark_str(k.value, bindings)
+                if val == "mujoco" and k.arg != "mujoco":
+                    found.setdefault(
+                        node.lineno,
+                        f"use_repo aliases `mujoco` as `{k.arg}`; the "
+                        f"@mujoco check would not see its labels")
+    return sorted(found.items())
+
+
 def scan_mujoco_labels(path, tree):
-    """Refuses a `@mujoco` label, or a load from the MuJoCo package, in a
-    Starlark file outside MUJOCO_PACKAGE. Returns `(line, detail)` pairs."""
+    """Refuses a `@mujoco` label, or a load from `@mujoco` or the MuJoCo
+    package, in a Starlark file outside MUJOCO_PACKAGE. Returns `(line, detail)`
+    pairs."""
     bindings = _collect_starlark_bindings(tree)
     found = {}
     for stmt in tree.body:
         context = _statement_context(stmt)
-        if (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call) and
-                isinstance(stmt.value.func, ast.Name) and
-                stmt.value.func.id == "load" and stmt.value.args):
-            label = _eval_starlark_str(stmt.value.args[0], bindings)
-            if label is None or MUJOCO_LOAD_RE.match(label):
-                found.setdefault(stmt.lineno, (
-                    f"load from the MuJoCo package ({label}) outside "
-                    f"{MUJOCO_PACKAGE}"))
-            continue
         for node in ast.walk(stmt):
+            if (isinstance(node, ast.Call) and
+                    isinstance(node.func, ast.Name) and
+                    node.func.id == "load" and node.args):
+                label = _eval_starlark_str(node.args[0], bindings)
+                stripped = label.strip() if label is not None else None
+                if (stripped is None or MUJOCO_LOAD_RE.match(stripped) or
+                        MUJOCO_LABEL_RE.match(stripped)):
+                    found.setdefault(getattr(node, "lineno", stmt.lineno), (
+                        f"load from MuJoCo ({label}) outside "
+                        f"{MUJOCO_PACKAGE}"))
+                continue
             if not isinstance(node, (ast.Constant, ast.BinOp, ast.Call)):
                 continue
             val = _eval_starlark_str(node, bindings)
@@ -2068,34 +2398,41 @@ def scan_mujoco_labels(path, tree):
     return sorted(found.items())
 
 
-def run_mujoco_checks(files, read, out=sys.stdout):
+def run_mujoco_checks(files, read, out=sys.stdout, is_symlink=None):
     """Runs scan_mujoco_labels over every tracked Starlark file outside
-    MUJOCO_PACKAGE. Returns the number of failures; fails closed on a file
-    it cannot read or parse."""
+    MUJOCO_PACKAGE and checks every `MODULE.bazel` / `*.MODULE.bazel` file.
+    Returns the number of failures; fails closed on symlinks or unreadable /
+    unparsable files."""
     failures = 0
     scanned = 0
     for path in sorted(files):
-        if path == "MODULE.bazel":
-            # A repo_name would give the dependency a label the scan misses.
-            for node in ast.walk(ast.parse(read(path), filename=path)):
-                if (isinstance(node, ast.Call) and
-                        getattr(node.func, "id", "") == "bazel_dep"):
-                    kw = {k.arg: k.value for k in node.keywords}
-                    name = kw.get("name")
-                    repo = kw.get("repo_name")
-                    if (isinstance(name, ast.Constant) and
-                            name.value == "mujoco" and repo is not None and
-                            getattr(repo, "value", None) != "mujoco"):
-                        failures += 1
-                        print(f"VIOLATION {path}:{node.lineno}: mujoco's "
-                              f"bazel_dep sets a repo_name; the @mujoco "
-                              f"check would not see its labels", file=out)
+        is_mod = _is_module_bazel_file(path)
+        is_star = _is_starlark_file(path)
+        if is_symlink is not None and (
+                is_mod or is_star or path.startswith("talOS/")) and (
+                is_symlink(path)):
+            failures += 1
+            print(f"VIOLATION {path}: symlink cannot be verified statically "
+                  f"for @mujoco confinement (fail closed)", file=out)
             continue
-        if path.startswith(MUJOCO_PACKAGE) or not _is_starlark_file(path):
+        if is_mod:
+            try:
+                tree = ast.parse(read(path).removeprefix("\ufeff"),
+                                 filename=path)
+            except (OSError, UnicodeDecodeError, SyntaxError) as exc:
+                failures += 1
+                print(f"VIOLATION {path}: cannot scan MODULE.bazel for "
+                      f"@mujoco: {exc} (fail closed)", file=out)
+                continue
+            for line, detail in _scan_module_bazel(path, tree):
+                failures += 1
+                print(f"VIOLATION {path}:{line}: {detail}", file=out)
+            continue
+        if path.startswith(MUJOCO_PACKAGE) or not is_star:
             continue
         scanned += 1
         try:
-            tree = ast.parse(read(path), filename=path)
+            tree = ast.parse(read(path).removeprefix("\ufeff"), filename=path)
         except (OSError, UnicodeDecodeError, SyntaxError) as exc:
             failures += 1
             print(f"VIOLATION {path}: cannot scan for @mujoco: {exc} "
@@ -2108,6 +2445,80 @@ def run_mujoco_checks(files, read, out=sys.stdout):
         print(f"MuJoCo dependency check passed ({scanned} Starlark file(s) "
               f"outside {MUJOCO_PACKAGE})", file=out)
     return failures
+
+
+def run_layer_mapping_checks(files, out=sys.stdout):
+    """Fails closed if any tracked `BUILD` / `BUILD.bazel` file lives in an
+    unmapped `talOS/<pkg>` package or an unmapped top-level root outside
+    `OUTSIDE_TALOS` (in a repository that owns `talOS/`)."""
+    failures = 0
+    has_talos_tree = any(path.startswith("talOS/") for path in files)
+    checked = 0
+    for path in sorted(files):
+        base = os.path.basename(path)
+        if base not in STARLARK_BASENAMES:
+            continue
+        checked += 1
+        parts = path.split("/")
+        if len(parts) == 1:
+            continue
+        root = parts[0]
+        if root == "talOS":
+            if len(parts) == 2:
+                failures += 1
+                print(f"VIOLATION {path}: unmapped root talOS/ package is not "
+                      f"assigned to a layer in tools/check_layers.py "
+                      f"(RULES.md 5 / REQ-CONTRACT-16)", file=out)
+                continue
+            talos_pkg = f"talOS/{parts[1]}"
+            if talos_pkg not in KNOWN_TALOS_PACKAGES:
+                failures += 1
+                print(f"VIOLATION {path}: unmapped talOS package "
+                      f"`{talos_pkg}` is not assigned to a layer in "
+                      f"tools/check_layers.py (RULES.md 5 / REQ-CONTRACT-16)",
+                      file=out)
+        elif has_talos_tree and root not in KNOWN_TOP_LEVEL_BUILD_ROOTS:
+            failures += 1
+            print(f"VIOLATION {path}: unmapped top-level Bazel root `{root}/` "
+                  f"is not covered by OUTSIDE_TALOS in tools/check_layers.py "
+                  f"(RULES.md 5 / REQ-CONTRACT-16)", file=out)
+    if not failures:
+        print(f"Layer package mapping check passed ({checked} BUILD file(s))",
+              file=out)
+    return failures
+
+
+def _has_symlink_component(path, root=None):
+    """True when `path` is a symlink or traverses a symlinked directory.
+
+    For relative paths (such as every path from `git ls-files`), checks every
+    path component from the workspace root down. When `root` is given, checks
+    every component below `root`. For bare absolute paths without `root`,
+    checks `os.path.islink(path)` (and `read_source_file` also opens with
+    `O_NOFOLLOW`) so host OS symlinks such as macOS `/var -> /private/var` do
+    not cause false positives."""
+    if root is not None:
+        rel = os.path.relpath(path, root)
+        if rel == ".." or rel.startswith(".." + os.sep):
+            return True
+        cur = root
+        for part in rel.split(os.sep):
+            if not part or part == ".":
+                continue
+            cur = os.path.join(cur, part)
+            if os.path.islink(cur):
+                return True
+        return False
+    if not os.path.isabs(path):
+        cur = ""
+        for part in path.replace("\\", "/").split("/"):
+            if not part or part == ".":
+                continue
+            cur = f"{cur}/{part}" if cur else part
+            if os.path.islink(cur):
+                return True
+        return False
+    return os.path.islink(path)
 
 
 def discover_scanned_files(files, read):
@@ -2176,13 +2587,25 @@ def _is_exempt_cli_violation(violation, exempt_cli_files):
     return violation.header in allowed_headers
 
 
-def run_source_checks(files, read, exempt_cli_files=None, out=sys.stdout):
+def run_source_checks(files, read, exempt_cli_files=None, out=sys.stdout,
+                      is_symlink=None):
     """Scans C++ sources and BUILD/`.bzl` files outside `talOS/` for RULES.md 2
     bypasses. Returns the number of failures."""
     if exempt_cli_files is None:
         exempt_cli_files = NON_NODE_CLI_FILES
-    cpp_files, starlark_trees, read_errors = discover_scanned_files(files, read)
     failures = 0
+    non_symlink_files = []
+    for path in files:
+        if (is_symlink is not None and _is_in_scanned_tree(path) and
+                is_symlink(path)):
+            failures += 1
+            print(f"VIOLATION {path}: symlink under scanned tree cannot be "
+                  f"verified statically (fail closed)", file=out)
+            continue
+        non_symlink_files.append(path)
+
+    cpp_files, starlark_trees, read_errors = discover_scanned_files(
+        non_symlink_files, read)
     for path, detail in read_errors:
         failures += 1
         print(f"VIOLATION {path}: {detail} (fail closed)", file=out)
@@ -2243,18 +2666,26 @@ def run_source_checks(files, read, exempt_cli_files=None, out=sys.stdout):
 
 
 def tracked_files():
-    """Returns tracked files from git; fails closed on error."""
+    """Returns tracked files from git; fails closed on error or empty index."""
     proc = subprocess.run(
         ["git", "ls-files", "-z"],
         capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         raise RuntimeError(
             f"git ls-files failed ({proc.returncode}): {proc.stderr.strip()}")
-    return [path for path in proc.stdout.split("\0") if path]
+    files = [path for path in proc.stdout.split("\0") if path]
+    if not files:
+        raise RuntimeError(
+            "git ls-files returned no tracked files (fail closed)")
+    return files
 
 
 def read_source_file(path):
-    with open(path, encoding="utf-8-sig") as f:
+    if _has_symlink_component(path):
+        raise OSError(f"refusing symlink path: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    with os.fdopen(fd, "r", encoding="utf-8-sig") as f:
         return f.read()
 
 
@@ -2270,8 +2701,11 @@ def main(argv=None):
     if not args.source_only:
         failures += run(Bazel())
     files = tracked_files()
-    failures += run_source_checks(files, read_source_file)
-    failures += run_mujoco_checks(files, read_source_file)
+    failures += run_layer_mapping_checks(files)
+    failures += run_source_checks(
+        files, read_source_file, is_symlink=_has_symlink_component)
+    failures += run_mujoco_checks(
+        files, read_source_file, is_symlink=_has_symlink_component)
     return 1 if failures else 0
 
 
