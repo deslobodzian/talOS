@@ -259,7 +259,7 @@ configuration fingerprint. Config load does not open the model, so a
 
 An optional top-level `[simulation]` table configures physics chassis geometry,
 end-of-travel hard stops, battery sag, chassis dynamics, per-mechanism
-inertia/friction and the MuJoCo model:
+inertia/friction, the robot's start pose and the MuJoCo model:
 - `wheel_radius_m` (positive finite double, default `0.0508` m),
 - `[[simulation.swerve_modules]]` entries (`drive`, `steer`, `x_m`, `y_m`, where
   `drive` and `steer` name distinct configured motors, no motor appears twice,
@@ -278,6 +278,20 @@ inertia/friction and the MuJoCo model:
   with no duplicates; `inertia_kg_m2` required positive finite at the mechanism
   shaft; optional `load`, `"roller"` (default) or `"flywheel"`; optional
   non-negative finite `viscous_damping_nm_per_radps` and `static_friction_nm`),
+- `[simulation.start_pose]`, where the simulator places the robot at start,
+  in the field frame: `x_m`, `y_m` and `yaw_rad`, each a finite number (an
+  integer reads as one). Optional; unset, the robot starts at
+  (2, 2, 0). A file that sets it sets all three keys, and its pose replaces
+  an included file's whole. With a `[simulation.mujoco] field`, (`x_m`,
+  `y_m`) must lie on that field's floor, edges included (`rebuilt_2026`:
+  0 to 16.541188 m by 0 to 8.069326 m; config load holds each field's floor
+  in `config::kSimulationMujocoFields`). That checks the floor only: a pose
+  inside a field structure passes config load, and the plant then starts
+  with the robot overlapping it. Config load refuses a section that
+  is not a table, an unknown or missing key, a value that is not a finite
+  number and a position off the field's floor, naming the key and the file
+  that sets the pose. The gateway's `--start-pose` overrides it
+  ([simulator flags](../simulation/README.md)).
 - `[simulation.mujoco]`, the MuJoCo model: `robot_model` (required, the
   robot's MJCF file), `robot_model_files` (optional array: every other file
   the model reads, such as meshes), `field` (optional field model name,
@@ -300,8 +314,9 @@ inertia/friction and the MuJoCo model:
   load.
 
 Like `motor_type` and `sim_motor`, `[simulation]` stays off the wire and out of
-`ConfigurationId`; `sim_gateway --physics` passes `wheel_radius_m` in
-`PhysicsOptions` and binds `swerve_modules` (`SetSwerveModules`), `hard_stops`
+`ConfigurationId`; `sim_gateway --physics` passes `wheel_radius_m` and the
+start pose (`ApplyStartPose`: `--start-pose`, else `start_pose`, else the
+default) in `PhysicsOptions` and binds `swerve_modules` (`SetSwerveModules`), `hard_stops`
 (`SetHardStops`), `battery` (`SetBatteryModel`), `chassis`
 (`SetChassisDynamics`), and `mechanisms` (`SetMechanisms`) on
 `PhysicsSimBackend` before `Reconfigure` so all of them survive any later

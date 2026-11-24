@@ -197,15 +197,26 @@ class MujocoGatewayTest(unittest.TestCase):
 
     # REQ-DEV-37: a free-root robot on the 2026 field (504 FUEL) runs for
     # 50 ms with --physics given and ends normally, having printed its
-    # binding table and the plant's clock.
+    # binding table, the plant's clock, and on its backend line the start
+    # pose its config's [simulation.start_pose] sets.
     def test_short_run_on_the_field(self):
+        source = _path("ROVER_CONFIG")
         port, remote = udp_ports()
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as peer:
+        with tempfile.TemporaryDirectory() as tmp, socket.socket(
+                socket.AF_INET, socket.SOCK_DGRAM) as peer:
+            shutil.copy(source.parent / "rover.xml", Path(tmp) / "rover.xml")
+            config = Path(tmp) / "robot.toml"
+            config.write_text(
+                source.read_text(encoding="utf-8")
+                + "\n[simulation.start_pose]\nx_m = 1.907\ny_m = 5.302\n"
+                "yaw_rad = 2.705\n", encoding="utf-8")
             peer.bind(("127.0.0.1", remote))
-            proc = _run("--config", str(_path("ROVER_CONFIG")), "--physics",
+            proc = _run("--config", str(config), "--physics",
                         "--port", str(port), "--remote-port", str(remote),
                         "--duration-s", "0.05")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("backend=mujoco start_pose=1.907,5.302,2.705 (config)",
+                      proc.stderr)
         self.assertIn("roller", proc.stderr)  # its binding table row
         self.assertIn("stepped_s=", proc.stdout)
         self.assertIn("overspeed_excursions=0", proc.stdout)

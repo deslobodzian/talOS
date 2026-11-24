@@ -211,7 +211,8 @@ cc_test(
 
 # REQ-DEV-37: the program as a child process: --describe against
 # sim_gateway --physics, refusals naming the key or flag, a model file
-# robot_model_files omits, a diverging model, and 50 ms on the 2026 field.
+# robot_model_files omits, a diverging model, and 50 ms on the 2026 field
+# from the config's start pose.
 # Integration lane: real-time runs over loopback UDP.
 py_test(
     name = "mujoco_gateway_test",
@@ -277,7 +278,8 @@ cc_test(
 )
 
 # REQ-DEV-37: Configure refuses each analytic chassis key and flag when the
-# model owns the chassis, and accepts them with a welded root.
+# model owns the chassis, and accepts them with a welded root; the robot
+# starts at --start-pose, else the config's start pose, else the default.
 cc_test(
     name = "gateway_extension_test",
     size = "small",
@@ -296,6 +298,7 @@ cc_test(
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/hardware",
+        "//talOS/simulation:gateway_main",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],
