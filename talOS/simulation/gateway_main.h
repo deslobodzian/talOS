@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -85,6 +86,11 @@ class GatewayExtension {
   // /sim/state and the entries exceed a registry row's
   // introspect::kMaxSourcesPerNode (64), so at most 63 entries. Throw: exit 1.
   virtual event::Manifest Topics() const { return {}; }
+  // The ring, in slots, of Topics()' entry `index`, which --describe
+  // declares and the extension's own publisher must open: a power of two in
+  // [2, MAX_SLOTS], or 0 for MAX_SLOTS, every other topic's. Called with
+  // Topics(), once per entry; a ring out of range exits 1.
+  virtual uint32_t TopicSlots(std::size_t /*index*/) const { return 0; }
   // After AfterTick, once per tick while the registry row is up: one entry
   // per Topics() entry, in its order, zeroed before the call. Throw: exit 1.
   virtual void Counts(std::span<TopicCount> out) const {}

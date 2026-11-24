@@ -15,4 +15,11 @@ static_assert(alignof(sim::MatchState) == 8,
               "sim.MatchState alignment changed; update docs/DATA_FLOW.md");
 static_assert(Message<sim::MatchState>);
 
+// REQ-DEV-43: /sim/telemetry/pieces's shared-memory slot contract.
+static_assert(sizeof(sim::GamePieces) == 8336,
+              "sim.GamePieces size changed; update docs/DATA_FLOW.md");
+static_assert(alignof(sim::GamePieces) == 8,
+              "sim.GamePieces alignment changed; update docs/DATA_FLOW.md");
+static_assert(Message<sim::GamePieces>);
+
 }  // namespace talos::hardware

@@ -2,6 +2,7 @@ import type {Snapshot} from '../core';
 import type {AlertLatch} from './alerts';
 import type {PlaybackState, SystemState} from './types';
 import type {SessionManifest} from './manifest';
+import type {PiecesSnapshot} from './pieces';
 
 export type WorkerMessage =
     {type: 'frames'; frames: Snapshot[]; reset: boolean} |
@@ -9,6 +10,7 @@ export type WorkerMessage =
     {type: 'playback'; state: PlaybackState} |
     ({type: 'system'} & SystemState) |
     {type: 'manifest'; manifest: SessionManifest|null; error: string} |
+    {type: 'pieces'; pieces: PiecesSnapshot|null} |
     {type: 'export'; buffer: ArrayBuffer} |
     {type: 'updates'; messages: WorkerMessage[]; dropped: number; coalesced: number};
 

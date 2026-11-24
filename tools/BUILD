@@ -373,6 +373,7 @@ cc_binary(
         "//talOS/events:events_log",
         "//talOS/hardware",
         "//talOS/hardware:sim_messages",
+        "//talOS/hardware:sim_rings",
         "//talOS/introspection:registry",
         "//talOS/msgs:geometry",
         "//talOS/protocol",

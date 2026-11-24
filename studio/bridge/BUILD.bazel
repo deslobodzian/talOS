@@ -56,6 +56,37 @@ cc_library(
     ],
 )
 
+# The MuJoCo gateway's game pieces for Studio's 3D viewport (REQ-DEV-43):
+# the latest /sim/telemetry/pieces quantised to millimetres, and each
+# programmer client's keyframe and change-only messages under its budget.
+# Header-only, like :telemetry.
+cc_library(
+    name = "pieces",
+    hdrs = ["pieces.h"],
+    deps = [
+        ":telemetry",
+        "//talOS/hardware:sim_messages",
+        "//talOS/telemetry:wire",
+    ],
+)
+
+cc_test(
+    name = "pieces_test",
+    size = "small",
+    srcs = ["tests/pieces_test.cc"],
+    deps = [
+        ":drive",
+        ":pieces",
+        ":system",
+        ":telemetry",
+        "//talOS/hardware:sim_messages",
+        "//talOS/telemetry:frames",
+        "//talOS/telemetry:schema",
+        "@flatbuffers",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # Static HTTP file serving shared by :studio_bridge and //studio/review:
 # MIME lookup, hashed-asset Cache-Control, path containment, symlink-escape
 # detection and bounded file reading.
@@ -169,6 +200,8 @@ cc_binary(
     name = "studio_mock",
     srcs = ["mock.cc"],
     deps = [
+        "//talOS/hardware:sim_messages",
+        "//talOS/hardware:sim_rings",
         "//talOS/rtms",
         "//talOS/telemetry:frames",
         "//talOS/telemetry:schema",
@@ -185,10 +218,13 @@ cc_binary(
     visibility = ["//visibility:public"],
     deps = [
         ":drive",
+        ":pieces",
         ":static_files",
         ":system",
         ":telemetry",
         "//talOS/configuration",
+        "//talOS/hardware:sim_messages",
+        "//talOS/hardware:sim_rings",
         "//talOS/introspection:describe",
         "//talOS/introspection:registry",
         "//talOS/process",
@@ -310,6 +346,7 @@ cc_test(
     ],
     deps = [
         "//talOS/events:events_core",
+        "//talOS/hardware:sim_messages",
         "//talOS/introspection:registry",
         "//talOS/process:realtime_outcome",
         "//talOS/telemetry:wire",
@@ -327,6 +364,28 @@ py_test(
         "testdata/robot.toml",
         ":studio_bridge",
     ],
+)
+
+# REQ-DEV-43: the launcher's --describe-only with --start-studio-bridge, on
+# the MuJoCo gateway (which writes /sim/telemetry/pieces) and on sim_gateway
+# (which does not), exits 0 with no finding about the topic. Integration
+# lane: the launcher probes five binaries.
+py_test(
+    name = "pieces_describe_test",
+    size = "small",
+    srcs = ["pieces_describe_test.py"],
+    data = [
+        ":studio_bridge",
+        "//talOS/bridge:hardware_node",
+        "//talOS/launcher",
+        "//talOS/simulation:sim_gateway",
+        "//talOS/simulation/mujoco:sim_gateway",
+        "//talOS/telemetry:node",
+    ],
+    env = {"LAUNCHER": "$(rlocationpath //talOS/launcher)"},
+    legacy_create_init = False,
+    tags = ["integration"],
+    deps = ["@rules_python//python/runfiles"],
 )
 
 # Deterministic SHA-256 stamp over Studio's web inputs and telemetry.fbs,

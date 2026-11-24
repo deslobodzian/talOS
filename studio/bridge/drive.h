@@ -118,6 +118,46 @@ class BridgeEgress {
   EgressBudget shared_;
 };
 
+// Whether a programmer client may send `framed_bytes` now, spending
+// nothing: the shared reservation lets it, its own bucket holds the bytes
+// and `own_room` more (the room its telemetry leaves an owed pieces message,
+// ClientFeeds::Pump), the shared bucket holds the bytes, and nothing of its
+// output is still `buffered`. A send short of either bucket is due again
+// when both hold it (`schedule`); one short of only the shared bucket is
+// recorded with the reservation at its own size, without the room, so the
+// room never becomes a reservation. `held` counts sends refused for
+// buffered output.
+template <class Client>
+bool AffordProgrammerSend(SharedReservation<Client>& reservation,
+                          BridgeEgress& egress, WakeSchedule& schedule,
+                          Client client, EgressBudget& own,
+                          std::size_t framed_bytes, std::size_t own_room,
+                          ClientFeeds::Feed feed, std::int64_t now_ns,
+                          bool buffered, std::uint64_t& held) {
+  const double rate = egress.plan().programmer_client_bytes_per_s;
+  if (!reservation.MaySpend(client, framed_bytes, own, rate, now_ns)) {
+    return false;
+  }
+  if (own_room != 0 && !own.available(framed_bytes + own_room, rate, now_ns)) {
+    schedule.Deferred(now_ns, own.wait_ns(framed_bytes + own_room, rate));
+    return false;
+  }
+  const bool fits_own = own.available(framed_bytes, rate, now_ns);
+  std::int64_t wait_ns = 0;
+  if (!egress.Affordable(own, false, framed_bytes, now_ns, wait_ns)) {
+    schedule.Deferred(now_ns, wait_ns);
+    if (fits_own && !buffered) {
+      reservation.BlockedOnShared(client, framed_bytes, feed);
+    }
+    return false;
+  }
+  if (buffered) {
+    ++held;
+    return false;
+  }
+  return true;
+}
+
 // The close a drive client is sent when a newer one takes its slot: a
 // WebSocket close code from the application range and its reason.
 inline constexpr int kDriveEvictedCloseCode = 4000;

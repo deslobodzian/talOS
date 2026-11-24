@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <span>
 #include <stdexcept>
@@ -12,6 +13,10 @@
 #include <thread>
 #include <vector>
 
+#include "sim/sim_descriptor.h"
+#include "sim/sim_generated.h"
+#include "sim/topics.h"
+#include "talOS/hardware/sim_rings.h"
 #include "talOS/rtms/rtms.h"
 #include "talOS/telemetry/frames.h"
 #include "talOS/telemetry/wire.h"
@@ -33,6 +38,20 @@ int main(int argc, char** argv) try {
   // idle and when it publishes.
   std::vector<std::string> args(argv, argv + argc);
   const bool on_stdin = std::erase(args, "--on-stdin") > 0;
+  // `--pieces`: also publish /sim/telemetry/pieces on every 10th tick, as the
+  // MuJoCo gateway does (REQ-DEV-43): 504 pieces in a 30-wide grid 0.2 m
+  // apart from (1, 1) m, the last 48 out of play, and pieces 0 to 9 moving
+  // 10 mm in x each message.
+  std::optional<RTMSQueue> pieces;
+  if (std::erase(args, "--pieces") > 0) {
+    pieces.emplace(
+        ::sim::topics::kPieces, sizeof(::sim::GamePieces),
+        alignof(::sim::GamePieces), talos::schema::Of<::sim::GamePieces>(),
+        talos::hardware::sim::kPiecesSlots,
+        RTMSOptions{.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
+                    .read_mode = ReadMode::SEQUENCE,
+                    .publisher = true});
+  }
   RTMSQueue queue(args.size() > 1 ? args[1] : "/talos/telemetry",
                   wire::slot_bytes, 8, talos::schema::Bytes(), wire::slot_count,
                   {.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
@@ -128,6 +147,27 @@ int main(int argc, char** argv) try {
             [&publish](std::span<const std::uint8_t> page,
                        const talos::telemetry::PageSpan&) { publish(page); })) {
       throw std::logic_error("mock: a value page outgrew its bound");
+    }
+    if (pieces && seq % 10 == 0) {
+      constexpr std::uint32_t kPieces = 504;
+      const auto moved = static_cast<float>(seq) * 0.001F;
+      ::sim::GamePieces message{};
+      message.mutate_sample_time_ns(header.timestamp_ns);
+      message.mutate_pieces_count(kPieces);
+      message.mutate_radius_m(0.075F);
+      for (std::uint32_t i = 0; i < kPieces; ++i) {
+        const auto at = static_cast<flatbuffers::uoffset_t>(i);
+        const std::uint32_t row = i / 30;
+        message.mutable_x_m()->Mutate(
+            at,
+            1.0F + 0.2F * static_cast<float>(i % 30) + (i < 10 ? moved : 0));
+        message.mutable_y_m()->Mutate(at,
+                                      1.0F + 0.2F * static_cast<float>(row));
+        message.mutable_z_m()->Mutate(at, 0.075F);
+        message.mutable_in_play()->Mutate(at, i < 456);
+      }
+      pieces->write(
+          std::as_bytes(std::span<const ::sim::GamePieces, 1>{&message, 1}));
     }
     if (on_stdin) {
       // Tells the test the tick is in the topic.

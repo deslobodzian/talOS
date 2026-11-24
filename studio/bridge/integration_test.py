@@ -692,6 +692,105 @@ class BridgeIntegration(unittest.TestCase):
                 for process in processes:
                     self.assertEqual(process.returncode, 0)
 
+    # REQ-DEV-43
+    def test_game_pieces_reach_programmer_clients_only(self):
+        """A programmer client gets a keyframe of the pieces, then their changes.
+
+        With the mock publishing /sim/telemetry/pieces as the MuJoCo gateway
+        does, a /telemetry client is sent a PCS1 keyframe of all 504 pieces in
+        millimetres, then deltas naming only the ten pieces that move; a
+        /drive client is sent no pieces message at all. Telemetry of 600
+        changing channels wants far more than the client's share, and the
+        deltas keep coming beside it through the bridge's whole send path:
+        judged against the telemetry pages the same client received, not
+        against any clock, so a slow or stalled host thins both.
+        """
+        workspace = Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main")
+        binaries = workspace / "studio/bridge"
+        topic = f"/test/telemetry/p{os.getpid()}"
+        processes = []
+        with tempfile.TemporaryDirectory() as webroot, \
+                tempfile.TemporaryDirectory() as configs:
+            Path(configs, "robot.toml").write_text(
+                "[robot]\nperiod_us = 5000\n\n"
+                "[studio]\nmax_clients = 2\ndashboard = \"dashboard.toml\"\n\n"
+                "[subsystems]\n")
+            Path(configs, "dashboard.toml").write_text(
+                "[dashboard]\ntitle = \"Pit\"\ndrive_clients = 1\n\n"
+                "[[widgets]]\nkind = \"number\"\nat = [0, 0, 2, 1]\n"
+                "channel = \"drive/velocity\"\n")
+            try:
+                mock = subprocess.Popen([str(binaries / "studio_mock"), topic, "600",
+                                         "--pieces"],
+                                        stdout=subprocess.PIPE, text=True)
+                processes.append(mock)
+                self.assertEqual(mock.stdout.readline().strip(), "ready")
+                bridge = subprocess.Popen([str(binaries / "studio_bridge"), topic, "0", webroot,
+                                           "--config", str(Path(configs, "robot.toml"))],
+                                          stdout=subprocess.PIPE, text=True)
+                processes.append(bridge)
+                port = bound_port(bridge)
+
+                def pieces_message(payload):
+                    flags, records, count = struct.unpack_from("<BxHI", payload, 4)
+                    entries = {}
+                    for r in range(records):
+                        index, play, x, y, z = struct.unpack_from("<HBxiii", payload, 24 + 16 * r)
+                        entries[index] = (bool(play & 1), x, y, z)
+                    self.assertEqual(len(payload), 24 + 16 * records)
+                    return bool(flags & 1), count, entries
+
+                with socket.create_connection(("127.0.0.1", port), timeout=10) as programmer, \
+                        socket.create_connection(("127.0.0.1", port), timeout=10) as drive:
+                    self.assertIn(b"101 Switching Protocols", upgrade(programmer))
+                    self.assertIn(b"101 Switching Protocols", upgrade(drive, "/drive"))
+                    # After the pieces keyframe, the next 200 telemetry pages
+                    # (about 5 s of the client's share) and the pieces
+                    # messages among them. Healthy, about one pieces message
+                    # comes per two pages (0.52 measured: 20 Hz of deltas
+                    # beside about 38 pages a second); pieces that wait for
+                    # telemetry to be current, as the reserve design did,
+                    # 0.08 (10 in 124 pages). A host stall of a second costs
+                    # some 20 deltas and lets a 64,000 B burst (about 53
+                    # pages) through, which leaves about 0.27; at least 40
+                    # (0.2) separates both.
+                    messages, pages = [], 0
+                    for _ in range(20000):
+                        opcode, payload = any_frame(programmer)
+                        if opcode != BINARY:
+                            continue
+                        if payload[:4] == b"PCS1":
+                            messages.append(pieces_message(payload))
+                        elif messages:
+                            pages += 1
+                            if pages == 200:
+                                break
+                    self.assertEqual(pages, 200)
+                    self.assertGreaterEqual(len(messages) - 1, 40,
+                                            "pieces starved beside telemetry")
+                    keyframe, count, entries = messages[0]
+                    self.assertTrue(keyframe)
+                    self.assertEqual(count, 504)
+                    self.assertEqual(len(entries), 504)
+                    # Piece 100: column 10, row 3, at rest.
+                    self.assertEqual(entries[100], (True, 3000, 1600, 75))
+                    self.assertFalse(entries[500][0])
+                    for keyframe, count, entries in messages[1:4]:
+                        self.assertFalse(keyframe)
+                        self.assertEqual(count, 504)
+                        self.assertTrue(entries)
+                        self.assertLessEqual(set(entries), set(range(10)))
+
+                    # Twenty frames of the dashboard's own feed, over which
+                    # the pieces kept moving: none is a pieces message.
+                    for _ in range(20):
+                        opcode, payload = any_frame(drive)
+                        self.assertNotEqual(payload[:4], b"PCS1")
+            finally:
+                stop(processes)
+                for process in processes:
+                    self.assertEqual(process.returncode, 0)
+
     # REQ-OPS-34
     def test_cache_headers(self):
         """Hashed assets are cached for good; pages and live JSON are not.

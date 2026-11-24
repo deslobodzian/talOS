@@ -116,7 +116,7 @@ MuJoCo has no continuous collision detection, and a ball at 10 m/s moves
 
 | Name | What |
 |---|---|
-| `fuel_000` ... `fuel_503` | fuel bodies, each with free joint `fuel_NNN_joint` and sphere geom `fuel_NNN_geom` |
+| `fuel_000` ... `fuel_503` | fuel bodies, each with free joint `fuel_NNN_joint` and sphere geom `fuel_NNN_geom`: the model's only free bodies, all of one radius, so they are its game pieces, in index order ([the MuJoCo gateway](../../README.md#the-mujoco-gateway)) |
 | `carpet_fuel`, `carpet_robot` | the two coincident carpet planes |
 | `guardrail_table`, `guardrail_far` | guardrails along y = 0 and y = 8.069 m |
 | `blue_wall_*` | alliance wall segments: `stations_outpost`, `tower`, `stations_depot`, `outpost_guardrail`, `outpost_depot`, `corral_sill`, `outpost_middle`, `chute_jamb_guardrail`, `chute_jamb_depot`, `outpost_top` |
@@ -243,7 +243,8 @@ started) when the plant is given it (`ObserveMatch`, whether or not a step
 follows) and again with each step, the plant's step count, and nothing else:
 no clock, and no allocation after `Attach`. A FUEL is in play, held (scored
 and parked, waiting for its HUB to return it) or reserve (in the reserve
-row, never placed).
+row, never placed); `InPlay` answers false for a held or reserve FUEL, so
+Studio does not draw it (REQ-DEV-43).
 
 - **Scoring.** A FUEL that is not held, whose centre is inside a
   `*_hub_score` cylinder with any downward velocity at the end of a step,

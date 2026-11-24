@@ -35,6 +35,12 @@ class GameRules : public WorldRules {
   // gateway fills it.
   virtual void Report(::sim::MatchState& match) const = 0;
   virtual FmsReport Fms() const = 0;
+  // Whether the model's body `body` (a free body: a game piece) is in play
+  // after the last Step's rules: false for one the game holds out of play
+  // (scored and parked off the field, or a reserve never placed), which
+  // Studio does not draw (REQ-DEV-43). A body the game does not referee is
+  // in play. Any body id of the attached model; no allocation.
+  virtual bool InPlay(int /*body*/) const { return true; }
 };
 
 struct FieldEntry {

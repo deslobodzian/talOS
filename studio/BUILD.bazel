@@ -171,6 +171,7 @@ STUDIO_TESTS = {
     "layout_test": "layout.test.ts",
     "manifest_test": "manifest.test.ts",
     "panels_test": "panels.test.tsx",
+    "pieces_test": "pieces.test.ts",
     "plot_test": "plot.test.tsx",
     "recorded_test": "recorded.test.tsx",
     "review_golden_test": "review_golden.test.ts",
