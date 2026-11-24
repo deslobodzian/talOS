@@ -1,5 +1,7 @@
 #include "talOS/node/node.h"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -44,6 +46,9 @@ namespace talos {
 
 static_assert(BytePublishOptions{}.slots == MAX_SLOTS,
               "byte topics default to the loop topics' ring size");
+
+std::vector<introspect::EndpointAttribute> NodeEndpointAttributes(
+    const Node& node);
 
 struct Node::Impl {
   struct SubscriptionSlot {
@@ -341,6 +346,46 @@ struct Node::Impl {
       }
     }
     for (const auto& hook : impl->after_update) hook();
+  }
+
+  static std::vector<introspect::EndpointAttribute> EndpointAttributes(
+      const Node& node) {
+    const Impl& impl = *node.impl_;
+    std::vector<introspect::EndpointAttribute> attributes;
+    for (const auto& slot : impl.subscriptions) {
+      std::uint32_t flags = 0;
+      if (slot->optional) flags |= introspect::naming::kSourceFlagOptional;
+      if (slot->observer) flags |= introspect::naming::kSourceFlagObserver;
+      if (!impl.explicit_driver_station && slot->internal_driver_station) {
+        flags |= introspect::naming::kSourceFlagInternalDriverStation;
+      }
+      if (flags != 0) {
+        attributes.push_back(
+            {slot->topic, flags, static_cast<std::uint32_t>(slot->watcher)});
+      }
+    }
+    for (const auto& pub : impl.publishers) {
+      std::uint32_t flags = 0;
+      if (pub.operator_arming) {
+        flags |= introspect::naming::kSourceFlagOperatorArming;
+      }
+      if (pub.is_hardware_request) {
+        flags |= introspect::naming::kSourceFlagHardwareRequest;
+        if (impl.untargeted_outputs) {
+          flags |= introspect::naming::kSourceFlagUntargetedOutputs;
+        }
+      }
+      if (flags != 0) {
+        attributes.push_back(
+            {pub.topic, flags, static_cast<std::uint32_t>(pub.id)});
+      }
+    }
+    return attributes;
+  }
+
+  friend std::vector<introspect::EndpointAttribute> NodeEndpointAttributes(
+      const Node& node) {
+    return EndpointAttributes(node);
   }
 };
 
@@ -1263,6 +1308,29 @@ std::function<void(event::log::LogWriterOptions&)> log_options_for_test;
 // Empty otherwise.
 std::function<void(introspect::Reporter::Options&)> reporter_options_for_test;
 
+// Tests only: snapshot of this process's newest alive registry row for `name`
+// (empty if none is published yet).
+std::vector<introspect::naming::SourceShape> RegistrySourcesForTest(
+    std::string_view name) {
+  const auto reader = introspect::RegistryReader::open();
+  if (!reader) return {};
+  std::uint64_t best_gen = 0;
+  std::vector<introspect::naming::SourceShape> out;
+  for (const auto& row : reader->nodes()) {
+    if (row.name != name || row.pid != static_cast<std::uint64_t>(::getpid()) ||
+        !row.alive || row.generation < best_gen) {
+      continue;
+    }
+    best_gen = row.generation;
+    out.clear();
+    for (const auto& s : row.sources) {
+      out.push_back(
+          {s.kind, s.name, s.message_bytes, s.flags, {}, 0, s.alignment});
+    }
+  }
+  return out;
+}
+
 namespace {
 
 // Flags every node binary accepts.
@@ -1617,38 +1685,14 @@ int RunOnRecordedInputs(const char* node_name, const Flags& flags,
   return 0;
 }
 
-// Endpoint attributes of the loop's sources: the optional subscriptions, the
-// observers, armed target-lane publishers, internal-only Driver Station
-// subscriptions, and the devices layer's hardware request (marked when the node
-// lifted the flush's live-target gate via mark_untargeted_outputs).
+// Endpoint attributes of the loop's sources, each tagged with its exact
+// manifest source_id so flags never smear across distinct endpoints sharing a
+// topic name: optional subscriptions, observers, armed target-lane publishers,
+// internal-only Driver Station subscriptions, and the devices layer's hardware
+// request (marked when the node lifted the flush's live-target gate via
+// mark_untargeted_outputs).
 std::vector<introspect::EndpointAttribute> Endpoints(const Node& node) {
-  std::vector<introspect::EndpointAttribute> attributes;
-  for (const std::string_view topic : NodeAccess::optional_topics(node)) {
-    attributes.push_back({topic, introspect::naming::kSourceFlagOptional});
-  }
-  for (const std::string_view topic : NodeAccess::observer_topics(node)) {
-    attributes.push_back({topic, introspect::naming::kSourceFlagObserver});
-  }
-  for (const std::string_view topic :
-       NodeAccess::armed_target_lane_topics(node)) {
-    attributes.push_back(
-        {topic, introspect::naming::kSourceFlagOperatorArming});
-  }
-  for (const std::string_view topic :
-       NodeAccess::internal_driver_station_topics(node)) {
-    attributes.push_back(
-        {topic, introspect::naming::kSourceFlagInternalDriverStation});
-  }
-  if (const std::string_view topic = NodeAccess::hardware_request(node);
-      !topic.empty()) {
-    const std::uint32_t untargeted =
-        NodeAccess::untargeted_outputs(node)
-            ? introspect::naming::kSourceFlagUntargetedOutputs
-            : 0u;
-    attributes.push_back(
-        {topic, introspect::naming::kSourceFlagHardwareRequest | untargeted});
-  }
-  return attributes;
+  return NodeEndpointAttributes(node);
 }
 
 std::uint32_t ByteTopicFlags(const NodeAccess::ByteTopicShape& topic) {

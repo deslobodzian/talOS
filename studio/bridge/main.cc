@@ -304,6 +304,7 @@ struct Bridge {
   std::vector<talos::introspect::NodeSnapshot> registry_nodes;
   bool registry_read = false;  // the last refresh could open the registry
   bool refusal_mode = false;   // --refusal-file: serving a phase-1 refusal
+  bool simulation = false;     // --sim: timeshare unless TALOS_REALTIME=1
   std::string drive_summary;
   std::uint64_t evicted = 0;
   // Returns from the event loop's wait (every one, whatever woke it), and of
@@ -637,6 +638,7 @@ struct Bridge {
     node.target = "//studio/bridge:studio_bridge";
     node.pid = static_cast<std::uint64_t>(::getpid());
     node.session_id = session_id;
+    node.flags = simulation ? talos::introspect::kFlagSimulation : 0u;
     node.start_wall_ns = started_wall_ns;
     node.heartbeat_monotonic_ns = talos::introspect::monotonic_now_ns();
     node.alive = true;
@@ -986,6 +988,7 @@ int main(int argc, char** argv) try {
   std::uint64_t session_id = 0;
   bool bad_session_id = false;
   bool bad_config = false;
+  bool simulation = false;
   unsigned idle_timeout_s = kIdleTimeoutS;
   bool bad_idle_timeout = false;
   const auto parse_session_id = [&](std::string_view value) {
@@ -1013,6 +1016,10 @@ int main(int argc, char** argv) try {
     static constexpr std::string_view kRefusalFile = "--refusal-file";
     static constexpr std::string_view kRefusalReason = "--refusal-reason";
     static constexpr std::string_view kIdleTimeoutS = "--idle-timeout-s";
+    if (argument == "--sim") {
+      simulation = true;
+      continue;
+    }
     if (argument == kConfig && i + 1 < argc) {
       const std::string_view value = argv[++i];
       if (value.empty()) {
@@ -1116,6 +1123,8 @@ int main(int argc, char** argv) try {
            "/drive\n"
            "       [--idle-timeout-s S]  client idle timeout, 8 to 960 "
            "(default 16)\n"
+           "       [--sim]               simulation mode (timeshare unless "
+           "TALOS_REALTIME=1)\n"
            "       [--describe]          print the --describe envelope and "
            "exit\n";
     return 2;
@@ -1180,6 +1189,7 @@ int main(int argc, char** argv) try {
   Bridge bridge;
   bridge.topic = topic;
   bridge.session_id = session_id;
+  bridge.simulation = simulation;
   bridge.refusal_mode = !refusal_file.empty() || !refusal_reason.empty();
   if (!bridge.refusal_mode) {
     // Watched by segment name, not by topic. A topic like /talos/telemetry has
@@ -1512,7 +1522,7 @@ int main(int argc, char** argv) try {
           .name = std::string{studio::kStudioBridgeNodeName},
           .target = "//studio/bridge:studio_bridge",
           .session_id = bridge.session_id,
-          .flags = 0,
+          .flags = simulation ? talos::introspect::kFlagSimulation : 0u,
       });
       talos::event::Registration source;
       source.id = 0;
@@ -1534,13 +1544,25 @@ int main(int argc, char** argv) try {
           talos::event::Manifest{source, pieces},
           std::vector<talos::introspect::EndpointAttribute>{
               {::sim::topics::kPieces, PiecesTopic::kFlags}});
-      bridge.registration->set_realtime(
-          {.tier = talos::process::LoopTier::kObserver});
-      bridge.report_registration();
     } catch (const std::exception& e) {
       throw std::runtime_error(
           std::string{"studio_bridge: cannot claim node registry row: "} +
           e.what());
+    }
+  }
+  // Best effort, last before entering the loop: runs at LoopTier::kObserver
+  // (SCHED_FIFO 40 on Linux, QOS_CLASS_USER_INTERACTIVE on macOS) unless --sim
+  // or TALOS_REALTIME=0 says otherwise (REQ-RT-08). Refusal mode serves only a
+  // static error page without shared memory or a live registry row.
+  if (!bridge.refusal_mode) {
+    talos::process::RealtimeOutcome realtime{
+        .tier = talos::process::LoopTier::kObserver};
+    if (talos::process::RealtimeRequested(simulation)) {
+      realtime = talos::process::ConfigureRealtime({.tier = realtime.tier});
+    }
+    if (bridge.registration) {
+      bridge.registration->set_realtime(realtime);
+      bridge.report_registration();
     }
   }
   std::cout << "listening "

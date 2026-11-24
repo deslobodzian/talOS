@@ -81,23 +81,27 @@ TEST(Readiness, EachConditionBlocksWithItsReasonInOrder) {
   EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kReady);
 }
 
-// A field the caller never fills blocks the shot: a default input is
-// stale, and with only the age and solution flags filled in each numeric
-// check still fails in turn.
+// A field the caller never fills blocks the shot: every field of a default
+// ReadinessInput fails its check in precedence order until explicitly set.
 // REQ-DEV-19
 TEST(Readiness, UnfilledFieldsFail) {
   const ReadinessLimits limits = Limits();
-  EXPECT_EQ(CheckReadiness(ReadinessInput{}, limits), ReadinessReason::kStale);
-
   ReadinessInput in;
+  EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kStale);
   in.pose_age_us = 0;
+  EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kNoSolution);
   in.solution_valid = true;
+  EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kNotConverged);
   in.converged = true;
+  EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kOutOfRange);
   in.in_range = true;
+  EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kTurretLimit);
   in.turret_reachable = true;
   EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kRobotTooFast);
   in.robot_speed_mps = 0.0;
+  EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kRobotRotatingTooFast);
   in.robot_omega_radps = 0.0;
+  EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kAimError);
   in.aim_error_rad = 0.0;
   // The flywheel error was forgotten: not ready while it spins up.
   EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kFlywheelNotAtSpeed);

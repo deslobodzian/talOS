@@ -24,12 +24,14 @@
 #              the copy, whose output base has built it, into a sibling
 #              directory, then moved into the copy's path so that the
 #              build reuses that output base (its talOS path, relative to
-#              a sibling or absolute, holds there too). Then talOS goes in
-#              as its README's git submodule would: a `git archive` of this
-#              checkout at talos/, the overrides pointed there, and
-#              `bazel build --nobuild //...`, which loads every package and
-#              fails if //... descends into talos/ (the .bazelignore
-#              new_robot writes keeps it out).
+#              a sibling or absolute, holds there too). It runs `bazel test
+#              //...` on the generated repository before scaffolding any
+#              mechanisms, then scaffolds intake and feeder and tests again.
+#              Then talOS goes in as its README's git submodule would: a
+#              `git archive` of this checkout at talos/, the overrides
+#              pointed there, and `bazel build --nobuild //...`, which loads
+#              every package and fails if //... descends into talos/ (the
+#              .bazelignore new_robot writes keeps it out).
 # The copy's MODULE.bazel points @talos (and studio_web), and its .bazelrc
 # its import of talos.bazelrc (check_copy_lock.sh's point_rc_at_talos), at
 # the talOS checkout holding this script. BAZEL_FLAGs go to every `bazel run` and
@@ -198,6 +200,8 @@ for variant in plain coverage new_robot; do
   bazel_started=1
   if [ "$variant" = new_robot ]; then
     phase "$variant: new_robot --standalone" new_robot
+    phase "$variant: bazel test //... (as generated)" \
+      bazel test --test_output=errors ${bazel_flags[@]+"${bazel_flags[@]}"} //...
   fi
   phase "$variant: scaffold intake (cpp)" scaffold intake cpp
   phase "$variant: scaffold feeder (py)" scaffold feeder py

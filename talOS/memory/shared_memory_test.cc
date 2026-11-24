@@ -20,6 +20,13 @@
 
 #include "talOS/memory/residency.h"
 
+#if defined(__linux__)
+#include <sys/wait.h>
+
+#include <sstream>
+#include <vector>
+#endif
+
 namespace {
 bool fail_truncate = false;
 bool fail_close = false;
@@ -497,3 +504,194 @@ TEST(SharedMemory, MakeResidentHandlesUnalignedSmallBuffersWithinBounds) {
   EXPECT_EQ(heap_buf[1], 0x88);
   EXPECT_EQ(heap_buf[2], 0x99);
 }
+
+#if defined(__linux__)
+namespace {
+
+// Probes in a forked child whether RLIMIT_MEMLOCK=0 actually causes mlock to
+// fail with ENOMEM or EPERM. Processes with CAP_IPC_LOCK (including root by
+// default) bypass RLIMIT_MEMLOCK, in which case the caller skips rather than
+// reporting a false pass.
+enum class MemlockProbe { kRefused, kBypassed, kError };
+
+MemlockProbe ProbeMemlockZero() {
+  const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+  const pid_t child = ::fork();
+  if (child < 0) return MemlockProbe::kError;
+  if (child == 0) {
+    const rlimit zero{0, 0};
+    if (::setrlimit(RLIMIT_MEMLOCK, &zero) != 0) ::_exit(2);
+    void* p = ::mmap(nullptr, page, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) ::_exit(3);
+    const int err = ::mlock(p, page) == 0 ? 0 : errno;
+    if (err == 0) {
+      ::munlock(p, page);
+      ::_exit(1);
+    }
+    ::_exit((err == ENOMEM || err == EPERM) ? 0 : 4);
+  }
+  int status = 0;
+  if (::waitpid(child, &status, 0) != child || !WIFEXITED(status)) {
+    return MemlockProbe::kError;
+  }
+  if (WEXITSTATUS(status) == 0) return MemlockProbe::kRefused;
+  if (WEXITSTATUS(status) == 1) return MemlockProbe::kBypassed;
+  return MemlockProbe::kError;
+}
+
+// Child body for LateSharedMemoryUnderMemlockZeroReportsRefusalOnce, factored
+// out of EXPECT_EXIT to avoid preprocessor comma splitting.
+[[noreturn]] void RunLateSharedMemoryMemlockZeroChild() {
+  const rlimit zero{0, 0};
+  if (::setrlimit(RLIMIT_MEMLOCK, &zero) != 0) {
+    std::fprintf(stderr, "setrlimit failed: %s\n", std::strerror(errno));
+    std::fflush(stderr);
+    std::_Exit(10);
+  }
+
+  const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+  void* probe_page = ::mmap(nullptr, page, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (probe_page == MAP_FAILED) {
+    std::fprintf(stderr, "mmap probe failed: %s\n", std::strerror(errno));
+    std::fflush(stderr);
+    std::_Exit(11);
+  }
+  const int probe_err = ::mlock(probe_page, page) == 0 ? 0 : errno;
+  if (probe_err == 0) ::munlock(probe_page, page);
+  ::munmap(probe_page, page);
+  if (probe_err != ENOMEM && probe_err != EPERM) {
+    std::fprintf(stderr, "unexpected mlock probe errno: %d (%s)\n", probe_err,
+                 std::strerror(probe_err));
+    std::fflush(stderr);
+    std::_Exit(12);
+  }
+
+  const std::string base = "/memlock_late_" + std::to_string(::getpid());
+  const std::string early_path = base + "_early";
+  const std::string late1_path = base + "_late1";
+  const std::string late2_path = base + "_late2";
+  const auto unlink_all = [&] {
+    ::shm_unlink(ShmObjectName(early_path).c_str());
+    ::shm_unlink(ShmObjectName(late1_path).c_str());
+    ::shm_unlink(ShmObjectName(late2_path).c_str());
+  };
+  unlink_all();
+
+  std::fflush(stderr);
+  int pipefd[2]{-1, -1};
+  if (::pipe(pipefd) != 0) std::_Exit(13);
+  const int saved_stderr = ::dup(STDERR_FILENO);
+  if (saved_stderr < 0 || ::dup2(pipefd[1], STDERR_FILENO) < 0) {
+    std::_Exit(14);
+  }
+  ::close(pipefd[1]);
+
+  bool before_keep_ok = false;
+  talos::memory::Residency kept{};
+  bool after_keep_ok = false;
+  bool after_late1_ok = false;
+  bool after_late2_ok = false;
+  bool after_attach_ok = false;
+  std::string caught_error;
+  try {
+    SharedMemoryPtr early{early_path, page};
+    before_keep_ok = !talos::memory::MappingsKeptResident() &&
+                     !talos::memory::LateLockRefused();
+
+    kept = talos::memory::KeepMappingsResident();
+    after_keep_ok = talos::memory::MappingsKeptResident() &&
+                    !talos::memory::LateLockRefused() && kept.ranges == 1 &&
+                    kept.bytes == page && kept.failed == 1 &&
+                    kept.first_error == probe_err;
+
+    // Late SharedMemoryPtr allocations (CREATE and ATTACH) after
+    // KeepMappingsResident(): all succeed and remain writable,
+    // LateLockRefused() flips true on the first, and only the first prints the
+    // refusal warning.
+    SharedMemoryPtr late1{late1_path, page};
+    static_cast<unsigned char*>(late1.ptr())[0] = 0x5a;
+    after_late1_ok = late1.ptr() != nullptr &&
+                     late1.mode() == SharedMemoryMode::CREATE &&
+                     talos::memory::LateLockRefused();
+
+    SharedMemoryPtr late2{late2_path, page};
+    static_cast<unsigned char*>(late2.ptr())[0] = 0xa5;
+    after_late2_ok = late2.ptr() != nullptr &&
+                     late2.mode() == SharedMemoryMode::CREATE &&
+                     talos::memory::LateLockRefused();
+
+    SharedMemoryPtr late_attach{early_path, page};
+    static_cast<unsigned char*>(late_attach.ptr())[0] = 0x3c;
+    after_attach_ok = late_attach.ptr() != nullptr &&
+                      late_attach.mode() == SharedMemoryMode::ATTACH &&
+                      talos::memory::LateLockRefused();
+  } catch (const std::exception& e) {
+    caught_error = e.what();
+  }
+  unlink_all();
+
+  std::fflush(stderr);
+  ::dup2(saved_stderr, STDERR_FILENO);
+  ::close(saved_stderr);
+
+  std::string captured;
+  char buf[512];
+  for (ssize_t n = 0; (n = ::read(pipefd[0], buf, sizeof buf)) > 0;) {
+    captured.append(buf, static_cast<std::size_t>(n));
+  }
+  ::close(pipefd[0]);
+
+  std::vector<std::string> lines;
+  std::istringstream stream{captured};
+  for (std::string line; std::getline(stream, line);) {
+    lines.push_back(line);
+  }
+
+  const std::string expected_late =
+      std::string{
+          "talos: shared memory mapped after realtime setup is prefaulted "
+          "but not locked (mlock: "} +
+      std::strerror(probe_err) + "); further refusals are not reported";
+  const bool lines_ok = lines.size() == 1 && lines[0] == expected_late;
+
+  if (!caught_error.empty() || !before_keep_ok || !after_keep_ok ||
+      !after_late1_ok || !after_late2_ok || !after_attach_ok || !lines_ok) {
+    std::fprintf(stderr,
+                 "caught='%s' before_keep=%d after_keep=%d (ranges=%zu "
+                 "bytes=%zu failed=%zu err=%d) late1=%d late2=%d attach=%d "
+                 "lines=%zu\ncaptured:\n%s\nexpected: %s\n",
+                 caught_error.c_str(), before_keep_ok ? 1 : 0,
+                 after_keep_ok ? 1 : 0, kept.ranges, kept.bytes, kept.failed,
+                 kept.first_error, after_late1_ok ? 1 : 0,
+                 after_late2_ok ? 1 : 0, after_attach_ok ? 1 : 0, lines.size(),
+                 captured.c_str(), expected_late.c_str());
+    std::fflush(stderr);
+    std::_Exit(1);
+  }
+  std::_Exit(0);
+}
+
+}  // namespace
+
+// Under RLIMIT_MEMLOCK=0 on Linux (macOS ignores RLIMIT_MEMLOCK in favor of
+// the system-wide wired limit), opening a new SharedMemoryPtr while
+// MappingsKeptResident() is active keeps the mapping usable, sets
+// LateLockRefused(), and prints the late-refusal warning to stderr once even
+// across multiple late SharedMemoryPtr allocations. Runs in a re-executed
+// child so MappingsKeptResident() starts false and RLIMIT_MEMLOCK=0 stays
+// isolated to the child.
+// REQ-RT-09
+TEST(SharedMemory, LateSharedMemoryUnderMemlockZeroReportsRefusalOnce) {
+  const MemlockProbe probe = ProbeMemlockZero();
+  if (probe == MemlockProbe::kBypassed) {
+    GTEST_SKIP() << "process bypasses RLIMIT_MEMLOCK=0 (e.g. CAP_IPC_LOCK)";
+  }
+  ASSERT_EQ(probe, MemlockProbe::kRefused)
+      << "failed to probe RLIMIT_MEMLOCK=0 behaviour";
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(RunLateSharedMemoryMemlockZeroChild(),
+              ::testing::ExitedWithCode(0), "");
+}
+#endif

@@ -50,6 +50,7 @@
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/memory/residency.h"
+#include "talOS/process/process.h"
 
 namespace talos::introspect {
 
@@ -180,6 +181,7 @@ class Reporter {
     // 500 ms. Its 10 ms cadence lasts only as long as construction, which
     // the launcher bounds (kConstructionTimeout); start() ends it.
     thread_ = std::jthread{[this](const std::stop_token& stop) {
+      process::ConfigureBackgroundThread();
       while (!stop.stop_requested()) {
         if (registration_) registration_->heartbeat();
         pause(stop, std::chrono::milliseconds{10});
@@ -268,6 +270,7 @@ class Reporter {
  private:
   template <typename Loop>
   void run(Loop& loop, const std::stop_token& stop) {
+    process::ConfigureBackgroundThread();
     // The loop publishes its counters array before it stores running(), and
     // that store synchronizes with this load, so a visible `true` means the
     // manifest is frozen and the counters exist. The 2 ms polls last only

@@ -682,6 +682,195 @@ class LintTestTimeTest(unittest.TestCase):
                 self.assertEqual(failures, 1, out)
                 self.assertIn(f"{rc_path}:1: retry", out)
 
+    # REQ-RT-17: steady_now, random_device, getrandom/getentropy,
+    # clock_nanosleep, timespec_get, bare/::time(, and Python clock/random
+    # import & alias bypasses must all be caught without false positives.
+    def test_req_rt_17_wall_clock_sleep_and_random_bypasses_are_caught(self):
+        cc_node = ("bench/main_processor/motor/motor.cc",
+                   {"bench/main_processor/motor/BUILD": NODE_BUILD})
+        py_node = ("examples/arm/arm.py",
+                   {"examples/arm/BUILD.bazel": PY_NODE_BUILD})
+        framework_node = ("talOS/teleop/node.cc", {})
+        test_cc = ("talOS/rtms/rtms_test.cc", {})
+
+        cases = (
+            # C++ steady_now()
+            ("cc_qualified_steady_now", *cc_node,
+             "auto t = talos::event::steady_" + "now();\n", "clock", 1),
+            ("cc_short_steady_now", *cc_node,
+             "auto t = event::steady_" + "now();\n", "clock", 1),
+            ("cc_bare_steady_now", *cc_node,
+             "auto t = steady_" + "now();\n", "clock", 1),
+            ("framework_steady_now", *framework_node,
+             "auto t = talos::event::steady_" + "now();\n", "clock", 1),
+            # C++ random_device, getrandom, getentropy
+            ("cc_std_random_device_decl", *cc_node,
+             "std::random_" + "device rd;\n", "random", 1),
+            ("cc_std_random_device_temp", *cc_node,
+             "auto x = std::random_" + "device{}();\n", "random", 1),
+            ("cc_bare_random_device", *cc_node,
+             "random_" + "device rd;\n", "random", 1),
+            ("cc_getrandom", *cc_node,
+             "auto n = get" + "random(buf, sizeof(buf), 0);\n", "random", 1),
+            ("cc_global_getrandom", *cc_node,
+             "auto n = ::get" + "random(buf, sizeof(buf), 0);\n", "random", 1),
+            ("cc_getentropy", *cc_node,
+             "int rc = get" + "entropy(buf, sizeof(buf));\n", "random", 1),
+            ("cc_global_getentropy", *cc_node,
+             "int rc = ::get" + "entropy(buf, sizeof(buf));\n", "random", 1),
+            # C++ clock_nanosleep (both tests and node code)
+            ("cc_node_clock_nanosleep", *cc_node,
+             "clock_" + "nanosleep(CLOCK_MONOTONIC, 0, &ts, nullptr);\n",
+             "sleep", 1),
+            ("cc_test_clock_nanosleep", *test_cc,
+             "::clock_" + "nanosleep(CLOCK_MONOTONIC, 0, &ts, nullptr);\n",
+             "sleep", 1),
+            # C++ timespec_get
+            ("cc_timespec_get", *cc_node,
+             "timespec_" + "get(&ts, TIME_UTC);\n", "clock", 1),
+            ("cc_std_timespec_get", *cc_node,
+             "std::timespec_" + "get(&ts, TIME_UTC);\n", "clock", 1),
+            ("cc_global_timespec_get", *cc_node,
+             "::timespec_" + "get(&ts, TIME_UTC);\n", "clock", 1),
+            # C++ bare time( and ::time(
+            ("cc_bare_time_assign", *cc_node,
+             "auto t = ti" + "me(nullptr);\n", "clock", 1),
+            ("cc_bare_time_stmt", *cc_node,
+             "ti" + "me(&now);\n", "clock", 1),
+            ("cc_bare_time_return", *cc_node,
+             "return ti" + "me(0);\n", "clock", 1),
+            ("cc_bare_time_cast", *cc_node,
+             "auto t = (long)ti" + "me(nullptr);\n", "clock", 1),
+            ("cc_bare_time_if", *cc_node,
+             "if (ok) ti" + "me(&now);\n", "clock", 1),
+            ("cc_bare_time_multiline", *cc_node,
+             "auto t = ti" + "me(\n    nullptr);\n", "clock", 1),
+            ("cc_global_time", *cc_node,
+             "auto t = ::ti" + "me(nullptr);\n", "clock", 1),
+            # Python aliased time/datetime/random/os.getrandom/uuid imports
+            ("py_from_time_as", *py_node,
+             "from ti" + "me import monotonic as mono\n", "clock", 1),
+            ("py_inline_suite_import_time_as", *py_node,
+             "if True: import ti" + "me as wall\n", "clock", 1),
+            ("py_inline_suite_from_time_as", *py_node,
+             "if True: from ti" + "me import sleep as nap\n", "clock", 1),
+            ("py_from_datetime_as", *py_node,
+             "from date" + "time import datetime as dt\n", "clock", 1),
+            ("py_from_datetime_date_as", *py_node,
+             "from date" + "time import date as d\n", "clock", 1),
+            ("py_from_datetime_star", *py_node,
+             "from date" + "time import *\n", "clock", 1),
+            ("py_from_datetime_multiline", *py_node,
+             "from date" + "time import (\n    timedelta,\n    datetime as dt,\n)\n",
+             "clock", 1),
+            ("py_import_datetime_as", *py_node,
+             "import date" + "time as dt\n", "clock", 1),
+            ("py_import_multi_datetime", *py_node,
+             "import math, date" + "time as dt\n", "clock", 1),
+            ("py_date_today", *py_node,
+             "d = da" + "te.today()\n", "clock", 1),
+            ("py_import_random_as", *py_node,
+             "import ran" + "dom as rng\n", "random", 1),
+            ("py_from_random_as", *py_node,
+             "from ran" + "dom import randint as ri\n", "random", 1),
+            ("py_inline_suite_import_random_as", *py_node,
+             "if True: import ran" + "dom as rng\n", "random", 1),
+            ("py_import_numpy_random_as", *py_node,
+             "import numpy.ran" + "dom as nr\n", "random", 1),
+            ("py_from_numpy_random", *py_node,
+             "from numpy.ran" + "dom import default_rng as dr\n", "random", 1),
+            ("py_from_numpy_import_random_as", *py_node,
+             "from numpy import ran" + "dom as nr\n", "random", 1),
+            ("py_os_getrandom", *py_node,
+             "b = os.get" + "random(4)\n", "random", 1),
+            ("py_aliased_os_getrandom", *py_node,
+             "import os as o\nb = o.get" + "random(4)\n", "random", 2),
+            ("py_from_os_getrandom_as", *py_node,
+             "from os import get" + "random as gr\n", "random", 1),
+            ("py_from_os_getrandom_multiline", *py_node,
+             "from os import (\n    path,\n    get" + "random,\n)\n",
+             "random", 1),
+            ("py_uuid4", *py_node,
+             "u = uuid.uu" + "id4()\n", "random", 1),
+            ("py_aliased_uuid4", *py_node,
+             "import uuid as u\nx = u.uu" + "id4()\n", "random", 2),
+            ("py_uuid1", *py_node,
+             "u = uuid.uu" + "id1()\n", "random", 1),
+            ("py_from_uuid4_as", *py_node,
+             "from uuid import uu" + "id4 as u4\n", "random", 1),
+            ("py_from_uuid_star", *py_node,
+             "from uuid import *\n", "random", 1),
+            ("py_from_datetime_backslash_cont", *py_node,
+             "from datetime import \\\n    datetime as dt\n", "clock", 1),
+            ("py_from_os_backslash_cont", *py_node,
+             "from os import \\\n    get" + "random as gr\n", "random", 1),
+            ("py_from_uuid_backslash_cont", *py_node,
+             "from uuid import \\\n    uu" + "id4 as u4\n", "random", 1),
+            ("py_from_numpy_backslash_cont", *py_node,
+             "from numpy import \\\n    random as nr\n", "random", 1),
+            ("py_from_threading_backslash_cont", *py_node,
+             "from threading import \\\n    Lock as L\n", "lock", 1),
+        )
+        for name, path, extra, text, kind, expected_line in cases:
+            with self.subTest(name=name):
+                failures, out = lint({path: text, **extra})
+                self.assertEqual(failures, 1, out)
+                self.assertIn(f"{path}:{expected_line}: {kind}", out)
+
+        # Negative cases: member calls, qualified non-std calls, C++/Python
+        # function definitions, comments, strings, non-clock datetime/uuid
+        # imports, and test-only uses must not false-positive.
+        failures, out = lint({
+            "bench/main_processor/motor/BUILD": NODE_BUILD,
+            "bench/main_processor/motor/motor.cc": (
+                "// steady_" + "now(); std::random_" + "device rd;\n"
+                "/* ti" + "me(nullptr); timespec_" + "get(&ts, 0); */\n"
+                'const char* s = "ti' + 'me(nullptr) get' + 'random(b, 4, 0)";\n'
+                "auto a = obj.time();\n"
+                "auto b = obj.time(1);\n"
+                "auto c = ptr->time();\n"
+                "auto d = ptr->time(1);\n"
+                "auto e = my_ns::time(nullptr);\n"
+                "auto f = Clock::time(0);\n"
+                "double time() const { return 0.0; }\n"
+                "double time(int x) const { return x; }\n"
+                "void time(std::int64_t t);\n"
+                "auto g = my_time(0);\n"
+                "auto h = obj.steady_now();\n"
+                "auto i = ptr->steady_now();\n"
+                "auto j = obj.getrandom(buf, 4, 0);\n"
+                "auto k = ptr->getentropy(buf, 4);\n"
+                "auto l = my_ns::getrandom(buf, 4, 0);\n"
+                "auto m = obj.timespec_get(&ts, 0);\n"
+                "auto n = my_ns::timespec_get(&ts, 0);\n"
+            ),
+            # Tests may use node-only APIs (steady_now, random_device, etc.).
+            "bench/main_processor/motor/node_test.cc": (
+                "auto t = event::steady_" + "now();\n"
+                "std::random_" + "device rd;\n"
+                "auto n = get" + "random(buf, 4, 0);\n"
+                "auto s = ti" + "me(nullptr);\n"
+                "timespec_" + "get(&ts, TIME_UTC);\n"
+            ),
+            "examples/arm/BUILD.bazel": PY_NODE_BUILD,
+            "examples/arm/arm.py": (
+                "class Timer:\n"
+                "    def time(self):\n"
+                "        return 0\n"
+                "    def time_at(self, x):\n"
+                "        return self.time()\n"
+                "def time(x):\n"
+                "    return x\n"
+                "y = obj.time(1)\n"
+                "from datetime import timedelta, timezone\n"
+                "from uuid import UUID, uuid5\n"
+                "from mypkg import datetime\n"
+                "from mypkg import uuid\n"
+                "import my_datetime\n"
+            ),
+        })
+        self.assertEqual(failures, 0, out)
+
 
 if __name__ == "__main__":
     unittest.main()

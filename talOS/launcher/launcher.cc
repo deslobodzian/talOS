@@ -120,26 +120,33 @@ struct Launcher::BridgeStatusObserver {
 
 namespace {
 
-// How often Supervise polls `/hw/status` while waiting for the current bridge
-// run's first status message to check `protocol_version_id`. Stops once that
-// run's version has been checked.
-constexpr std::chrono::milliseconds kBridgeProtocolPoll{20};
-
-// How often Supervise checks whether every non-observer member's loop has
-// started while waiting to write kSimScheduleStartFile. Stops once written or
-// once sim_gateway exits with no pending restart.
-constexpr std::chrono::milliseconds kSimScheduleStartPoll{20};
-
 // The topic ends a registry row published, or nullopt while it has
-// published none: a row is visible from its claim, and a writer that never
-// sets kFlagConstructing (the hardware bridge, the simulation gateway)
-// publishes its sources just after. Sources are written once per claim,
-// before the count (NodeRegistration::publish), so the acquire below sees
-// them whole. `complete` is false when the row could not hold them all.
+// published none and its loop has not yet started: a row is visible from its
+// claim, and a writer that never sets kFlagConstructing (the hardware bridge,
+// the simulation gateway) publishes its sources just after, before setting
+// its realtime outcome or first dispatch. Once kFlagConstructing is clear and
+// either RealtimeOf(flags) or dispatch_count > 0 is observed, source_count == 0
+// is an empty published endpoint list so CheckEndpoints catches a node that
+// declared endpoints in --describe but published none at runtime
+// (REQ-CONTRACT-11). Sources are written once per claim, before the count
+// (NodeRegistration::publish), so the acquire below sees them whole.
+// `complete` is false when the row could not hold them all.
 std::optional<std::vector<naming::SourceShape>> PublishedEndpoints(
-    const introspect::NodeRecord& record, bool& complete) {
+    const introspect::NodeRecord& record, uint32_t flags, bool& complete) {
+  // Load dispatch_count before source_count so an acquire sees sources already
+  // published before a writer's first dispatch.
+  const uint64_t dispatch =
+      record.dispatch_count.load(std::memory_order_acquire);
   const uint32_t count = record.source_count.load(std::memory_order_acquire);
-  if (count == 0) return std::nullopt;
+  if (count == 0) {
+    const bool loop_started =
+        (flags & introspect::kFlagConstructing) == 0 &&
+        (introspect::RealtimeOf(flags).has_value() || dispatch > 0);
+    if (!loop_started) return std::nullopt;
+    complete =
+        record.declared_source_count.load(std::memory_order_relaxed) == 0;
+    return std::vector<naming::SourceShape>{};
+  }
   const auto held = std::min<uint32_t>(
       count, static_cast<uint32_t>(introspect::kMaxSourcesPerNode));
   complete =
@@ -574,6 +581,16 @@ int Launcher::RefuseLaunch(std::string_view reason,
   stop_signals.Install();
   if (process::stop_requested.load()) return 1;
 
+  std::optional<ChildOutput> refusal_output;
+  try {
+    refusal_output.emplace();
+  } catch (const std::exception& e) {
+    ConsoleLine(std::cerr)
+        << "[launcher] cannot start refusal studio_bridge output drain ("
+        << e.what() << ")\n";
+    return 1;
+  }
+
   SupervisionWakeup wakeup;
   int stdout_fd = -1;
   std::string spawn_error;
@@ -585,14 +602,16 @@ int Launcher::RefuseLaunch(std::string_view reason,
     return 1;
   }
   if (stdout_fd >= 0) {
-    const int flags = ::fcntl(stdout_fd, F_GETFL, 0);
-    if (flags >= 0) ::fcntl(stdout_fd, F_SETFL, flags | O_NONBLOCK);
+    refusal_output->Add(stdout_fd, "/dev/null", kStudioBridgeName, pid,
+                        /*echo=*/false, "listening ");
   }
 
   ServiceNotifier notifier;
   const auto watchdog = notifier.watchdog_interval();
   const auto start_time = options_.supervision_clock();
   SupervisionTime next_watchdog = SupervisionTime::max();
+  SupervisionTime next_lock_refresh = SupervisionTime::min();
+  bool lock_lost_reported = false;
   const auto deadline_after = [](SupervisionTime start, int duration_s) {
     if (duration_s <= 0) return SupervisionTime::max();
     const auto offset = std::chrono::duration_cast<SupervisionTime::duration>(
@@ -607,73 +626,63 @@ int Launcher::RefuseLaunch(std::string_view reason,
   bool ready_sent = false;
   SupervisionTime shutdown_deadline = SupervisionTime::max();
   bool port_announced = false;
-  std::string stdout_buf;
 
-  const auto drain_stdout = [&] {
-    if (stdout_fd < 0) return;
-    char chunk[256];
-    for (;;) {
-      const ssize_t n = ::read(stdout_fd, chunk, sizeof(chunk));
-      if (n > 0) {
-        if (!port_announced && stdout_buf.size() < 4096) {
-          stdout_buf.append(chunk, static_cast<std::size_t>(n));
-        }
-        continue;
-      }
-      if (n == 0 ||
-          (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
-        ::close(stdout_fd);
-        stdout_fd = -1;
-      }
-      break;
-    }
-    if (!port_announced) {
-      std::size_t pos = 0;
-      for (std::size_t nl = stdout_buf.find('\n', pos); nl != std::string::npos;
-           nl = stdout_buf.find('\n', pos)) {
-        std::string_view line(stdout_buf.data() + pos, nl - pos);
-        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-        constexpr std::string_view kPrefix = "listening ";
-        if (line.starts_with(kPrefix)) {
-          const std::string_view value = line.substr(kPrefix.size());
-          int bound = 0;
-          const auto* end = value.data() + value.size();
-          const auto [ptr, ec] = std::from_chars(value.data(), end, bound);
-          if (!value.empty() && ec == std::errc{} && ptr == end && bound >= 1 &&
-              bound <= 65535) {
-            port_announced = true;
-            ConsoleLine(std::cout)
-                << "[launcher] Launch refused; serving refusal on "
-                   "http://localhost:"
-                << bound << "/drive\n";
-            pos = nl + 1;
-            break;
-          }
-        }
-        pos = nl + 1;
-      }
-      if (pos > 0) stdout_buf.erase(0, pos);
+  const auto check_port = [&] {
+    if (port_announced) return;
+    const auto matched = refusal_output->MatchedLine("/dev/null", pid);
+    if (!matched) return;
+    constexpr std::string_view kPrefix = "listening ";
+    if (!matched->starts_with(kPrefix)) return;
+    const std::string_view value =
+        std::string_view{*matched}.substr(kPrefix.size());
+    int bound = 0;
+    const auto* end = value.data() + value.size();
+    const auto [ptr, ec] = std::from_chars(value.data(), end, bound);
+    if (!value.empty() && ec == std::errc{} && ptr == end && bound >= 1 &&
+        bound <= 65535) {
+      port_announced = true;
+      ConsoleLine(std::cout) << "[launcher] Launch refused; serving refusal on "
+                                "http://localhost:"
+                             << bound << "/drive\n";
     }
   };
 
   for (;;) {
-    drain_stdout();
+    check_port();
     int status = 0;
-    const pid_t reaped = ::waitpid(pid, &status, WNOHANG);
+    pid_t reaped = 0;
+    do {
+      reaped = ::waitpid(pid, &status, WNOHANG);
+    } while (reaped < 0 && errno == EINTR);
     if (reaped == pid) {
       FinishProcessGroup(pid);
-      drain_stdout();
-      if (stdout_fd >= 0) {
-        ::close(stdout_fd);
-        stdout_fd = -1;
-      }
+      refusal_output->Stop();
+      check_port();
       if (!stop_sent) {
         ConsoleLine(std::cerr) << "[launcher] refusal studio_bridge exited ("
                                << ExitReason(status) << ")\n";
       }
       break;
     }
+    if (reaped < 0) {
+      ConsoleLine(std::cerr)
+          << "[launcher] waitpid on refusal studio_bridge (pid " << pid
+          << ") failed (" << std::strerror(errno) << ")\n";
+      FinishProcessGroup(pid);
+      refusal_output->Stop();
+      break;
+    }
     const SupervisionTime now = options_.supervision_clock();
+    if (session_lock_ != nullptr && now >= next_lock_refresh) {
+      next_lock_refresh = now + kLockFileRefresh;
+      if (!session_lock_->Refresh() && !lock_lost_reported) {
+        lock_lost_reported = true;
+        ConsoleLine(std::cerr)
+            << "[launcher] the session lock " << session_lock_->path()
+            << " was removed; a second launcher in this namespace "
+               "would no longer be refused\n";
+      }
+    }
     // Notify systemd READY=1 only once the bridge is alive and has announced
     // its listening port, so an immediate EADDRINUSE exit never falsely
     // reports READY=1 before returning 1.
@@ -699,13 +708,11 @@ int Launcher::RefuseLaunch(std::string_view reason,
     auto wake = SupervisionTime::max();
     const auto due = [&wake](SupervisionTime at) { wake = std::min(wake, at); };
     if (ready_sent && watchdog) due(next_watchdog);
+    if (session_lock_ != nullptr) due(next_lock_refresh);
     if (stop_sent) {
       if (now < shutdown_deadline) due(shutdown_deadline);
     } else {
       due(deadline);
-      if (!port_announced && stdout_fd >= 0) {
-        due(now + std::chrono::milliseconds{10});
-      }
     }
     wakeup.Wait(wake == SupervisionTime::max()
                     ? std::chrono::nanoseconds::max()
@@ -1700,6 +1707,10 @@ void Launcher::NodeLaunch::NewRun(SupervisionTime spawned) {
 void Launcher::SpawnFailed(NodeProcessInfo& proc, NodeLaunch& launch,
                            SupervisionTime now, const std::string& error) {
   proc.failed = true;
+  proc.pid = -1;
+  proc.exited = true;
+  proc.exit_code = -1;
+  proc.exit_signal = 0;
   proc.RecordSpawnFailure();
   ConsoleLine line{std::cerr};
   line << "[launcher] cannot spawn " << proc.name << " (" << error << "); ";
@@ -1757,8 +1768,12 @@ void Launcher::Restart(NodeProcessInfo& proc, NodeLaunch& launch,
   // The attempt counts against the rolling budget whether or not it spawns.
   launch.restart.Started(now);
   ShowRestart(proc, launch.restart);
-  // Only a spawned run sets a pid.
-  const int restart = proc.pid > 0 ? proc.restart_count + 1 : 0;
+  // Only a previously spawned run increments the restart number.
+  const bool had_spawned =
+      proc.pid > 0 || proc.restart_count > 0 ||
+      std::any_of(proc.runs.begin(), proc.runs.end(),
+                  [](const NodeRun& run) { return run.pid > 0; });
+  const int restart = had_spawned ? proc.restart_count + 1 : 0;
   if (launch.log_arg != 0) {
     launch.args[launch.log_arg] =
         NodeLogPath(options_.output_dir, proc.name, restart);
@@ -1944,7 +1959,7 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
           // with its endpoints published (CheckEndpoints).
           if (launch.compare_endpoints && !launch.endpoints_checked &&
               (flags & introspect::kFlagConstructing) == 0) {
-            reads.published = PublishedEndpoints(record, live_complete);
+            reads.published = PublishedEndpoints(record, flags, live_complete);
           }
           reads.loss = DeliveryCountsOf(record);
           return reads;
@@ -1992,6 +2007,37 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
   return changed;
 }
 
+SupervisionTime NextSupervisionWake(const SupervisionWakeInputs& inputs) {
+  SupervisionTime wake = SupervisionTime::max();
+  const auto due = [&wake](SupervisionTime at) { wake = std::min(wake, at); };
+  // The pass's WATCHDOG=1 went out at about `now`.
+  if (inputs.watchdog) {
+    due(ServiceNotifier::NextDeadline(inputs.now, *inputs.watchdog));
+  }
+  if (inputs.next_lock_refresh) due(*inputs.next_lock_refresh);
+  if (inputs.stop_phase == SupervisionStopPhase::kBridge) {
+    if (!inputs.bridge_killed && inputs.now < inputs.bridge_stop_deadline) {
+      due(std::min(inputs.bridge_stop_deadline,
+                   inputs.now + kBridgeQuiescePoll));
+    }
+  } else if (inputs.stop_phase == SupervisionStopPhase::kAllSignaled) {
+    // Once passed, its SIGKILLs are sent; the exits they cause wake it.
+    if (inputs.now < inputs.shutdown_deadline) due(inputs.shutdown_deadline);
+  } else {
+    due(inputs.session_deadline);
+    if (inputs.sim_schedule_polling) due(inputs.now + kSimScheduleStartPoll);
+    if (inputs.bridge_protocol_polling) due(inputs.now + kBridgeProtocolPoll);
+    for (const SupervisionTime next_look : inputs.member_next_looks) {
+      due(next_look);
+    }
+  }
+  for (const SupervisionTime due_at : inputs.pending_restarts) {
+    due(due_at);
+  }
+  if (inputs.studio_next_check) due(*inputs.studio_next_check);
+  return wake;
+}
+
 void Launcher::Supervise(SessionManifest& manifest,
                          std::vector<NodeProcessInfo>& procs,
                          std::vector<NodeLaunch>& launches,
@@ -1999,13 +2045,17 @@ void Launcher::Supervise(SessionManifest& manifest,
                          std::optional<std::size_t> sim_gateway_index,
                          BridgeStatusObserver* status_observer,
                          std::chrono::steady_clock::time_point deadline) {
-  enum class StopPhase { kNone, kBridge, kAllSignaled };
+  using StopPhase = SupervisionStopPhase;
   StopPhase stop_phase = StopPhase::kNone;
   bool bridge_killed = false;
   bool sim_schedule_done = !sim_gateway_index.has_value();
   auto bridge_stop_deadline = std::chrono::steady_clock::time_point::max();
   auto shutdown_deadline = std::chrono::steady_clock::time_point::max();
   std::optional<introspect::RegistryMapping> registry;
+  std::vector<SupervisionTime> member_next_looks;
+  std::vector<SupervisionTime> pending_restarts;
+  member_next_looks.reserve(procs.size());
+  pending_restarts.reserve(procs.size());
   // Every first run's liveness counts from here, not its spawn.
   const auto started = options_.supervision_clock();
   for (auto& launch : launches) launch.NewRun(started);
@@ -2290,9 +2340,12 @@ void Launcher::Supervise(SessionManifest& manifest,
     }
 
     // Two-phase shutdown (REQ-OPS-20): stop `hardware_node` first so the
-    // bridge stops forwarding commands (and sends its neutral) before actuator
-    // owners exit; bound the wait at kBridgeStopTimeout (SIGKILL if hung), and
-    // only after `hardware_node` has been reaped signal the remaining children.
+    // bridge sends its shutdown neutral, closes its waits and UDP socket, and
+    // stops forwarding before actuator owners exit. Bound quiescence at
+    // kBridgeStopTimeout (SIGKILL and wait for reap if hung without quiescing);
+    // once `hardware_node` has either exited or marked kFlagQuiesced, signal
+    // the remaining members and share kStopTimeout (2 s) with any quiesced
+    // bridge still flushing its `.tlog`.
     const auto running_bridge = [&]() -> std::optional<std::size_t> {
       for (std::size_t i = 0; i < procs.size(); ++i) {
         if (procs[i].name == kHardwareNodeName && procs[i].pid > 0 &&
@@ -2302,10 +2355,18 @@ void Launcher::Supervise(SessionManifest& manifest,
       }
       return std::nullopt;
     };
-    const auto signal_remaining = [&] {
+    const auto bridge_quiesced = [&](std::size_t idx) -> bool {
+      if (!registry) return false;
+      const auto row =
+          ReadRunRow(&*registry, procs[idx].pid, options_.session_id,
+                     launches[idx].spawned_monotonic_ns,
+                     [](const introspect::NodeRecord&, uint32_t) { return 0; });
+      return row.has_value() && (row->flags & introspect::kFlagQuiesced) != 0;
+    };
+    const auto signal_remaining = [&](std::optional<std::size_t> skip_idx) {
       stop_phase = StopPhase::kAllSignaled;
-      shutdown_deadline = now + kStopTimeout;
       for (std::size_t i = 0; i < procs.size(); ++i) {
+        if (skip_idx && i == *skip_idx) continue;
         const auto& proc = procs[i];
         if (proc.pid <= 0 || proc.exited) continue;
         // The exit this causes is reaped by a later pass, which reads the
@@ -2313,6 +2374,7 @@ void Launcher::Supervise(SessionManifest& manifest,
         SignalProcessGroup(proc.pid, kStopSignal);
         if (launches[i].kill_reason.empty()) launches[i].kill_reason = kRunStop;
       }
+      shutdown_deadline = options_.supervision_clock() + kStopTimeout;
     };
     if (stop_phase == StopPhase::kNone &&
         (process::stop_requested.load() || past_deadline ||
@@ -2320,18 +2382,19 @@ void Launcher::Supervise(SessionManifest& manifest,
       ConsoleLine(std::cout) << "[launcher] Stopping children...\n";
       if (const auto bridge_idx = running_bridge()) {
         stop_phase = StopPhase::kBridge;
-        bridge_stop_deadline = now + kBridgeStopTimeout;
         SignalProcessGroup(procs[*bridge_idx].pid, kStopSignal);
         if (launches[*bridge_idx].kill_reason.empty()) {
           launches[*bridge_idx].kill_reason = kRunStop;
         }
+        bridge_stop_deadline =
+            options_.supervision_clock() + kBridgeStopTimeout;
       } else {
-        signal_remaining();
+        signal_remaining(std::nullopt);
       }
     } else if (stop_phase == StopPhase::kBridge) {
       const auto bridge_idx = running_bridge();
-      if (!bridge_idx) {
-        signal_remaining();
+      if (!bridge_idx || (!bridge_killed && bridge_quiesced(*bridge_idx))) {
+        signal_remaining(bridge_idx);
       } else if (!bridge_killed && now >= bridge_stop_deadline) {
         bridge_killed = true;
         SignalProcessGroup(procs[*bridge_idx].pid, SIGKILL);
@@ -2353,42 +2416,47 @@ void Launcher::Supervise(SessionManifest& manifest,
     // Sleeps until the earliest time a pass has something to decide without
     // an event; a child's exit and a stop signal wake it at once. Every
     // timed decision above must be here, or it waits for an unrelated wake.
-    auto wake = SupervisionTime::max();
-    const auto due = [&wake](SupervisionTime at) { wake = std::min(wake, at); };
-    // The pass's WATCHDOG=1 went out at about `now`.
-    if (watchdog) due(ServiceNotifier::NextDeadline(now, *watchdog));
-    if (refreshes_locks) due(next_lock_refresh);
-    if (stop_phase == StopPhase::kBridge) {
-      if (!bridge_killed && now < bridge_stop_deadline) {
-        due(bridge_stop_deadline);
-      }
-    } else if (stop_phase == StopPhase::kAllSignaled) {
-      // Once passed, its SIGKILLs are sent; the exits they cause wake it.
-      if (now < shutdown_deadline) due(shutdown_deadline);
-    } else {
-      due(deadline);
-      if (sim_schedule_polling) due(now + kSimScheduleStartPoll);
-      if (status_observer != nullptr) {
-        for (std::size_t i = 0; i < procs.size(); ++i) {
-          if (procs[i].name == kHardwareNodeName && procs[i].pid > 0 &&
-              !procs[i].exited && !launches[i].protocol_checked) {
-            due(now + kBridgeProtocolPoll);
-            break;
-          }
+    SupervisionWakeInputs wake_inputs;
+    wake_inputs.now = now;
+    wake_inputs.watchdog = watchdog;
+    if (refreshes_locks) wake_inputs.next_lock_refresh = next_lock_refresh;
+    wake_inputs.stop_phase = stop_phase;
+    wake_inputs.bridge_killed = bridge_killed;
+    wake_inputs.bridge_stop_deadline = bridge_stop_deadline;
+    wake_inputs.shutdown_deadline = shutdown_deadline;
+    wake_inputs.session_deadline = deadline;
+    wake_inputs.sim_schedule_polling = sim_schedule_polling;
+    if (status_observer != nullptr) {
+      for (std::size_t i = 0; i < procs.size(); ++i) {
+        if (procs[i].name == kHardwareNodeName && procs[i].pid > 0 &&
+            !procs[i].exited && !launches[i].protocol_checked) {
+          wake_inputs.bridge_protocol_polling = true;
+          break;
         }
       }
-      // Each run the next pass watches (WatchRun): its row's next look.
-      for (std::size_t i = 0; i < procs.size(); ++i) {
-        if (procs[i].pid <= 0 || procs[i].exited ||
-            launches[i].heartbeat_killed || (studio && i == studio->index()))
-          continue;
-        due(launches[i].liveness.NextLook(launches[i].limits));
+    }
+    // Each run the next pass watches (WatchRun): its row's next look.
+    member_next_looks.clear();
+    for (std::size_t i = 0; i < procs.size(); ++i) {
+      if (procs[i].pid <= 0 || procs[i].exited ||
+          launches[i].heartbeat_killed || (studio && i == studio->index()))
+        continue;
+      member_next_looks.push_back(
+          launches[i].liveness.NextLook(launches[i].limits));
+    }
+    wake_inputs.member_next_looks = member_next_looks;
+    pending_restarts.clear();
+    for (const auto& launch : launches) {
+      if (launch.restart.pending()) {
+        pending_restarts.push_back(launch.restart.due_at());
       }
     }
-    for (const auto& launch : launches) {
-      if (launch.restart.pending()) due(launch.restart.due_at());
+    wake_inputs.pending_restarts = pending_restarts;
+    if (studio) {
+      wake_inputs.studio_next_check =
+          studio->NextCheck(stop_phase != StopPhase::kNone);
     }
-    if (studio) due(studio->NextCheck(stop_phase != StopPhase::kNone));
+    const SupervisionTime wake = NextSupervisionWake(wake_inputs);
     wakeup.Wait(wake == SupervisionTime::max()
                     ? std::chrono::nanoseconds::max()
                     : wake - options_.supervision_clock());

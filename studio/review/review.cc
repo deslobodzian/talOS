@@ -231,19 +231,37 @@ Response Review::Get(std::string_view path, std::string_view query) {
     return Error(404, "not found");
   }
   Response error;
+  if (route == "declared.json" || route == "manifest.json") {
+    if (!ValidateSessionDir(id, error)) return error;
+    return route == "declared.json" ? Declared(id) : Manifest(id);
+  }
   const Session* session = Open(id, error);
   if (session == nullptr) return error;
   try {
     if (route == "channels.json") return Channels(*session);
     if (route == "bounds.json") return Bounds(*session);
     if (route == "timeline.json") return Timeline(*session);
-    if (route == "declared.json") return Declared(id);
-    if (route == "manifest.json") return Manifest(id);
     if (route == "snapshot") return Snapshot(*session, query);
     return Series(id, *session, query);
   } catch (const std::exception& e) {
     return Error(500, e.what());
   }
+}
+
+bool Review::ValidateSessionDir(std::string_view id, Response& error) const {
+  if (!ValidSessionId(id)) {
+    error = Error(400, "invalid session id");
+    return false;
+  }
+  const fs::path dir = library_ / std::string{id};
+  std::error_code ignored;
+  const fs::file_status st = fs::symlink_status(dir, ignored);
+  if (ignored || fs::is_symlink(st) || !fs::is_directory(st) ||
+      !IsSession(dir)) {
+    error = Error(404, "no session " + std::string{id});
+    return false;
+  }
+  return true;
 }
 
 const Session* Review::Open(std::string_view id, Response& error) {
@@ -256,13 +274,8 @@ const Session* Review::Open(std::string_view id, Response& error) {
     it->second.used = requests_;
     return it->second.session.get();
   }
+  if (!ValidateSessionDir(id, error)) return nullptr;
   const fs::path dir = library_ / std::string{id};
-  std::error_code ignored;
-  if (!fs::is_directory(dir, ignored) || fs::is_symlink(dir, ignored) ||
-      !IsSession(dir)) {
-    error = Error(404, "no session " + std::string{id});
-    return nullptr;
-  }
   try {
     auto session = Session::Open(dir);
     const Session* opened = session.get();

@@ -62,6 +62,7 @@
 // sample_time() uses.
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -193,6 +194,10 @@ class Motor {
   // Commands adjusted to configured limits or neutralized for non-finite
   // values, counted once per setter call over this handle's device lifetime.
   std::uint64_t clamped_count() const;
+  // This motor's slot index in configured motor order (0..kMaxMotors-1),
+  // matching its bit position in /hw/status motor_fault_mask,
+  // motor_forward_limit_mask and motor_reverse_limit_mask.
+  std::uint8_t hardware_index() const;
   // Node-shared software frame; ignored unless the sample is connected, its
   // position at most RezeroAgeBound old at its State, and both input and
   // resulting offset finite: zeroed() then stays as it was, so a homing

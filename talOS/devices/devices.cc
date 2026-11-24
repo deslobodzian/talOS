@@ -185,6 +185,7 @@ struct HardwareLink::Impl {
     std::uint64_t set_update = 0;
     hardware::MotorRequest motor{};
     const hardware::MotorConfig* motor_config = nullptr;
+    std::uint8_t hardware_index = 0;  // index in config.hardware.motors
     std::uint64_t clamped_count = 0;
     double position_offset = 0;  // Motor/Gyro software zero
     bool zeroed = false;         // position_offset was set by rezero
@@ -663,9 +664,15 @@ std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
     impl.devices.push_back({.kind = kind, .id = id, .name = std::string{name}});
   }
   if (kind == Kind::kMotor) {
-    for (const auto& motor : impl.config.hardware.motors) {
-      if (motor.id == id) {
-        impl.devices.back().motor_config = &motor;
+    static_assert(hardware::kMaxMotors <= 32,
+                  "motor_fault_mask is uint32_t and indexes motors by bit");
+    static_assert(
+        hardware::kMaxMotors <= std::numeric_limits<std::uint8_t>::max(),
+        "Motor::hardware_index returns uint8_t");
+    for (std::size_t i = 0; i < impl.config.hardware.motors.size(); ++i) {
+      if (impl.config.hardware.motors[i].id == id) {
+        impl.devices.back().motor_config = &impl.config.hardware.motors[i];
+        impl.devices.back().hardware_index = static_cast<std::uint8_t>(i);
         break;
       }
     }
@@ -785,6 +792,11 @@ void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
 std::uint64_t HardwareAccess::motor_clamped_count(const HardwareLink& link,
                                                   std::size_t index) {
   return link.impl_->At(index, Kind::kMotor).clamped_count;
+}
+
+std::uint8_t HardwareAccess::motor_hardware_index(const HardwareLink& link,
+                                                  std::size_t index) {
+  return link.impl_->At(index, Kind::kMotor).hardware_index;
 }
 
 void HardwareAccess::motor_rezero(HardwareLink& link, std::size_t index,
@@ -1044,6 +1056,10 @@ void Motor::stop() {
 std::uint64_t Motor::clamped_count() const {
   return HardwareAccess::motor_clamped_count(RequireLink(link_, "Motor"),
                                              index_);
+}
+std::uint8_t Motor::hardware_index() const {
+  return HardwareAccess::motor_hardware_index(RequireLink(link_, "Motor"),
+                                              index_);
 }
 void Motor::rezero(double position_rot) {
   HardwareAccess::motor_rezero(RequireLink(link_, "Motor"), index_,

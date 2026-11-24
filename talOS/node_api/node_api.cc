@@ -788,6 +788,14 @@ int32_t talos_motor_clamped_count(TalosNode* node, int64_t index,
   });
 }
 
+int32_t talos_motor_hardware_index(TalosNode* node, int64_t index) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    const std::size_t idx = Index(index);
+    return static_cast<int32_t>(
+        HardwareAccess::motor_hardware_index(FindLink(node, idx), idx));
+  });
+}
+
 int32_t talos_digital_output_set(TalosNode* node, int64_t index,
                                  int32_t value) {
   return Guard<int32_t>(TALOS_ERR, [&] {

@@ -27,8 +27,9 @@ namespace talos::launcher {
 // Studio bridge
 //
 // The one roster member supervised differently. It takes positional args
-// rather than the node flags (plus --session-id, --config, --declared and
-// --manifest) and logs plaintext to studio_bridge.log rather than a .tlog. It
+// rather than the node flags (plus --session-id, --config, --declared,
+// --manifest, and --sim in simulation) and logs plaintext to studio_bridge.log
+// rather than a .tlog. It
 // claims a live registry row (observer tier, advancing heartbeat_monotonic_ns
 // and dispatch_count on every loop pass), so the launcher watches it with
 // RunLiveness (period kStudioBridgePeriod) and kills and restarts a hung or

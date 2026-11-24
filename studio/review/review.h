@@ -54,10 +54,13 @@
 //       and runs_dropped (which also sums each node's manifest runs_dropped).
 //   GET /review/<id>/declared.json
 //       the session directory's graph.json verbatim (application/json, up to
-//       kMaxDeclaredBytes), or 404 plain text when absent
+//       kMaxDeclaredBytes), or 404 plain text when absent; validated against
+//       ValidSessionId and session directory existence without opening logs
 //   GET /review/<id>/manifest.json
 //       the session directory's manifest.json verbatim (application/json, up
-//       to kMaxManifestBytes), or 404 plain text when absent
+//       to kMaxManifestBytes), or 404 plain text when absent; validated
+//       against ValidSessionId and session directory existence without opening
+//       logs
 //   GET /review/<id>/snapshot?t_ns=
 //       {"t_ns","channels":{name:{"value","sample_ns"}}}
 //       value as the bridge's /telemetry.json writes a sample, or null for
@@ -161,6 +164,11 @@ class Review {
   const ReadStats& last_read() const { return last_read_; }
 
  private:
+  // Validates `id` and confirms its non-symlink session directory exists in
+  // `library_` (without indexing any .tlog). Sets `error` (400 or 404) and
+  // returns false otherwise.
+  bool ValidateSessionDir(std::string_view id, Response& error) const;
+
   // The opened session `id`, indexing it on first use; null with `error`
   // set to the response for an unknown id or a session that cannot be read.
   const Session* Open(std::string_view id, Response& error);

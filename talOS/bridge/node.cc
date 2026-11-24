@@ -1504,8 +1504,10 @@ int HardwareNode::Run(int duration_s) {
   SendShutdownNeutral(stop_us);
   const uint64_t ran_us = ElapsedUs(stop_us, start_us);
   CloseWaits();
+  peer_.Close();
 
   PublishIntrospection();
+  if (registration_) registration_->mark_quiesced();
 
   std::printf("hardware_node: states=%llu commands=%llu\n",
               static_cast<unsigned long long>(states_received_),
@@ -1553,6 +1555,7 @@ int HardwareNode::Run(int duration_s) {
         .kind = event::EventKind::EXIT, .event_time = now, .now = now});
     log_->flush();
     ReportLogFailure();
+    PublishIntrospection();
     std::printf(
         "hardware_node: recording_failed=%d recording_capped=%d "
         "recording_gaps=%llu records_lost=%llu\n",
@@ -1561,6 +1564,7 @@ int HardwareNode::Run(int duration_s) {
         static_cast<unsigned long long>(log_->lost_records()));
     log_incomplete = log_->incomplete();
   }
+  std::fflush(stdout);
   // A run without one State never heard the controller. It says so on
   // stderr either way, beside the summary, since under the launcher the
   // exit status cannot: the launcher passes its members no --duration-s and
@@ -1570,7 +1574,6 @@ int HardwareNode::Run(int duration_s) {
   // spawned yet). Only a run that reached its own --duration-s (a bridge run
   // directly) fails for it.
   if (states_received_ == 0) {
-    std::fflush(stdout);  // after the summary in a shared log
     std::fprintf(stderr,
                  "hardware_node warning: ended without receiving a State "
                  "from the controller at %s:%u (ran %.1f s)\n",

@@ -207,10 +207,11 @@ std::string Flat(std::size_t count) {
   return out + "]";
 }
 
-std::string Sample(std::string_view t, std::string_view x) {
+std::string Sample(std::string_view t, std::string_view x,
+                   std::string_view y = "0") {
   return std::string{R"({"t": )"} + std::string{t} + R"(, "x": )" +
-         std::string{x} +
-         R"(, "y": 0, "heading": 0, "vx": 0, "vy": 0, "omega": 0})";
+         std::string{x} + R"(, "y": )" + std::string{y} +
+         R"(, "heading": 0, "vx": 0, "vy": 0, "omega": 0})";
 }
 
 // Guards: malformed, unsupported or implausible input returns an error
@@ -269,6 +270,12 @@ TEST(ChoreoTest, RejectsMalformedInputWithAClearError) {
       {"time beyond an hour", Document("1", "[" + Sample("3601", "0") + "]"),
        "trajectory.samples[0].t"},
       {"x beyond 100 m", Document("1", "[" + Sample("0", "100.5") + "]"),
+       "trajectory.samples[0]"},
+      {"x below -100 m", Document("1", "[" + Sample("0", "-100.5") + "]"),
+       "trajectory.samples[0]"},
+      {"y beyond 100 m", Document("1", "[" + Sample("0", "0", "100.5") + "]"),
+       "trajectory.samples[0]"},
+      {"y below -100 m", Document("1", "[" + Sample("0", "0", "-100.5") + "]"),
        "trajectory.samples[0]"},
       {"x overflows a double", Document("1", "[" + Sample("0", "1e999") + "]"),
        nullptr},

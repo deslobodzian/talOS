@@ -446,12 +446,19 @@ TEST(TargetSolverTurret, SeamHysteresisStopsAFullTurnSweep) {
   double turret_rad = kPi - 0.01;
   for (int tick = 0; tick < 20; ++tick) {
     // The needed heading alternates pi - 0.005 and -pi + 0.005.
-    const double needed_rad = (tick % 2 == 0) ? kPi - 0.005 : -kPi + 0.005;
+    const bool seam_crossed = (tick % 2 != 0);
+    const double needed_rad = seam_crossed ? -kPi + 0.005 : kPi - 0.005;
     const Eigen::Vector2d target(4.0 * std::cos(needed_rad),
                                  4.0 * std::sin(needed_rad));
     const Solution s = full.SolveStatic(origin, target, turret_rad);
     ASSERT_TRUE(s.valid);
-    EXPECT_GT(s.turret_rad, kPi - 0.02) << "tick " << tick;
+    if (seam_crossed) {
+      EXPECT_FALSE(s.turret_reachable) << "tick " << tick;
+      EXPECT_EQ(s.turret_rad, kPi) << "tick " << tick;
+    } else {
+      EXPECT_TRUE(s.turret_reachable) << "tick " << tick;
+      EXPECT_NEAR(s.turret_rad, kPi - 0.005, kTight) << "tick " << tick;
+    }
     turret_rad = s.turret_rad;
   }
   // Well past the seam (0.2 rad > 0.05): the turret goes around.
@@ -461,6 +468,41 @@ TEST(TargetSolverTurret, SeamHysteresisStopsAFullTurnSweep) {
       kPi - 0.01);
   EXPECT_TRUE(around.turret_reachable);
   EXPECT_NEAR(around.turret_rad, -kPi + 0.2, kTight);
+}
+
+// Symmetric seam hysteresis at min_rad = -pi: jittering across the seam from
+// the negative side holds -pi as unreachable inside 0.05 rad and sweeps around
+// to +pi - 0.2 once past 0.05 rad.
+// REQ-DEV-18
+TEST(TargetSolverTurret, SeamHysteresisStopsAFullTurnSweepAtMinLimit) {
+  const ShotTable table = RealisticTable();
+  const SE2<double> origin = Pose(0.0, 0.0, 0.0);
+  const TargetSolver full(Turret(0.0, 0.0, 0.0, {-kPi, kPi, 0.05}), table);
+  double turret_rad = -kPi + 0.01;
+  for (int tick = 0; tick < 20; ++tick) {
+    // The needed heading alternates -pi + 0.005 and pi - 0.005.
+    const bool seam_crossed = (tick % 2 != 0);
+    const double needed_rad = seam_crossed ? kPi - 0.005 : -kPi + 0.005;
+    const Eigen::Vector2d target(4.0 * std::cos(needed_rad),
+                                 4.0 * std::sin(needed_rad));
+    const Solution s = full.SolveStatic(origin, target, turret_rad);
+    ASSERT_TRUE(s.valid);
+    if (seam_crossed) {
+      EXPECT_FALSE(s.turret_reachable) << "tick " << tick;
+      EXPECT_EQ(s.turret_rad, -kPi) << "tick " << tick;
+    } else {
+      EXPECT_TRUE(s.turret_reachable) << "tick " << tick;
+      EXPECT_NEAR(s.turret_rad, -kPi + 0.005, kTight) << "tick " << tick;
+    }
+    turret_rad = s.turret_rad;
+  }
+  // Well past the seam (0.2 rad > 0.05): the turret goes around.
+  const Solution around = full.SolveStatic(
+      origin,
+      Eigen::Vector2d(4.0 * std::cos(kPi - 0.2), 4.0 * std::sin(kPi - 0.2)),
+      -kPi + 0.01);
+  EXPECT_TRUE(around.turret_reachable);
+  EXPECT_NEAR(around.turret_rad, kPi - 0.2, kTight);
 }
 
 // Aiming at an exact travel limit with seam_hysteresis_rad > 0 and measured
@@ -844,9 +886,30 @@ TEST(TargetSolverMoving, NonConvergenceIsBoundedAndFlagged) {
   ASSERT_TRUE(s.valid);
   EXPECT_FALSE(s.converged);
   EXPECT_EQ(s.iteration_count, 7);
+  EXPECT_NEAR(s.virtual_target_x_m, 3.3, kTight);
+  EXPECT_NEAR(s.distance_m, 3.3, kTight);
+  EXPECT_NEAR(s.time_of_flight_s, 2.0, kTight);
   for (const double value :
        {s.distance_m, s.shot_heading_rad, s.turret_rad, s.flywheel_rps,
         s.hood_rad, s.time_of_flight_s, s.virtual_target_x_m}) {
+    EXPECT_TRUE(std::isfinite(value));
+  }
+
+  // Even iteration bound stops on the opposite half of the two-cycle.
+  config.max_iteration_count = 6;
+  const TargetSolver even_solver(config, steep);
+  const Solution even = even_solver.SolveWithFieldVelocity(
+      Pose(0.0, 0.0, 0.0), FieldTwist{2.0, 0.0, 0.0},
+      Eigen::Vector2d(3.5, 0.0));
+  ASSERT_TRUE(even.valid);
+  EXPECT_FALSE(even.converged);
+  EXPECT_EQ(even.iteration_count, 6);
+  EXPECT_NEAR(even.virtual_target_x_m, -0.5, kTight);
+  EXPECT_NEAR(even.distance_m, 0.5, kTight);
+  EXPECT_NEAR(even.time_of_flight_s, 0.1, kTight);
+  for (const double value : {even.distance_m, even.shot_heading_rad,
+                             even.turret_rad, even.flywheel_rps, even.hood_rad,
+                             even.time_of_flight_s, even.virtual_target_x_m}) {
     EXPECT_TRUE(std::isfinite(value));
   }
   // The same table converges standing still.

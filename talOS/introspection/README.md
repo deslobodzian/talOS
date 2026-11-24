@@ -207,6 +207,18 @@ them clear, and an older reader ignores them. Once set they stay set until
 the slot is claimed again, since what they report stays lost. The launcher records them in the session manifest while the
 node runs ([launcher supervision](../launcher/README.md#restarts)).
 
+`kFlagQuiesced` (bit 15 of `flags`) says a shutting-down node has finished its
+hardware/realtime work and is only tearing down (such as flushing its `.tlog`).
+The hardware bridge sets it via `NodeRegistration::mark_quiesced()` right after
+sending its shutdown neutral, closing its waits and UDP socket, and publishing
+introspection, before calling `LogWriter::finish()` / `LogWriter::flush()`, so
+the launcher can stop actuator owners within `kBridgeStopTimeout` (500 ms) while
+giving the quiesced bridge `kStopTimeout` (2 s) to finish flushing its log
+([launcher supervision](../launcher/README.md#node-output)). `NodeSnapshot::quiesced()`
+reads it. Like the event log flags, it is a bit every earlier writer left clear
+(failing closed to waiting for exit) and every earlier reader ignores, so the
+layout and version are unchanged.
+
 ## Realtime scheduling
 
 A node's loop asks for realtime scheduling once, just before it runs

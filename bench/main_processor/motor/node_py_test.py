@@ -20,6 +20,7 @@ import os
 import unittest
 
 import talos
+from bridge.BridgeStatus import BridgeStatus
 from motor import topics
 from motor.ControlMode import ControlMode
 from motor.MotorState import MotorState
@@ -112,8 +113,6 @@ class BenchMotorTest(unittest.TestCase):
     # REQ-CONTRACT-25: clock-mapping jitter putting acquisition time slightly
     # ahead of node.now_ns clamps uint64 ages to 0 instead of wrapping near 2**64.
     def test_future_clock_mapped_acquisition_clamps_age_to_zero(self):
-        from bridge.BridgeStatus import BridgeStatus
-
         sim = Sim(CONFIG)
         sim.add(bench.BenchMotor, "motor")
         hw = SimHardware(sim)
@@ -327,6 +326,58 @@ class ParityTest(unittest.TestCase):
         del sim
         scenario = [(name, *actions, parity.wait(0.01))
                     for name, *actions in SCENARIO]
+        parity.assert_same_behaviour(
+            CppBenchMotor, bench.BenchMotor, config, "motor", scenario,
+            topics=[(MotorState, topics.STATE)], motors=["kraken"])
+
+    # REQ-CONTRACT-14: /motor/state.fault masks /hw/status.motor_fault_mask to
+    # kraken's own Motor.hardware_index bit in both C++ and Python, so another
+    # motor's fault bit does not raise kraken's fault even when kraken is not
+    # at hardware index 0.
+    def test_motor_fault_mask_isolates_kraken_bit_in_parity(self):
+        config = os.path.join(os.environ["TEST_TMPDIR"],
+                              "motor_fault_mask.toml")
+        with open(config, "w", encoding="utf-8") as f:
+            f.write(
+                "[robot]\nperiod_us = 5000\ncommand_timeout_us = 100000\n"
+                "[subsystems.alpha.motors.other]\n"
+                'type = "TalonFX"\ncan_id = 10\n'
+                "[subsystems.motor.motors.kraken]\n"
+                'type = "TalonFX"\ncan_id = 1\n')
+        probe_sim = Sim(config)
+        kraken_slot = probe_sim.add(bench.BenchMotor, "motor").motor.hardware_index
+        del probe_sim
+        self.assertEqual(kraken_slot, 1)
+        other_slot = 0
+
+        mtype = talos.message_type(BridgeStatus)
+
+        def publish_fault_mask(mask, expected_fault):
+            def run(rig):
+                cur = rig.sim.latest(BridgeStatus, "/hw/status")
+                self.assertIsNotNone(cur)
+                fields = {f: getattr(cur, f) for f in mtype.fields}
+                fields["health_valid"] = True
+                fields["motor_fault_mask"] = mask
+                rig.hw.lose_states(2)
+                rig.sim.publish(BridgeStatus, "/hw/status", **fields)
+                rig.advance(0.005)
+                state = rig.sim.latest(MotorState, topics.STATE)
+                self.assertTrue(state.fault_valid)
+                self.assertEqual(state.fault, expected_fault)
+            return run
+
+        scenario = [
+            ("warm up", parity.gateway(True), parity.wait(0.02),
+             parity.require_published()),
+            ("other motor faulted does not raise kraken fault",
+             publish_fault_mask(1 << other_slot, False)),
+            ("kraken faulted raises kraken fault",
+             publish_fault_mask(1 << kraken_slot, True)),
+            ("both faulted raises kraken fault",
+             publish_fault_mask((1 << other_slot) | (1 << kraken_slot), True)),
+            ("cleared", publish_fault_mask(0, False)),
+        ]
         parity.assert_same_behaviour(
             CppBenchMotor, bench.BenchMotor, config, "motor", scenario,
             topics=[(MotorState, topics.STATE)], motors=["kraken"])

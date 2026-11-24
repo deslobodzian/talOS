@@ -1017,6 +1017,182 @@ class BridgeIntegration(unittest.TestCase):
                 for process in processes:
                     self.assertEqual(process.returncode, 0)
 
+    # REQ-SAFE-35
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") or sys.platform == "darwin",
+        "inspects open sockets and shared memory via /proc+/dev/shm (Linux) or lsof+shm_open (macOS)",
+    )
+    def test_configured_supervised_drive_bridge_opens_no_writer_and_no_datagram_socket(self):
+        """A configured, supervised bridge serving /drive holds no RTMS writer and no UDP/raw socket.
+
+        Covers the --config, --session-id, and /drive WebSocket paths that the
+        standalone bridge check does not enter: claiming a live registry row
+        (--session-id) and serving a driver dashboard (/drive) must still open
+        zero UDP/raw sockets and claim zero RTMS topic writers.
+        """
+        workspace = Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main")
+        binaries = workspace / "studio/bridge"
+        topic = f"/test/telemetry/sd{os.getpid()}"
+        session_id = str(os.getpid())
+        processes = []
+        with tempfile.TemporaryDirectory() as webroot, \
+                tempfile.TemporaryDirectory() as configs:
+            Path(configs, "robot.toml").write_text(
+                "[robot]\nperiod_us = 5000\n\n"
+                "[studio]\nmax_clients = 1\ndashboard = \"dashboard.toml\"\n\n"
+                "[subsystems.alpha]\nnode = \"//test:alpha\"\ncritical = false\n")
+            Path(configs, "dashboard.toml").write_text(
+                "[dashboard]\ntitle = \"Pit\"\ndrive_clients = 1\n\n"
+                "[[widgets]]\nkind = \"number\"\nat = [0, 0, 2, 1]\n"
+                "channel = \"drive/velocity\"\n")
+            try:
+                mock = subprocess.Popen([str(binaries / "studio_mock"), topic],
+                                        stdout=subprocess.PIPE, text=True)
+                processes.append(mock)
+                self.assertEqual(mock.stdout.readline().strip(), "ready")
+                bridge = subprocess.Popen(
+                    [str(binaries / "studio_bridge"), topic, "0", webroot,
+                     "--config", str(Path(configs, "robot.toml")),
+                     "--session-id", session_id],
+                    stdout=subprocess.PIPE, text=True)
+                processes.append(bridge)
+                port = bound_port(bridge)
+                with socket.create_connection(("127.0.0.1", port), timeout=10) as ws:
+                    self.assertIn(b"101 Switching Protocols", upgrade(ws, "/drive"))
+                    # Confirm /drive is actively serving both telemetry pages
+                    # and the drive summary before inspecting OS descriptors.
+                    got_binary = False
+                    got_summary = False
+                    while not (got_binary and got_summary):
+                        opcode, payload = any_frame(ws)
+                        if opcode == BINARY:
+                            self.assertEqual(payload[8:12], b"TLM3")
+                            got_binary = True
+                        else:
+                            self.assertEqual(opcode, TEXT)
+                            document = json.loads(payload.decode())
+                            if document["kind"] == "talos.drive.summary":
+                                got_summary = True
+
+                    if sys.platform.startswith("linux"):
+                        segments = rtms_segments()
+                        written = [name for name, writer, _ in segments if writer == bridge.pid]
+                        self.assertEqual(written, [], f"bridge pid {bridge.pid} writes {written}")
+                        telemetry = [(writer, readers) for _, writer, readers in segments
+                                     if bridge.pid in readers]
+                        self.assertIn((mock.pid, {bridge.pid}), telemetry,
+                                      f"no segment written by the mock ({mock.pid}) and read by "
+                                      f"the bridge ({bridge.pid}): {segments}")
+
+                        held = socket_inodes(bridge.pid)
+                        datagram = held & table_inodes("udp", "udp6", "udplite", "udplite6",
+                                                       "raw", "raw6")
+                        self.assertEqual(datagram, set(),
+                                         f"bridge holds UDP or raw sockets {datagram}")
+                        tcp, unix = table_inodes("tcp", "tcp6"), table_inodes("unix")
+                        self.assertTrue(held & tcp,
+                                        f"none of {held} is TCP: the listener is missing")
+                        self.assertEqual(held - tcp - unix, set(),
+                                         f"bridge sockets neither TCP nor Unix: {held - tcp - unix}")
+                    else:
+                        writer, readers = darwin_rtms_segment(topic)
+                        self.assertNotEqual(writer, bridge.pid,
+                                            f"bridge pid {bridge.pid} owns writer on {topic}")
+                        self.assertEqual(writer, mock.pid,
+                                         f"expected mock pid {mock.pid} as writer, got {writer}")
+                        self.assertIn(bridge.pid, readers,
+                                      f"bridge pid {bridge.pid} not listed in readers {readers}")
+
+                        # With --session-id nonzero, NodeRegistration maps the
+                        # live node registry rw- in addition to the subscribed
+                        # telemetry topic reader slot (no other SM=SHM segment).
+                        writable_shm = darwin_writable_shm_regions(bridge.pid)
+                        self.assertEqual(
+                            len(writable_shm), 2,
+                            f"expected exactly 2 writable SM=SHM regions "
+                            f"(telemetry topic + live registry), "
+                            f"got {len(writable_shm)}: {writable_shm}",
+                        )
+
+                        lsof_bin = darwin_tool("lsof", "/usr/sbin/lsof")
+                        udp = subprocess.run(
+                            [lsof_bin, "-n", "-P", "-a", "-p", str(bridge.pid), "-i", "UDP"],
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        self.assertIn(udp.returncode, (0, 1), udp.stderr)
+                        if udp.returncode == 1:
+                            self.assertEqual(udp.stderr, "",
+                                             f"lsof -i UDP failed: {udp.stderr}")
+                        self.assertEqual(udp.stdout.strip(), "",
+                                         f"bridge holds UDP sockets:\n{udp.stdout}")
+
+                        all_fds = subprocess.run(
+                            [lsof_bin, "-n", "-P", "-a", "-p", str(bridge.pid), "-F", "ftPTan"],
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        self.assertEqual(all_fds.returncode, 0, all_fds.stderr)
+                        records = parse_lsof_fields(all_fds.stdout)
+                        self.assertTrue(records, "lsof returned no descriptors for bridge")
+
+                        port_re = re.compile(rf":{port}(?:$|[^0-9])")
+                        ws_port_re = re.compile(rf":{ws.getsockname()[1]}(?:$|[^0-9])")
+                        tcp_listeners = []
+                        tcp_clients = []
+                        for rec in records:
+                            fd_type = rec.get("t", "")
+                            proto = rec.get("P", "")
+                            state = rec.get("state", "")
+                            access = rec.get("a", "")
+                            name = rec.get("n", "")
+                            if fd_type == "PSXSHM":
+                                self.assertNotIn(access, ("w", "u"),
+                                                 f"bridge holds writable shm descriptor: {rec}")
+                                continue
+                            if fd_type in DARWIN_NON_SOCKET_TYPES and not proto:
+                                continue
+                            if fd_type == "unix":
+                                continue
+                            if (fd_type == "systm"
+                                    and name.startswith("[ctl com.apple.netsrc ")):
+                                continue
+                            self.assertIn(fd_type, ("IPv4", "IPv6"),
+                                          f"bridge holds disallowed socket type: {rec}")
+                            self.assertEqual(proto, "TCP",
+                                             f"bridge holds non-TCP socket: {rec}")
+                            local, sep, remote = name.partition("->")
+                            if not sep and state == "LISTEN" and port_re.search(local):
+                                tcp_listeners.append(rec)
+                            elif (sep and state == "ESTABLISHED"
+                                  and port_re.search(local)
+                                  and ws_port_re.search(remote)):
+                                tcp_clients.append(rec)
+                            else:
+                                self.fail(f"bridge holds unexpected TCP socket: {rec}")
+                        self.assertEqual(
+                            len(tcp_listeners), 1,
+                            f"expected exactly 1 TCP LISTEN socket on port {port}, "
+                            f"got {tcp_listeners} in {records}",
+                        )
+                        self.assertEqual(
+                            len(tcp_clients), 1,
+                            f"expected 1 ESTABLISHED /drive ws client socket, "
+                            f"got {tcp_clients} in {records}",
+                        )
+
+                # Confirm --session-id actually claimed its live registry row.
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/system.json", timeout=3) as response:
+                    graph = json.loads(response.read())
+                self.assertTrue(graph["registry"]["available"])
+                bridge_nodes = [n for n in graph["nodes"] if n["name"] == "studio_bridge"]
+                self.assertEqual(len(bridge_nodes), 1, graph["nodes"])
+                self.assertTrue(bridge_nodes[0]["alive"])
+                self.assertEqual(str(bridge_nodes[0]["session_id"]), session_id)
+            finally:
+                stop(processes)
+                for process in processes:
+                    self.assertEqual(process.returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

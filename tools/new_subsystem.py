@@ -993,6 +993,29 @@ TEST_F(@PASCAL@Test, StuckSwitchStopsWithinTheMargin) {
   }
   EXPECT_EQ(Request(), Mode::kNeutral);
   EXPECT_EQ(Latest().homing(), @PASCAL@Homing::FAILED);
+
+  // Recover by disabling, leave the switch and drive past kHomeMarginRot,
+  // then drop the zero (motor reset) at a non-zero position with the
+  // switch stuck closed: the second zero must enforce kHomeMarginRot again.
+  SetHome(false);
+  hw.set_driver_station(DsPacket(ds::kTeleop));  // disabled
+  sim.step(40ms);
+  Teleop();
+  Hold(1.0, 60ms);
+  ASSERT_EQ(Request(), Mode::kMotionMagic);
+  ASSERT_NEAR(Latest().position_rot(), 1.0, 1e-9);
+
+  SetHome(true);
+  hw.reset_device("@NAME@", "@NAME@");
+  sim.step(80ms);  // past the masked reset states; re-zeroes on the switch
+  ASSERT_EQ(Latest().homing(), @PASCAL@Homing::HOMED);
+  for (int tick = 0; tick < 10; ++tick) {
+    Hold(1.5, 20ms);
+    EXPECT_LE(hw.motor_request("@NAME@", "@NAME@").demand,
+              2.9 + 0.15 + 1e-9);
+  }
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_EQ(Latest().homing(), @PASCAL@Homing::FAILED);
 }
 
 // REQ-DEV-01: off the switch, a goal past either end of the travel
@@ -1702,6 +1725,29 @@ PY_POSITION_RAW_TESTS = '''
             # Never more than HOME_MARGIN_ROT (0.15) above the false zero.
             demand = self.hw.motor_request("@NAME@", "@NAME@").demand
             self.assertLessEqual(demand, 1.9 + 0.15 + 1e-9)
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        self.assertEqual(self.state().homing, @PASCAL@Homing.FAILED)
+
+        # Recover by disabling, leave the switch and drive past
+        # HOME_MARGIN_ROT, then drop the zero (motor reset) at a non-zero
+        # position with the switch stuck closed: the second zero must
+        # enforce HOME_MARGIN_ROT again.
+        self.set_home(False)
+        self.hw.set_driver_station(teleop=True)  # disabled
+        self.sim.step(0.04)
+        self.teleop()
+        self.hold(1.0, 0.06)
+        self.assertEqual(self.mode(), talos.Mode.MOTION_MAGIC)
+        self.assertAlmostEqual(self.state().position_rot, 1.0, places=9)
+
+        self.set_home(True)
+        self.hw.reset_device("@NAME@", "@NAME@")
+        self.sim.step(0.08)  # past masked reset states; re-zeroes on switch
+        self.assertEqual(self.state().homing, @PASCAL@Homing.HOMED)
+        for _ in range(10):
+            self.hold(1.5, 0.02)
+            demand = self.hw.motor_request("@NAME@", "@NAME@").demand
+            self.assertLessEqual(demand, 2.9 + 0.15 + 1e-9)
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         self.assertEqual(self.state().homing, @PASCAL@Homing.FAILED)
 
