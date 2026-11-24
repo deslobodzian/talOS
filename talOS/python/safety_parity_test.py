@@ -478,6 +478,51 @@ class SafetyParityTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             sim.add(BadSlots, "planner")
 
+    # REQ-CONTRACT-14: _max_age_ns (Subscription.fresh, HardwareLink.fresh) and
+    # Node.publish_bytes reject bool, strings, floats, and negative integers
+    # instead of silently coercing True -> 1s / 1 byte or leaking ctypes errors.
+    def test_max_age_and_publish_bytes_reject_bool_and_invalid_types(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        hw = SimHardware(sim)
+
+        class Watcher:
+            def __init__(self, node):
+                self.sub = node.subscribe(Goal, "/planner/goal")
+                self.link = talos.HardwareLink(node)
+
+        w = sim.add(Watcher, "planner")
+        sim.publish(Goal, "/planner/goal", height_rot=1.0, enabled=True,
+                    tick_count=1)
+        sim.step(0.01)
+        hw.lose_states(20)
+        sim.step(0.15)
+
+        for fresh_fn in (w.sub.fresh, w.link.fresh):
+            for bad in (True, False, "1.0", object()):
+                with self.subTest(fn=fresh_fn.__qualname__, bad=bad):
+                    with self.assertRaises(TypeError):
+                        fresh_fn(bad)
+
+        bad_publish_cases = [
+            (TypeError, lambda n: n.publish_bytes("frames", True)),
+            (TypeError, lambda n: n.publish_bytes("frames", False)),
+            (TypeError, lambda n: n.publish_bytes("frames", 64, slots=True)),
+            (TypeError, lambda n: n.publish_bytes("frames", 1.5)),
+            (TypeError, lambda n: n.publish_bytes("frames", 64, slots=16.0)),
+            (ValueError, lambda n: n.publish_bytes("frames", -1)),
+            (ValueError, lambda n: n.publish_bytes("frames", 64, slots=-1)),
+        ]
+        for idx, (exc_type, fn) in enumerate(bad_publish_cases):
+            with self.subTest(case=idx, exc=exc_type.__name__):
+                s = Sim.from_toml(ROBOT_TOML)
+
+                class BadNode:
+                    def __init__(self, node):
+                        fn(node)
+
+                with self.assertRaises(exc_type):
+                    s.add(BadNode, "planner")
+
     # REQ-CONTRACT-14: HardwareLink.enabled matches talos.robot_enabled(node).
     def test_hardware_link_enabled_parity(self):
         sim = Sim.from_toml(ROBOT_TOML)
@@ -685,6 +730,118 @@ class SafetyParityTest(unittest.TestCase):
         self.assertEqual(len(reenter_errors), 1)
         self.assertEqual(len(heard), 2)
         self.assertEqual(heard[-1][1], 35_000_000)
+
+    # REQ-SAFE-04, REQ-CONTRACT-14: Python non-finite (NaN, +inf, -inf)
+    # actuation, rezero, PWM, and mechanism goals neutralize safely matching
+    # C++ / C ABI semantics.
+    def test_non_finite_actuation_and_rezero_neutralize_safely(self):
+        non_finite_toml = ROBOT_TOML + """
+[subsystems.rig.motors.rig_wheel]
+can_id = 10
+foc = true
+max_torque_current_a = 40.0
+[subsystems.rig.sensors.rig_gyro]
+type = "Pigeon2"
+can_id = 11
+[subsystems.rig.pwm_outputs.rig_servo]
+channel = 0
+"""
+        sim = Sim.from_toml(non_finite_toml)
+        hw = SimHardware(sim)
+
+        class Rig:
+            def __init__(self, node):
+                talos.allow_untargeted_outputs(node)
+                self.motor = talos.Motor(node, "rig_wheel")
+                self.gyro = talos.Gyro(node, "rig_gyro")
+                self.servo = talos.PwmOutput(node, "rig_servo")
+                self.action = lambda: None
+
+            def update(self):
+                self.action()
+
+        class ArmRig:
+            def __init__(self, node):
+                talos.allow_untargeted_outputs(node)
+                self.mech = PositionMechanism(node, "arm")
+                self.action = lambda: self.mech.stop()
+
+            def update(self):
+                self.action()
+                self.mech.update()
+
+        class ShooterRig:
+            def __init__(self, node):
+                talos.allow_untargeted_outputs(node)
+                self.mech = VelocityMechanism(node, "flywheel")
+                self.action = lambda: self.mech.stop()
+
+            def update(self):
+                self.action()
+                self.mech.update()
+
+        rig = sim.add(Rig, "rig")
+        arm = sim.add(ArmRig, "arm")
+        shooter = sim.add(ShooterRig, "shooter")
+        hw.enable(True)
+        hw.set_motor("rig", "rig_wheel", 1.0, 0.0)
+        hw.set_gyro("rig", "rig_gyro", 0.5, 0.0)
+        sim.step(0.02)
+
+        non_finite = (math.nan, math.inf, -math.inf)
+        for bad in non_finite:
+            rig.motor.rezero(bad)
+            rig.gyro.rezero(bad)
+            self.assertFalse(rig.motor.zeroed)
+            self.assertFalse(rig.gyro.zeroed)
+
+        rig.motor.rezero(0.0)
+        self.assertTrue(rig.motor.zeroed)
+
+        for bad in non_finite:
+            actions = [
+                lambda b=bad: rig.motor.set_duty_cycle(b),
+                lambda b=bad: rig.motor.set_voltage(b),
+                lambda b=bad: rig.motor.set_velocity(b),
+                lambda b=bad: rig.motor.set_velocity(10.0, ff_volts=b),
+                lambda b=bad: rig.motor.set_position(b),
+                lambda b=bad: rig.motor.set_position(0.5, ff_volts=b),
+                lambda b=bad: rig.motor.set_motion_magic(b),
+                lambda b=bad: rig.motor.set_motion_magic(0.5, ff_volts=b),
+                lambda b=bad: rig.motor.set_torque_current(b),
+            ]
+            for fn in actions:
+                prev_clamped = rig.motor.clamped_count
+                rig.action = lambda f=fn, b=bad: (f(), rig.servo.set(b))
+                sim.step(0.02)
+                self.assertEqual(
+                    hw.applied_motor("rig", "rig_wheel").mode,
+                    talos.Mode.NEUTRAL)
+                self.assertIsNone(hw.applied_pwm("rig", "rig_servo"))
+                self.assertGreater(rig.motor.clamped_count, prev_clamped)
+
+            for arm_fn in (
+                lambda b=bad: arm.mech.set_goal(b),
+                lambda b=bad: arm.mech.set_goal(0.2, feedforward_v=b),
+                lambda b=bad: arm.mech.set_goal_units(b),
+                lambda b=bad: arm.mech.set_goal_units(90.0, feedforward_v=b),
+                lambda b=bad: arm.mech.hold(feedforward_v=b),
+            ):
+                arm.action = arm_fn
+                shooter.action = lambda b=bad: shooter.mech.set_goal(b)
+                sim.step(0.02)
+                self.assertEqual(
+                    hw.applied_motor("arm", "arm").mode, talos.Mode.NEUTRAL)
+                self.assertEqual(
+                    hw.applied_motor("shooter", "flywheel").mode,
+                    talos.Mode.NEUTRAL)
+
+            shooter.action = lambda b=bad: shooter.mech.set_goal(
+                20.0, feedforward_v=b)
+            sim.step(0.02)
+            self.assertEqual(
+                hw.applied_motor("shooter", "flywheel").mode,
+                talos.Mode.NEUTRAL)
 
 
 if __name__ == "__main__":

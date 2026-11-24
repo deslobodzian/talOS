@@ -138,6 +138,7 @@ cc_test(
     srcs = ["node_api_test.cc"],
     deps = [
         ":node_api_testing",
+        "//talOS/msgs:control",
         "@googletest//:gtest_main",
     ],
 )
