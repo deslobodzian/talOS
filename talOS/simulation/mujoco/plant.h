@@ -113,9 +113,15 @@ class MujocoPlant final : public hardware::sim::ExternalPlant {
   // fatal-warning check is followed by mj_kinematics, mj_comPos and
   // mj_comVel, then every rule's AfterStep. AfterStep must not throw: a rule
   // that returns false, or throws anyway, fails the plant for good with its
-  // failure() text (or the exception's), and no rule runs again.
+  // failure() text (or the exception's), and no rule runs again. Such a rule
+  // may have written part of what it meant to (some bodies placed, others
+  // not); the failure is permanent, so nothing reads that world as valid.
   void AddRules(WorldRules& rules);
-  // The match input every rule sees in every Step until the next call.
+  // The match input every rule sees in every Step until the next call. Each
+  // rule first observes it here (WorldRules::ObserveMatch), in the order
+  // added, whether or not a step follows; a rule that returns false or
+  // throws fails the plant for good, as in AfterStep. On a failed plant it
+  // only holds the input.
   void SetMatchInput(const MatchInput& input);
 
  private:

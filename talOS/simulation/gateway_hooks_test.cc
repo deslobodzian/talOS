@@ -1,8 +1,8 @@
 // Integration tier (fork/exec, loopback UDP, the live registry): the gateway
-// library's extension hooks (gateway_main.h: BeforeTick, Topics, Counts) as a
-// program built on RunSimGateway uses them, through gateway_hooks_fixture.
-// This is the plumbing a referee's Driver Station stamp and match topic will
-// use; it proves no refereeing.
+// library's extension hooks (gateway_main.h: BeforeTick, Stamp, Topics,
+// Counts) as a program built on RunSimGateway uses them, through
+// gateway_hooks_fixture. This is the plumbing a referee's Driver Station
+// stamp and match topic use; it proves no refereeing.
 #include <arpa/inet.h>
 #include <gtest/gtest.h>
 #include <netinet/in.h>
@@ -272,9 +272,10 @@ class GatewayHooks : public ::testing::Test {
 };
 HooksRun* GatewayHooks::run_ = nullptr;
 
-// Every Driver Station packet carries what BeforeTick stamped on its own
-// tick: that tick's flags and its schedule time, absent before time zero,
-// on the same clock as the mode schedule (exact, no tolerance).
+// Every Driver Station packet carries what Stamp wrote on its own tick from
+// that tick's BeforeTick: that tick's flags and its schedule time, absent
+// before time zero, on the same clock as the mode schedule (exact, no
+// tolerance).
 TEST_F(GatewayHooks, PacketsCarryTheStampOfTheTickTheyGoOutOn) {
   ASSERT_EQ(run_->status, 0) << run_->log;
   ASSERT_NE(run_->start_us, 0U) << "no Driver Station packet\n" << run_->log;
@@ -317,19 +318,23 @@ TEST_F(GatewayHooks, PacketsCarryTheStampOfTheTickTheyGoOutOn) {
   EXPECT_GT(teleop, 0);
 }
 
-// BeforeTick runs on every tick, not only on those that send a packet.
-TEST_F(GatewayHooks, BeforeTickRunsOnEveryTick) {
+// BeforeTick and Stamp run on every tick, not only on those that send a
+// packet.
+TEST_F(GatewayHooks, BeforeTickAndStampRunOnEveryTick) {
   ASSERT_EQ(run_->status, 0) << run_->log;
   unsigned long long before_calls = 0;
+  unsigned long long stamp_calls = 0;
   unsigned long long after_calls = 0;
   const auto at = run_->log.find("hooks: ");
   ASSERT_NE(at, std::string::npos) << run_->log;
   ASSERT_EQ(std::sscanf(run_->log.c_str() + at,
-                        "hooks: before_tick_calls=%llu after_tick_calls=%llu",
-                        &before_calls, &after_calls),
-            2)
+                        "hooks: before_tick_calls=%llu stamp_calls=%llu "
+                        "after_tick_calls=%llu",
+                        &before_calls, &stamp_calls, &after_calls),
+            3)
       << run_->log;
   EXPECT_EQ(before_calls, after_calls);
+  EXPECT_EQ(stamp_calls, after_calls);
   EXPECT_GT(before_calls, run_->packets.size());
 }
 

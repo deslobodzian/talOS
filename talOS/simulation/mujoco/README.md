@@ -41,7 +41,34 @@ sensor. It runs the simulator's own program (`RunSimGateway`,
 `talOS/simulation/gateway_main.h`) with `MujocoGatewayExtension`
 (`gateway_extension.h`), so it describes and registers as the roster member
 `sim_gateway` with the same `/sim/state` publication and reports the
-`sim_gateway` program in its State; only the target label differs.
+`sim_gateway` program in its State; its target label differs, and it also
+publishes `/sim/state/match` (below).
+
+**The match.** Before the plant's first step the program adds the world
+rules: the robot model's scripted shooters (below), if it has any, then the
+field's game, if the field has one (`rebuilt_2026` does:
+[its rules](fields/rebuilt_2026/README.md#rules)), made with
+`[simulation.mujoco] seed`. The shooters come first, so a FUEL a shooter
+launches is judged by the game at the exit in the same step. A contract the
+model breaks (a shooter's missing exit, a field site the game needs) is a
+config refusal, naming the element. Each tick, before the plant steps, the
+rules get the tick's match input (`MatchInputOf`), and observe it at once
+(`WorldRules::ObserveMatch`), so the period and match time follow it even on
+a tick whose plant time rounds to no step: the Driver Station's
+mode (its mode bits only while one is attached), the gateway's enable
+(enabled and not e-stopped), the FMS alliance and the schedule clock once
+it has started (`--mode-schedule`, `--schedule-start-file`). The Driver
+Station packets carry the game's match time and game message as of the
+tick they are sent on, after its steps (the gateway's `Stamp` hook); with
+no game they carry 0 and an empty message. After each tick the program
+writes `/sim/state/match` (`sim.MatchState`, `talOS/hardware/sim.fbs`): the
+game's report, the tick's node-clock time as `sample_time_ns` (the clock
+`/sim/state` is stamped on, at the tick's start where `/sim/state` reads it
+after the tick) and the scripted shooters' launches as
+`shots_count`; with no game, period None and zero counts but the shots.
+The topic is declared whatever the config, so the launcher's `--describe`
+probe and the run agree. The same model, config, seed and tick times give
+the same States and the same `/sim/state/match`.
 
 A config selects it in `[robot] sim_gateway`
 (`"//talOS/simulation/mujoco:mujoco_gateway"`, or
@@ -87,7 +114,9 @@ and the count of overspeed excursions (a bound rotor above 250 rps, logged,
 not fatal). In the plant and the extension, only these reports read the
 wall clock. After `sim_gateway`'s
 summary line it prints to stdout `mujoco_gateway: stepped_s=...
-dropped_s=... dropped_ticks=... overspeed_excursions=...`.
+dropped_s=... dropped_ticks=... overspeed_excursions=... period=...
+blue_points=... red_points=... shots=...`, the last four from the last
+`/sim/state/match`.
 
 A world that fails (see **Failure** below) puts every output in total loss
 first; at the end of that tick the program prints the plant's clock and the
@@ -236,7 +265,8 @@ The joint's positive direction shoots, and the actuator's `gear` is
 positive. `MakeScriptedShooters`
 (`scripted_shooter.h`) finds every such motor in a compiled model and
 returns them as one world rule (below), or none when no actuator carries any
-part of the contract. It refuses, naming the motor and the element, a
+part of the contract; `mujoco_gateway` adds it (the match, above). It
+refuses, naming the motor and the element, a
 missing site or numeric, a numeric without exactly two values, an
 efficiency outside (0, 1] or a contact radius that is not positive, an inlet
 that is not a box, a flywheel that is a slide or a tendon or whose
@@ -278,17 +308,20 @@ the shooter changes nothing but the launched body and the flywheel's speed.
 
 **World rules.** What changes the world after a step besides physics is a
 `WorldRules` (`world_rules.h`), added to the plant with
-`MujocoPlant::AddRules` before its first `Step`. After each MuJoCo step that
-passes the failure check below, the plant brings positions and velocities
-up to the step's end (`mj_kinematics`, `mj_comPos`, `mj_comVel`; not
-`mj_forward`, whose collision and constraint stages cost far more) and runs
-every rule in the order added, with the match input last given to
-`SetMatchInput`. A rule may write free joints' positions and velocities,
-the velocity of a joint it names and the collision bits of geoms its README
-names. A rule that reports a failure or throws stops the world for good, as
-an unstable step does, with the rule's text. A rule's `Attach` that leaves
-the world unstable (a bad position, velocity or acceleration, a full arena)
-is refused by `AddRules`, naming the warning, and fails the plant.
+`MujocoPlant::AddRules` before its first `Step`; `mujoco_gateway` adds the
+robot's scripted shooters, then the field's game. After each MuJoCo step
+that passes the failure check below, the plant brings positions and
+velocities up to the step's end (`mj_kinematics`, `mj_comPos`, `mj_comVel`;
+not `mj_forward`, whose collision and constraint stages cost far more) and
+runs every rule in the order added, with the match input last given to
+`SetMatchInput`, which each rule has also observed when it was given
+(`ObserveMatch`, before any step). A rule may write free joints' positions
+and velocities, the velocity of a joint it names and the collision bits of
+geoms its README names. A rule that reports a failure or throws stops the
+world for good, as an unstable step does, with the rule's text. A rule's
+`Attach` that leaves the world unstable (a bad position, velocity or
+acceleration, a full arena) is refused by `AddRules`, naming the warning,
+and fails the plant.
 
 **Solver.** The robot's whole `<option>` and `<size>` are dropped when it is
 attached: the field's win, MuJoCo prints a warning naming each field the
@@ -317,13 +350,27 @@ bound motor against the analytic model, tick for tick through two
 assembles the world twice as the program does and ticks both at the same
 jittered times with the same commands, a tick past the step cap, a device
 reset and a supply fault: their encoded States are identical, and a 1 µs
-change at one tick makes them differ. `gateway_extension_test` holds the
-chassis-owner refusals, one per key and flag, against a welded root that
-accepts them. `fields_test` holds the field names config load accepts to the
-ones the program loads, each with its FUEL. `mujoco_gateway_test`
+change at one tick makes them differ. It does the same with the 2026 field,
+its rules and a robot whose scripted shooter launches a preload into the
+blue HUB (REQ-DEV-39, REQ-DEV-40), comparing `/sim/state/match` too, over
+a disabled, AUTO and TELEOP sequence: the periods come in order, the
+launch scores in the step that launched it, each tick's Driver Station
+stamp is that tick's match, the tick TELEOP starts on included, and
+another seed draws the other alliance at TELEOP's tie.
+`gateway_extension_test` holds the chassis-owner refusals, one per key
+and flag, against a welded root that accepts them, and the match input
+each Driver Station state gives. `fields_test` holds
+the field names config load accepts to the ones the program loads, each
+with its FUEL, and attaches each field's game. `match_state_test`
+(integration, REQ-DEV-40) runs the program on the 2026 field through a mode
+schedule: `/sim/state/match` walks None, AUTO and TELEOP counting down,
+each Driver Station packet carries the time left and game message of its
+own tick's `/sim/state/match`, the first TELEOP packet included, and the live
+registry row declares what `--describe` declares. `mujoco_gateway_test`
 (integration) runs the program: `--describe` against
-`sim_gateway --physics`'s; refusals from the extension, from the backend and
-from the plant's `Bind`, each named on stderr; a model file
+`sim_gateway --physics`'s, `/sim/state/match` aside; refusals from the
+extension, from the backend, from the plant's `Bind` and from a scripted
+shooter's broken contract, each named on stderr; a model file
 `robot_model_files` omits, against the same config where the file is; a
 diverging model; and 50 ms on the 2026 field. `testdata/` holds small
 models and configs (an arm on a welded root, a free-root rover with a
