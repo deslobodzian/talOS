@@ -32,6 +32,17 @@ cc_test(
 )
 
 cc_test(
+    name = "lie_property_test",
+    size = "small",
+    srcs = ["lie_property_test.cc"],
+    deps = [
+        ":geometry",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "swerve_module_test",
     size = "small",
     srcs = ["swerve_module_test.cc"],
