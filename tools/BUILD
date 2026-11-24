@@ -304,6 +304,22 @@ py_test(
     main = "lint_test_time_test.py",
 )
 
+# python3 tools/check_testing_rules.py (CI: the lint job)
+# Enforces docs/TESTING.md §6.7 (perf targets depend unconditionally on
+# //talOS/process:host_qualification, use StallMeter, and record
+# host_unqualified/[HOST_UNQUALIFIED]) and §8.2 (e2e/soak targets and
+# talos_sim_test preserve failure artifacts under TEST_UNDECLARED_OUTPUTS_DIR).
+py_test(
+    name = "check_testing_rules_test",
+    size = "small",
+    srcs = [
+        "check_testing_rules.py",
+        "check_testing_rules_test.py",
+    ],
+    legacy_create_init = False,
+    main = "check_testing_rules_test.py",
+)
+
 # tools/format.sh --check (tools/prepush.sh; CI: the clang-format job)
 # lists the C/C++ files changed since the base, untracked ones included. The
 # test runs it on a throwaway repository with a stub clang-format.

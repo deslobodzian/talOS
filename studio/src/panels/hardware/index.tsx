@@ -139,12 +139,12 @@ const rateString = (rate: number|null): string =>
     rate === null ? '—' : `${rate >= 100 ? rate.toFixed(0) : rate.toFixed(1)}/s`;
 
 const volts = (v: number|undefined) =>
-    v === undefined ? '—' : `${v.toFixed(2)} V`;
+    v === undefined || !Number.isFinite(v) ? '—' : `${v.toFixed(2)} V`;
 const micros = (us: number|undefined) =>
-    us === undefined ? '—' : durationUs(us);
+    us === undefined || !Number.isFinite(us) ? '—' : durationUs(us);
 // A uint64 counter, with the absent case shown as "no data".
 const count = (value: number|undefined) =>
-    value === undefined ? '—' : integer(value);
+    value === undefined || !Number.isFinite(value) ? '—' : integer(value);
 
 // When a bit last rose, as a human offset from the end of the retained view.
 const ago = (lastSetAt: number|null, endSec: number): string => {
@@ -220,10 +220,13 @@ function HardwarePanel() {
 
   const ch = snapshot?.channels ?? {};
   const present = useMemo(() => new Set(dictionary.map(c => c.name)), [dictionary]);
-  const num = (name: string): number|undefined => ch[`${HW}${name}`];
+  const num = (name: string): number|undefined => {
+    const v = ch[`${HW}${name}`];
+    return v === undefined || !Number.isFinite(v) ? undefined : v;
+  };
   const flag = (name: string): boolean|undefined => {
     const v = num(name);
-    return v === undefined ? undefined : v !== 0;
+    return v === undefined || !Number.isFinite(v) ? undefined : v !== 0;
   };
 
   const buses = canBuses(ch, busNames);
@@ -262,7 +265,8 @@ function HardwarePanel() {
   const protocolVersion = num('protocol_version_id');
   const mismatchedProtocol = num('mismatched_protocol_version_id');
   const protocolMismatch = flag('alert_error_protocol_mismatch') === true ||
-      (mismatchedProtocol !== undefined && mismatchedProtocol !== 0);
+      (mismatchedProtocol !== undefined && Number.isFinite(mismatchedProtocol) &&
+       mismatchedProtocol !== 0);
   const timeoutUs = num('command_timeout_us');  // not published by the 2026 bridge
 
   const counterRows: CounterRow[] = useMemo(() => {
@@ -370,7 +374,8 @@ function HardwarePanel() {
                   `${HW}mismatched_protocol_version_id` : `${HW}protocol_version_id`}
               tone={protocolMismatch ? 'warn' : undefined}>
           {protocolMismatch ?
-              (mismatchedProtocol !== undefined && mismatchedProtocol !== 0 ?
+              (mismatchedProtocol !== undefined && Number.isFinite(mismatchedProtocol) &&
+               mismatchedProtocol !== 0 ?
                   `mismatch (expected ${count(protocolVersion)}, gateway ${integer(mismatchedProtocol)})` :
                   `mismatch (expected ${count(protocolVersion)})`) :
               count(protocolVersion)}

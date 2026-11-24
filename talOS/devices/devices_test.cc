@@ -277,6 +277,88 @@ TEST(Devices, UnconfiguredOrFaultedStateForcesNeutralEvenWhenEnabled) {
   EXPECT_EQ(command->motors[0].demand, 0.0);
 }
 
+// REQ-SAFE-02: robot_enabled(node) is false and outputs stay neutral (a) before
+// any /hw/state is published, and (b) when a kConfigured | kEnabled /hw/state
+// arrives carrying a mismatched config_id (both before and after an accepted
+// disabled State).
+TEST(Devices,
+     NoAcceptedStateOrMismatchedConfigIdDisablesAndKeepsOutputsNeutral) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  Node& node = sim.node("mech");
+  const std::uint64_t id = hardware::ConfigurationId(
+      node.extension<HardwareLink>().config().hardware);
+  mech.a_velocity = 12.5;
+  mech.led_on = true;
+  mech.servo_out = 0.75;
+
+  const auto publish = [&](std::uint64_t config_id,
+                           std::uint64_t sample_time_us, std::uint32_t flags) {
+    hardware::State state{};
+    state.config_id = config_id;
+    state.boot_id = 7;
+    state.sample_time_us = sample_time_us;
+    state.flags = flags;
+    Packet packet{};
+    packet.size =
+        static_cast<std::uint32_t>(hardware::Encode(state, packet.data));
+    sim.publish(hardware::kStateTopic, packet);
+    sim.step(5ms);
+  };
+
+  // (a) Before any /hw/state is published: disabled and nothing sent.
+  EXPECT_FALSE(robot_enabled(node));
+  sim.step(20ms);
+  EXPECT_FALSE(robot_enabled(node));
+  EXPECT_FALSE(mech.enabled_in_update);
+  EXPECT_EQ(Sent(sim), 0u);
+
+  // (b) A kConfigured | kEnabled /hw/state with a mismatched config_id is
+  // rejected before any accepted state: still disabled and nothing sent.
+  publish(id ^ 1u, 1000, hardware::kConfigured | hardware::kEnabled);
+  EXPECT_FALSE(robot_enabled(node));
+  EXPECT_FALSE(mech.enabled_in_update);
+  EXPECT_EQ(Sent(sim), 0u);
+
+  // Accept a matching disabled state so flushes emit /hw/request/mech, then
+  // send a mismatched kConfigured | kEnabled state: robot_enabled stays false
+  // and every flushed output (motor, DIO, PWM) stays neutral.
+  publish(id, 2000, hardware::kConfigured);
+  ASSERT_FALSE(robot_enabled(node));
+  ASSERT_FALSE(mech.enabled_in_update);
+  ASSERT_GT(Sent(sim), 0u);
+
+  publish(id ^ 1u, 3000, hardware::kConfigured | hardware::kEnabled);
+  EXPECT_FALSE(robot_enabled(node));
+  EXPECT_FALSE(mech.enabled_in_update);
+  auto command = LastCommand(sim);
+  ASSERT_TRUE(command.has_value());
+  EXPECT_EQ(command->observed_time_us, 2000u);
+  EXPECT_EQ(command->motors[0].mode, Mode::kNeutral);
+  EXPECT_EQ(command->motors[0].demand, 0.0);
+  EXPECT_EQ(command->motors[1].mode, Mode::kNeutral);
+  ASSERT_EQ(command->digital_output_count, 1);
+  EXPECT_FALSE(command->digital_outputs[0].value);
+  ASSERT_EQ(command->pwm_output_count, 1);
+  EXPECT_EQ(command->pwm_outputs[0],
+            hardware::PwmRequest{.id = command->pwm_outputs[0].id});
+
+  // Control check: a matching kConfigured | kEnabled state enables and drives.
+  publish(id, 4000, hardware::kConfigured | hardware::kEnabled);
+  EXPECT_TRUE(robot_enabled(node));
+  EXPECT_TRUE(mech.enabled_in_update);
+  command = LastCommand(sim);
+  ASSERT_TRUE(command.has_value());
+  EXPECT_EQ(command->observed_time_us, 4000u);
+  EXPECT_EQ(command->motors[0].mode, Mode::kVelocity);
+  EXPECT_DOUBLE_EQ(command->motors[0].demand, 12.5);
+  ASSERT_EQ(command->digital_output_count, 1);
+  EXPECT_TRUE(command->digital_outputs[0].value);
+  ASSERT_EQ(command->pwm_output_count, 1);
+  EXPECT_EQ(command->pwm_outputs[0].mode, hardware::PwmMode::kPulse);
+  EXPECT_DOUBLE_EQ(command->pwm_outputs[0].output, 0.75);
+}
+
 // REQ-SAFE-02
 TEST(Devices, StaleStateForcesNeutralButKeepsFlushing) {
   auto sim = Sim::FromToml(kRobotToml);
@@ -363,6 +445,7 @@ TEST(Devices, StaleStateBoundaryIsTheCommandTimeout) {
   EXPECT_TRUE(went_neutral);
 }
 
+// REQ-SAFE-04
 TEST(Devices, MotorDemandsClampPerDeviceAndCountAdjustedCalls) {
   std::string toml{kRobotToml};
   toml.insert(toml.find("[subsystems.mech.digital_outputs"),
@@ -430,6 +513,7 @@ TEST(Devices, ClampedCountRisesOncePerAdjustedCall) {
   EXPECT_EQ(twice.motor.clamped_count(), before + 2);
 }
 
+// REQ-SAFE-04
 TEST(Devices, MotorVoltageDutyPositionAndFeedforwardUseConfiguredLimits) {
   struct Limited {
     explicit Limited(Node& node) : motor{node, "a"} {
@@ -1102,6 +1186,7 @@ can_id = 6
   EXPECT_EQ(hw.motor_request("mech", "unrelated").mode, Mode::kPosition);
 }
 
+// REQ-SAFE-04
 TEST(Devices, NonFiniteDemandIsNeutral) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");
@@ -1113,6 +1198,78 @@ TEST(Devices, NonFiniteDemandIsNeutral) {
     mech.a_velocity = demand;
     sim.step(10ms);
     EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kNeutral);
+  }
+}
+
+// REQ-SAFE-04: non-finite feedforward (NaN, +Inf, -Inf) neutralizes only the
+// affected motor and increments its clamped_count() once per call, while a
+// sibling motor on the same node keeps driving untouched.
+TEST(Devices, NonFiniteFeedforwardNeutralizesOnlyAffectedMotor) {
+  struct DualMotor {
+    explicit DualMotor(Node& n) : a{n, "a"}, b{n, "b"} {
+      AllowUntargetedOutputs(n);
+    }
+    void update() {
+      switch (mode) {
+        case Mode::kVelocity:
+          a.set_velocity(10.0, ff, 1);
+          break;
+        case Mode::kPosition:
+          a.set_position(1.0, ff, 1);
+          break;
+        case Mode::kMotionMagic:
+          a.set_motion_magic(1.0, ff, 1);
+          break;
+        default:
+          a.stop();
+          break;
+      }
+      b.set_voltage(4.0);
+    }
+    Motor a, b;
+    Mode mode = Mode::kVelocity;
+    double ff = 0.5;
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<DualMotor>("mech");
+  SimHardware hw{sim};
+  hw.enable();
+  sim.step(10ms);
+  mech.a.rezero();
+  ASSERT_TRUE(mech.a.zeroed());
+
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  for (const Mode mode :
+       {Mode::kVelocity, Mode::kPosition, Mode::kMotionMagic}) {
+    mech.mode = mode;
+    mech.ff = 0.5;
+    sim.step(5ms);
+    ASSERT_EQ(hw.motor_request("mech", "a").mode, mode);
+    ASSERT_EQ(hw.motor_request("mech", "b").mode, Mode::kVoltage);
+
+    for (const double ff :
+         {std::numeric_limits<double>::quiet_NaN(), kInf, -kInf}) {
+      SCOPED_TRACE(ff);
+      const std::uint64_t a_before = mech.a.clamped_count();
+      const std::uint64_t b_before = mech.b.clamped_count();
+      mech.ff = ff;
+      sim.step(5ms);  // one tick
+      const auto a_req = hw.motor_request("mech", "a");
+      EXPECT_EQ(a_req.mode, Mode::kNeutral);
+      EXPECT_EQ(a_req.demand, 0.0);
+      EXPECT_EQ(a_req.feedforward_v, 0.0);
+      EXPECT_EQ(a_req.slot, 0);
+      EXPECT_EQ(mech.a.clamped_count(), a_before + 1);
+      const auto b_req = hw.motor_request("mech", "b");
+      EXPECT_EQ(b_req.mode, Mode::kVoltage);
+      EXPECT_DOUBLE_EQ(b_req.demand, 4.0);
+      EXPECT_EQ(mech.b.clamped_count(), b_before);
+    }
+
+    mech.ff = 0.5;
+    sim.step(5ms);
+    EXPECT_EQ(hw.motor_request("mech", "a").mode, mode);
+    EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").feedforward_v, 0.5);
   }
 }
 

@@ -18,6 +18,7 @@
 //
 // Both parsers throw std::invalid_argument naming the problem.
 
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -67,9 +68,23 @@ inline std::vector<std::string> Split(std::string_view text, char delimiter) {
   }
 }
 
-// The whole of `text` as a finite number; std::stod's own exceptions are
-// reported as std::invalid_argument too.
+// The whole of `text` as a finite decimal number (no leading whitespace or
+// hexadecimal floats); std::stod's own exceptions are reported as
+// std::invalid_argument too.
 inline double Finite(const std::string& text, const char* what) {
+  if (text.empty() || std::isspace(static_cast<unsigned char>(text.front()))) {
+    throw std::invalid_argument(std::string{what} + " must be finite: '" +
+                                text + "'");
+  }
+  std::string_view digits{text};
+  if (digits.front() == '+' || digits.front() == '-') {
+    digits.remove_prefix(1);
+  }
+  if (digits.size() >= 2 && digits[0] == '0' &&
+      (digits[1] == 'x' || digits[1] == 'X')) {
+    throw std::invalid_argument(std::string{what} + " must be finite: '" +
+                                text + "'");
+  }
   std::size_t used = 0;
   double value = 0;
   try {
@@ -94,6 +109,7 @@ inline std::vector<SchedulePhase> ParseModeSchedule(std::string_view spec) {
   namespace detail = schedule_detail;
   std::vector<SchedulePhase> phases;
   double end_s = 0;
+  std::chrono::microseconds prev_end{0};
   std::size_t start = 0;
   while (true) {
     const auto comma = spec.find(',', start);
@@ -125,7 +141,13 @@ inline std::vector<SchedulePhase> ParseModeSchedule(std::string_view spec) {
     if (end_s > detail::kMaxSeconds) {
       throw std::invalid_argument("mode schedule is too long");
     }
-    phases.push_back({flags, detail::Micros(end_s)});
+    const auto end = detail::Micros(end_s);
+    if (end <= prev_end) {
+      throw std::invalid_argument(
+          "mode schedule phase must be at least 1 microsecond: '" + part + "'");
+    }
+    prev_end = end;
+    phases.push_back({flags, end});
     if (comma == std::string_view::npos) return phases;
     start = comma + 1;
   }

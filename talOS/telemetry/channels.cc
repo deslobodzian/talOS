@@ -110,6 +110,9 @@ class Flattener {
 
       if (type.base_type() == reflection::BaseType::Array) {
         const std::size_t count = type.fixed_length();
+        if (count == 0) {
+          Refuse(field_name, "has zero array length");
+        }
         const bool nested = type.element() == reflection::BaseType::Obj;
         const std::size_t element =
             nested ? ObjectIndex(type.index(), field_name) : 0;
@@ -128,12 +131,16 @@ class Flattener {
             Refuse(field_name, "has non-scalar array element type");
           }
         }
-        if (count > 0 &&
-            (element_bytes > (bytes - field_def->offset()) / count ||
-             element_bytes >
-                 (std::numeric_limits<std::size_t>::max() - field_offset) /
-                     count)) {
+        if (element_bytes > (bytes - field_def->offset()) / count ||
+            element_bytes >
+                (std::numeric_limits<std::size_t>::max() - field_offset) /
+                    count) {
           Refuse(field_name, "array offset overflows");
+        }
+        if (!nested && count > kMaxTopicElements - elements_) {
+          Refuse(field_name, "expands to more than " +
+                                 std::to_string(kMaxTopicElements) +
+                                 " scalar elements");
         }
         for (std::size_t i = 0; i < count; ++i) {
           const std::string element_name =
@@ -184,10 +191,16 @@ class Flattener {
   void AddScalar(reflection::BaseType base, std::int32_t type_index,
                  std::string_view field_name, std::string name,
                  std::size_t offset, bool whole_field) {
+    if (++elements_ > kMaxTopicElements) {
+      Refuse(field_name, "expands to more than " +
+                             std::to_string(kMaxTopicElements) +
+                             " scalar elements");
+    }
     if (options_.keep && !options_.keep(name)) return;
     ++kept_;
     if (channels_.size() >= options_.max_channels) {
-      // Counted, not kept: the walk is bounded by kMaxTopicStructs.
+      // Counted, not kept: the walk is bounded by kMaxTopicStructs and
+      // kMaxTopicElements.
       if (options_.truncate) return;
       Refuse(field_name, "is past the topic's " +
                              std::to_string(options_.max_channels) +
@@ -205,7 +218,9 @@ class Flattener {
       if (whole_field && IsStatusTopic()) {
         channel.alert = AlertLevelOf(field_name);
       }
-    } else if (type_index >= 0) {
+    } else if (type_index >= 0 &&
+               (channel.kind == Talos::Telemetry::ChannelKind_Int ||
+                channel.kind == Talos::Telemetry::ChannelKind_UInt)) {
       channel.labels = EnumLabels(schema_, type_index);
     } else {
       channel.unit = std::string{schema::unit_for_field(field_name)};
@@ -222,6 +237,7 @@ class Flattener {
   std::size_t kept_{0};
   std::vector<bool> open_;  // by object index: being flattened now
   std::size_t structs_{0};
+  std::size_t elements_{0};
 };
 
 Channel Unread(std::string name, ChannelKind kind, std::string unit = "",

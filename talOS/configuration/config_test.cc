@@ -5,8 +5,10 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <limits>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -2258,6 +2260,212 @@ static_friction_nm = 0.02
   EXPECT_EQ(mechs_only.simulation.mechanisms[0],
             (SimulationMechanismConfig{
                 "m1", 0.09, SimulationLoadKind::kFlywheel, 0.01, 0.02}));
+}
+
+// REQ-CONTRACT-17: [robot] max_restarts is validated at config load as an exact
+// integer in [1, INT_MAX], and [robot] name/hardware_node/sim_gateway must be
+// non-empty strings when present.
+TEST(ConfigTest, RejectsInvalidRobotMaxRestartsAndEmptyIdentityStrings) {
+  EXPECT_NO_THROW(Parse("[robot]\nmax_restarts = 1\n"));
+  EXPECT_NO_THROW(Parse("[robot]\nmax_restarts = " +
+                        std::to_string(std::numeric_limits<int>::max()) +
+                        "\n"));
+  const int64_t above_int_max =
+      static_cast<int64_t>(std::numeric_limits<int>::max()) + 1;
+  for (const std::string& bad :
+       {std::string{"0"}, std::string{"-1"}, std::string{"1.0"},
+        std::string{"1.5"}, std::string{"\"3\""}, std::string{"true"},
+        std::to_string(above_int_max)}) {
+    SCOPED_TRACE(bad);
+    ExpectRejectedNaming("[robot]\nmax_restarts = " + bad + "\n",
+                         "max_restarts");
+  }
+  for (const char* key : {"name", "hardware_node", "sim_gateway"}) {
+    for (const char* bad : {"\"\"", "123", "true"}) {
+      SCOPED_TRACE(std::string(key) + " = " + bad);
+      ExpectRejectedNaming(std::string("[robot]\n") + key + " = " + bad + "\n",
+                           key);
+    }
+  }
+}
+
+// REQ-CONTRACT-17, REQ-CONTRACT-31: when a table-based overlay includes a
+// [[subsystems]] manifest base, [subsystems.<sub>.trajectories] overrides take
+// effect before trajectory files are listed or required to exist.
+TEST_F(ManifestTest,
+       TableOverlayOverridesIncludedManifestTrajectoryBeforeValidation) {
+  Write("override.traj", "{}\n");
+  Write("subsystems/kept.traj", "{}\n");
+  Write("subsystems/auto.toml", R"(
+[subsystem]
+name = "auto"
+node = "//bot/auto:node"
+[trajectories]
+taxi = "missing_base.traj"
+keep = "kept.traj"
+[motors.m]
+can_id = 1
+)");
+  Write("base.toml", R"(
+[[subsystems]]
+name = "auto"
+path = "subsystems/auto.toml"
+)");
+  Write("robot.toml", R"(
+include = "base.toml"
+[subsystems.auto.trajectories]
+taxi = "override.traj"
+)");
+
+  std::vector<std::string> seen_data;
+  const toml::table resolved = ResolveRobotConfig(
+      Robot(), detail::ParseTomlFile,
+      [&](const std::string& path, const std::string& /*label*/) {
+        seen_data.push_back(path);
+      });
+  ASSERT_EQ(seen_data.size(), 2u);
+  for (const auto& p : seen_data) {
+    EXPECT_EQ(p.find("missing_base.traj"), std::string::npos) << p;
+  }
+  const auto cfg = ParseRobotConfig(Robot());
+  EXPECT_TRUE(std::filesystem::equivalent(cfg.TrajectoryPath("auto", "taxi"),
+                                          dir_ / "override.traj"));
+  EXPECT_TRUE(std::filesystem::equivalent(cfg.TrajectoryPath("auto", "keep"),
+                                          dir_ / "subsystems/kept.traj"));
+
+  // Unoverridden base trajectory missing -> error names the subsystem file.
+  std::filesystem::remove(dir_ / "subsystems/kept.traj");
+  try {
+    static_cast<void>(ParseRobotConfig(Robot()));
+    ADD_FAILURE() << "accepted missing unoverridden base trajectory";
+  } catch (const std::invalid_argument& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find("subsystems/auto.toml"), std::string::npos) << what;
+    EXPECT_NE(what.find("trajectories.keep"), std::string::npos) << what;
+  }
+}
+
+// REQ-SAFE-26, REQ-CONTRACT-17: subsystem period_us must be a positive exact
+// integer on every subsystem, and integral floats are rejected for all integer
+// configuration fields.
+TEST(ConfigTest,
+     RejectsNonPositiveSubsystemPeriodAndIntegralFloatsForIntegerFields) {
+  for (const std::string_view bad :
+       {"0", "-5000", "5000.0", "\"5000\"", "true"}) {
+    SCOPED_TRACE(bad);
+    // Non-actuator subsystem.
+    ExpectRejectedNaming(
+        "[subsystems.observer]\nperiod_us = " + std::string{bad} + "\n",
+        "period_us");
+    // Actuator-owning subsystem.
+    ExpectRejectedNaming(
+        "[subsystems.test]\nperiod_us = " + std::string{bad} + "\n",
+        "period_us");
+    // Also enforced when validate_hardware = false (build-time resolve.cc).
+    EXPECT_THROW(ParseRobotConfigTable(
+                     toml::parse("[subsystems.observer]\nperiod_us = " +
+                                 std::string{bad} + "\n"),
+                     /*validate_hardware=*/false),
+                 std::invalid_argument);
+  }
+  for (const std::string_view bad : {
+           "[robot]\nperiod_us = 5000.0\n",
+           "[robot]\ncommand_timeout_us = 100000.0\n",
+           "[robot]\ncontroller_port = 5802.0\n",
+           "[robot]\nlocal_port = 5803.0\n",
+           "[robot]\nlog_keep_sessions = 5.0\n",
+           "[robot]\nlog_max_bytes = 1024.0\n",
+           "[studio]\nhttp_port = 5800.0\n",
+           "[studio]\nmax_clients = 4.0\n",
+           "[subsystems.test.motors.m2]\ncan_id = 2.0\n",
+           "[subsystems.test.sensors.s]\ncan_id = 2.0\n",
+           "[subsystems.test.digital_inputs.d]\ndio = 0.0\n",
+           "[subsystems.test.digital_outputs.d]\ndio = 0.0\n",
+           "[subsystems.test.analog_inputs.a]\nchannel = 0.0\n",
+           "[subsystems.test.pwm_outputs.p]\nchannel = 0.0\n",
+           "[subsystems.test.encoders.e]\ndio_a = 0.0\ndio_b = 1\n",
+       }) {
+    SCOPED_TRACE(bad);
+    ExpectRejected(bad);
+  }
+}
+
+// REQ-CONTRACT-17: duplicate device names are refused naming both subsystems
+// (even with validate_hardware = false), follower motors are refused in
+// [[simulation.swerve_modules]], and explicit empty follow/feedback_sensor
+// strings are rejected.
+TEST(ConfigTest,
+     RejectsDuplicateDeviceNamesFollowersInSwerveAndEmptyMotorRefs) {
+  const std::string dup_across_subs = R"(
+[subsystems.arm.motors.shared_name]
+can_id = 1
+[subsystems.intake.motors.shared_name]
+can_id = 2
+)";
+  for (const bool validate_hw : {true, false}) {
+    SCOPED_TRACE(validate_hw ? "validate_hardware=true"
+                             : "validate_hardware=false");
+    try {
+      static_cast<void>(
+          ParseRobotConfigTable(toml::parse(dup_across_subs), validate_hw));
+      ADD_FAILURE() << "accepted duplicate device name across subsystems";
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      EXPECT_NE(what.find("shared_name"), std::string::npos) << what;
+      EXPECT_NE(what.find("arm"), std::string::npos) << what;
+      EXPECT_NE(what.find("intake"), std::string::npos) << what;
+    }
+  }
+
+  // Same subsystem, different device tables.
+  try {
+    static_cast<void>(ParseRobotConfigTable(
+        toml::parse("[subsystems.arm.motors.dup]\ncan_id = 1\n"
+                    "[subsystems.arm.sensors.dup]\ncan_id = 2\n"),
+        /*validate_hardware=*/false));
+    ADD_FAILURE() << "accepted duplicate device name in same subsystem";
+  } catch (const std::invalid_argument& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find("dup"), std::string::npos) << what;
+    EXPECT_NE(what.find("arm"), std::string::npos) << what;
+  }
+
+  // Follower motor named as swerve_modules drive or steer.
+  const std::string swerve_devices = R"(
+[subsystems.drive.motors]
+m_d0 = { can_id = 10 }
+m_s0 = { can_id = 11 }
+m_d_follow = { can_id = 12, follow = "m_d0" }
+m_s_follow = { can_id = 13, follow = "m_s0" }
+)";
+  for (const auto& [toml_entry, follower, master] : {
+           std::tuple{"[[simulation.swerve_modules]]\n"
+                      "drive = \"m_d_follow\"\nsteer = \"m_s0\"\n"
+                      "x_m = 0.3\ny_m = 0.3\n",
+                      "m_d_follow", "m_d0"},
+           std::tuple{"[[simulation.swerve_modules]]\n"
+                      "drive = \"m_d0\"\nsteer = \"m_s_follow\"\n"
+                      "x_m = 0.3\ny_m = 0.3\n",
+                      "m_s_follow", "m_s0"},
+       }) {
+    SCOPED_TRACE(follower);
+    try {
+      static_cast<void>(Parse(swerve_devices + toml_entry));
+      ADD_FAILURE() << "accepted follower motor in swerve_modules: "
+                    << follower;
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      EXPECT_NE(what.find(follower), std::string::npos) << what;
+      EXPECT_NE(what.find(master), std::string::npos) << what;
+    }
+  }
+
+  // Explicit empty follow or feedback_sensor strings.
+  ExpectRejectedNaming("follow = \"\"\n", "follow");
+  ExpectRejectedNaming("feedback_sensor = \"\"\n", "feedback_sensor");
+  ExpectRejectedNaming(
+      "feedback = \"RemoteCANcoder\"\nfeedback_sensor = \"\"\n",
+      "feedback_sensor");
 }
 
 }  // namespace

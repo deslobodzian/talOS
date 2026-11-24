@@ -331,16 +331,18 @@ class CanBusHealth {
       }
       const bool ok = sample.read_state == hardware::CanBusReadState::kOk;
       Spell& spell = spells_[i];
-      if (ok && spell.failing) {
-        spell.failing = false;
-        on_change(Change{i, Event::kRecovered, p.status, false,
-                         p.failed_reads - spell.failed_reads_before});
-      } else if (!ok && !spell.failing && (p.read || !fresh)) {
+      if (ok) {
+        if (spell.failing) {
+          spell.failing = false;
+          on_change(Change{i, Event::kRecovered, p.status, false,
+                           p.failed_reads - spell.last_ok_failed_reads});
+        }
+        spell.last_ok_failed_reads = p.failed_reads;
+      } else if (!spell.failing && (p.read || !fresh)) {
         spell.failing = true;
         const bool failed_read = fresh && p.read && !p.ok;
-        spell.failed_reads_before = p.failed_reads - (failed_read ? 1 : 0);
         on_change(Change{i, Event::kFailing, p.status, !failed_read,
-                         failed_read ? 1u : 0u});
+                         p.failed_reads - spell.last_ok_failed_reads});
       }
     }
   }
@@ -359,7 +361,7 @@ class CanBusHealth {
  private:
   struct Spell {
     bool failing{false};
-    uint64_t failed_reads_before{0};
+    uint64_t last_ok_failed_reads{0};
   };
 
   std::shared_ptr<Board> board_;

@@ -38,6 +38,7 @@ bool append_type(const reflection::Schema& schema, reflection::BaseType base,
     out += reflection::EnumNameBaseType(base);
     return true;
   }
+  if (!IsEnumBaseType(base)) return false;
   const reflection::Enum* e = schema.enums()->Get(index);
   if (e == nullptr || e->name() == nullptr || e->values() == nullptr)
     return false;

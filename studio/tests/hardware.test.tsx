@@ -314,3 +314,53 @@ test('the hardware panel displays expected and observed mismatched protocol vers
   assert.doesNotMatch(okHtml, /mismatch/);
   assert.match(okHtml, /<dt>Protocol<\/dt><dd>11<\/dd>/);
 });
+
+// REQ-OPS-36, REQ-OPS-37: non-finite /hw/status samples (NaN, +/-Infinity) must
+// render as unknown ('—'), never as false-positive yes/active/mismatch/"NaN V".
+test('the hardware panel treats non-finite readings as unknown, never true or NaN', () => {
+  for (const bad of [NaN, Infinity, -Infinity]) {
+    const studio = createStaticStudio({
+      frames: [{
+        stream_id: 'a', sequence_id: '0', timestamp_ns: '1000000000', dictionary_id: 1,
+        chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+        channels: {
+          'hw/status/battery_v': bad,
+          'hw/status/brownout': bad,
+          'hw/status/health_valid': bad,
+          'hw/status/configured': bad,
+          'hw/status/subsystem_count': bad,
+          'hw/status/protocol_version_id': 11,
+          'hw/status/mismatched_protocol_version_id': bad,
+          'hw/status/alert_error_protocol_mismatch': bad,
+          'hw/status/state_age_us': bad,
+          'hw/status/clock_offset_us': bad,
+          'hw/status/clock_offset_spread_us': bad,
+          'hw/status/clock_offset_valid': bad,
+          'hw/status/states_received_count': bad
+        },
+        units: {}, labels: {}
+      }],
+      playback: {mode: 'PAUSED', cursor_ns: '1000000000'}
+    });
+    const html = renderToStaticMarkup(
+        <StudioProvider studio={studio}>
+          <hardwarePanel.component config={hardwarePanel.defaultConfig}
+                                   setConfig={() => {}} instanceId="test"/>
+        </StudioProvider>);
+    const text = html.replace(/<[^>]*>/g, '|');
+    assert.doesNotMatch(html, /NaN|Infinity/, `non-finite leaked for ${bad}: ${html}`);
+    assert.doesNotMatch(html, /mismatch/, `false protocol mismatch for ${bad}`);
+    assert.match(text, /Battery\|+—/, `battery for ${bad}`);
+    assert.match(text, /Brownout\|+—/, `brownout for ${bad}`);
+    assert.match(text, /Health valid\|+—/, `health_valid for ${bad}`);
+    assert.match(text, /Config acknowledged\|+—/, `configured for ${bad}`);
+    assert.match(text, /Subsystems\|+—/, `subsystem_count for ${bad}`);
+    assert.match(text, /State age\|+—/, `state_age_us for ${bad}`);
+    assert.match(text, /Offset\|+—/, `clock_offset_us for ${bad}`);
+    assert.match(text, /Spread\|+—/, `clock_offset_spread_us for ${bad}`);
+    assert.match(text, /Valid\|+—/, `clock_offset_valid for ${bad}`);
+    assert.match(html, /brownout \(unknown\)/, `brownout chart note for ${bad}`);
+    assert.doesNotMatch(text, /(Brownout|Health valid|Config acknowledged|Valid)\|+yes/,
+                        `non-finite rendered as yes for ${bad}`);
+  }
+});
