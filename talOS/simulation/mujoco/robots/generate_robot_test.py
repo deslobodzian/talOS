@@ -202,6 +202,19 @@ class NameTest(unittest.TestCase):
         zaxis = tuple(map(float, sites["intake_beam"].get("zaxis").split()))
         self.assertAlmostEqual(math.hypot(*zaxis), 1.0, places=5)
 
+        tiny_piece = copy.deepcopy(example("shooter_rig"))
+        tiny_piece.pop("preload", None)
+        tiny_piece["game_piece"]["radius_m"] = 1e-13
+        tiny_piece["bumpers"]["bottom_m"] = 0.0
+        tiny_piece["feeder"]["compression_m"] = 0.0
+        tiny_piece["flywheel"]["compression_m"] = 0.0
+        tiny_model = ET.fromstring(generate_robot.generate(tiny_piece, "y.toml"))
+        tiny_sites = {s.get("name"): s for s in tiny_model.iter("site")}
+        inlet_half = tuple(
+            map(float, tiny_sites["flywheel_inlet"].get("size").split())
+        )
+        self.assertTrue(all(v > 0.0 for v in inlet_half), inlet_half)
+
 
 class ContractTest(unittest.TestCase):
 

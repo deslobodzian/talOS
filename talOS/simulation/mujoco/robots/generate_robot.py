@@ -1012,7 +1012,8 @@ class _Builder:
         half = ((gate_x - back_x) / 2, width / 2, r)
         self.claim("site", motor + "_inlet", "hopper")
         ET.SubElement(self.chassis, "site", name=motor + "_inlet", type="box",
-                      pos=_nums(*inlet), size=_nums(*half),
+                      pos=_nums(*inlet, key="hopper"),
+                      size=" ".join(_pos_num(v, "hopper") for v in half),
                       rgba="0 0 1 0.3", group="4")
         self.inlets.append((inlet, half))
         # Where a preload may sit: in front of the roller, between the side
