@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import unittest
@@ -329,6 +330,72 @@ class TidyFallbackTest(unittest.TestCase):
         out = r.stdout + r.stderr
         self.assertEqual(r.returncode, 2, out)
         self.assertIn("probe failed for another reason", out)
+
+    # REQ-DEV-25: invoking tidy.sh by relative path from a subdirectory (even
+    # with CDPATH set) still resolves sibling clang18.sh.
+    def test_relative_invocation_from_subdirectory(self):
+        sub = os.path.join(self.repo, "sub")
+        os.makedirs(sub, exist_ok=True)
+        env = dict(self.env, STUB_NATIVE_FAIL="0", CDPATH=self.tmp)
+        r = subprocess.run(
+            ["bash", "../tools/tidy.sh", "--base", self.base],
+            cwd=sub,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    # REQ-DEV-25: SIGTERM to a running tidy.sh triggers cleanup and removes
+    # its temporary directory rather than leaking it.
+    def test_sigterm_cleans_up_temp_directory(self):
+        tidy_tmp = os.path.join(self.tmp, "tidy_sigterm_tmp")
+        os.makedirs(tidy_tmp)
+        ready_fifo = os.path.join(self.tmp, "tidy_ready.fifo")
+        hold_fifo = os.path.join(self.tmp, "tidy_hold.fifo")
+        os.mkfifo(ready_fifo)
+        os.mkfifo(hold_fifo)
+
+        clang_tidy = os.path.join(
+            self.cache_dir, "talos", "clang-18", "venv", "bin", "clang-tidy"
+        )
+        put(
+            clang_tidy,
+            "#!/bin/sh\n"
+            'if [ "$1" = --version ]; then echo "LLVM version 18.1.8"; exit 0; fi\n'
+            'echo ready > "$STUB_READY_FIFO"\n'
+            'exec cat "$STUB_HOLD_FIFO"\n',
+            0o755,
+        )
+
+        env = dict(
+            self.env,
+            TMPDIR=tidy_tmp,
+            STUB_READY_FIFO=ready_fifo,
+            STUB_HOLD_FIFO=hold_fifo,
+        )
+        proc = subprocess.Popen(
+            ["bash", "tools/tidy.sh", "--base", self.base],
+            cwd=self.repo,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            with open(ready_fifo, encoding="utf-8") as f:
+                self.assertEqual(f.read().strip(), "ready")
+            self.assertTrue(os.listdir(tidy_tmp))
+            os.killpg(proc.pid, signal.SIGTERM)
+            out, err = proc.communicate(timeout=15)
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+        self.assertEqual(proc.returncode, 143, out + err)
+        self.assertEqual(os.listdir(tidy_tmp), [])
 
 
 if __name__ == "__main__":

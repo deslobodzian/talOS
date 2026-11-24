@@ -760,6 +760,72 @@ class CheckCommissioningTest(unittest.TestCase):
         self.commit("examples: symlink inside exempt dir")
         self.assertEqual(check_commissioning.check(self.base), [])
 
+    # REQ-DEV-33, RULES.md 4: in a criss-cross merge between --base and HEAD,
+    # commits already reachable from --base are not re-checked, while new
+    # commits on HEAD are still checked.
+    def test_criss_cross_merge_skips_commits_already_in_base(self):
+        motor = "bench/main_processor/configuration/subsystems/motor.toml"
+        aux = "bench/main_processor/configuration/subsystems/aux.toml"
+
+        # Two branches A and B from base, each with an un-trailered CAN id
+        # change (representing history already landed in --base).
+        self.git("checkout", "-q", "-b", "branch_a", self.base)
+        self.put(motor, MOTOR.replace("= 1", "= 2"))
+        self.commit("a: change motor id")
+        commit_a = self.git("rev-parse", "HEAD").strip()
+
+        self.git("checkout", "-q", "-b", "branch_b", self.base)
+        self.put(aux, "[motors.aux]\ntype = \"TalonFX\"\ncan_id = 3\n")
+        self.commit("b: add aux id")
+        commit_b = self.git("rev-parse", "HEAD").strip()
+
+        # Criss-cross merges: base_tip merges B into A; head_branch merges A
+        # into B. Both A and B are merge bases of base_tip and head_branch.
+        self.git("checkout", "-q", "-b", "base_branch", commit_a)
+        self.git("merge", "-q", "--no-ff", "-m", "merge b into a", commit_b)
+        base_tip = self.git("rev-parse", "HEAD").strip()
+
+        self.git("checkout", "-q", "-b", "head_branch", commit_b)
+        self.git("merge", "-q", "--no-ff", "-m", "merge a into b", commit_a)
+        bases = self.git("merge-base", "--all", base_tip, "HEAD").splitlines()
+        self.assertEqual(set(bases), {commit_a, commit_b})
+
+        # Clean commit on head_branch: neither A nor B should be re-checked.
+        self.put("README.md", "note\n")
+        self.commit("docs: clean note")
+        self.assertEqual(check_commissioning.check(base_tip), [])
+
+        # A real CAN id change on head_branch after the criss-cross merge is
+        # still caught (and only that commit).
+        self.put(motor, MOTOR.replace("= 1", "= 9"))
+        self.commit("bench: renumber after criss-cross")
+        head_tip = self.git("rev-parse", "HEAD").strip()[:12]
+        found = check_commissioning.check(base_tip)
+        self.assertEqual(len(found), 1, found)
+        self.assertTrue(found[0].startswith(head_tip), found)
+        self.assertIn("from 2 to 9", found[0])
+
+    # REQ-DEV-33, RULES.md 4: non-UTF-8 bytes in a commit message must not
+    # crash git() with UnicodeDecodeError.
+    def test_non_utf8_commit_message_does_not_crash(self):
+        motor = "bench/main_processor/configuration/subsystems/motor.toml"
+        self.put(motor, MOTOR.replace("= 1", "= 8"))
+        self.git("add", "-A")
+        tree = self.git("write-tree").strip()
+        proc = subprocess.run(
+            ["git", "commit-tree", tree, "-p", self.base],
+            input=b"bench: non-utf8 \xff\xfe message\n",
+            cwd=self.repo,
+            env=self.env,
+            capture_output=True,
+            check=True,
+        )
+        oid = proc.stdout.decode("ascii").strip()
+        self.git("reset", "--hard", "-q", oid)
+        found = check_commissioning.check(self.base)
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("from 1 to 8", found[0])
+
 
 if __name__ == "__main__":
     unittest.main()

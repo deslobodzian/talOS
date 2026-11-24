@@ -12,6 +12,7 @@ the test's own directory, so the worktree it makes is the test's to inspect.
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import unittest
@@ -50,6 +51,10 @@ class PrepushTest(unittest.TestCase):
             "#!/bin/sh\n"
             'if [ -w src/a.txt ]; then mode=writable; else mode=read-only; fi\n'
             'echo "$PWD|$mode|$*" >> "$STUB_BAZEL_LOG"\n'
+            'if [ "$1" = build ] && [ -n "${STUB_BUILD_READY_FIFO:-}" ]; then\n'
+            '  echo ready > "$STUB_BUILD_READY_FIFO"\n'
+            '  exec cat "$STUB_BUILD_HOLD_FIFO"\n'
+            'fi\n'
             '[ "$1" = info ] && echo "$STUB_OUT_PATH"\n'
             '[ "$1" = build ] && mkdir -p "$STUB_OUT_PATH" &&'
             ' cp -R "$STUB_BUILT"/. "$STUB_OUT_PATH"/\n'
@@ -735,15 +740,21 @@ class PrepushTest(unittest.TestCase):
                 clear_log()
                 status, out, calls = self.prepush()
                 self.assertEqual(status, 0, out)
+                wt = os.path.join(self.tmpdir, f"talos-prepush-{os.getuid()}")
+                shutdown_cwds = [cwd for cwd, _, args in calls
+                                 if args == "shutdown"]
+                self.assertIn(wt, shutdown_cwds, calls)
                 for dep in ("robot_repo", "wrist_repo"):
                     self.assertIn(f"prepush: dependent-{dep} ok", out)
+                    self.assertIn(
+                        os.path.join(wt, "examples", dep), shutdown_cwds, calls)
                     dep_calls = dependent_calls(calls, dep)
-                    self.assertEqual(len(dep_calls), 1, calls)
-                    self.assertEqual(dep_calls[0][0], "test")
-                    self.assertIn("//...", dep_calls[0])
+                    test_calls = [c for c in dep_calls if c[0] == "test"]
+                    self.assertEqual(len(test_calls), 1, calls)
+                    self.assertIn("//...", test_calls[0])
                     self.assertIn(
                         "@talos//talOS/configuration:config_fuzz_test",
-                        dep_calls[0])
+                        test_calls[0])
 
         # A failure in dependent test runs fails prepush naming both steps.
         clear_log()
@@ -893,6 +904,100 @@ class PrepushTest(unittest.TestCase):
             PATH=wrap_dir + os.pathsep + self.env["PATH"])
         self.assertEqual(status, 1, out)
         self.assertIn("prepush: checkout-unchanged FAILED", out)
+
+    # REQ-DEV-25: each dependent workspace is guarded individually and only
+    # started dependents receive bazel shutdown before worktree removal.
+    def test_missing_wrist_repo_is_guarded_and_present_dependent_shuts_down(self):
+        self.commit("examples/robot_repo/MODULE.bazel", "robot_repo")
+        put(os.path.join(self.repo, "tools", "check_robot_repo_scaffold.sh"),
+            "#!/bin/sh\nexit 0\n", 0o755)
+        self.git("add", "tools/check_robot_repo_scaffold.sh")
+        self.git("commit", "-qm", "scaffold check")
+        status, out, calls = self.prepush()
+        self.assertEqual(status, 0, out)
+        self.assertIn("prepush: dependent-robot_repo ok", out)
+        self.assertIn(
+            "prepush: dependent-wrist_repo not needed (this commit has no "
+            "examples/wrist_repo)", out)
+        wt = os.path.join(self.tmpdir, f"talos-prepush-{os.getuid()}")
+        shutdown_cwds = [cwd for cwd, _, args in calls if args == "shutdown"]
+        self.assertIn(wt, shutdown_cwds, calls)
+        self.assertIn(os.path.join(wt, "examples", "robot_repo"),
+                      shutdown_cwds, calls)
+        self.assertNotIn(os.path.join(wt, "examples", "wrist_repo"),
+                         shutdown_cwds, calls)
+        self.assert_cleaned_up()
+
+    # REQ-DEV-25: a failure while writing $lock/pid cleans up the empty lock
+    # directory immediately so future runs are not permanently wedged.
+    def test_write_pid_failure_cleans_up_lock_directory(self):
+        lock = os.path.join(self.tmpdir, f"talos-prepush-{os.getuid()}.lock")
+        real_mv = shutil.which("mv")
+        wrap_dir = os.path.join(self.tmp, "wrap_mv")
+        put(os.path.join(wrap_dir, "mv"),
+            "#!/bin/sh\n"
+            f'for a in "$@"; do\n'
+            f'  if [ "$a" = {shlex.quote(os.path.join(lock, "pid"))} ]; then\n'
+            '    exit 1\n'
+            '  fi\n'
+            'done\n'
+            f'exec {shlex.quote(real_mv)} "$@"\n',
+            0o755)
+        status, out, calls = self.prepush(
+            PATH=wrap_dir + os.pathsep + self.env["PATH"])
+        self.assertEqual(status, 2, out)
+        self.assertIn("cannot write", out)
+        self.assertEqual(calls, [], out)
+        self.assertFalse(os.path.exists(lock), "empty lock directory leaked")
+
+        # Subsequent run succeeds rather than being wedged.
+        status, out, _ = self.prepush()
+        self.assertEqual(status, 0, out)
+        self.assert_cleaned_up()
+
+    # REQ-DEV-25: SIGHUP mid-run triggers cleanup of both $lock and $wt.
+    def test_sighup_mid_run_cleans_up_lock_and_worktree(self):
+        ready_fifo = os.path.join(self.tmp, "prepush_ready.fifo")
+        hold_fifo = os.path.join(self.tmp, "prepush_hold.fifo")
+        os.mkfifo(ready_fifo)
+        os.mkfifo(hold_fifo)
+        env = dict(
+            self.env,
+            STUB_BUILD_READY_FIFO=ready_fifo,
+            STUB_BUILD_HOLD_FIFO=hold_fifo,
+        )
+        proc = subprocess.Popen(
+            ["bash", self.script, "--skip-gradle", "--skip-studio"],
+            cwd=self.repo,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            with open(ready_fifo, encoding="utf-8") as f:
+                self.assertEqual(f.read().strip(), "ready")
+            os.killpg(proc.pid, signal.SIGHUP)
+            out, err = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+        self.assertEqual(proc.returncode, 129, out + err)
+        self.assert_cleaned_up()
+
+    # REQ-DEV-25: CDPATH set in the environment must not corrupt captured cd
+    # paths in prepush.sh.
+    def test_cdpath_does_not_break_directory_resolution(self):
+        cwd = os.path.join(self.repo, "src")
+        status, out, _ = self.prepush(
+            cwd=cwd,
+            TMPDIR=os.path.relpath(self.tmpdir, cwd),
+            CDPATH=self.tmp,
+        )
+        self.assertEqual(status, 0, out)
+        self.assert_cleaned_up()
 
 
 if __name__ == "__main__":

@@ -6,8 +6,8 @@ RULES.md 4: an agent never sets `commissioned = true` or changes a physical
 CAN id (or moves a device to another CAN bus, which changes its physical CAN
 address) in a robot config; a person does that at the robot
 (docs/BRINGUP.md "Human commissioning"). This checks each commit in
-`merge-base(<rev>, HEAD)..HEAD` (a merged branch's commits included) on its
-own. For every non-exempt tracked `*.toml` file (matched case-insensitively)
+`<rev>..HEAD` (requiring shared history with `<rev>`, a merged branch's commits
+included) on its own. For every non-exempt tracked `*.toml` file (matched case-insensitively)
 that commit changes, it reads the parent and commit blobs directly from git
 (`git cat-file blob`), parses both as TOML 1.0 with `tomllib` (failing closed
 on invalid UTF-8, TOML parse errors, or non-regular file modes), and reports
@@ -140,6 +140,7 @@ def is_robot_config(path):
 
 def git(*args):
     return subprocess.run(["git", *args], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace",
                           check=True).stdout
 
 
@@ -457,7 +458,8 @@ def pair_findings(path, old_entry, new_entry):
 
 def merge_bases(p1, p2):
     proc = subprocess.run(["git", "merge-base", "--all", p1, p2],
-                          capture_output=True, text=True, check=False)
+                          capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", check=False)
     if proc.returncode == 0:
         return proc.stdout.splitlines()
     if proc.returncode == 1:
@@ -534,12 +536,12 @@ def commit_findings(pinned, commit, parents):
 
 
 def check(base):
-    """Every finding in merge-base(base, HEAD)..HEAD not covered by a trailer."""
+    """Every finding in base..HEAD (with shared history) not covered by a trailer."""
     pinned = pinned_git()
-    start = git("merge-base", base, "HEAD").strip()
+    git("merge-base", base, "HEAD")
     found = []
     for entry in git("rev-list", "--parents", "--reverse",
-                     f"{start}..HEAD").splitlines():
+                     f"{base}..HEAD").splitlines():
         commit, *parents = entry.split()
         trailer = git("log", "-1",
                       f"--format=%(trailers:key={TRAILER},valueonly)",
