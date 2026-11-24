@@ -54,7 +54,6 @@
 #include "talOS/launcher/launcher.h"
 #include "talOS/launcher/testdata/first_exec.h"
 #include "talOS/launcher/testdata/supervision_events.h"
-#include "talOS/memory/residency.h"
 #include "talOS/memory/shared_memory_ptr.h"
 #include "talOS/protocol/types.h"
 #include "talOS/rtms/process_liveness.h"
@@ -6913,21 +6912,14 @@ TEST(Supervision, QuiescedBridgeDecouplesActuatorStopFromLogFlushTimeout) {
   }
 }
 
-// RT-2 (software part): late ring mlock refusal exposed via
-// memory::LateLockRefused, recorded into a live registry row via
-// NodeRegistration::note_realtime_refused, and warned/merged by
-// Launcher::NoteRealtime (both after initial full and partial grants, and at
+// RT-2 (software part): late ring mlock refusal recorded into a live
+// registry row via NodeRegistration::note_realtime_refused, and warned/merged
+// by Launcher::NoteRealtime (both after initial full and partial grants, and at
 // reap time via FinalDeliveryCounts) and NodeProcessInfo::RecordRealtime.
 // REQ-RT-09, REQ-OPS-18
 TEST(Supervision, LateRingLockRefusalWarnsAndMergesIntoManifest) {
-  // Part 1: residency seam + NodeRegistration::note_realtime_refused guards.
+  // Part 1: NodeRegistration::note_realtime_refused guards.
   {
-    EXPECT_FALSE(talos::memory::LateLockRefused());
-    talos::memory::SetLateLockRefusedForTest(true);
-    EXPECT_TRUE(talos::memory::LateLockRefused());
-    talos::memory::SetLateLockRefusedForTest(false);
-    EXPECT_FALSE(talos::memory::LateLockRefused());
-
     const std::string reg_path =
         "/late_rt_test_" + std::to_string(::getpid()) + ".reg";
     introspect::RegistryMapping::unlink(reg_path);

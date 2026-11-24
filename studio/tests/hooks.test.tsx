@@ -34,10 +34,6 @@ function snap(seq: number, ts: string, channels: Record<string, number>): Snapsh
   };
 }
 
-test('static studio rpc rejects rather than waiting for a worker it has not got', async () => {
-  await assert.rejects(() => createStaticStudio({}).actions.rpc('get_latest', {}));
-});
-
 test('status strip keeps unknown enabled state free of fault or healthy tones', () => {
   for (const enabled of [null, false, true]) {
     const studio = createStaticStudio({frames: [

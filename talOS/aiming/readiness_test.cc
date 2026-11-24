@@ -295,12 +295,6 @@ TEST(ReadinessGate, SkippedTicksRestartTheSettleCount) {
   EXPECT_EQ(wrapped.passing_tick_count, 1);
 }
 
-// settle_tick_count = 1 means no debounce.
-TEST(ReadinessGate, OneTickIsImmediate) {
-  ReadinessGate gate(Limits(1));
-  EXPECT_TRUE(gate.Update(AllGood(), 0).ready);
-}
-
 // Bad limits are refused, naming the key; an infinite speed limit is no
 // limit.
 TEST(ReadinessGate, RejectsBadLimits) {

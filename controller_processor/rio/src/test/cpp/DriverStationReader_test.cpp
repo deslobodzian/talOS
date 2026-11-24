@@ -454,8 +454,6 @@ TEST(DriverStationReader, StopAbandonsARefreshThatDoesNotReturn) {
 TEST(DriverStationReader, WpilibCallsRefreshPeriodicallyAndOnNewData) {
   static_assert(DriverStationReader::kWaitTimeoutUs == 20'000);
   static_assert(DriverStationReader::kLoopTickWindowUs == 20'000);
-  EXPECT_EQ(DriverStationReader::kWaitTimeoutUs, 20'000u);
-  EXPECT_EQ(DriverStationReader::kLoopTickWindowUs, 20'000u);
 
   HAL_Initialize(500, 0);
   struct ResetSimDs {

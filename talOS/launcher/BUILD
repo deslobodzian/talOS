@@ -1092,7 +1092,6 @@ cc_test(
         ":supervision_events",
         "//talOS/bridge:messages",
         "//talOS/introspection:registry",
-        "//talOS/memory:residency",
         "//talOS/protocol",
         "//talOS/rtms",
         "//talOS/rtms:process_liveness",

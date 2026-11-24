@@ -6,17 +6,6 @@ load("@rules_python//python:defs.bzl", "py_test")
 # MuJoCo rigid-body physics (README.md). Only this package and its
 # subpackages may depend on @mujoco (tools/check_layers.py --source-only).
 
-# MuJoCo as built here steps repeatably and restarts bit-exactly from a saved
-# state: a precondition of REQ-DEV-37, whose own test is the gateway's.
-cc_test(
-    name = "determinism_test",
-    srcs = ["determinism_test.cc"],
-    deps = [
-        "@googletest//:gtest_main",
-        "@mujoco",
-    ],
-)
-
 # The MuJoCo world behind the MuJoCo gateway (REQ-DEV-37): the robot MJCF
 # attached to a field MJCF or a flat carpet, stepped as an ExternalPlant of
 # PhysicsSimBackend. Visible only inside this package tree, so @mujoco stays

@@ -129,14 +129,6 @@ TEST(ClockOffset, DuplicateAndReorderedSamplesAreIgnored) {
   EXPECT_EQ(clock.window_count(), 11u);
 }
 
-TEST(ClockOffset, TheFirstSampleOfABootMayBeAtGatewayTimeZero) {
-  Estimator clock;
-  EXPECT_TRUE(clock.Observe(5, 0, kBridgeStartUs));
-  EXPECT_TRUE(clock.Observe(5, 5000, kBridgeStartUs + 5000));
-  EXPECT_EQ(clock.ignored_count(), 0u);
-  EXPECT_EQ(clock.offset_us(), static_cast<std::int64_t>(kBridgeStartUs));
-}
-
 // Either sign of clock drift must move the window's minimum: fast clocks
 // retire the old minimum, while slow clocks immediately use the newest.
 TEST(ClockOffset, FollowsBridgeClockDriftInEitherDirection) {

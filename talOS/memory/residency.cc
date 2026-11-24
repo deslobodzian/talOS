@@ -93,10 +93,6 @@ bool LateLockRefused() noexcept {
   return reported_late_failure.load(std::memory_order_relaxed);
 }
 
-void SetLateLockRefusedForTest(bool refused) noexcept {
-  reported_late_failure.store(refused, std::memory_order_relaxed);
-}
-
 void TrackMapping(void* address, std::size_t size) {
   MappingState& state = Mappings();
   const std::scoped_lock lock{state.mutex};

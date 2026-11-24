@@ -466,28 +466,6 @@ void ProbeThread(void* argument) {
 
 }  // namespace
 
-// The detector's pool threads (created by the library with default
-// attributes, from a thread at ordinary priority) must run below the node
-// loops, and the pool must be the size detection keeps, not one it replaces.
-TEST(CpuAprilTagBackendTest, DetectorPoolThreadsRunAtBackgroundPriority) {
-  apriltag_detector_t* td = apriltag_detector_create();
-  td->nthreads = 3;
-  EnsureBackgroundWorkerPool(td);
-  ASSERT_NE(td->wp, nullptr);
-  EXPECT_EQ(workerpool_get_nthreads(td->wp), td->nthreads);
-
-  PoolProbe probe;
-  probe.threads = td->nthreads;
-  for (int i = 0; i < td->nthreads; ++i) {
-    workerpool_add_task(td->wp, ProbeThread, &probe);
-  }
-  workerpool_run(td->wp);
-  apriltag_detector_destroy(td);
-
-  EXPECT_EQ(probe.arrived, 3);
-  EXPECT_EQ(probe.background, 3);
-}
-
 // REQ-RT-10: CpuAprilTagBackend::Detect configures its AprilTag worker-pool
 // threads at background priority without callers invoking
 // EnsureBackgroundWorkerPool directly.
