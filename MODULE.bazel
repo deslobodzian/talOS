@@ -14,7 +14,10 @@ local_path_override(
 # Pinned for the macOS C++ toolchain under Bazel 8.6 / Xcode (supplies the
 # macOS C++ toolchain targets; without it Bazel resolves transitive 1.24.2).
 bazel_dep(name = "apple_support", version = "2.0.0", repo_name = "build_bazel_apple_support")
-bazel_dep(name = "rules_cc", version = "0.2.18")
+
+# 0.2.22: the version mujoco 3.17.0 (below) asks for, raised here so the root
+# pin is the version the graph resolves.
+bazel_dep(name = "rules_cc", version = "0.2.22")
 bazel_dep(name = "googletest", version = "1.17.0.bcr.2")
 bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "flatbuffers", version = "25.12.19")
@@ -59,8 +62,18 @@ configuration_http_archive(
 
 # Choreo .traj (JSON) trajectories, read by //talOS/trajectory at load time,
 # and a session's manifest.json, read by //talOS/events:input_replay.
-# 3.11.3 is the version the module graph already resolves transitively.
-bazel_dep(name = "nlohmann_json", version = "3.11.3")
+# 3.12.0.bcr.1 is the version the module graph already resolves transitively
+# (mujoco, below, brings it in through rules_cc_autoconf).
+bazel_dep(name = "nlohmann_json", version = "3.12.0.bcr.1")
+
+# MuJoCo rigid-body physics, built from source as MuJoCo's library target
+# @mujoco//:mujoco. No Python bindings or viewer; the target also compiles and
+# links the classic OpenGL renderer and UI code, unused here, with no GLFW and
+# no link-time GL. Used only under //talOS/simulation/mujoco
+# (tools/check_layers.py refuses it elsewhere). 3.17.0 rather than 4.0.x:
+# 4.0.x would raise rules_python, apple_support and rules_cc for the whole
+# repository, and 4.0.0 has a sparse-solver bug.
+bazel_dep(name = "mujoco", version = "3.17.0")
 
 # Hedron's Compile Commands Extractor for Bazel
 # https://github.com/hedronvision/bazel-compile-commands-extractor

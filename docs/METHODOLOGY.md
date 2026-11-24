@@ -353,8 +353,9 @@ A dependency is adopted when it meets all of these:
 | Geometry, kinematics and pose estimation | C++: header-only `talos::geometry` SO2/SE2/SO3/SE3 on Eigen 3.4 (`@eigen3`); drivetrain inverse/forward swerve kinematics use it with per-module speed limits. Python: `robotpy-wpimath` 2026.2.1.1 | in use: shared C++ frame math. `robotpy-wpimath` is pinned in `talOS/python/requirements.txt` for a robot's Python nodes, and no talOS node imports it (the 2026 robot's pose estimator, in its own repository, does); `wpilib_lockstep_test` aligns GradleRIO with the RobotPy native/wrapper wheels only |
 | Smoothing and mapping (factor graphs) | GTSAM 4.3.0 (`gtsam` wheel on PyPI, BSD) | pinned in `talOS/python/requirements.txt` for a robot's Python nodes; no talOS node imports it (the 2026 robot's pose estimator, in its own repository, does) |
 | Vision: AprilTag pose observations | `talOS/vision`: upstream AprilTag 3.4.5 (`@apriltag`), OpenCV 4.12 conversion/IO, Metal preprocessing/CCL on macOS, AVFoundation/V4L2 capture | in use: typed detector options, decode-margin/Hamming validity gates before localization, undistorted homography, robust joint single/multi-tag corner solving with floor/tilt priors, marginalized field-frame x/y/yaw covariance and configured uncertainty floors; ambiguity unknown=1, verified unique=0; one robot node per camera, no side-channel server |
-| Autonomous paths | Choreo `.traj` files (JSON, read with nlohmann/json 3.11.3 from the BCR, MIT), loaded and followed by `talOS/trajectory` | in use by the 2026 robot's autonomous node (its own repository), which plans with `MakeStraightLine` and follows with `HolonomicFollower`. wpimath's C++ controllers have no Bazel module, so the follower is talos code |
+| Autonomous paths | Choreo `.traj` files (JSON, read with nlohmann/json 3.12.0 from the BCR, MIT), loaded and followed by `talOS/trajectory` | in use by the 2026 robot's autonomous node (its own repository), which plans with `MakeStraightLine` and follows with `HolonomicFollower`. wpimath's C++ controllers have no Bazel module, so the follower is talos code |
 | RoboRIO hardware | WPILib HAL and Phoenix 6 | in use |
+| Rigid-body simulation of a robot and field | MuJoCo 3.17.0: MuJoCo's library target `@mujoco//:mujoco` built from source (no Python bindings or viewer; it also compiles and links the classic OpenGL renderer and UI code, unused, with no GLFW and no link-time GL). It links MuJoCo (Apache-2.0), ccd (BSD-3-Clause), miniz (MIT), tinyxml2 and lodepng (Zlib), tinyobjloader (MIT), qhull (Qhull: permissive, not OSI-approved) and marchingcubecpp (public domain, no licence file). Qhull and marchingcubecpp are exceptions to condition 1, the owner's to accept | used only under `//talOS/simulation/mujoco` and its subpackages, which `tools/check_layers.py --source-only` enforces; never linked into a node or the RoboRIO program |
 
 Every `bazel_dep` of the root `MODULE.bazel` is a row here
 (`tools/check_deps_listed.py`, a source lint, fails on a module missing from
@@ -366,7 +367,7 @@ asks for; only an override, such as `single_version_override`, fixes one).
 | Bazel module | For |
 |---|---|
 | `apple_support` | the Apple C++ toolchain on macOS under Bazel 8.6 / Xcode (`repo_name` `build_bazel_apple_support`; supplies the configured macOS C++ toolchain targets instead of transitive 1.24.2); root pin |
-| `rules_cc` | C++ rules |
+| `rules_cc` | C++ rules (0.2.22, the version `mujoco` asks for) |
 | `googletest` | C++ tests |
 | `platforms` | OS constraints (`@platforms//os:*`) in `select`s |
 | `flatbuffers` | message schemas, `flatc`, the C++ and Python runtimes |
@@ -374,6 +375,7 @@ asks for; only an override, such as `single_version_override`, fixes one).
 | `rules_python` | Python rules, the 3.11 toolchain and the pinned pip lock |
 | `nlohmann_json` | Choreo `.traj` and session manifest reading |
 | `opencv` | `talOS/vision` image conversion and IO (patched, root only) |
+| `mujoco` | rigid-body physics under `//talOS/simulation/mujoco` |
 | `wrist` | `examples/wrist_repo`, the standalone-subsystem example (dev only) |
 | `hedron_compile_commands` | `compile_commands.json` for clang-tidy (dev only) |
 | `aspect_rules_js` | Studio's npm dependency graph (dev only) |
