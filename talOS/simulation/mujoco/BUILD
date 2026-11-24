@@ -1,5 +1,7 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@rules_python//python:defs.bzl", "py_test")
 
 # MuJoCo rigid-body physics (README.md). Only this package and its
 # subpackages may depend on @mujoco (tools/check_layers.py --source-only).
@@ -41,5 +43,138 @@ cc_test(
         "//talOS/node:allocation_probe",
         "@googletest//:gtest_main",
         "@mujoco",
+    ],
+)
+
+# mujoco_gateway (README.md): sim_gateway --physics with the MuJoCo world as
+# the plant (REQ-DEV-37). A config names it in [robot] sim_gateway.
+cc_binary(
+    name = "mujoco_gateway",
+    srcs = ["mujoco_gateway.cc"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":gateway_extension",
+        ":plant",
+        "//talOS/simulation:gateway_main",
+    ],
+)
+
+# The program's GatewayExtension: assembles the world from the config's
+# [simulation.mujoco], finds the field models in its runfiles, and reports
+# the plant's clock. A library so the component tests drive it in process.
+cc_library(
+    name = "gateway_extension",
+    srcs = ["gateway_extension.cc"],
+    hdrs = ["gateway_extension.h"],
+    data = ["//talOS/simulation/mujoco/fields/rebuilt_2026"],
+    local_defines = [
+        "TALOS_MUJOCO_FIELD_REBUILT_2026=\\\"$(rlocationpath //talOS/simulation/mujoco/fields/rebuilt_2026)\\\"",
+    ],
+    visibility = ["//talOS/simulation/mujoco:__subpackages__"],
+    deps = [
+        ":plant",
+        "//talOS/configuration",
+        "//talOS/hardware",
+        "//talOS/simulation:gateway_main",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+# REQ-DEV-37: a bound motor against the analytic rigid-body mechanism of the
+# same inertia, tick for tick through two Gateways (the design note's
+# bounds; intended differences in the test's header).
+cc_test(
+    name = "gateway_differential_test",
+    size = "small",
+    srcs = ["gateway_differential_test.cc"],
+    deps = [
+        ":plant",
+        "//talOS/hardware",
+        "//talOS/hardware:codecs",
+        "@googletest//:gtest_main",
+        "@mujoco",
+    ],
+)
+
+# REQ-DEV-37: two compiles of one model, ticked at the same jittered times
+# with the same commands and faults, give identical encoded States; a 1 us
+# change at one tick does not.
+cc_test(
+    name = "gateway_bit_identity_test",
+    size = "small",
+    srcs = ["gateway_bit_identity_test.cc"],
+    deps = [
+        ":gateway_extension",
+        ":plant",
+        "//talOS/configuration",
+        "//talOS/hardware",
+        "//talOS/hardware:codecs",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# REQ-DEV-37: the program as a child process: --describe against
+# sim_gateway --physics, refusals naming the key or flag, a model file
+# robot_model_files omits, a diverging model, and 50 ms on the 2026 field.
+# Integration lane: real-time runs over loopback UDP.
+py_test(
+    name = "mujoco_gateway_test",
+    size = "small",
+    srcs = ["mujoco_gateway_test.py"],
+    data = [
+        ":mujoco_gateway",
+        "//talOS/simulation:sim_gateway",
+    ] + glob(["testdata/**"]),
+    env = {
+        "ARM_XML": "$(rlocationpath testdata/arm/arm.xml)",
+        "MUJOCO_GATEWAY": "$(rlocationpath :mujoco_gateway)",
+        "ROVER_CONFIG": "$(rlocationpath testdata/rover/robot.toml)",
+        "SIM_GATEWAY": "$(rlocationpath //talOS/simulation:sim_gateway)",
+        "UNLISTED_MESH_CONFIG": "$(rlocationpath testdata/unlisted_mesh/robot.toml)",
+    },
+    legacy_create_init = False,
+    tags = ["integration"],
+    deps = [
+        "//talOS/build:udp_ports",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+# REQ-DEV-37: the field names config load accepts are the ones the gateway
+# finds in its runfiles and loads, and no others.
+cc_test(
+    name = "fields_test",
+    size = "small",
+    srcs = ["fields_test.cc"],
+    deps = [
+        ":gateway_extension",
+        ":plant",
+        "//talOS/configuration",
+        "@googletest//:gtest_main",
+        "@mujoco",
+    ],
+)
+
+# REQ-DEV-37: Configure refuses each analytic chassis key and flag when the
+# model owns the chassis, and accepts them with a welded root.
+cc_test(
+    name = "gateway_extension_test",
+    size = "small",
+    srcs = ["gateway_extension_test.cc"],
+    data = [
+        "testdata/arm/arm.xml",
+        "testdata/rover/rover.xml",
+    ],
+    env = {
+        "ARM_XML": "$(rlocationpath testdata/arm/arm.xml)",
+        "ROVER_XML": "$(rlocationpath testdata/rover/rover.xml)",
+    },
+    deps = [
+        ":gateway_extension",
+        ":plant",
+        "//talOS/configuration",
+        "//talOS/hardware",
+        "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
     ],
 )

@@ -24,6 +24,7 @@
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/driver_station/schedule.h"
 #include "talOS/events/os/poller.h"
+#include "talOS/hardware/config_error.h"
 #include "talOS/hardware/endpoint.h"
 #include "talOS/hardware/sim_backend.h"
 #include "talOS/hardware/sim_physics.h"
@@ -201,7 +202,8 @@ int Run(int argc, char** argv,
   try {
     bool describe = false;
     bool saw_sim = false;
-    bool physics = program.physics_only;
+    // An extension configures the physics backend, so it implies --physics.
+    bool physics = program.physics_only || extension != nullptr;
     double duration_s = 0;
     std::vector<ds::SchedulePhase> phases;
     std::vector<ds::JoystickEvent> joysticks;
@@ -307,6 +309,11 @@ int Run(int argc, char** argv,
     std::optional<talos::hardware::sim::ChassisDynamics> chassis_dynamics;
     std::vector<talos::hardware::sim::MechanismSpec> mechanisms;
     const auto robot_config = talos::config::ParseRobotConfig(config_path);
+    if (extension == nullptr && robot_config.simulation.mujoco) {
+      std::fprintf(stderr,
+                   "sim_gateway: ignoring [simulation.mujoco]; "
+                   "//talOS/simulation/mujoco:mujoco_gateway simulates it\n");
+    }
     {
       ports = talos::simulation::ResolveGatewayPorts(robot_config, port_flag,
                                                      remote_port_flag);
@@ -413,8 +420,12 @@ int Run(int argc, char** argv,
       extension->Configure(robot_config, options, physics_backend);
     }
     if (!gateway.Reconfigure(hw_config)) {
+      const std::optional<talos::hardware::ConfigError>& error =
+          gateway.config_error();
       throw std::runtime_error(
-          "sim_gateway: Reconfigure failed for the robot config");
+          "sim_gateway: Reconfigure failed for the robot config" +
+          (error ? ": " + talos::hardware::FormatConfigError(*error)
+                 : std::string()));
     }
     talos::simulation::ResolveFaults(faults, hw_config);
     talos::hardware::Endpoint endpoint{gateway};

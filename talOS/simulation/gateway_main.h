@@ -14,7 +14,10 @@
 namespace talos::simulation {
 
 // Every hook runs on the gateway's only thread. A hook's std::exception ends
-// the program with exit 1 and its message on stderr, without the summary.
+// the program with exit 1 and its message on stderr, without the summary. A
+// program with an extension always runs the physics backend, as if --physics
+// were given. Anything the extension attaches to the backend (an external
+// plant) must outlive RunSimGateway.
 class GatewayExtension {
  public:
   virtual ~GatewayExtension() = default;
@@ -34,6 +37,7 @@ struct GatewayProgramInfo {
   std::string_view target;        // --describe and registry target
   std::string_view backend_name;  // stderr "backend=" for the physics backend
   bool physics_only{false};       // --physics implied and accepted
+                                  // (an extension implies it too)
 };
 
 // The gateway's whole program; returns main's exit code. `extension` may be

@@ -199,6 +199,14 @@ the RoboRIO, so it takes the bridge's tier for its loop period
 timeshare beside time-constraint nodes stops sending State whenever the host
 stalls timeshare work, and the nodes then correctly expire their targets.
 
+## MuJoCo gateway
+
+`//talOS/simulation/mujoco:mujoco_gateway` is this program with a MuJoCo
+world as the physics backend's plant: the robot's model from the config's
+`[simulation.mujoco]` on a field model. A config names it in `[robot]
+sim_gateway`; its flags, output and model rules are in
+[its README](mujoco/README.md#mujoco_gateway).
+
 ## Tests
 
 `schedules_test` covers the fault schedule's parsing, resolution, application,
