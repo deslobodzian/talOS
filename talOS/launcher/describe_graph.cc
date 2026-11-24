@@ -125,6 +125,7 @@ std::vector<naming::SourceShape> SessionTopics(
     const std::vector<NodeDescription>& described) {
   std::vector<naming::SourceShape> topics;
   for (const auto& node : described) {
+    if (!node.answered) continue;
     for (const auto& source : node.declared.sources) {
       if (source.kind == event::SourceKind::TIMER) continue;
       const auto known = std::find_if(
@@ -161,6 +162,7 @@ bool ProbeDescribe(const std::vector<std::string>& args,
                    std::chrono::milliseconds timeout,
                    introspect::Description& out, std::string& error,
                    int injected_spawn_failures, int stop_fd) {
+  out = {};
   error.clear();
   if (timeout <= std::chrono::milliseconds{0}) {
     error = "describe timeout must be positive (" +
@@ -310,6 +312,12 @@ bool ProbeDescribe(const std::vector<std::string>& args,
     } else if (WIFSIGNALED(status)) {
       error += "; killed by signal " + SignalText(WTERMSIG(status));
     }
+    out = {};
+    return false;
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    error = "describe probe failed (" + ExitReason(status) + ")";
+    out = {};
     return false;
   }
   return true;
@@ -521,6 +529,7 @@ std::vector<naming::Diagnostic> LintCriticalNodes(
     const auto& spec = specs[i];
     const auto& node = described[i];
     const bool writes_targets =
+        node.answered &&
         std::any_of(node.declared.sources.begin(), node.declared.sources.end(),
                     [](const auto& source) {
                       return source.kind == event::SourceKind::SENDER &&
@@ -776,6 +785,8 @@ std::vector<naming::Diagnostic> DescribeGraph(
     if (!graph_path.empty()) args.insert(args.end(), {"--graph", graph_path});
     args.insert(args.end(), spec.extra_args.begin(), spec.extra_args.end());
     if (described.missing) return;
+    described.declared = {};
+    described.error.clear();
     const auto injected = options.probe_spawn_failures.find(spec.name);
     try {
       described.answered = ProbeDescribe(
@@ -786,6 +797,9 @@ std::vector<naming::Diagnostic> DescribeGraph(
     } catch (const std::exception& e) {
       described.answered = false;
       described.error = e.what();
+    }
+    if (!described.answered) {
+      described.declared = {};
     }
   };
 
@@ -991,8 +1005,8 @@ std::string EndpointMismatch(const std::vector<naming::SourceShape>& declared,
       std::tuple<std::string, int, std::uint32_t, std::uint32_t, std::uint32_t>;
   constexpr std::uint32_t kLinted =
       naming::kSourceFlagExternal | naming::kSourceFlagOptional |
-      naming::kSourceFlagObserver | naming::kSourceFlagUntargetedOutputs |
-      naming::kSourceFlagOperatorArming |
+      naming::kSourceFlagObserver | naming::kSourceFlagHardwareRequest |
+      naming::kSourceFlagUntargetedOutputs | naming::kSourceFlagOperatorArming |
       naming::kSourceFlagInternalDriverStation;
   const auto keys = [](const std::vector<naming::SourceShape>& sources) {
     std::vector<Key> out;
@@ -1015,6 +1029,9 @@ std::string EndpointMismatch(const std::vector<naming::SourceShape>& declared,
       if ((flags & naming::kSourceFlagExternal) != 0) out += ", external";
       if ((flags & naming::kSourceFlagOptional) != 0) out += ", optional";
       if ((flags & naming::kSourceFlagObserver) != 0) out += ", observer";
+      if ((flags & naming::kSourceFlagHardwareRequest) != 0) {
+        out += ", hardware_request";
+      }
       if ((flags & naming::kSourceFlagUntargetedOutputs) != 0) {
         out += ", untargeted_outputs";
       }
@@ -1050,6 +1067,7 @@ std::string EndpointMismatch(const std::vector<naming::SourceShape>& declared,
 std::size_t CountDeclaredTopics(const std::vector<NodeDescription>& described) {
   std::vector<std::string> topics;
   for (const auto& node : described) {
+    if (!node.answered) continue;
     for (const auto& source : node.declared.sources) {
       if (source.kind == event::SourceKind::TIMER) continue;
       if (std::find(topics.begin(), topics.end(), source.name) ==
@@ -1112,7 +1130,9 @@ std::string GraphToJson(uint64_t session_id, const std::string& config_path,
       ss << "      \"describe_error\": " << Quoted(node.error) << ",\n";
     }
     ss << "      \"sources\": [";
-    for (std::size_t j = 0; j < node.declared.sources.size(); ++j) {
+    const std::size_t source_count =
+        node.answered ? node.declared.sources.size() : 0;
+    for (std::size_t j = 0; j < source_count; ++j) {
       const auto& source = node.declared.sources[j];
       ss << (j ? ",\n        {" : "\n        {");
       ss << "\"kind\": " << Quoted(event::to_string(source.kind));
@@ -1131,7 +1151,7 @@ std::string GraphToJson(uint64_t session_id, const std::string& config_path,
       }
       ss << "}";
     }
-    ss << (node.declared.sources.empty() ? "]\n" : "\n      ]\n");
+    ss << (source_count == 0 ? "]\n" : "\n      ]\n");
     ss << "    }" << (i + 1 < described.size() ? "," : "") << "\n";
   }
   ss << "  ],\n";

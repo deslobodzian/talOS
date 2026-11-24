@@ -1,10 +1,12 @@
-// Unit tests for launcher phase-1 graph/roster rules without spawning
-// subprocesses (REQ-SAFE-28).
+// Unit tests for launcher phase-1 describe, graph, and roster rules
+// (REQ-SAFE-28, REQ-OPS-01, REQ-OPS-03).
 #include "talOS/launcher/describe_graph.h"
 
 #include <gtest/gtest.h>
+#include <sys/stat.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -621,6 +623,210 @@ labels = []
       {"telemetry", "labels[0].channel"}, {"telemetry", "labels[0].from"},
   };
   EXPECT_TRUE(LintParameterKeys(cfg, {telemetry}, "").empty());
+}
+
+void WriteExecutableStub(const std::filesystem::path& path,
+                         std::string_view script) {
+  std::ofstream out{path, std::ios::binary | std::ios::trunc};
+  ASSERT_TRUE(out.is_open()) << path;
+  out << script;
+  out.close();
+  ASSERT_EQ(::chmod(path.c_str(), 0755), 0) << path;
+}
+
+// REQ-OPS-01, REQ-OPS-03: a Pass-2 --graph probe failure clears any Pass-1
+// declared.sources so stale topics never reach GraphToJson, topic counts,
+// session segments, or target-lane criticality checks.
+TEST(DescribeGraphUnitTest,
+     Pass2FailureClearsStalePass1SourcesFromGraphAndTopics) {
+  const std::filesystem::path dir =
+      std::filesystem::path{::testing::TempDir()} /
+      "describe_graph_pass2_failure";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+
+  introspect::Description pass1;
+  pass1.name = "reader";
+  pass1.target = "//example/reader:node";
+  pass1.reads_graph = true;
+  naming::SourceShape state_sender =
+      MakeSource(event::SourceKind::SENDER, "/reader/state");
+  state_sender.message_bytes = 16;
+  state_sender.alignment = 8;
+  state_sender.slots = 16;
+  state_sender.schema = "example.State";
+  state_sender.schema_hash = 0x123456789abcdef0ULL;
+  pass1.sources.push_back(state_sender);
+
+  const std::filesystem::path stub = dir / "reader_stub.sh";
+  ASSERT_NO_FATAL_FAILURE(
+      WriteExecutableStub(stub,
+                          "#!/bin/sh\n"
+                          "for arg in \"$@\"; do\n"
+                          "  if [ \"$arg\" = \"--graph\" ]; then\n"
+                          "    exit 1\n"
+                          "  fi\n"
+                          "done\n"
+                          "cat <<'TALOS_DESCRIBE'\n" +
+                              introspect::DescribeToJson(pass1) +
+                              "TALOS_DESCRIBE\n"
+                              "exit 0\n"));
+
+  NodeSpec spec;
+  spec.name = "reader";
+  spec.target = "//example/reader:node";
+  spec.binary_path = stub.string();
+  spec.critical = false;
+  spec.owns_actuators = false;
+
+  LauncherOptions options;
+  options.config_path = (dir / "robot.toml").string();
+  options.output_dir = dir.string();
+
+  std::vector<NodeDescription> described;
+  const auto diagnostics = DescribeGraph({spec}, options, described);
+  EXPECT_FALSE(naming::HasError(diagnostics));
+  ASSERT_EQ(described.size(), 1u);
+  EXPECT_FALSE(described[0].answered);
+  EXPECT_TRUE(described[0].declared.sources.empty());
+  EXPECT_EQ(CountDeclaredTopics(described), 0u);
+
+  const std::string json =
+      GraphToJson(1, options.config_path, described, diagnostics);
+  EXPECT_NE(json.find("\"described\": false"), std::string::npos) << json;
+  EXPECT_NE(json.find("\"sources\": []"), std::string::npos) << json;
+  EXPECT_EQ(json.find("/reader/state"), std::string::npos) << json;
+
+  // Synthetic unanswered NodeDescription carrying stale sources (including a
+  // target-lane sender and invalid slots = 0) must be ignored by all
+  // downstream helpers.
+  NodeSpec synthetic_spec;
+  synthetic_spec.name = "reader";
+  synthetic_spec.target = "//example/reader:node";
+  synthetic_spec.critical = false;
+  synthetic_spec.owns_actuators = false;
+
+  NodeDescription synthetic{.roster_name = "reader",
+                            .target = "//example/reader:node",
+                            .answered = false,
+                            .error = "probe failed"};
+  naming::SourceShape stale_target =
+      MakeSource(event::SourceKind::SENDER, "/beta/target/teleop");
+  stale_target.message_bytes = 16;
+  stale_target.alignment = 8;
+  stale_target.slots = 0;
+  stale_target.schema = "example.Target";
+  stale_target.schema_hash = 0x1111222233334444ULL;
+  synthetic.declared.sources.push_back(std::move(stale_target));
+
+  EXPECT_EQ(CountDeclaredTopics({synthetic}), 0u);
+  EXPECT_TRUE(LintCriticalNodes({synthetic_spec}, {synthetic}).empty());
+  EXPECT_NO_THROW({
+    const std::vector<RTMSQueue> segments = CreateSessionSegments({synthetic});
+    EXPECT_TRUE(segments.empty());
+  });
+
+  const std::string synthetic_json = GraphToJson(2, "", {synthetic}, {});
+  EXPECT_NE(synthetic_json.find("\"described\": false"), std::string::npos)
+      << synthetic_json;
+  EXPECT_NE(synthetic_json.find("\"sources\": []"), std::string::npos)
+      << synthetic_json;
+  EXPECT_EQ(synthetic_json.find("/beta/target/teleop"), std::string::npos)
+      << synthetic_json;
+
+  std::filesystem::remove_all(dir);
+}
+
+// REQ-OPS-01: ProbeDescribe refuses a probe that prints valid JSON and then
+// exits non-zero or dies by a fatal signal, clearing `out` rather than
+// keeping parsed or pre-existing fields.
+TEST(DescribeGraphUnitTest,
+     ProbeDescribeRefusesNonZeroExitOrSignalAfterValidJson) {
+  const std::filesystem::path dir =
+      std::filesystem::path{::testing::TempDir()} /
+      "describe_graph_probe_exit_status";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+
+  introspect::Description valid;
+  valid.name = "probe_node";
+  valid.target = "//example/probe_node:node";
+  naming::SourceShape state_sender =
+      MakeSource(event::SourceKind::SENDER, "/probe_node/state");
+  state_sender.message_bytes = 16;
+  state_sender.alignment = 8;
+  state_sender.slots = 16;
+  state_sender.schema = "example.State";
+  state_sender.schema_hash = 0x123456789abcdef0ULL;
+  valid.sources.push_back(state_sender);
+  const std::string valid_json = introspect::DescribeToJson(valid);
+
+  const std::filesystem::path ok_stub = dir / "ok.sh";
+  ASSERT_NO_FATAL_FAILURE(WriteExecutableStub(ok_stub,
+                                              "#!/bin/sh\n"
+                                              "cat <<'TALOS_DESCRIBE'\n" +
+                                                  valid_json +
+                                                  "TALOS_DESCRIBE\n"
+                                                  "exit 0\n"));
+
+  const std::filesystem::path exit1_stub = dir / "exit1.sh";
+  ASSERT_NO_FATAL_FAILURE(WriteExecutableStub(exit1_stub,
+                                              "#!/bin/sh\n"
+                                              "cat <<'TALOS_DESCRIBE'\n" +
+                                                  valid_json +
+                                                  "TALOS_DESCRIBE\n"
+                                                  "exit 1\n"));
+
+  const std::filesystem::path abrt_stub = dir / "abrt.sh";
+  ASSERT_NO_FATAL_FAILURE(
+      WriteExecutableStub(abrt_stub,
+                          "#!/bin/sh\n"
+                          "cat <<'TALOS_DESCRIBE'\n" +
+                              valid_json +
+                              "TALOS_DESCRIBE\n"
+                              "ulimit -c 0 2>/dev/null || true\n"
+                              "kill -ABRT $$\n"));
+
+  // Positive control: the same JSON with exit 0 succeeds.
+  {
+    introspect::Description out;
+    std::string error;
+    EXPECT_TRUE(ProbeDescribe({ok_stub.string(), "--describe"},
+                              std::chrono::seconds{10}, out, error))
+        << error;
+    EXPECT_EQ(out.name, "probe_node");
+    ASSERT_EQ(out.sources.size(), 1u);
+  }
+
+  // Non-zero exit after valid JSON is refused and clears pre-seeded `out`.
+  {
+    introspect::Description out;
+    out.name = "sentinel";
+    out.sources.push_back(
+        MakeSource(event::SourceKind::SENDER, "/sentinel/state"));
+    std::string error;
+    EXPECT_FALSE(ProbeDescribe({exit1_stub.string(), "--describe"},
+                               std::chrono::seconds{10}, out, error));
+    EXPECT_TRUE(out.sources.empty());
+    EXPECT_TRUE(out.name.empty());
+    EXPECT_NE(error.find("exit code 1"), std::string::npos) << error;
+  }
+
+  // Fatal signal after valid JSON is refused and clears pre-seeded `out`.
+  {
+    introspect::Description out;
+    out.name = "sentinel";
+    out.sources.push_back(
+        MakeSource(event::SourceKind::SENDER, "/sentinel/state"));
+    std::string error;
+    EXPECT_FALSE(ProbeDescribe({abrt_stub.string(), "--describe"},
+                               std::chrono::seconds{10}, out, error));
+    EXPECT_TRUE(out.sources.empty());
+    EXPECT_TRUE(out.name.empty());
+    EXPECT_NE(error.find("SIGABRT"), std::string::npos) << error;
+  }
+
+  std::filesystem::remove_all(dir);
 }
 
 }  // namespace
