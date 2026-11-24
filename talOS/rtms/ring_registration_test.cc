@@ -3,6 +3,8 @@
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -1688,6 +1690,80 @@ TEST(RingRegistration, OpenerRefusesALiveClaimantThatOutlastsTheWait) {
       << "the name holds another segment";
   EXPECT_EQ(outcome.named->lifetime, kLifetimeClosing | talos::OwnProcessWord())
       << "the opener changed the claim";
+}
+
+std::atomic<int> g_sigusr1_count{0};
+static_assert(std::atomic<int>::is_always_lock_free);
+
+void CountSigUsr1(int /*signum*/) {
+  g_sigusr1_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+// REQ-OPS-03: interrupting signals (EINTR) delivered while a session owner
+// inspects and waits on a live claimant must not cause HeaderView to fail and
+// blindly unlink the segment, nor collapse the retry wait.
+TEST(RingRegistration, SessionOwnerWaitsForLiveClaimantUnderSignalDelivery) {
+  constexpr std::size_t kSlots = 4;
+  const std::string path = MakeUniquePath("/ring_session_sig");
+
+  struct SigUsr1Guard {
+    SigUsr1Guard() {
+      struct sigaction action {};
+      action.sa_handler = CountSigUsr1;
+      ::sigemptyset(&action.sa_mask);
+      // Explicitly omit SA_RESTART so syscalls and nanosleep observe EINTR.
+      action.sa_flags = 0;
+      installed = ::sigaction(SIGUSR1, &action, &previous) == 0;
+    }
+    ~SigUsr1Guard() {
+      if (installed) ::sigaction(SIGUSR1, &previous, nullptr);
+    }
+    SigUsr1Guard(const SigUsr1Guard&) = delete;
+    SigUsr1Guard& operator=(const SigUsr1Guard&) = delete;
+    struct sigaction previous {};
+    bool installed{false};
+  } sig_guard;
+  ASSERT_TRUE(sig_guard.installed);
+  g_sigusr1_count.store(0, std::memory_order_release);
+
+  const HeldClaimantOutcome outcome = OpenPastAHeldClaimant(path, kSlots, [&] {
+    const pthread_t target = ::pthread_self();
+    std::atomic<bool> stop{false};
+    std::thread signaler{[&] {
+      while (!stop.load(std::memory_order_acquire)) {
+        ::pthread_kill(target, SIGUSR1);
+        std::this_thread::yield();
+      }
+    }};
+    struct StopAndJoin {
+      StopAndJoin(std::atomic<bool>& stop_in, std::thread& thread_in)
+          : stop{stop_in}, thread{thread_in} {}
+      std::atomic<bool>& stop;
+      std::thread& thread;
+      StopAndJoin(const StopAndJoin&) = delete;
+      StopAndJoin& operator=(const StopAndJoin&) = delete;
+      ~StopAndJoin() {
+        stop.store(true, std::memory_order_release);
+        if (thread.joinable()) thread.join();
+      }
+    } join_guard{stop, signaler};
+    return OpenSessionPublisher(path, kSlots);
+  });
+
+  EXPECT_GT(g_sigusr1_count.load(std::memory_order_acquire), 0)
+      << "no SIGUSR1 was delivered during the claimant wait";
+  EXPECT_FALSE(outcome.error.empty()) << "the session owner's open returned";
+  EXPECT_NE(outcome.error.find(path), std::string::npos) << outcome.error;
+  EXPECT_NE(outcome.error.find("pid " + std::to_string(::getpid())),
+            std::string::npos)
+      << outcome.error;
+  ASSERT_TRUE(outcome.named.has_value())
+      << "EINTR caused session owner to unlink the live claimant's segment";
+  EXPECT_EQ(outcome.named->segment_id, outcome.claimant_segment_id)
+      << "the name holds another segment";
+  EXPECT_EQ(outcome.named->lifetime, kLifetimeClosing | talos::OwnProcessWord())
+      << "the session owner changed the claim";
+  EXPECT_EQ(outcome.waits, kHeldWaitAttempts);
 }
 
 }  // namespace
