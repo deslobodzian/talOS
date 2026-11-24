@@ -214,7 +214,7 @@ class Teleop {
           const double raw = stick.axis(b.axis);
           if (!std::isfinite(raw)) {
             invalid_axis = true;
-            break;
+            continue;
           }
           if (std::abs(raw) > b.deadband_frac) {
             any_live = true;
@@ -224,7 +224,7 @@ class Teleop {
               const double val = rescaled * b.scale;
               if (!schema::FitsFloatingPoint(b.axis_field.base_type, val)) {
                 invalid_axis = true;
-                break;
+                continue;
               }
               schema::EncodeNumber(sub.buffer.data() + b.axis_field.offset,
                                    b.axis_field.base_type, val);
@@ -238,6 +238,11 @@ class Teleop {
         TargetAccess::lane_send(node_, sub.lane_index, sub.buffer.data(),
                                 sub.buffer.size());
       } else {
+        if (invalid_axis) {
+          for (auto& b : sub.bindings) {
+            b.toggled = false;
+          }
+        }
         sub.commanding = false;
         TargetAccess::lane_release(node_, sub.lane_index);
       }
