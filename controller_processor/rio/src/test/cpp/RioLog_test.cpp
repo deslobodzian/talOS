@@ -311,7 +311,6 @@ std::vector<std::string> LatencyLines(const std::vector<std::string>& lines) {
 // REQ-RT-25
 TEST(RioLog, LatencyReportsEachWindowsPercentilesMaxAndCountThenResets) {
   static_assert(RioLog::kPhaseWindowUs == 10'000'000);
-  EXPECT_EQ(RioLog::kPhaseWindowUs, 10'000'000u);
   std::vector<std::string> lines;
   RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
   log.Drain(0);  // starts the window clock
