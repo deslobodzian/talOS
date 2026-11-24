@@ -14,6 +14,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -727,6 +728,46 @@ TEST_F(MetalAprilTagParityTest, SetOptionsIsAtomicOnInvalidOptions) {
   bad_family.family_name = "not_a_real_family";
   EXPECT_THROW(metal_backend_->SetOptions(bad_family), std::invalid_argument);
 
+  const auto expect_invalid_option =
+      [&](const char* label,
+          const talos::vision::apriltag::DetectorOptions& bad_opts) {
+        SCOPED_TRACE(label);
+        EXPECT_THROW((void)MetalAprilTagBackend(bad_opts),
+                     std::invalid_argument);
+        EXPECT_THROW(metal_backend_->SetOptions(bad_opts),
+                     std::invalid_argument);
+      };
+
+  for (const float bad_decimate : {std::numeric_limits<float>::quiet_NaN(),
+                                   std::numeric_limits<float>::infinity(),
+                                   -std::numeric_limits<float>::infinity(),
+                                   0.0f, -1.0f, -1e20f, 32768.0f}) {
+    auto opts = good_opts;
+    opts.quad_decimate = bad_decimate;
+    expect_invalid_option("quad_decimate", opts);
+  }
+  for (const float bad_sigma :
+       {std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(), 64.5f, -64.5f}) {
+    auto opts = good_opts;
+    opts.quad_sigma = bad_sigma;
+    expect_invalid_option("quad_sigma", opts);
+  }
+  for (const double bad_sharpening :
+       {std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity()}) {
+    auto opts = good_opts;
+    opts.decode_sharpening = bad_sharpening;
+    expect_invalid_option("decode_sharpening", opts);
+  }
+  for (const int bad_hamming : {-1, 4}) {
+    auto opts = good_opts;
+    opts.max_hamming = bad_hamming;
+    expect_invalid_option("max_hamming", opts);
+  }
+
   talos::vision::Frame frame(
       0, 0, 0, talos::event::steady_now(), static_cast<uint32_t>(im->width),
       static_cast<uint32_t>(im->height), static_cast<uint32_t>(im->stride),
@@ -740,6 +781,104 @@ TEST_F(MetalAprilTagParityTest, SetOptionsIsAtomicOnInvalidOptions) {
     EXPECT_EQ(res.effective_backend, "metal");
   }
   image_u8_destroy(im);
+}
+
+TEST_F(MetalAprilTagParityTest,
+       DetectHandles4096AlignedAndNonPageMultipleInputs) {
+  apriltag_family_t* tf = tag36h11_create();
+  image_u8_t* tag_im = apriltag_to_image(tf, 4);
+  ASSERT_NE(tag_im, nullptr);
+
+  auto stamp_centered_tag = [&](uint8_t* dst, int width, int height,
+                                int stride) {
+    for (int y = 0; y < height; ++y) {
+      std::memset(dst + static_cast<size_t>(y) * static_cast<size_t>(stride),
+                  210, static_cast<size_t>(width));
+    }
+    const int scale = 8;
+    const int start_x = (width - tag_im->width * scale) / 2;
+    const int start_y = (height - tag_im->height * scale) / 2;
+    for (int ty = 0; ty < tag_im->height; ++ty) {
+      for (int tx = 0; tx < tag_im->width; ++tx) {
+        const uint8_t v = tag_im->buf[static_cast<size_t>(ty) *
+                                          static_cast<size_t>(tag_im->stride) +
+                                      static_cast<size_t>(tx)];
+        for (int sy = 0; sy < scale; ++sy) {
+          for (int sx = 0; sx < scale; ++sx) {
+            dst[static_cast<size_t>(start_y + ty * scale + sy) *
+                    static_cast<size_t>(stride) +
+                static_cast<size_t>(start_x + tx * scale + sx)] = v;
+          }
+        }
+      }
+    }
+  };
+
+  // 1. 4096-aligned (explicitly non-16384-aligned) pointer with 65536-byte
+  // (16 KiB multiple) buffer: on Apple Silicon, newBufferWithBytesNoCopy
+  // requires 16 KiB alignment so Metal must copy instead of aliasing.
+  {
+    constexpr int kWidth = 256;
+    constexpr int kHeight = 256;
+    constexpr size_t kBytes = static_cast<size_t>(kWidth) * kHeight;
+    static_assert(kBytes % 16384u == 0u);
+
+    std::vector<uint8_t> storage(kBytes + 32768u, 0);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(storage.data());
+    const uintptr_t aligned_16k = (base + 16383u) & ~uintptr_t{16383u};
+    uint8_t* ptr_16k = storage.data() + static_cast<size_t>(aligned_16k - base);
+    uint8_t* ptr_4k = ptr_16k + 4096u;
+    ASSERT_EQ(reinterpret_cast<uintptr_t>(ptr_4k) % 4096u, 0u);
+    ASSERT_NE(reinterpret_cast<uintptr_t>(ptr_4k) % 16384u, 0u);
+
+    stamp_centered_tag(ptr_4k, kWidth, kHeight, kWidth);
+    const auto cpu_dets = cpu_backend_->Detect(ptr_4k, kWidth, kHeight, kWidth,
+                                               intrinsics_, tag_size_m_);
+    const auto metal_dets =
+        metal_backend_->Detect(ptr_4k, kWidth, kHeight, kWidth,
+                               PixelFormat::kGray8, intrinsics_, tag_size_m_);
+    ASSERT_EQ(cpu_dets.size(), 1u);
+    EXPECT_EQ(cpu_dets[0].id, 4);
+    AssertAcceptanceContract(cpu_dets, metal_dets, "Aligned4096Not16384");
+
+    // Also verify page-aligned + page-multiple buffer parity (zero-copy path).
+    ASSERT_EQ(reinterpret_cast<uintptr_t>(ptr_16k) % 16384u, 0u);
+    std::memmove(ptr_16k, ptr_4k, kBytes);
+    const auto metal_16k_dets =
+        metal_backend_->Detect(ptr_16k, kWidth, kHeight, kWidth,
+                               PixelFormat::kGray8, intrinsics_, tag_size_m_);
+    AssertAcceptanceContract(cpu_dets, metal_16k_dets, "Aligned16384PageMult");
+  }
+
+  // 2. 16384-aligned pointer with non-page-multiple byte size (321 * 241 =
+  // 77361 bytes, odd): must not pass non-page-multiple length to
+  // newBufferWithBytesNoCopy.
+  {
+    constexpr int kWidth = 321;
+    constexpr int kHeight = 241;
+    constexpr size_t kBytes = static_cast<size_t>(kWidth) * kHeight;
+    static_assert(kBytes % 4096u != 0u);
+    static_assert(kBytes % 16384u != 0u);
+
+    std::vector<uint8_t> storage(kBytes + 16384u, 0);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(storage.data());
+    const uintptr_t aligned_16k = (base + 16383u) & ~uintptr_t{16383u};
+    uint8_t* ptr_16k = storage.data() + static_cast<size_t>(aligned_16k - base);
+    ASSERT_EQ(reinterpret_cast<uintptr_t>(ptr_16k) % 16384u, 0u);
+
+    stamp_centered_tag(ptr_16k, kWidth, kHeight, kWidth);
+    const auto cpu_dets = cpu_backend_->Detect(ptr_16k, kWidth, kHeight, kWidth,
+                                               intrinsics_, tag_size_m_);
+    const auto metal_dets =
+        metal_backend_->Detect(ptr_16k, kWidth, kHeight, kWidth,
+                               PixelFormat::kGray8, intrinsics_, tag_size_m_);
+    ASSERT_EQ(cpu_dets.size(), 1u);
+    EXPECT_EQ(cpu_dets[0].id, 4);
+    AssertAcceptanceContract(cpu_dets, metal_dets, "NonPageMultipleBytes");
+  }
+
+  image_u8_destroy(tag_im);
+  tag36h11_destroy(tf);
 }
 
 #if defined(__APPLE__)
@@ -922,6 +1061,71 @@ TEST_F(MetalAprilTagParityTest, GpuThresholdParityWithMinDiff256) {
   }
   AssertThresholdParity(*metal_backend_, im, 256, "MinDiff256");
   image_u8_destroy(im);
+}
+
+TEST_F(MetalAprilTagParityTest,
+       RunGpuThresholdRejectsShortStrideAndUndersizedBuffers) {
+  if (!metal_backend_->supports_gpu()) {
+    GTEST_SKIP() << "No Metal GPU available";
+  }
+  MTL::Device* device = metal_backend_->device();
+  MTL::CommandQueue* queue = metal_backend_->queue();
+  ASSERT_NE(device, nullptr);
+  ASSERT_NE(queue, nullptr);
+
+  NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+
+  constexpr uint32_t kWidth = 32;
+  constexpr uint32_t kHeight = 32;
+  constexpr size_t kFullBytes = static_cast<size_t>(kWidth) * kHeight;
+  constexpr uint8_t kSentinel = 0x5Au;
+
+  auto run_and_expect_untouched = [&](MTL::Buffer* gray_buf,
+                                      MTL::Buffer* thresh_buf, uint32_t w,
+                                      uint32_t h, uint32_t stride) {
+    std::memset(thresh_buf->contents(), kSentinel, thresh_buf->length());
+    MTL::CommandBuffer* cmd_buf = queue->commandBuffer();
+    ASSERT_NE(cmd_buf, nullptr);
+    metal_backend_->RunGpuThreshold(cmd_buf, gray_buf, thresh_buf, w, h, stride,
+                                    /*min_diff=*/5);
+    cmd_buf->commit();
+    cmd_buf->waitUntilCompleted();
+    EXPECT_EQ(cmd_buf->status(), MTL::CommandBufferStatusCompleted);
+    const auto* out = static_cast<const uint8_t*>(thresh_buf->contents());
+    for (size_t i = 0; i < thresh_buf->length(); ++i) {
+      ASSERT_EQ(out[i], kSentinel) << "Output buffer mutated at byte " << i;
+    }
+  };
+
+  MTL::Buffer* full_gray =
+      device->newBuffer(kFullBytes, MTL::ResourceStorageModeShared);
+  MTL::Buffer* small_gray =
+      device->newBuffer(kFullBytes - 1, MTL::ResourceStorageModeShared);
+  MTL::Buffer* full_thresh =
+      device->newBuffer(kFullBytes, MTL::ResourceStorageModeShared);
+  MTL::Buffer* small_thresh =
+      device->newBuffer(kFullBytes - 1, MTL::ResourceStorageModeShared);
+  ASSERT_NE(full_gray, nullptr);
+  ASSERT_NE(small_gray, nullptr);
+  ASSERT_NE(full_thresh, nullptr);
+  ASSERT_NE(small_thresh, nullptr);
+  std::memset(full_gray->contents(), 128, kFullBytes);
+  std::memset(small_gray->contents(), 128, kFullBytes - 1);
+
+  // 1. Non-zero stride < width must be rejected.
+  run_and_expect_untouched(full_gray, full_thresh, kWidth, kHeight, kWidth - 1);
+  // 2. Undersized gray buffer must be rejected.
+  run_and_expect_untouched(small_gray, full_thresh, kWidth, kHeight, kWidth);
+  // 3. Undersized threshold output buffer must be rejected.
+  run_and_expect_untouched(full_gray, small_thresh, kWidth, kHeight, kWidth);
+  // 4. Stride * height exceeding buffer length must be rejected.
+  run_and_expect_untouched(full_gray, full_thresh, kWidth, kHeight, kWidth + 4);
+
+  full_gray->release();
+  small_gray->release();
+  full_thresh->release();
+  small_thresh->release();
+  pool->release();
 }
 
 #endif  // defined(__APPLE__)

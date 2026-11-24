@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -77,13 +78,19 @@ class RecordedCameraSource final : public CameraSource {
   void SetConnectionCallback(ConnectionCallback callback) override;
   bool Start() override;
   void Stop() override;
-  bool IsRunning() const override { return running_.load(); }
+  bool IsRunning() const override {
+    return running_.load(std::memory_order_acquire);
+  }
   // False once the recording has ended, one mean frame period after its
   // last frame (not with it, so the consumer takes that frame first): the
   // consumer sees a camera that went away and reopens it, which plays the
   // recording again.
-  bool IsConnected() const override { return connected_.load(); }
-  uint64_t dropped_frames() const override { return dropped_.load(); }
+  bool IsConnected() const override {
+    return connected_.load(std::memory_order_acquire);
+  }
+  uint64_t dropped_frames() const override {
+    return dropped_.load(std::memory_order_relaxed);
+  }
 
   // kManual only: delivers every frame due at node-clock `now_ns`, in order.
   // The first call after Start() anchors playback: the first frame is due at
@@ -93,40 +100,63 @@ class RecordedCameraSource final : public CameraSource {
   std::size_t frame_count() const;
 
  private:
-  // Decodes frame `index` of `sequence` (the opened sequence_) into pixels_;
-  // false (counted dropped) when it cannot be decoded or its size differs
-  // from the first frame's.
-  bool Decode(const ImageSequence& sequence, std::size_t index);
+  static thread_local const RecordedCameraSource* t_play_source;
+  static thread_local bool t_in_frame_callback;
+
+  bool IsSelfPlayThread() const { return t_play_source == this; }
+  bool IsInFrameCallback() const {
+    return t_play_source == this && t_in_frame_callback;
+  }
+  bool IsCancelled(std::uint64_t generation) const;
+  bool HasJoinableThreadsLocked() const;
+  void StopAndDetachThreadsLocked(std::vector<std::thread>& to_join);
+  static void JoinThreads(std::vector<std::thread>& threads);
+
+  // Decodes frame `index` of `sequence` into `pixels`; false (counted dropped)
+  // when it cannot be decoded or its size differs from `width` x `height`.
+  bool Decode(const ImageSequence& sequence, std::size_t index,
+              std::uint32_t width, std::uint32_t height,
+              std::vector<std::uint8_t>* pixels);
   // Hands the decoded frame to the frame callback, stamped `capture_ns`.
-  void Emit(std::size_t index, std::int64_t capture_ns);
-  void Play(std::int64_t start_ns);
-  // Sleeps until host-clock `due_ns`; false when Stop() interrupts it.
-  bool WaitUntil(std::int64_t due_ns);
+  void Emit(std::size_t index, std::int64_t capture_ns, std::uint64_t session,
+            std::uint32_t width, std::uint32_t height,
+            const std::vector<std::uint8_t>& pixels);
+  void Play(const std::shared_ptr<const ImageSequence>& sequence,
+            std::uint64_t generation, std::uint64_t session,
+            std::uint32_t width, std::uint32_t height, std::int64_t start_ns,
+            std::int64_t end_ns);
+  // Sleeps until host-clock `due_ns`; false when Stop() or a newer Start()
+  // interrupts it.
+  bool WaitUntil(std::int64_t due_ns, std::uint64_t generation);
   void Report(ConnectionState state, std::string_view reason);
-  void Finish();
+  void Finish(std::uint64_t generation);
 
   CameraSourceConfig config_;
   Pacing pacing_;
-  std::optional<ImageSequence> sequence_;
-  std::vector<std::uint8_t> pixels_;
+  mutable std::mutex lifecycle_mutex_;
+  std::condition_variable lifecycle_cv_;
+  std::size_t active_teardowns_ = 0;
+  mutable std::mutex state_mutex_;
+  std::shared_ptr<const ImageSequence> sequence_;
   std::mutex callback_mutex_;
   FrameCallback frame_callback_;
   ConnectionCallback connection_callback_;
   std::atomic<bool> running_{false}, connected_{false};
   std::atomic<std::uint64_t> dropped_{0};
   std::uint64_t session_ = 0;
-  // kManual playback position.
+  // kManual playback position (guarded by state_mutex_).
   std::optional<std::int64_t> manual_start_ns_;
   std::size_t next_ = 0;
   // When the recording ends, after its first frame: one frame period after
-  // its last frame.
+  // its last frame (guarded by state_mutex_).
   std::int64_t end_ns_ = 0;
-  // kRealtime playback thread.
+  // kRealtime playback thread and cancellation state (guarded by stop_mutex_).
   std::thread thread_;
   std::vector<std::thread> retired_threads_;
-  std::mutex stop_mutex_;
+  mutable std::mutex stop_mutex_;
   std::condition_variable stop_cv_;
   bool stop_ = false;
+  std::uint64_t generation_ = 0;
 };
 
 // The camera node's source factory: a `camera.device` starting with

@@ -4,6 +4,7 @@
 #include <bit>
 #include <charconv>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <system_error>
@@ -101,6 +102,10 @@ Response ReadSessionJsonFile(const fs::path& path, std::uintmax_t max_bytes,
 // when current (CachedRecordedMatch), else "unknown".
 std::string_view ClassOf(const fs::path& dir, const SessionEntry& entry) {
   if (!entry.classified) return "other";
+  std::error_code ec;
+  const fs::file_status st =
+      fs::symlink_status(dir / talos::launcher::kSessionClassFile, ec);
+  if (ec || fs::is_symlink(st) || !fs::is_regular_file(st)) return "unknown";
   std::uintmax_t log_bytes = 0;
   for (const auto& [name, bytes] : entry.files) {
     if (name.ends_with(".tlog")) log_bytes += bytes;
@@ -168,7 +173,11 @@ std::optional<SessionEntry> ReadEntry(const fs::path& dir) {
              {std::pair{"start_wall_ns", &entry.start_wall_ns},
               std::pair{"end_wall_ns", &entry.end_wall_ns}}) {
           const auto it = manifest.find(key);
-          if (it != manifest.end() && it->is_number_integer()) {
+          if (it != manifest.end() && it->is_number_integer() &&
+              (!it->is_number_unsigned() ||
+               it->get<std::uint64_t>() <=
+                   static_cast<std::uint64_t>(
+                       std::numeric_limits<std::int64_t>::max()))) {
             *field = it->get<std::int64_t>();
           }
         }
@@ -301,7 +310,8 @@ Response Review::Sessions() {
   for (fs::directory_iterator it{library_, error};
        !error && it != fs::directory_iterator{}; it.increment(error)) {
     std::error_code type_error;
-    if (!it->is_directory(type_error) || it->is_symlink(type_error)) continue;
+    const fs::file_status st = it->symlink_status(type_error);
+    if (type_error || fs::is_symlink(st) || !fs::is_directory(st)) continue;
     auto entry = ReadEntry(it->path());
     if (!entry) continue;
     entry->verdict = ClassOf(it->path(), *entry);

@@ -10,7 +10,13 @@
 import {useEffect, useMemo, useRef, useState} from 'react';
 
 import {useActions, useEvents, usePlayback, useSourceKind} from '../../data/hooks';
-import type {EventCategory, RobotEvent, Severity} from '../../data/types';
+import type {
+  EventCategory,
+  PlaybackState,
+  RobotEvent,
+  Severity,
+  StudioActions
+} from '../../data/types';
 import {timestamp} from '../../ui/formatters';
 import {EmptyState} from '../../ui/primitives';
 import type {PanelDefinition, PanelProps} from '../types';
@@ -94,41 +100,80 @@ function EventRow({event, cursorNs, copied, onCopy, onSeek}: {
   </div>;
 }
 
-function EventsPanel({config, setConfig}: PanelProps<EventsConfig>) {
-  const events = useEvents();
-  const playback = usePlayback();
-  const actions = useActions();
-  const sourceKind = useSourceKind();
-  const recorded = sourceKind === 'recorded';
+export type EventsPanelHooks = {
+  useState: typeof useState;
+  useRef: typeof useRef;
+  useEffect: typeof useEffect;
+  useMemo: typeof useMemo;
+};
 
-  const filtered = useMemo(
+const REACT_HOOKS: EventsPanelHooks = {useState, useRef, useEffect, useMemo};
+
+export type EventsPanelViewProps = PanelProps<EventsConfig> & {
+  events: readonly RobotEvent[];
+  playback: PlaybackState;
+  actions: StudioActions;
+  recorded: boolean;
+  hooks?: EventsPanelHooks;
+};
+
+export function EventsPanelView({
+  config,
+  setConfig,
+  events,
+  playback,
+  actions,
+  recorded,
+  hooks = REACT_HOOKS
+}: EventsPanelViewProps) {
+  const {
+    useState: useStateHook,
+    useRef: useRefHook,
+    useEffect: useEffectHook,
+    useMemo: useMemoHook
+  } = hooks;
+
+  const filtered = useMemoHook(
       () => filterEvents(events, config),
       [events, config.severities, config.categories, config.text]);
 
-  const counts = useMemo(() => {
+  const counts = useMemoHook(() => {
     const c: Record<Severity, number> = {info: 0, warn: 0, error: 0};
     for (const event of events) c[event.severity]++;
     return c;
   }, [events]);
 
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const [start, setStart] = useState(0);
-  const [viewport, setViewport] = useState(SSR_VIEWPORT);
-  const [copied, setCopied] = useState<string|null>(null);
+  const scrollRef = useRefHook<HTMLDivElement>(null);
+  const [start, setStart] = useStateHook(0);
+  const [viewport, setViewport] = useStateHook(SSR_VIEWPORT);
+  const [copied, setCopied] = useStateHook<string|null>(null);
 
+  const hasList = events.length > 0 && filtered.length > 0;
   const newestId = filtered.length ? filtered[0].id : null;
+  const filterKey =
+      `${config.severities.join(',')}|${config.categories.join(',')}|${config.text}`;
 
   // Keep the list pinned to the newest row while following.
-  useEffect(() => {
+  useEffectHook(() => {
     if (!config.follow) return;
     const el = scrollRef.current;
     if (el) el.scrollTop = 0;
     setStart(0);
   }, [config.follow, newestId]);
 
-  // Measure the scroll viewport once mounted (fixed height per row means the
-  // window size is all that is needed).
-  useEffect(() => {
+  // Reset the virtual window whenever the list unmounts or the filter criteria
+  // change, so remounting at scrollTop = 0 cannot leave `start` pointing past
+  // the visible viewport.
+  useEffectHook(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = 0;
+    setStart(0);
+  }, [hasList, filterKey]);
+
+  // Measure the scroll viewport whenever the list container mounts (fixed
+  // height per row means the window size is all that is needed).
+  useEffectHook(() => {
+    if (!hasList) return;
     const el = scrollRef.current;
     if (!el) return;
     const update = () => setViewport(el.clientHeight || SSR_VIEWPORT);
@@ -138,10 +183,10 @@ function EventsPanel({config, setConfig}: PanelProps<EventsConfig>) {
       ro.observe(el);
       return () => ro.disconnect();
     }
-  }, []);
+  }, [hasList]);
 
   // The "copied" hint fades back to "plot" on its own.
-  useEffect(() => {
+  useEffectHook(() => {
     if (copied == null) return;
     const id = setTimeout(() => setCopied(null), 1500);
     return () => clearTimeout(id);
@@ -159,7 +204,8 @@ function EventsPanel({config, setConfig}: PanelProps<EventsConfig>) {
   };
 
   const count = Math.ceil(viewport / ROW_HEIGHT) + OVERSCAN * 2;
-  const rows = filtered.slice(start, start + count);
+  const effectiveStart = Math.min(start, Math.max(0, filtered.length - 1));
+  const rows = filtered.slice(effectiveStart, effectiveStart + count);
 
   const toggleSeverity = (severity: Severity) => setConfig({
     ...config,
@@ -232,7 +278,7 @@ function EventsPanel({config, setConfig}: PanelProps<EventsConfig>) {
           onScroll={onScroll}>
       <div className="events-spacer" style={{height: filtered.length * ROW_HEIGHT}}>
         {rows.map((event, i) => <div key={event.id} className="event-row-slot"
-            style={{top: (start + i) * ROW_HEIGHT}}>
+            style={{top: (effectiveStart + i) * ROW_HEIGHT}}>
           <EventRow event={event} cursorNs={playback.cursor_ns}
                     copied={copied === event.channel}
                     onCopy={copyChannel}
@@ -244,6 +290,20 @@ function EventsPanel({config, setConfig}: PanelProps<EventsConfig>) {
       </div>
     </div>}
   </div>;
+}
+
+function EventsPanel(props: PanelProps<EventsConfig>) {
+  const events = useEvents();
+  const playback = usePlayback();
+  const actions = useActions();
+  const sourceKind = useSourceKind();
+  return EventsPanelView({
+    ...props,
+    events,
+    playback,
+    actions,
+    recorded: sourceKind === 'recorded'
+  });
 }
 
 export const eventsPanel: PanelDefinition<EventsConfig> = {
