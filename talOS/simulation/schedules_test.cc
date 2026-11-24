@@ -191,5 +191,58 @@ TEST(Schedules, RejectsNonFiniteElapsedOverflowAndAmbiguousTargets) {
   EXPECT_FALSE(events[0].finished);
 }
 
+// REQ-DEV-05, REQ-DEV-10: a supply_voltage fault overrides the battery model
+// during its interval and restores the configured battery model (not a
+// hardcoded 12.8 V resting bus) via ClearSupplyVoltageOverride() at its end.
+TEST(Schedules, SupplyVoltageFaultRestoresConfiguredBatteryModel) {
+  talos::hardware::Config config;
+  talos::hardware::MotorConfig drive{.id = 1, .name = "drive", .can_id = 1};
+  drive.stator_limit_a = 100.0;
+  drive.supply_limit_a = 60.0;
+  config.motors.push_back(drive);
+  talos::hardware::sim::PhysicsSimBackend backend;
+  backend.SetBatteryModel({.nominal_voltage_v = 12.6,
+                           .internal_resistance_ohm = 0.05,
+                           .base_current_a = 4.0,
+                           .brownout_voltage_v = 6.75});
+  ASSERT_TRUE(backend.Configure(config));
+  constexpr double kRestingV = 12.6 - 0.05 * 4.0;
+  EXPECT_NEAR(backend.supply_voltage(), kRestingV, 1e-9);
+
+  const std::array<talos::hardware::MotorRequest, 1> request{{
+      {1, talos::hardware::Mode::kVoltage, 0, 10.0, 0.0},
+  }};
+  ASSERT_TRUE(backend.Apply(request));
+  auto events = ParseFaults("1:2:supply_voltage:all:7");
+  ResolveFaults(events, config);
+
+  // Before the fault: battery model sags below its resting 12.4 V under load.
+  EXPECT_FALSE(ApplyFaults(events, 0.0, backend));
+  backend.Step(0.005);
+  EXPECT_LT(backend.supply_voltage(), kRestingV - 0.1);
+
+  // During the fault: explicit override pins the bus to 7.0 V despite load.
+  EXPECT_FALSE(ApplyFaults(events, 1.0, backend));
+  backend.Step(0.005);
+  EXPECT_DOUBLE_EQ(backend.supply_voltage(), 7.0);
+
+  // At interval end: ClearSupplyVoltageOverride() restores the battery model's
+  // resting voltage (12.4 V, not 12.8 V) and resumes dynamic load sag.
+  EXPECT_FALSE(ApplyFaults(events, 2.0, backend));
+  EXPECT_NEAR(backend.supply_voltage(), kRestingV, 1e-9);
+  backend.Step(0.005);
+  EXPECT_LT(backend.supply_voltage(), kRestingV - 0.1);
+
+  talos::hardware::State state;
+  state.sample_time_us = 10000;
+  ASSERT_TRUE(backend.Read(state));
+  EXPECT_TRUE(state.health.valid);
+  EXPECT_LT(state.health.battery_v, kRestingV - 0.1);
+
+  // Unloaded after Neutral(): returns to configured resting 12.4 V, not 12.8 V.
+  backend.Neutral();
+  EXPECT_NEAR(backend.supply_voltage(), kRestingV, 1e-9);
+}
+
 }  // namespace
 }  // namespace talos::simulation

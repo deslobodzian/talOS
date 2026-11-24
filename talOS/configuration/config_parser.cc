@@ -1073,6 +1073,177 @@ toml::table ExpandManifest(const toml::array& manifest, const std::string& path,
   return subs_view;
 }
 
+SimulationBatteryConfig ParseSimulationBattery(const toml::table& tbl) {
+  for (auto&& [k, v] : tbl) {
+    const std::string_view ks = k.str();
+    if (ks != "nominal_voltage_v" && ks != "internal_resistance_ohm" &&
+        ks != "base_current_a" && ks != "brownout_voltage_v") {
+      throw std::invalid_argument("[simulation.battery] unknown key '" +
+                                  std::string(ks) + "'");
+    }
+  }
+  SimulationBatteryConfig battery;
+  battery.nominal_voltage_v =
+      Read<double>(tbl, "nominal_voltage_v", battery.nominal_voltage_v);
+  if (!std::isfinite(battery.nominal_voltage_v) ||
+      !(battery.nominal_voltage_v > 0.0 && battery.nominal_voltage_v <= 16.0)) {
+    throw std::invalid_argument(
+        "[simulation.battery] field 'nominal_voltage_v' must be finite and in "
+        "(0, 16]");
+  }
+  battery.internal_resistance_ohm = Read<double>(
+      tbl, "internal_resistance_ohm", battery.internal_resistance_ohm);
+  if (!std::isfinite(battery.internal_resistance_ohm) ||
+      battery.internal_resistance_ohm < 0.0) {
+    throw std::invalid_argument(
+        "[simulation.battery] field 'internal_resistance_ohm' must be finite "
+        "and non-negative");
+  }
+  battery.base_current_a =
+      Read<double>(tbl, "base_current_a", battery.base_current_a);
+  if (!std::isfinite(battery.base_current_a) || battery.base_current_a < 0.0) {
+    throw std::invalid_argument(
+        "[simulation.battery] field 'base_current_a' must be finite and "
+        "non-negative");
+  }
+  battery.brownout_voltage_v =
+      Read<double>(tbl, "brownout_voltage_v", battery.brownout_voltage_v);
+  if (!std::isfinite(battery.brownout_voltage_v) ||
+      battery.brownout_voltage_v < 0.0 ||
+      !(battery.brownout_voltage_v < battery.nominal_voltage_v)) {
+    throw std::invalid_argument(
+        "[simulation.battery] field 'brownout_voltage_v' must be finite and in "
+        "[0, nominal_voltage_v)");
+  }
+  return battery;
+}
+
+SimulationChassisConfig ParseSimulationChassis(const toml::table& tbl) {
+  for (auto&& [k, v] : tbl) {
+    const std::string_view ks = k.str();
+    if (ks != "mass_kg" && ks != "moment_of_inertia_kg_m2" &&
+        ks != "traction_coefficient") {
+      throw std::invalid_argument("[simulation.chassis] unknown key '" +
+                                  std::string(ks) + "'");
+    }
+  }
+  SimulationChassisConfig chassis;
+  chassis.mass_kg =
+      ReadRequired<double>(tbl, "mass_kg", "[simulation.chassis]");
+  if (!std::isfinite(chassis.mass_kg) || !(chassis.mass_kg > 0.0)) {
+    throw std::invalid_argument(
+        "[simulation.chassis] field 'mass_kg' must be finite and positive");
+  }
+  if (tbl.contains("moment_of_inertia_kg_m2")) {
+    const double moi = Read<double>(tbl, "moment_of_inertia_kg_m2", 0.0);
+    if (!std::isfinite(moi) || !(moi > 0.0)) {
+      throw std::invalid_argument(
+          "[simulation.chassis] field 'moment_of_inertia_kg_m2' must be finite "
+          "and positive");
+    }
+    chassis.moment_of_inertia_kg_m2 = moi;
+  }
+  if (tbl.contains("traction_coefficient")) {
+    const double mu = Read<double>(tbl, "traction_coefficient", 0.0);
+    if (!std::isfinite(mu) || !(mu > 0.0)) {
+      throw std::invalid_argument(
+          "[simulation.chassis] field 'traction_coefficient' must be finite "
+          "and positive");
+    }
+    chassis.traction_coefficient = mu;
+  }
+  return chassis;
+}
+
+std::vector<SimulationMechanismConfig> ParseSimulationMechanisms(
+    const toml::array& mechanisms,
+    const std::unordered_map<std::string_view, const RawDevice*>&
+        motors_by_name) {
+  std::vector<SimulationMechanismConfig> out;
+  std::unordered_set<std::string> seen_motors;
+  out.reserve(mechanisms.size());
+  for (std::size_t i = 0; i < mechanisms.size(); ++i) {
+    const std::string entry_where =
+        "[simulation] mechanisms[" + std::to_string(i) + "]";
+    const auto* entry = mechanisms[i].as_table();
+    if (entry == nullptr) {
+      throw std::invalid_argument(entry_where + " must be a table");
+    }
+    for (auto&& [k, v] : *entry) {
+      const std::string_view ks = k.str();
+      if (ks != "motor" && ks != "inertia_kg_m2" && ks != "load" &&
+          ks != "viscous_damping_nm_per_radps" && ks != "static_friction_nm") {
+        throw std::invalid_argument(entry_where + " unknown key '" +
+                                    std::string(ks) + "'");
+      }
+    }
+    SimulationMechanismConfig mech;
+    mech.motor = ReadRequired<std::string>(*entry, "motor", entry_where);
+    if (mech.motor.empty()) {
+      throw std::invalid_argument(entry_where +
+                                  " field 'motor' must be a non-empty string");
+    }
+    mech.inertia_kg_m2 =
+        ReadRequired<double>(*entry, "inertia_kg_m2", entry_where);
+    if (!std::isfinite(mech.inertia_kg_m2) || !(mech.inertia_kg_m2 > 0.0)) {
+      throw std::invalid_argument(
+          entry_where + " field 'inertia_kg_m2' must be finite and positive");
+    }
+    if (entry->contains("load")) {
+      const auto load = Read<std::string>(*entry, "load", "");
+      if (load == "roller") {
+        mech.load = SimulationLoadKind::kRoller;
+      } else if (load == "flywheel") {
+        mech.load = SimulationLoadKind::kFlywheel;
+      } else {
+        throw std::invalid_argument(
+            entry_where +
+            " field 'load' must be \"roller\" or \"flywheel\", not \"" + load +
+            "\"");
+      }
+    }
+    if (entry->contains("viscous_damping_nm_per_radps")) {
+      const double damping =
+          Read<double>(*entry, "viscous_damping_nm_per_radps", 0.0);
+      if (!std::isfinite(damping) || damping < 0.0) {
+        throw std::invalid_argument(
+            entry_where +
+            " field 'viscous_damping_nm_per_radps' must be finite and "
+            "non-negative");
+      }
+      mech.viscous_damping_nm_per_radps = damping;
+    }
+    if (entry->contains("static_friction_nm")) {
+      const double friction = Read<double>(*entry, "static_friction_nm", 0.0);
+      if (!std::isfinite(friction) || friction < 0.0) {
+        throw std::invalid_argument(
+            entry_where +
+            " field 'static_friction_nm' must be finite and non-negative");
+      }
+      mech.static_friction_nm = friction;
+    }
+    const auto motor_it = motors_by_name.find(mech.motor);
+    if (motor_it == motors_by_name.end()) {
+      throw std::invalid_argument(entry_where + ": motor '" + mech.motor +
+                                  "' names no configured motor");
+    }
+    const auto* motor_raw = motor_it->second;
+    const auto& motor_cfg = std::get<hardware::MotorConfig>(motor_raw->config);
+    if (motor_cfg.master_id != 0) {
+      throw std::invalid_argument(
+          entry_where + ": motor '" + mech.motor + "' follows '" +
+          motor_raw->follow_motor +
+          "'; configure the mechanism on its master instead");
+    }
+    if (!seen_motors.insert(mech.motor).second) {
+      throw std::invalid_argument(
+          entry_where + ": duplicate mechanism for motor '" + mech.motor + "'");
+    }
+    out.push_back(std::move(mech));
+  }
+  return out;
+}
+
 }  // namespace
 
 std::filesystem::path RobotConfig::TrajectoryPath(std::string_view subsystem,
@@ -1543,7 +1714,8 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
     }
     for (auto&& [k, v] : *sim) {
       if (k.str() != "wheel_radius_m" && k.str() != "swerve_modules" &&
-          k.str() != "hard_stops") {
+          k.str() != "hard_stops" && k.str() != "battery" &&
+          k.str() != "chassis" && k.str() != "mechanisms") {
         throw std::invalid_argument("[simulation] unknown key '" +
                                     std::string(k.str()) + "'");
       }
@@ -1699,6 +1871,28 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
         }
         s.hard_stops.push_back(std::move(stop));
       }
+    }
+    if (sim->contains("battery")) {
+      const auto* battery = (*sim)["battery"].as_table();
+      if (battery == nullptr) {
+        throw std::invalid_argument("[simulation.battery] must be a table");
+      }
+      s.battery = ParseSimulationBattery(*battery);
+    }
+    if (sim->contains("chassis")) {
+      const auto* chassis = (*sim)["chassis"].as_table();
+      if (chassis == nullptr) {
+        throw std::invalid_argument("[simulation.chassis] must be a table");
+      }
+      s.chassis = ParseSimulationChassis(*chassis);
+    }
+    if (sim->contains("mechanisms")) {
+      const auto* mechanisms = (*sim)["mechanisms"].as_array();
+      if (mechanisms == nullptr) {
+        throw std::invalid_argument(
+            "[simulation] field 'mechanisms' must be an array of tables");
+      }
+      s.mechanisms = ParseSimulationMechanisms(*mechanisms, motors_by_name);
     }
   }
 
