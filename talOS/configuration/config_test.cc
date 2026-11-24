@@ -1554,5 +1554,373 @@ max_rot = 1.5
   }
 }
 
+// REQ-CONTRACT-17, REQ-DEV-10: [simulation.battery] defaults to unset when
+// omitted, applies default battery parameters when present, stays off the
+// hardware wire (ConfigurationId unchanged), and rejects invalid shapes, keys,
+// types, and voltage/resistance/current bounds.
+TEST(ConfigTest, SimulationBatteryParsesDefaultsStaysOffWireAndValidates) {
+  const auto plain = Parse("");
+  EXPECT_EQ(plain.simulation.battery, std::nullopt);
+
+  const auto empty_table = Parse("[simulation.battery]\n");
+  ASSERT_TRUE(empty_table.simulation.battery.has_value());
+  EXPECT_EQ(*empty_table.simulation.battery,
+            (SimulationBatteryConfig{12.8, 0.0, 0.0, 6.75}));
+  EXPECT_EQ(hardware::ConfigurationId(empty_table.hardware),
+            hardware::ConfigurationId(plain.hardware));
+
+  const auto custom = Parse(R"(
+[simulation.battery]
+nominal_voltage_v = 12.6
+internal_resistance_ohm = 0.018
+base_current_a = 2.5
+brownout_voltage_v = 6.5
+)");
+  ASSERT_TRUE(custom.simulation.battery.has_value());
+  EXPECT_EQ(*custom.simulation.battery,
+            (SimulationBatteryConfig{12.6, 0.018, 2.5, 6.5}));
+  EXPECT_EQ(hardware::ConfigurationId(custom.hardware),
+            hardware::ConfigurationId(plain.hardware));
+
+  // Boundary values: nominal_voltage_v == 16.0 and zeros for resistance,
+  // base current, and brownout voltage are valid.
+  const auto bounds = Parse(R"(
+[simulation.battery]
+nominal_voltage_v = 16.0
+internal_resistance_ohm = 0.0
+base_current_a = 0.0
+brownout_voltage_v = 0.0
+)");
+  ASSERT_TRUE(bounds.simulation.battery.has_value());
+  EXPECT_EQ(*bounds.simulation.battery,
+            (SimulationBatteryConfig{16.0, 0.0, 0.0, 0.0}));
+
+  for (const std::string_view bad : {
+           "[simulation]\nbattery = 1\n",
+           "[simulation]\nbattery = []\n",
+           "[simulation.battery]\nunknown = 1\n",
+           "[simulation.battery]\nnominal_voltage_v = 0.0\n",
+           "[simulation.battery]\nnominal_voltage_v = -1.0\n",
+           "[simulation.battery]\nnominal_voltage_v = 16.01\n",
+           "[simulation.battery]\nnominal_voltage_v = nan\n",
+           "[simulation.battery]\nnominal_voltage_v = inf\n",
+           "[simulation.battery]\nnominal_voltage_v = -inf\n",
+           "[simulation.battery]\nnominal_voltage_v = \"12.8\"\n",
+           "[simulation.battery]\nnominal_voltage_v = true\n",
+           "[simulation.battery]\ninternal_resistance_ohm = -0.001\n",
+           "[simulation.battery]\ninternal_resistance_ohm = nan\n",
+           "[simulation.battery]\ninternal_resistance_ohm = inf\n",
+           "[simulation.battery]\ninternal_resistance_ohm = -inf\n",
+           "[simulation.battery]\ninternal_resistance_ohm = \"0.02\"\n",
+           "[simulation.battery]\ninternal_resistance_ohm = false\n",
+           "[simulation.battery]\nbase_current_a = -0.1\n",
+           "[simulation.battery]\nbase_current_a = nan\n",
+           "[simulation.battery]\nbase_current_a = inf\n",
+           "[simulation.battery]\nbase_current_a = -inf\n",
+           "[simulation.battery]\nbase_current_a = \"1.5\"\n",
+           "[simulation.battery]\nbase_current_a = true\n",
+           "[simulation.battery]\nbrownout_voltage_v = -0.1\n",
+           "[simulation.battery]\nbrownout_voltage_v = 12.8\n",
+           "[simulation.battery]\nbrownout_voltage_v = 13.0\n",
+           "[simulation.battery]\nnominal_voltage_v = 6.75\n",
+           "[simulation.battery]\nnominal_voltage_v = 6.0\n",
+           "[simulation.battery]\nbrownout_voltage_v = nan\n",
+           "[simulation.battery]\nbrownout_voltage_v = inf\n",
+           "[simulation.battery]\nbrownout_voltage_v = -inf\n",
+           "[simulation.battery]\nbrownout_voltage_v = \"6.75\"\n",
+           "[simulation.battery]\nbrownout_voltage_v = true\n",
+       }) {
+    SCOPED_TRACE(bad);
+    ExpectRejected(bad);
+  }
+  ExpectRejected(
+      "[simulation.battery]\nnominal_voltage_v = 12.0\n"
+      "brownout_voltage_v = 12.0\n");
+}
+
+// REQ-CONTRACT-17, REQ-DEV-10: [simulation.chassis] defaults to unset when
+// omitted, requires positive finite mass_kg when present, stays off the
+// hardware wire (ConfigurationId unchanged), and rejects invalid shapes, keys,
+// types, and non-positive or non-finite values.
+TEST(ConfigTest, SimulationChassisParsesDefaultsStaysOffWireAndValidates) {
+  const auto plain = Parse("");
+  EXPECT_EQ(plain.simulation.chassis, std::nullopt);
+
+  const auto minimal = Parse("[simulation.chassis]\nmass_kg = 52.0\n");
+  ASSERT_TRUE(minimal.simulation.chassis.has_value());
+  EXPECT_EQ(*minimal.simulation.chassis,
+            (SimulationChassisConfig{52.0, std::nullopt, std::nullopt}));
+  EXPECT_EQ(hardware::ConfigurationId(minimal.hardware),
+            hardware::ConfigurationId(plain.hardware));
+
+  const auto full = Parse(R"(
+[simulation.chassis]
+mass_kg = 54.5
+moment_of_inertia_kg_m2 = 6.2
+traction_coefficient = 1.15
+)");
+  ASSERT_TRUE(full.simulation.chassis.has_value());
+  EXPECT_EQ(*full.simulation.chassis,
+            (SimulationChassisConfig{54.5, 6.2, 1.15}));
+  EXPECT_EQ(hardware::ConfigurationId(full.hardware),
+            hardware::ConfigurationId(plain.hardware));
+
+  for (const std::string_view bad : {
+           "[simulation]\nchassis = 1\n",
+           "[simulation]\nchassis = []\n",
+           "[simulation.chassis]\n",
+           "[simulation.chassis]\ntraction_coefficient = 1.1\n",
+           "[simulation.chassis]\nmass_kg = 50.0\nunknown = 1\n",
+           "[simulation.chassis]\nmass_kg = 0.0\n",
+           "[simulation.chassis]\nmass_kg = -5.0\n",
+           "[simulation.chassis]\nmass_kg = nan\n",
+           "[simulation.chassis]\nmass_kg = inf\n",
+           "[simulation.chassis]\nmass_kg = -inf\n",
+           "[simulation.chassis]\nmass_kg = \"50\"\n",
+           "[simulation.chassis]\nmass_kg = true\n",
+           "[simulation.chassis]\nmass_kg = 50.0\n"
+           "moment_of_inertia_kg_m2 = 0.0\n",
+           "[simulation.chassis]\nmass_kg = 50.0\n"
+           "moment_of_inertia_kg_m2 = -1.0\n",
+           "[simulation.chassis]\nmass_kg = 50.0\n"
+           "moment_of_inertia_kg_m2 = nan\n",
+           "[simulation.chassis]\nmass_kg = 50.0\n"
+           "moment_of_inertia_kg_m2 = inf\n",
+           "[simulation.chassis]\nmass_kg = 50.0\n"
+           "moment_of_inertia_kg_m2 = -inf\n",
+           "[simulation.chassis]\nmass_kg = 50.0\n"
+           "moment_of_inertia_kg_m2 = \"6.0\"\n",
+           "[simulation.chassis]\nmass_kg = 50.0\n"
+           "moment_of_inertia_kg_m2 = false\n",
+           "[simulation.chassis]\nmass_kg = 50.0\n"
+           "traction_coefficient = 0.0\n",
+           "[simulation.chassis]\nmass_kg = 50.0\n"
+           "traction_coefficient = -0.5\n",
+           "[simulation.chassis]\nmass_kg = 50.0\n"
+           "traction_coefficient = nan\n",
+           "[simulation.chassis]\nmass_kg = 50.0\n"
+           "traction_coefficient = inf\n",
+           "[simulation.chassis]\nmass_kg = 50.0\n"
+           "traction_coefficient = -inf\n",
+           "[simulation.chassis]\nmass_kg = 50.0\n"
+           "traction_coefficient = \"1.1\"\n",
+           "[simulation.chassis]\nmass_kg = 50.0\n"
+           "traction_coefficient = true\n",
+       }) {
+    SCOPED_TRACE(bad);
+    ExpectRejected(bad);
+  }
+}
+
+// REQ-CONTRACT-17, REQ-DEV-10: [[simulation.mechanisms]] configures per-motor
+// mechanism inertia and losses off the hardware wire (ConfigurationId
+// unchanged) and rejects invalid shapes, keys, types, bounds, unknown/non-motor
+// devices, duplicate motors, and follower motors.
+TEST(ConfigTest, SimulationMechanismsParseStayOffWireAndValidate) {
+  const std::string devices = R"(
+[subsystems.shooter.motors]
+m_roller = { can_id = 10 }
+m_flywheel = { can_id = 11 }
+[subsystems.shooter.sensors.enc]
+can_id = 20
+)";
+  const auto plain = Parse(devices);
+  EXPECT_TRUE(plain.simulation.mechanisms.empty());
+
+  const auto with_mechs = Parse(devices + R"(
+[[simulation.mechanisms]]
+motor = "m_roller"
+inertia_kg_m2 = 0.02
+
+[[simulation.mechanisms]]
+motor = "m_flywheel"
+inertia_kg_m2 = 0.08
+load = "flywheel"
+viscous_damping_nm_per_radps = 0.005
+static_friction_nm = 0.04
+)");
+  ASSERT_EQ(with_mechs.simulation.mechanisms.size(), 2u);
+  EXPECT_EQ(with_mechs.simulation.mechanisms[0],
+            (SimulationMechanismConfig{"m_roller", 0.02,
+                                       SimulationLoadKind::kRoller, 0.0, 0.0}));
+  EXPECT_EQ(
+      with_mechs.simulation.mechanisms[1],
+      (SimulationMechanismConfig{"m_flywheel", 0.08,
+                                 SimulationLoadKind::kFlywheel, 0.005, 0.04}));
+  EXPECT_EQ(hardware::ConfigurationId(with_mechs.hardware),
+            hardware::ConfigurationId(plain.hardware));
+
+  // Explicit "roller" and explicit zero damping/friction are accepted.
+  const auto explicit_defaults = Parse(devices + R"(
+[[simulation.mechanisms]]
+motor = "m_roller"
+inertia_kg_m2 = 0.01
+load = "roller"
+viscous_damping_nm_per_radps = 0.0
+static_friction_nm = 0.0
+)");
+  ASSERT_EQ(explicit_defaults.simulation.mechanisms.size(), 1u);
+  EXPECT_EQ(explicit_defaults.simulation.mechanisms[0],
+            (SimulationMechanismConfig{"m_roller", 0.01,
+                                       SimulationLoadKind::kRoller, 0.0, 0.0}));
+
+  for (const std::string_view bad : {
+           "[simulation]\nmechanisms = {}\n",
+           "[simulation]\nmechanisms = [1]\n",
+           // Unknown key.
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = 0.02\nextra = 1\n",
+           // Missing, empty, or wrong-type motor.
+           "[[simulation.mechanisms]]\ninertia_kg_m2 = 0.02\n",
+           "[[simulation.mechanisms]]\nmotor = \"\"\ninertia_kg_m2 = 0.02\n",
+           "[[simulation.mechanisms]]\nmotor = 1\ninertia_kg_m2 = 0.02\n",
+           // Missing, non-positive, non-finite, or wrong-type inertia_kg_m2.
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n",
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = 0.0\n",
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = -0.02\n",
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = nan\n",
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = inf\n",
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = -inf\n",
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = \"0.02\"\n",
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = true\n",
+           // Invalid load kind or type.
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = 0.02\nload = \"arm\"\n",
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = 0.02\nload = \"\"\n",
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = 0.02\nload = 1\n",
+           // Invalid viscous_damping_nm_per_radps.
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = 0.02\nviscous_damping_nm_per_radps = -0.01\n",
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = 0.02\nviscous_damping_nm_per_radps = nan\n",
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = 0.02\nviscous_damping_nm_per_radps = inf\n",
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = 0.02\nviscous_damping_nm_per_radps = \"0\"\n",
+           // Invalid static_friction_nm.
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = 0.02\nstatic_friction_nm = -0.01\n",
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = 0.02\nstatic_friction_nm = nan\n",
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = 0.02\nstatic_friction_nm = -inf\n",
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = 0.02\nstatic_friction_nm = false\n",
+           // Unknown motor or non-motor device.
+           "[[simulation.mechanisms]]\nmotor = \"missing\"\n"
+           "inertia_kg_m2 = 0.02\n",
+           "[[simulation.mechanisms]]\nmotor = \"enc\"\n"
+           "inertia_kg_m2 = 0.02\n",
+           // Duplicate motor.
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = 0.02\n"
+           "[[simulation.mechanisms]]\nmotor = \"m_roller\"\n"
+           "inertia_kg_m2 = 0.05\n",
+       }) {
+    SCOPED_TRACE(bad);
+    ExpectRejected(devices + std::string{bad});
+  }
+
+  // A mechanism targeting a follower motor is refused, naming both follower
+  // and master so the user configures it on the master instead.
+  try {
+    Parse(devices +
+          "[subsystems.shooter.motors.m_follower]\ncan_id = 12\n"
+          "follow = \"m_flywheel\"\n"
+          "[[simulation.mechanisms]]\nmotor = \"m_follower\"\n"
+          "inertia_kg_m2 = 0.05\n");
+    ADD_FAILURE() << "accepted mechanism on follower motor";
+  } catch (const std::invalid_argument& e) {
+    const std::string what = e.what();
+    EXPECT_NE(what.find("m_follower"), std::string::npos) << what;
+    EXPECT_NE(what.find("m_flywheel"), std::string::npos) << what;
+  }
+}
+
+// REQ-CONTRACT-17, REQ-DEV-10: [simulation.battery] and [simulation.chassis]
+// merge key-by-key across include overlays while [[simulation.mechanisms]]
+// replaces the base list.
+TEST_F(ManifestTest,
+       SimulationBatteryChassisAndMechanismsMergeAcrossIncludeOverlays) {
+  Write("robot.toml", R"(
+[robot]
+period_us = 5000
+
+[simulation.battery]
+nominal_voltage_v = 12.6
+internal_resistance_ohm = 0.02
+base_current_a = 1.5
+brownout_voltage_v = 6.5
+
+[simulation.chassis]
+mass_kg = 54.0
+moment_of_inertia_kg_m2 = 6.0
+traction_coefficient = 1.1
+
+[[simulation.mechanisms]]
+motor = "m0"
+inertia_kg_m2 = 0.03
+load = "roller"
+
+[subsystems.mech.motors]
+m0 = { can_id = 1 }
+m1 = { can_id = 2 }
+)");
+
+  Write("override_tables.toml", R"(
+include = "robot.toml"
+
+[simulation.battery]
+nominal_voltage_v = 12.0
+
+[simulation.chassis]
+traction_coefficient = 0.9
+)");
+  const auto tables_only =
+      ParseRobotConfig((dir_ / "override_tables.toml").string());
+  ASSERT_TRUE(tables_only.simulation.battery.has_value());
+  EXPECT_EQ(*tables_only.simulation.battery,
+            (SimulationBatteryConfig{12.0, 0.02, 1.5, 6.5}));
+  ASSERT_TRUE(tables_only.simulation.chassis.has_value());
+  EXPECT_EQ(*tables_only.simulation.chassis,
+            (SimulationChassisConfig{54.0, 6.0, 0.9}));
+  ASSERT_EQ(tables_only.simulation.mechanisms.size(), 1u);
+  EXPECT_EQ(tables_only.simulation.mechanisms[0],
+            (SimulationMechanismConfig{"m0", 0.03, SimulationLoadKind::kRoller,
+                                       0.0, 0.0}));
+
+  Write("override_mechanisms.toml", R"(
+include = "robot.toml"
+
+[[simulation.mechanisms]]
+motor = "m1"
+inertia_kg_m2 = 0.09
+load = "flywheel"
+viscous_damping_nm_per_radps = 0.01
+static_friction_nm = 0.02
+)");
+  const auto mechs_only =
+      ParseRobotConfig((dir_ / "override_mechanisms.toml").string());
+  ASSERT_TRUE(mechs_only.simulation.battery.has_value());
+  EXPECT_EQ(*mechs_only.simulation.battery,
+            (SimulationBatteryConfig{12.6, 0.02, 1.5, 6.5}));
+  ASSERT_TRUE(mechs_only.simulation.chassis.has_value());
+  EXPECT_EQ(*mechs_only.simulation.chassis,
+            (SimulationChassisConfig{54.0, 6.0, 1.1}));
+  ASSERT_EQ(mechs_only.simulation.mechanisms.size(), 1u);
+  EXPECT_EQ(mechs_only.simulation.mechanisms[0],
+            (SimulationMechanismConfig{
+                "m1", 0.09, SimulationLoadKind::kFlywheel, 0.01, 0.02}));
+}
+
 }  // namespace
 }  // namespace talos::config

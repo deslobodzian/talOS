@@ -92,7 +92,7 @@ Device targets use logical TOML device names, not physical CAN IDs.
 | `motor_disconnect` | Motor name | Invalid feedback, its ages growing, until the interval ends ([as the RoboRIO reports it](../hardware/README.md#simulation-backends-ideal-vs-physics-backed)) |
 | `sensor_disconnect` | Sensor name | Invalid feedback, its ages growing, until the interval ends |
 | `freeze` | Motor name | Hold feedback, its age growing, until the interval ends; the gateway marks it invalid once it is `command_timeout_us` old |
-| `supply_voltage` | `all` | Require fifth field, volts in `[0,16]`; restore the resting 12.8 V at end |
+| `supply_voltage` | `all` | Require fifth field, volts in `[0,16]`; clear the override (`ClearSupplyVoltageOverride()`) at end so `[simulation.battery]` sag (or the resting 12.8 V default) resumes |
 | `reset` | Motor or sensor name | One device-reset edge on the first tick at/after start |
 | `udp_blackout` | `bridge` | Drop **all outbound UDP**, including DS, hardware state and config ACKs |
 | `forward_limit` | Motor name | Press the switch on its TalonFX forward limit input until the interval ends |
@@ -155,17 +155,20 @@ Physics-only flags (all values must be finite; supplying any without
 | `--wheel-slip-gain G` | `0` | Nonnegative acceleration-dependent traction loss |
 | `--gyro-drift-radps R` | `0` | Reported yaw bias grows by `R × elapsed_seconds`, yaw rate gains `R` |
 
-Nominal wheel radius, swerve module coordinates, and mechanical end-of-travel
-hard stops come from the optional top-level `[simulation]` table
-(`wheel_radius_m`, `[[simulation.swerve_modules]]` with `drive`, `steer`,
-`x_m`, `y_m`, and `[[simulation.hard_stops]]` with `motor` and optional
-`min_rot` / `max_rot` in hardware mechanism rotations), falling back to
-`0.0508` m, ±0.30 m name inference, and no hard stops when omitted. Hard stops
-are enforced in `--physics` even when `soft_limits = false` (as required for
+Nominal wheel radius, swerve module coordinates, mechanical end-of-travel hard
+stops, battery sag, chassis mass/traction dynamics, and per-mechanism inertia
+come from the optional top-level `[simulation]` table (`wheel_radius_m`,
+`[[simulation.swerve_modules]]`, `[[simulation.hard_stops]]`,
+`[simulation.battery]`, `[simulation.chassis]`, and
+`[[simulation.mechanisms]]`), falling back to `0.0508` m, ±0.30 m name
+inference, no hard stops, a constant `12.8` V bus, kinematic chassis
+integration, and the legacy first-order motor lag when omitted. Hard stops are
+enforced in `--physics` even when `soft_limits = false` (as required for
 rezero-frame mechanisms), stopping the rotor so back-EMF drops to zero and
 stator current rises for stall homing. `[simulation]` never enters the hardware
-wire format or `ConfigurationId`
-([hardware configuration](../hardware/README.md#configuration)).
+wire format or `ConfigurationId`; keys, bounds, and model semantics live in
+[hardware configuration](../hardware/README.md#configuration) and
+[simulation backends](../hardware/README.md#simulation-backends-ideal-vs-physics-backed).
 
 Encoders truthfully measure wheel rotations; radius error changes ground
 travel only. Each wheel's slip fraction is
@@ -198,14 +201,16 @@ stalls timeshare work, and the nodes then correctly expire their targets.
 
 ## Tests
 
-`schedules_test` covers the fault schedule's parsing, resolution and
-application. `launcher_ports_test` (integration, about 1 s) has the launcher
-start the bridge and the simulator on a config's non-default ports, with no
-port argument written by hand, and checks that the bridge publishes the
-simulator's State. `sim_gateway_test` (integration, about 1 s) runs the
-simulator alone: `--describe` and its flag checks, a run without a config,
-the Driver Station packets of a mode and joystick schedule, the home
-switches `--physics` reads from a config, and `[simulation]` wheel radius and
-swerve module geometry. A robot's full-graph tests against the simulator live
-with the robot (the bench's:
+`schedules_test` covers the fault schedule's parsing, resolution, application,
+and `supply_voltage` restoration of a configured `[simulation.battery]` model.
+`launcher_ports_test` (integration, about 1 s) has the launcher start the
+bridge and the simulator on a config's non-default ports, with no port argument
+written by hand, and checks that the bridge publishes the simulator's State.
+`sim_gateway_test` (integration, about 1 s) runs the simulator alone:
+`--describe` and its flag checks, a run without a config, the Driver Station
+packets of a mode and joystick schedule, the home switches `--physics` reads
+from a config, `[simulation]` wheel radius and swerve module geometry, and
+`[simulation.battery]` / `[simulation.chassis]` / `[[simulation.mechanisms]]`
+end-to-end physics. A robot's full-graph tests against the simulator live with
+the robot (the bench's:
 [bench simulation tests](../../bench/main_processor/simulation/README.md)).
