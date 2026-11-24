@@ -62,8 +62,17 @@ int FuelBody(const mjModel* m, int k) {
   return body;
 }
 
+void WriteXml(const std::string& path, const char* xml) {
+  std::ofstream out(path);
+  out << xml;
+  if (!out.good()) {
+    throw std::runtime_error("failed to write " + path);
+  }
+}
+
 bool Asleep(const mjModel* m, const mjData* d, int body) {
-  return d->tree_asleep[m->body_treeid[body]] >= 0;
+  const int tree = m->body_treeid[body];
+  return tree >= 0 && d->tree_asleep[tree] >= 0;
 }
 
 // REQ-DEV-37: with sleeping on, after 2 s at rest every FUEL sleeps and the
@@ -74,13 +83,14 @@ TEST(MujocoSleeping, RestingFuelSleepsTheRobotNeverAndAStruckFuelWakes) {
   PlantModel model;
   model.field_xml = FieldXml();
   model.robot_xml = ::testing::TempDir() + "/sleeping_robot.xml";
-  std::ofstream(model.robot_xml) << kRobot;
+  WriteXml(model.robot_xml, kRobot);
   // 0.6 m short of the struck FUEL's centre, in -y, facing nothing else.
   model.start_x_m = 3.0;
   model.start_y_m = -1.4;
   model.sleeping = true;
   auto plant = MakePlant(model, {});
   const mjModel* m = plant->model();
+  ASSERT_NE(m->opt.enableflags & mjENBL_SLEEP, 0);
   // The test drives the robot by its root velocity between steps.
   auto* d = const_cast<mjData*>(plant->data());
   const int robot_tree = m->body_treeid[plant->robot_root_body()];
@@ -101,11 +111,14 @@ TEST(MujocoSleeping, RestingFuelSleepsTheRobotNeverAndAStruckFuelWakes) {
   const int dof = m->jnt_dofadr[m->body_jntadr[plant->robot_root_body()]];
   // 0.4 s at 2 m/s in -y: the box's front edge travels 0.8 m, past the
   // FUEL's centre 0.3 m beyond it.
+  bool struck_woke = false;
   for (int step = 0; step < 80; ++step) {
     d->qvel[dof + 0] = 0.0;
     d->qvel[dof + 1] = -2.0;
     ASSERT_TRUE(plant->Step(1, {})) << plant->failure();
+    if (!Asleep(m, d, struck)) struck_woke = true;
   }
+  EXPECT_TRUE(struck_woke) << "the struck FUEL never woke in tree_asleep";
   const double moved =
       std::hypot(position[0] - before[0], position[1] - before[1]);
   EXPECT_GT(moved, 0.1) << "the struck FUEL stayed where it slept";
@@ -136,7 +149,7 @@ TEST(MujocoSleeping, AWeldedRobotsPassiveTreeNeverSleeps) {
   PlantModel model;
   model.field_xml = FieldXml();
   model.robot_xml = ::testing::TempDir() + "/sleeping_welded_robot.xml";
-  std::ofstream(model.robot_xml) << kWeldedRobot;
+  WriteXml(model.robot_xml, kWeldedRobot);
   model.start_x_m = 3.0;  // 0.6 m from the reserve row's FUEL at x = 3.0 m
   model.start_y_m = -1.4;
   model.sleeping = true;
@@ -147,12 +160,41 @@ TEST(MujocoSleeping, AWeldedRobotsPassiveTreeNeverSleeps) {
   const int flap = mj_name2id(m, mjOBJ_BODY, "flap");
   ASSERT_GE(flap, 0);
   ASSERT_GE(m->body_treeid[flap], 0);
+  const int flap_dof = m->jnt_dofadr[m->body_jntadr[flap]];
 
   for (int step = 0; step < 400; ++step) {
     ASSERT_TRUE(plant->Step(1, {})) << plant->failure();
   }
+  // Verify the flap is actually at rest below sleep_tolerance so staying awake
+  // proves mjSLEEP_NEVER rather than ongoing motion.
+  EXPECT_LT(std::abs(d->qvel[flap_dof]), m->opt.sleep_tolerance);
   EXPECT_FALSE(Asleep(m, d, flap)) << "the robot's passive flap fell asleep";
   EXPECT_TRUE(Asleep(m, d, FuelBody(m, kStruck)));
+}
+
+// REQ-DEV-37: with PlantModel::sleeping left at its default (false), sleeping
+// stays disabled in the compiled world and resting FUEL stay awake past
+// MuJoCo's 10-step sleep window.
+TEST(MujocoSleeping, DefaultSleepingOffKeepsFuelAwake) {
+  InstallMujocoProcessHandlers();
+  PlantModel model;
+  ASSERT_FALSE(model.sleeping);
+  model.field_xml = FieldXml();
+  model.robot_xml = ::testing::TempDir() + "/sleeping_off_robot.xml";
+  WriteXml(model.robot_xml, kRobot);
+  model.start_x_m = 3.0;
+  model.start_y_m = -1.4;
+  auto plant = MakePlant(model, {});
+  const mjModel* m = plant->model();
+  const mjData* d = plant->data();
+  EXPECT_EQ(m->opt.enableflags & mjENBL_SLEEP, 0);
+
+  for (int step = 0; step < 100; ++step) {
+    ASSERT_TRUE(plant->Step(1, {})) << plant->failure();
+  }
+  int asleep = 0;
+  for (int k = 0; k < kFuel; ++k) asleep += Asleep(m, d, FuelBody(m, k));
+  EXPECT_EQ(asleep, 0) << "FUEL fell asleep with sleeping = false";
 }
 
 }  // namespace
