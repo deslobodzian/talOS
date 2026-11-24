@@ -183,6 +183,52 @@ TEST(ReadinessGate, DebouncesInTicksAndDropsImmediately) {
 
   gate.Reset();
   EXPECT_EQ(gate.Update(AllGood(), 18).reason, ReadinessReason::kSettling);
+
+  // Mid-settle failure (passing_tick_count == 2 -> fail) resets the count to 0
+  // so a full settle_tick_count streak is needed again.
+  r = gate.Update(AllGood(), 19);
+  EXPECT_FALSE(r.ready);
+  EXPECT_EQ(r.reason, ReadinessReason::kSettling);
+  EXPECT_EQ(r.passing_tick_count, 2);
+
+  ReadinessInput dip = AllGood();
+  dip.flywheel_error_rps = 5.0;
+  r = gate.Update(dip, 20);
+  EXPECT_FALSE(r.ready);
+  EXPECT_EQ(r.reason, ReadinessReason::kFlywheelNotAtSpeed);
+  EXPECT_EQ(r.passing_tick_count, 0);
+
+  r = gate.Update(AllGood(), 21);
+  EXPECT_FALSE(r.ready);
+  EXPECT_EQ(r.reason, ReadinessReason::kSettling);
+  EXPECT_EQ(r.passing_tick_count, 1);
+  r = gate.Update(AllGood(), 22);
+  EXPECT_FALSE(r.ready);
+  EXPECT_EQ(r.reason, ReadinessReason::kSettling);
+  EXPECT_EQ(r.passing_tick_count, 2);
+  r = gate.Update(AllGood(), 23);
+  EXPECT_TRUE(r.ready);
+  EXPECT_EQ(r.reason, ReadinessReason::kReady);
+  EXPECT_EQ(r.passing_tick_count, 3);
+}
+
+// REQ-DEV-19
+TEST(Readiness, ToStringCoversEveryReason) {
+  EXPECT_EQ(ToString(ReadinessReason::kReady), "ready");
+  EXPECT_EQ(ToString(ReadinessReason::kStale), "stale");
+  EXPECT_EQ(ToString(ReadinessReason::kNoSolution), "no solution");
+  EXPECT_EQ(ToString(ReadinessReason::kNotConverged), "not converged");
+  EXPECT_EQ(ToString(ReadinessReason::kOutOfRange), "out of range");
+  EXPECT_EQ(ToString(ReadinessReason::kTurretLimit), "turret limit");
+  EXPECT_EQ(ToString(ReadinessReason::kRobotTooFast), "robot too fast");
+  EXPECT_EQ(ToString(ReadinessReason::kRobotRotatingTooFast),
+            "robot rotating too fast");
+  EXPECT_EQ(ToString(ReadinessReason::kAimError), "aim error");
+  EXPECT_EQ(ToString(ReadinessReason::kFlywheelNotAtSpeed),
+            "flywheel not at speed");
+  EXPECT_EQ(ToString(ReadinessReason::kHoodNotAtGoal), "hood not at goal");
+  EXPECT_EQ(ToString(ReadinessReason::kSettling), "settling");
+  EXPECT_EQ(ToString(static_cast<ReadinessReason>(255)), "unknown");
 }
 
 // Ticks the caller skipped (disabled, paused) do not count: a gap in the

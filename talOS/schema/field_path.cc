@@ -224,11 +224,23 @@ ResolvedField ResolveField(const reflection::Schema& schema,
                                   "' exceeds enclosing struct bounds");
     }
     const reflection::Enum* enum_def = nullptr;
-    const auto* enums = schema.enums();
     const std::int32_t enum_idx = field->type()->index();
-    if (enums != nullptr && enum_idx >= 0 &&
-        static_cast<std::size_t>(enum_idx) < enums->size()) {
+    if (enum_idx >= 0) {
+      if (!IsEnumBaseType(base)) {
+        throw std::invalid_argument(std::string{where} + ": field '" + seg +
+                                    "' has enum index on non-integer scalar");
+      }
+      const auto* enums = schema.enums();
+      if (enums == nullptr ||
+          static_cast<std::size_t>(enum_idx) >= enums->size()) {
+        throw std::invalid_argument(std::string{where} + ": field '" + seg +
+                                    "' has invalid enum index");
+      }
       enum_def = enums->Get(enum_idx);
+      if (enum_def == nullptr) {
+        throw std::invalid_argument(std::string{where} + ": field '" + seg +
+                                    "' has invalid enum index");
+      }
     }
     return ResolvedField{
         .offset = curr_offset + field->offset(),
@@ -294,7 +306,15 @@ void EncodeField(std::byte* message, const ResolvedField& field,
       throw std::invalid_argument(at + ": unknown enum label '" + label +
                                   "' in " + enum_name);
     }
-    EncodeInteger(dest, field.base_type, ev->value(), where);
+    if (field.base_type == BaseType::ULong) {
+      // FlatBuffers reflection stores ULong enum enumerators as raw two's
+      // complement bit patterns in signed int64_t, so values >= 2^63 are
+      // negative in ev->value().
+      const auto v = static_cast<std::uint64_t>(ev->value());
+      std::memcpy(dest, &v, sizeof(v));
+    } else {
+      EncodeInteger(dest, field.base_type, ev->value(), where);
+    }
   } else if (field.base_type != BaseType::Float &&
              field.base_type != BaseType::Double &&
              std::holds_alternative<std::int64_t>(value)) {

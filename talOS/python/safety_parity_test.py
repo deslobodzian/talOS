@@ -12,9 +12,11 @@ Covers:
 
 import ctypes
 from datetime import timedelta
+import gc
 import io
 import math
 import os
+import struct
 import tempfile
 import unittest
 from unittest import mock
@@ -24,6 +26,7 @@ from control.VelocityTarget import VelocityTarget
 from demo.Goal import Goal
 import talos
 from talos import _abi
+from talos._messages import message_type
 from talos.mechanisms import (PositionMechanism, RollerWithSensor,
                               VelocityMechanism)
 from talos.testing import Sim, SimHardware, Stick
@@ -104,6 +107,58 @@ class SafetyParityTest(unittest.TestCase):
         self.assertIn("hardware request", results[0][1])
         self.assertEqual(hw.motor_request("roller", "wheel").mode,
                          talos.Mode.NEUTRAL)
+
+    # REQ-SAFE-14, REQ-SAFE-09: Python/C-ABI cannot forge an active
+    # TargetEnvelope by calling talos_publisher_send on a TargetLane slot
+    # while OperatorArming is disarmed.
+    def test_publisher_send_refuses_target_lane_slot(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        hw = SimHardware(sim)
+        results = []
+        goal_type = message_type(Goal)
+
+        class Consumer:
+            def __init__(self, node):
+                self.target = talos.Target(node, Goal)
+                self.received = []
+
+            def update(self):
+                t = self.target.get()
+                if t is not None:
+                    self.received.append(t)
+
+        class ForgedLane:
+            def __init__(self, node):
+                self.node = node
+                self.ds = talos.DriverStation(node)
+                self.arming = talos.OperatorArming(node)
+                # First publisher on this node -> slot 0.
+                self.lane = talos.TargetLane(
+                    node, Goal, "roller", "teleop", arming=self.arming)
+
+            def update(self):
+                gen = sim.driver_station_generation
+                if gen == 0 or results:
+                    return
+                header = struct.pack("<QB7x", gen, 1)
+                body = goal_type.encode(
+                    {"height_rot": 2.0, "enabled": True, "tick_count": 7})
+                payload = header + body
+                status = _abi.lib.talos_publisher_send(
+                    self.node._handle, 0, payload, len(payload))
+                err = _abi.lib.talos_last_error().decode()
+                results.append((status, err))
+
+        consumer = sim.add(Consumer, "roller")
+        sim.add(ForgedLane, "driver")
+        hw.enable(True)
+        hw.set_driver_station(enabled=True, teleop=True)
+        sim.step(0.04)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0][0], _abi.ERR)
+        self.assertIn("target lane", results[0][1])
+        self.assertEqual(consumer.received, [])
 
     # REQ-CONTRACT-14: a failed Sim.add() invalidates the Python Node handle
     # and wrappers built before the failure so surviving references raise
@@ -424,6 +479,51 @@ class SafetyParityTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             sim.add(BadSlots, "planner")
 
+    # REQ-CONTRACT-14: _max_age_ns (Subscription.fresh, HardwareLink.fresh) and
+    # Node.publish_bytes reject bool, strings, floats, and negative integers
+    # instead of silently coercing True -> 1s / 1 byte or leaking ctypes errors.
+    def test_max_age_and_publish_bytes_reject_bool_and_invalid_types(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        hw = SimHardware(sim)
+
+        class Watcher:
+            def __init__(self, node):
+                self.sub = node.subscribe(Goal, "/planner/goal")
+                self.link = talos.HardwareLink(node)
+
+        w = sim.add(Watcher, "planner")
+        sim.publish(Goal, "/planner/goal", height_rot=1.0, enabled=True,
+                    tick_count=1)
+        sim.step(0.01)
+        hw.lose_states(20)
+        sim.step(0.15)
+
+        for fresh_fn in (w.sub.fresh, w.link.fresh):
+            for bad in (True, False, "1.0", object()):
+                with self.subTest(fn=fresh_fn.__qualname__, bad=bad):
+                    with self.assertRaises(TypeError):
+                        fresh_fn(bad)
+
+        bad_publish_cases = [
+            (TypeError, lambda n: n.publish_bytes("frames", True)),
+            (TypeError, lambda n: n.publish_bytes("frames", False)),
+            (TypeError, lambda n: n.publish_bytes("frames", 64, slots=True)),
+            (TypeError, lambda n: n.publish_bytes("frames", 1.5)),
+            (TypeError, lambda n: n.publish_bytes("frames", 64, slots=16.0)),
+            (ValueError, lambda n: n.publish_bytes("frames", -1)),
+            (ValueError, lambda n: n.publish_bytes("frames", 64, slots=-1)),
+        ]
+        for idx, (exc_type, fn) in enumerate(bad_publish_cases):
+            with self.subTest(case=idx, exc=exc_type.__name__):
+                s = Sim.from_toml(ROBOT_TOML)
+
+                class BadNode:
+                    def __init__(self, node):
+                        fn(node)
+
+                with self.assertRaises(exc_type):
+                    s.add(BadNode, "planner")
+
     # REQ-CONTRACT-14: HardwareLink.enabled matches talos.robot_enabled(node).
     def test_hardware_link_enabled_parity(self):
         sim = Sim.from_toml(ROBOT_TOML)
@@ -584,7 +684,228 @@ class SafetyParityTest(unittest.TestCase):
         with self.assertRaises(talos.TalosError):
             hw.enable(True)
         with self.assertRaises(talos.TalosError):
+            hw.set_gateway_clock(offset=1.0)
+        with self.assertRaises(talos.TalosError):
             hw.motor_request("roller", "wheel")
+
+    # REQ-RT-05: Sim.resume() rejects re-entrant Sim.remove() inside overdue
+    # callbacks and settles prompt subscribers at sim.now() before returning.
+    def test_sim_resume_rejects_reentrant_remove_and_settles(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        reenter_errors = []
+        heard = []
+
+        class Receiver:
+            def __init__(self, node):
+                self.node = node
+                node.subscribe(
+                    Goal, "/planner/goal",
+                    callback=lambda g: heard.append(
+                        (g.tick_count, node.now_ns)))
+
+        class Talker:
+            def __init__(self, node):
+                self.node = node
+                self.pub = node.publish(Goal, "/planner/goal")
+                self.check_remove = False
+
+            def update(self):
+                if self.check_remove:
+                    self.check_remove = False
+                    try:
+                        sim.remove("planner")
+                    except talos.TalosError as err:
+                        reenter_errors.append(str(err))
+                self.pub.send(
+                    height_rot=1.0, enabled=True, tick_count=self.node.tick)
+
+        sim.add(Receiver, "roller")
+        talker = sim.add(Talker, "planner")
+        sim.step(0.01)
+        self.assertEqual(len(heard), 1)
+
+        sim.pause("planner", 0.1)
+        sim.step(0.025)
+        self.assertEqual(len(heard), 1)
+
+        talker.check_remove = True
+        sim.resume("planner")
+        self.assertEqual(len(reenter_errors), 1)
+        self.assertEqual(len(heard), 2)
+        self.assertEqual(heard[-1][1], 35_000_000)
+
+    # REQ-SAFE-04, REQ-CONTRACT-14: Python non-finite (NaN, +inf, -inf)
+    # actuation, rezero, PWM, and mechanism goals neutralize safely matching
+    # C++ / C ABI semantics.
+    def test_non_finite_actuation_and_rezero_neutralize_safely(self):
+        non_finite_toml = ROBOT_TOML + """
+[subsystems.rig.motors.rig_wheel]
+can_id = 10
+foc = true
+max_torque_current_a = 40.0
+[subsystems.rig.sensors.rig_gyro]
+type = "Pigeon2"
+can_id = 11
+[subsystems.rig.pwm_outputs.rig_servo]
+channel = 0
+"""
+        sim = Sim.from_toml(non_finite_toml)
+        hw = SimHardware(sim)
+
+        class Rig:
+            def __init__(self, node):
+                talos.allow_untargeted_outputs(node)
+                self.motor = talos.Motor(node, "rig_wheel")
+                self.gyro = talos.Gyro(node, "rig_gyro")
+                self.servo = talos.PwmOutput(node, "rig_servo")
+                self.action = lambda: None
+
+            def update(self):
+                self.action()
+
+        class ArmRig:
+            def __init__(self, node):
+                talos.allow_untargeted_outputs(node)
+                self.mech = PositionMechanism(node, "arm")
+                self.action = lambda: self.mech.stop()
+
+            def update(self):
+                self.action()
+                self.mech.update()
+
+        class ShooterRig:
+            def __init__(self, node):
+                talos.allow_untargeted_outputs(node)
+                self.mech = VelocityMechanism(node, "flywheel")
+                self.action = lambda: self.mech.stop()
+
+            def update(self):
+                self.action()
+                self.mech.update()
+
+        rig = sim.add(Rig, "rig")
+        arm = sim.add(ArmRig, "arm")
+        shooter = sim.add(ShooterRig, "shooter")
+        hw.enable(True)
+        hw.set_motor("rig", "rig_wheel", 1.0, 0.0)
+        hw.set_gyro("rig", "rig_gyro", 0.5, 0.0)
+        sim.step(0.02)
+
+        non_finite = (math.nan, math.inf, -math.inf)
+        for bad in non_finite:
+            rig.motor.rezero(bad)
+            rig.gyro.rezero(bad)
+            self.assertFalse(rig.motor.zeroed)
+            self.assertFalse(rig.gyro.zeroed)
+
+        rig.motor.rezero(0.0)
+        self.assertTrue(rig.motor.zeroed)
+
+        for bad in non_finite:
+            actions = [
+                lambda b=bad: rig.motor.set_duty_cycle(b),
+                lambda b=bad: rig.motor.set_voltage(b),
+                lambda b=bad: rig.motor.set_velocity(b),
+                lambda b=bad: rig.motor.set_velocity(10.0, ff_volts=b),
+                lambda b=bad: rig.motor.set_position(b),
+                lambda b=bad: rig.motor.set_position(0.5, ff_volts=b),
+                lambda b=bad: rig.motor.set_motion_magic(b),
+                lambda b=bad: rig.motor.set_motion_magic(0.5, ff_volts=b),
+                lambda b=bad: rig.motor.set_torque_current(b),
+            ]
+            for fn in actions:
+                prev_clamped = rig.motor.clamped_count
+                rig.action = lambda f=fn, b=bad: (f(), rig.servo.set(b))
+                sim.step(0.02)
+                self.assertEqual(
+                    hw.applied_motor("rig", "rig_wheel").mode,
+                    talos.Mode.NEUTRAL)
+                self.assertIsNone(hw.applied_pwm("rig", "rig_servo"))
+                self.assertGreater(rig.motor.clamped_count, prev_clamped)
+
+            for arm_fn in (
+                lambda b=bad: arm.mech.set_goal(b),
+                lambda b=bad: arm.mech.set_goal(0.2, feedforward_v=b),
+                lambda b=bad: arm.mech.set_goal_units(b),
+                lambda b=bad: arm.mech.set_goal_units(90.0, feedforward_v=b),
+                lambda b=bad: arm.mech.hold(feedforward_v=b),
+            ):
+                arm.action = arm_fn
+                shooter.action = lambda b=bad: shooter.mech.set_goal(b)
+                sim.step(0.02)
+                self.assertEqual(
+                    hw.applied_motor("arm", "arm").mode, talos.Mode.NEUTRAL)
+                self.assertEqual(
+                    hw.applied_motor("shooter", "flywheel").mode,
+                    talos.Mode.NEUTRAL)
+
+            shooter.action = lambda b=bad: shooter.mech.set_goal(
+                20.0, feedforward_v=b)
+            sim.step(0.02)
+            self.assertEqual(
+                hw.applied_motor("shooter", "flywheel").mode,
+                talos.Mode.NEUTRAL)
+    # REQ-CONTRACT-14: an unreachable GC cycle holding Sim, a hosted node, and
+    # SimHardware must destroy SimHardware before Sim even though PEP 442 clears
+    # weakrefs before __del__, and any teardown call on hw after Sim destruction
+    # must raise TalosError rather than UAF freed Sim.
+    def test_cyclic_gc_destroys_and_invalidates_sim_hardware_before_sim(self):
+        events = []
+        probe_calls = []
+
+        class CycleProbe:
+            def __init__(self, node):
+                self.hw = None
+
+            def __del__(self):
+                if self.hw is None:
+                    return
+                sim_dead = getattr(self.hw._sim, "_handle", None) is None
+                try:
+                    self.hw.set_gateway_clock(offset=1.0)
+                except talos.TalosError:
+                    probe_calls.append(("raised", sim_dead))
+                else:
+                    probe_calls.append(("ok", sim_dead))
+
+        real_hw_destroy = _abi.lib.talos_sim_hardware_destroy
+        real_sim_destroy = _abi.lib.talos_sim_destroy
+
+        def tracked_hw_destroy(handle):
+            events.append("hw_destroy")
+            return real_hw_destroy(handle)
+
+        def tracked_sim_destroy(handle):
+            events.append("sim_destroy")
+            return real_sim_destroy(handle)
+
+        gc.collect()
+        with mock.patch.object(
+            _abi.lib, "talos_sim_hardware_destroy",
+            side_effect=tracked_hw_destroy,
+        ), mock.patch.object(
+            _abi.lib, "talos_sim_destroy",
+            side_effect=tracked_sim_destroy,
+        ):
+            sim = Sim.from_toml(ROBOT_TOML)
+            probe = sim.add(CycleProbe, "planner")
+            hw = SimHardware(sim)
+            probe.hw = hw  # cycle: sim -> _nodes -> probe -> hw -> _sim -> sim
+            del sim, probe, hw
+            gc.collect()
+
+        self.assertEqual(events, ["hw_destroy", "sim_destroy"])
+        self.assertEqual(len(probe_calls), 1)
+        # Never allowed to succeed once Sim's handle is gone.
+        self.assertNotIn(("ok", True), probe_calls)
+
+        # Normal SimHardware GC while Sim stays alive destroys hw immediately
+        # and drops its entry from sim._hardwares.
+        sim2 = Sim.from_toml(ROBOT_TOML)
+        hw2 = SimHardware(sim2)
+        self.assertEqual(len(sim2._hardwares), 1)
+        del hw2
+        self.assertEqual(len(sim2._hardwares), 0)
 
 
 if __name__ == "__main__":

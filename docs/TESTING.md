@@ -224,8 +224,13 @@ Where RULES.md 12 is read too broadly or too narrowly:
    `//bench/main_processor:update_p99_perf_test` — the latter using the shared
    `StallMeter` helper in `//talOS/process:host_qualification` — record the
    gtest property `host_unqualified="true"` and `[HOST_UNQUALIFIED]` in their
-   failure message; uniform reporting across the remaining perf and timed e2e
-   tests is still open). **[review]**
+   failure message). **[enforced: `tools/check_testing_rules.py` (CI lint job
+   and `tools/prepush.sh` via `tools/source_lints.sh`) requires every
+   `perf`-tagged C++ target to depend unconditionally on
+   `//talOS/process:host_qualification`, use `StallMeter`, and record
+   `host_unqualified` and `[HOST_UNQUALIFIED]` (and any non-C++ `perf` target
+   to record `[HOST_UNQUALIFIED]`); timed integration/e2e host preconditions
+   remain review]**
 8. **Statistics over single samples.** A lateness or gap assertion uses the
    quantity the requirement names (the maximum inside a window, or a
    percentile over at least 50 samples), as
@@ -368,13 +373,19 @@ the host can run it. It is never noise.
    writes its session directory to Bazel's undeclared test outputs
    (`TEST_UNDECLARED_OUTPUTS_DIR`), `//studio:drive_browser_test` preserves
    its session's logs, a screenshot and the failing elements when a check
-   fails, and `talOS/build/sim_check.py` (every `talos_sim_test`),
+   fails, and every other `e2e` test (`talOS/build/sim_check.py` for every
+   `talos_sim_test` and the sim tests calling `sim_check.check` or
+   `sim_check.preserve_failure_artifacts`, plus
    `examples/robot_repo/bundle_install_test.py` and
-   `examples/robot_repo/studio_test.py` preserve `launch.log` and their
-   session/log directories under `TEST_UNDECLARED_OUTPUTS_DIR` on failure;
-   the remaining e2e and perf tests write theirs to temporary directories
-   that do not survive the run **[review]**. A flake is closed by a named
-   mechanism and a test that pins it (§5), not by a green rerun.
+   `examples/robot_repo/studio_test.py`) preserves `launch.log` and its
+   session/log directories under `TEST_UNDECLARED_OUTPUTS_DIR` on failure
+   **[enforced: `tools/check_testing_rules.py` (CI lint job and
+   `tools/prepush.sh` via `tools/source_lints.sh`) verifies that every
+   `e2e`- or `soak`-tagged target and every `talos_sim_test` preserves
+   failure artifacts under `TEST_UNDECLARED_OUTPUTS_DIR` directly or through
+   `sim_check.check` / `sim_check.preserve_failure_artifacts`]**. A flake is
+   closed by a named mechanism and a test that pins it (§5), not by a green
+   rerun.
 3. **Quarantine is explicit and expires.** A test that fails without a
    product change and cannot be fixed the same day gets the tags
    `["manual", "quarantine"]` (so `bazel test //...` skips it) and a TODO.md
@@ -485,7 +496,8 @@ compiles against a workstation's installed package and fails in CI
 build, reads the build's `.d` files for it).
 `tools/prepush.sh`, the pre-push rung
 ([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)), reproduces
-them. CI's source lints (test time, links, requirement trace, node test
+them. CI's source lints (test time, testing rules (`perf` host qualification
+and `e2e`/`soak` failure artifacts), links, requirement trace, node test
 matrix, METHODOLOGY.md §13's `bazel_dep` table, `layers-src`
 (`tools/check_layers.py --source-only`), and the RULES.md 4
 commissioning check against the diff base) are

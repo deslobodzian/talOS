@@ -44,6 +44,7 @@ CppBenchMotor = talos.cpp_node(
 NEUTRAL = talos.Mode.NEUTRAL
 VOLTAGE = talos.Mode.VOLTAGE
 VELOCITY = talos.Mode.VELOCITY
+TORQUE_CURRENT = talos.Mode.TORQUE_CURRENT
 
 # subsystems/motor.toml's max_bench_voltage_v.
 MAX_VOLTS = 2.0
@@ -62,9 +63,13 @@ class BenchMotorTest(unittest.TestCase):
                            ("max_bench_voltage_v", "-1.0"),
                            ("max_bench_voltage_v", "nan"),
                            ("max_bench_voltage_v", "inf"),
+                           ("max_bench_voltage_v", '"two"'),
+                           ("max_bench_voltage_v", "true"),
                            ("max_bench_torque_current_a", "-1.0"),
                            ("max_bench_torque_current_a", "nan"),
-                           ("max_bench_torque_current_a", "inf")):
+                           ("max_bench_torque_current_a", "inf"),
+                           ("max_bench_torque_current_a", '"two"'),
+                           ("max_bench_torque_current_a", "true")):
             with self.subTest(key=key, value=value):
                 sim = Sim.from_toml(
                     "[robot]\nperiod_us = 5000\n"
@@ -155,7 +160,7 @@ class BenchTeleopTest(unittest.TestCase):
         hw.enable()
 
         def push(axis=0.0, buttons=(), enabled=True):
-            stick = Stick(axes=(0.0, axis), buttons=buttons, button_count=2)
+            stick = Stick(axes=(0.0, axis), buttons=buttons, button_count=3)
             hw.set_driver_station(enabled=enabled, teleop=True,
                                   joysticks=[stick])
             sim.step(0.02)
@@ -165,6 +170,11 @@ class BenchTeleopTest(unittest.TestCase):
         self.assertEqual(push(axis=-1.0)[:2], (VOLTAGE, MAX_VOLTS))
         self.assertEqual(push(axis=-1.0, buttons=(2,))[:2], (VELOCITY, 30.0))
         self.assertEqual(push(axis=-1.0, buttons=(1, 2)).demand, 10.0)
+        # Button 3: TORQUE_CURRENT 2 A (the test config turns torque mode on);
+        # button 1 wins over it.
+        self.assertEqual(push(axis=-1.0, buttons=(3,))[:2],
+                         (TORQUE_CURRENT, 2.0))
+        self.assertEqual(push(axis=-1.0, buttons=(1, 3)).mode, VELOCITY)
         self.assertEqual(push().mode, NEUTRAL)
         push(buttons=(1,))
         hw.enable(False)
@@ -196,7 +206,7 @@ def target(mode, generation=None, voltage_v=0.0, velocity_rps=0.0,
 # matrix: parity 8 node_test.cc "NaN velocity", "infinite velocity"
 # matrix: parity 8 node_test.cc "NaN torque current"
 # matrix: parity 8 node_test.cc "infinite torque current"
-# matrix: parity 10 node_test.cc "autonomous, teleop lane"
+# matrix: parity 10 node_test.cc "teleop, auto lane", "autonomous, teleop lane"
 # matrix: parity 11 node_test.cc "autonomous, earlier teleop generation"
 # matrix: parity 11 node_test.cc "teleop, autonomous generation"
 # matrix: parity 11 node_test.cc "teleop, first teleop generation"
@@ -210,6 +220,11 @@ SCENARIO = [
     ("disabled", parity.wait(0.05), parity.require_published()),
     ("enabled, never sent", parity.gateway(True),
      parity.driver_station(enabled=True, teleop=True, then=0.05)),
+    ("teleop, auto lane",
+     parity.send(MotorTarget, "auto", mode=ControlMode.VELOCITY,
+                 voltage_v=0.0, velocity_rps=10.0, voltage_frac=0.0,
+                 torque_current_a=0.0, then=0.02),
+     parity.release(MotorTarget, "auto")),
     ("voltage above the clamp", target(ControlMode.VOLTAGE, voltage_v=20.0)),
     ("voltage below the clamp", target(ControlMode.VOLTAGE, voltage_v=-20.0)),
     ("voltage and axis",

@@ -32,10 +32,15 @@ class SE2 {
   // part goes through V(omega * dt)^-1, which grows without bound near the
   // nonzero multiples of 2 pi where no twist with that rate translates.
   static Vector3 Discretize(Scalar vx, Scalar vy, Scalar omega, Scalar dt) {
-    if (!(dt > Scalar(0)) || !std::isfinite(dt)) return Vector3(omega, vx, vy);
+    if (!(dt > Scalar(0)) || !std::isfinite(dt) ||
+        (vx == Scalar(0) && vy == Scalar(0))) {
+      return Vector3(omega, vx, vy);
+    }
+    const Scalar angle = omega * dt;
+    if (!std::isfinite(angle)) return Vector3(omega, vx, vy);
     Vector3 tau;
     tau(0) = omega;
-    tau.template tail<2>() = InverseV(omega * dt) * Vector2(vx, vy);
+    tau.template tail<2>() = InverseV(angle) * Vector2(vx, vy);
     return tau;
   }
 
@@ -135,22 +140,28 @@ class SE2 {
     return sqrt(sqrt(Eigen::NumTraits<Scalar>::epsilon()));
   }
 
-  // V(w)^-1 = (sinc I - m J) / (sinc^2 + m^2): regular at the origin, singular
-  // only at nonzero multiples of 2 pi.
+  // V(w)^-1 = (w / 2) cot(w / 2) I - (w / 2) J: regular at the origin,
+  // singular only at nonzero multiples of 2 pi (and avoiding denom underflow
+  // on huge |w|).
   static Matrix2 InverseV(Scalar w) {
+    if (!std::isfinite(w)) return Matrix2::Zero();
     const Scalar aw = std::abs(w);
-    Scalar sinc, m;
+    Scalar diag, off;
     if (aw < TaylorThreshold()) {
       const Scalar w2 = w * w;
-      sinc = Scalar(1) - w2 / Scalar(6);
-      m = w / Scalar(2) * (Scalar(1) - w2 / Scalar(12));
+      diag = Scalar(1) - w2 / Scalar(12) - w2 * w2 / Scalar(720);
+      off = w / Scalar(2);
     } else {
-      sinc = std::sin(w) / w;
-      m = (Scalar(1) - std::cos(w)) / w;
+      const Scalar half = w / Scalar(2);
+      const Scalar sin_half = std::sin(half);
+      if (sin_half == Scalar(0)) return Matrix2::Zero();
+      diag = half * (std::cos(half) / sin_half);
+      off = half;
+      if (!std::isfinite(diag)) return Matrix2::Zero();
     }
     Matrix2 vinv;
-    vinv << sinc, m, -m, sinc;
-    return vinv / (sinc * sinc + m * m);
+    vinv << diag, off, -off, diag;
+    return vinv;
   }
 
   Scalar theta_;

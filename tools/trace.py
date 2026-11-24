@@ -17,10 +17,11 @@ reading the existing tags follow (`// REQ-SAFE-09`, `# REQ-A, REQ-B: why`).
 - a tag naming an ID docs/REQUIREMENTS.md's catalogue lacks (file:line),
   and every framework catalogue's too (below);
 - a SAFE or CONTRACT requirement, or any P0, with no tagged test and no
-  verification cited in its row: an open TODO.md item's ID (`- [ ] **ID`),
-  a quoted BRINGUP.md heading after `BR`, or a BENCH.md heading after
-  `BENCH.md`. Tags in the sources of a quarantined target do not count
-  (TESTING.md §8.3);
+  verification cited: an open TODO.md item's ID (`- [ ] **ID`) in its row,
+  or (when its `Cheapest tier` names no runnable tier) a quoted BRINGUP.md
+  heading after `BR` or a BENCH.md heading after `BENCH.md` in its
+  `Cheapest tier` cell. Tags in the sources of a quarantined target do not
+  count (TESTING.md §8.3);
 - a SAFE, CONTRACT or P0 requirement whose `Cheapest tier` names a
   Bazel-runnable tier (`unit`, `component`, `contract`, `fuzz`/`property`,
   `integration`, `e2e`) and that has tagged tests (and no open TODO.md
@@ -233,18 +234,23 @@ def headings(text):
 
 
 def cited_verification(req, todo_items, bench_headings, bringup_headings):
-    """What the row cites that verifies it (TODO item, bench section), or
-    None."""
+    """What the row cites that verifies it (TODO item, bench/bringup section),
+    or None.
+
+    An open TODO.md item may appear anywhere in the row. A BRINGUP.md
+    (`BR "..."`) or BENCH.md heading counts only when cited in `req.tier` and
+    `req.tier` names no runnable tier, never from the Source/Doc column."""
     for todo_id in TODO_ID.findall(req.row):
         if todo_id in todo_items:
             return f"TODO.md {todo_id}"
-    for name in re.findall(r'\bBR "([^"]+)"', req.row):
-        if name.lower() in bringup_headings:
-            return f'BRINGUP.md "{name}"'
-    for after in re.findall(r"\bBENCH\.md\b([^;|]*)", req.row):
-        for heading in bench_headings:
-            if heading and heading in after.lower():
-                return f'BENCH.md "{heading}"'
+    if parse_cheapest_tier(req.tier)[0] is None:
+        for name in re.findall(r'\bBR "([^"]+)"', req.tier):
+            if name.lower() in bringup_headings:
+                return f'BRINGUP.md "{name}"'
+        for after in re.findall(r"\bBENCH\.md\b([^;|]*)", req.tier):
+            for heading in bench_headings:
+                if heading and heading in after.lower():
+                    return f'BENCH.md "{heading}"'
     return None
 
 

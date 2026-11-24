@@ -276,6 +276,54 @@ TEST_F(SuperstructureTest, NoGoalCountsAsStow) {
   EXPECT_EQ(RollerRequest().mode, Mode::kNeutral);
 }
 
+// REQ-SAFE-46: RollerWithSensor latches has_piece across a beam-break
+// disconnect. Superstructure must not trust that latched has_piece while
+// sensor_connected is false: it falls back to STOWED instead of raising or
+// staying trapped in SCORING indefinitely after the timed eject ends.
+TEST_F(SuperstructureTest,
+       DisconnectedBeamBreakExitsScoringAndDoesNotHoldLatchedPiece) {
+  EnableTeleop(sim, hw);
+  hw.ideal_motors();
+  Collect();
+
+  // Disconnect while HOLDING: latched has_piece must not hold or raise.
+  hw.set_connected("intake", "beam_break", false);
+  Hold(SuperstructureCommand::SCORE_HIGH, 100ms);
+  EXPECT_FALSE(IntakeNow().sensor_connected());
+  EXPECT_TRUE(IntakeNow().has_piece());
+  EXPECT_EQ(SuperstructureNow(), SuperstructureState::STOWED);
+  EXPECT_DOUBLE_EQ(LiftRequest().demand, 0.0);
+
+  Hold(SuperstructureCommand::STOW, 60ms);
+  EXPECT_EQ(SuperstructureNow(), SuperstructureState::STOWED);
+
+  // Reconnecting with the beam still broken restores HOLDING and scoring.
+  hw.set_connected("intake", "beam_break", true);
+  Hold(SuperstructureCommand::STOW, 60ms);
+  ASSERT_EQ(SuperstructureNow(), SuperstructureState::HOLDING);
+
+  Hold(SuperstructureCommand::SCORE_HIGH, 120ms);
+  ASSERT_EQ(SuperstructureNow(), SuperstructureState::SCORING);
+  ASSERT_EQ(IntakeNow().state(), IntakeState::EJECTING);
+
+  // Disconnect mid-score: Superstructure stows instead of trapping the lift
+  // high in SCORING once the intake's timed eject finishes and idles.
+  hw.set_connected("intake", "beam_break", false);
+  Hold(SuperstructureCommand::SCORE_HIGH, 100ms);
+  EXPECT_FALSE(IntakeNow().sensor_connected());
+  EXPECT_EQ(SuperstructureNow(), SuperstructureState::STOWED);
+  EXPECT_DOUBLE_EQ(LiftRequest().demand, 0.0);
+
+  Hold(SuperstructureCommand::SCORE_HIGH, 500ms);
+  EXPECT_EQ(IntakeNow().state(), IntakeState::IDLE);
+  EXPECT_EQ(RollerRequest().mode, Mode::kNeutral);
+  EXPECT_EQ(SuperstructureNow(), SuperstructureState::STOWED);
+  EXPECT_DOUBLE_EQ(LiftRequest().demand, 0.0);
+
+  Hold(SuperstructureCommand::STOW, 60ms);
+  EXPECT_EQ(SuperstructureNow(), SuperstructureState::STOWED);
+}
+
 // The superstructure on its own, with the mechanism states published by hand
 // so either one can go quiet.
 class SuperstructureAlone : public ::testing::Test {
@@ -506,15 +554,113 @@ TEST_F(SuperstructureAlone, UnknownCommandCancelsToStow) {
   EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
 }
 
-// REQ-CONTRACT-18, REQ-SAFE-04: a non-finite or non-positive high_rot fails
-// construction naming the key instead of sending NaN/inf or ejecting stowed.
+// REQ-CONTRACT-25: matrix case 6 for Superstructure, losing the Driver Station
+// drops its Target so an active raise cancels to STOW (HOLDING, lift to 0).
+TEST_F(SuperstructureAlone, DriverStationLossCancelsToStow) {
+  Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+  ASSERT_EQ(State(), SuperstructureState::RAISING);
+  hw.stop_driver_station();
+  for (int i = 0; i < 8; ++i) {
+    Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+  }
+  EXPECT_EQ(State(), SuperstructureState::HOLDING);
+  EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+  const auto intake = LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+  ASSERT_TRUE(intake.has_value());
+  EXPECT_EQ(intake->active, 1);
+  EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
+}
+
+// REQ-SAFE-07: matrix case 10 for Superstructure, its default [robot.targets]
+// policy accepts teleop in teleop and auto in autonomous, ignoring the other
+// mode's lane.
+TEST_F(SuperstructureAlone, OtherModesLaneIsIgnored) {
+  const IntakeStatus empty{IntakeState::IDLE, false, true};
+  // In teleop: auto lane is ignored.
+  for (int i = 0; i < 3; ++i) {
+    PublishTarget(sim, "superstructure", "auto",
+                  SuperstructureGoal{SuperstructureCommand::INTAKE});
+    sim.publish(topics::kIntakeStatus, empty);
+    sim.publish(topics::kElevatorStatus, kDown);
+    sim.step(20ms);
+  }
+  EXPECT_EQ(State(), SuperstructureState::STOWED);
+  ReleaseTarget<SuperstructureGoal>(sim, "superstructure", "auto");
+
+  // In autonomous: teleop lane is ignored; auto lane drives.
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kAutonomous));
+  sim.step(20ms);
+  for (int i = 0; i < 3; ++i) {
+    Tick(SuperstructureCommand::INTAKE, empty, kDown);
+  }
+  EXPECT_EQ(State(), SuperstructureState::STOWED);
+  ReleaseTarget<SuperstructureGoal>(sim, "superstructure", "teleop");
+
+  PublishTarget(sim, "superstructure", "auto",
+                SuperstructureGoal{SuperstructureCommand::INTAKE});
+  sim.publish(topics::kIntakeStatus, empty);
+  sim.publish(topics::kElevatorStatus, kDown);
+  sim.step(20ms);
+  EXPECT_EQ(State(), SuperstructureState::INTAKING);
+}
+
+// REQ-CONTRACT-25: matrix case 11 for Superstructure, a goal stamped with an
+// earlier Driver Station generation is ignored (counts as STOW); the current
+// generation's goal drives.
+TEST_F(SuperstructureAlone, EarlierGenerationTargetIsIgnored) {
+  const IntakeStatus empty{IntakeState::IDLE, false, true};
+  Tick(SuperstructureCommand::INTAKE, empty, kDown);
+  ASSERT_EQ(State(), SuperstructureState::INTAKING);
+  const std::uint64_t before = DriverStationGeneration(sim);
+  hw.set_driver_station(DsPacket(ds::kTeleop));  // disabled
+  sim.step(40ms);
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+  sim.step(20ms);
+  ASSERT_NE(DriverStationGeneration(sim), before);
+  PublishTarget(sim, "superstructure", "teleop",
+                SuperstructureGoal{SuperstructureCommand::INTAKE}, before);
+  sim.publish(topics::kIntakeStatus, empty);
+  sim.publish(topics::kElevatorStatus, kDown);
+  sim.step(20ms);
+  EXPECT_EQ(State(), SuperstructureState::STOWED);
+
+  Tick(SuperstructureCommand::INTAKE, empty, kDown);
+  EXPECT_EQ(State(), SuperstructureState::INTAKING);
+}
+
+// REQ-RT-06: Superstructure's steady-state tick allocates nothing.
+TEST_F(SuperstructureAlone, UpdateDoesNotAllocate) {
+  if (const auto why = AllocationProbe::Unsupported(); !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+  ASSERT_EQ(State(), SuperstructureState::RAISING);
+  PublishTarget(sim, "superstructure", "teleop",
+                SuperstructureGoal{SuperstructureCommand::SCORE_HIGH});
+  sim.publish(topics::kIntakeStatus, kHolding);
+  sim.publish(topics::kElevatorStatus, kDown);
+  AllocationProbe probe;
+  probe.start();
+  sim.step(60ms);
+  EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+  EXPECT_EQ(State(), SuperstructureState::RAISING);
+  EXPECT_DOUBLE_EQ(ElevatorGoalRot(), kHighRot);
+}
+
+// REQ-CONTRACT-18, REQ-SAFE-04: a missing, non-finite or non-positive high_rot
+// fails construction naming the key instead of sending NaN/inf or ejecting
+// stowed.
 TEST(SuperstructureConfig, BadHighRotFailsConstruction) {
-  for (const char* value : {"0.0", "-1.0", "nan", "inf", "-inf", "'ten'"}) {
-    SCOPED_TRACE(value);
+  for (const char* line :
+       {"", "high_rot = 0.0\n", "high_rot = -1.0\n", "high_rot = nan\n",
+        "high_rot = inf\n", "high_rot = -inf\n", "high_rot = 'ten'\n"}) {
+    SCOPED_TRACE(line);
     auto sim = Sim::FromToml(
         std::string{"[robot]\nperiod_us = 20000\ncommand_timeout_us = 100000\n"
-                    "[subsystems.superstructure]\nhigh_rot = "} +
-        value + "\n");
+                    "[subsystems.superstructure]\n"} +
+        line);
     try {
       sim.add<demo::Superstructure>("superstructure");
       ADD_FAILURE() << "constructed";
@@ -691,11 +837,16 @@ TEST_F(ElevatorAlone, DisconnectedFeedbackGoesNeutral) {
 
 // REQ-SAFE-04
 TEST_F(ElevatorAlone, NonFiniteDemandGoesNeutral) {
-  Drive(kHighRot, 50ms);
-  ASSERT_EQ(Applied().mode, Mode::kMotionMagic);
-  Drive(std::numeric_limits<double>::quiet_NaN(), 50ms);
-  ExpectNeutral();
-  EXPECT_DOUBLE_EQ(Status().height_rot(), kHighRot);  // never NaN
+  for (const double bad : {std::numeric_limits<double>::quiet_NaN(),
+                           std::numeric_limits<double>::infinity(),
+                           -std::numeric_limits<double>::infinity()}) {
+    SCOPED_TRACE(bad);
+    Drive(kHighRot, 50ms);
+    ASSERT_EQ(Applied().mode, Mode::kMotionMagic);
+    Drive(bad, 50ms);
+    ExpectNeutral();
+    EXPECT_DOUBLE_EQ(Status().height_rot(), kHighRot);  // never non-finite
+  }
 }
 
 // REQ-SAFE-07: elevator.toml's [targets] replaces [robot.targets]: only the
@@ -1116,6 +1267,124 @@ TEST_F(IntakeAlone, DisconnectedSensorClearsValidityAndLeavesRollerNeutral) {
   EXPECT_TRUE(Status().sensor_connected());
   EXPECT_EQ(Applied().mode, Mode::kVoltage);
   EXPECT_DOUBLE_EQ(Applied().demand, kIntakeVolts);
+}
+
+// REQ-CONTRACT-25: matrix case 4 for Intake, releasing its lane neutralizes
+// the roller and returns to IDLE.
+TEST_F(IntakeAlone, ReleasedLaneGoesNeutral) {
+  Drive(IntakeCommand::INTAKE, 3);
+  ASSERT_EQ(Applied().mode, Mode::kVoltage);
+  ReleaseTarget<IntakeGoal>(sim, "intake", "superstructure");
+  sim.step(40ms);
+  ExpectNeutral();
+  EXPECT_EQ(Status().state(), IntakeState::IDLE);
+}
+
+// REQ-CONTRACT-25: matrix case 5 for Intake, never sending a target keeps the
+// roller neutral and IDLE.
+TEST_F(IntakeAlone, NeverSentGoesNeutral) {
+  sim.step(100ms);
+  ExpectNeutral();
+  EXPECT_EQ(Status().state(), IntakeState::IDLE);
+}
+
+// REQ-CONTRACT-25: matrix case 6 for Intake, losing the Driver Station
+// neutralizes the roller once the DS view goes stale.
+TEST_F(IntakeAlone, DriverStationLossGoesNeutral) {
+  Drive(IntakeCommand::INTAKE, 3);
+  ASSERT_EQ(Applied().mode, Mode::kVoltage);
+  hw.stop_driver_station();
+  Drive(IntakeCommand::INTAKE, 8);  // 160 ms > command_timeout_us (100 ms)
+  ExpectNeutral();
+  EXPECT_EQ(Status().state(), IntakeState::IDLE);
+}
+
+// REQ-SAFE-07: matrix case 10 for Intake, intake.toml's [targets] replaces
+// [robot.targets] so only the superstructure lane drives in teleop and
+// autonomous alike.
+TEST_F(IntakeAlone, OtherModesLaneIsIgnored) {
+  for (const std::uint32_t mode : {ds::kTeleop, ds::kAutonomous}) {
+    SCOPED_TRACE(mode == ds::kTeleop ? "teleop" : "autonomous");
+    hw.set_driver_station(DsPacket(ds::kEnabled | mode));
+    sim.step(20ms);
+    for (int i = 0; i < 3; ++i) {
+      PublishTarget(sim, "intake", "teleop", IntakeGoal{IntakeCommand::INTAKE});
+      PublishTarget(sim, "intake", "auto", IntakeGoal{IntakeCommand::INTAKE});
+      sim.step(20ms);
+    }
+    ExpectNeutral();
+    ReleaseTarget<IntakeGoal>(sim, "intake", "teleop");
+    ReleaseTarget<IntakeGoal>(sim, "intake", "auto");
+  }
+  Drive(IntakeCommand::INTAKE, 3);
+  EXPECT_EQ(Applied().mode, Mode::kVoltage);
+  EXPECT_DOUBLE_EQ(Applied().demand, kIntakeVolts);
+}
+
+// REQ-RT-06: Intake's steady-state tick allocates nothing.
+TEST_F(IntakeAlone, UpdateDoesNotAllocate) {
+  if (const auto why = AllocationProbe::Unsupported(); !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  Drive(IntakeCommand::INTAKE, 3);
+  PublishTarget(sim, "intake", "superstructure",
+                IntakeGoal{IntakeCommand::INTAKE});
+  AllocationProbe probe;
+  probe.start();
+  sim.step(60ms);
+  EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+  EXPECT_EQ(Applied().mode, Mode::kVoltage);
+}
+
+// config/subsystems/intake.toml's intake, as a single-file config with one
+// [roller] key replaced.
+std::string IntakeConfig(const std::string& key, const std::string& value) {
+  std::vector<std::pair<std::string, std::string>> params{
+      {"sensor", "\"beam_break\""},
+      {"intake_v", "8.0"},
+      {"hold_v", "1.0"},
+      {"eject_v", "-10.0"},
+      {"eject_us", "500000"}};
+  std::string toml =
+      "[robot]\nperiod_us = 5000\ncommand_timeout_us = 100000\n\n"
+      "[subsystems.intake]\nperiod_us = 20000\n\n"
+      "[subsystems.intake.roller]\n";
+  for (const auto& [k, v] : params)
+    toml += k + " = " + (k == key ? value : v) + "\n";
+  return toml + R"(
+[subsystems.intake.motors.roller]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+
+[subsystems.intake.digital_inputs.beam_break]
+dio = 0
+)";
+}
+
+// REQ-CONTRACT-18: matrix case 9 for Intake, an invalid [roller] parameter
+// fails construction naming its key.
+TEST(IntakeConfig, BadParameterFailsConstruction) {
+  {
+    auto sim = Sim::FromToml(IntakeConfig("", ""));
+    EXPECT_NO_THROW(sim.add<demo::Intake>("intake"));
+  }
+  const std::vector<std::pair<std::string, std::string>> bad{
+      {"intake_v", "nan"},         {"intake_v", "inf"}, {"hold_v", "nan"},
+      {"eject_v", "nan"},          {"eject_us", "0"},   {"eject_us", "-1"},
+      {"sensor", "\"missing_di\""}};
+  for (const auto& [key, value] : bad) {
+    SCOPED_TRACE(key + " = " + value);
+    auto sim = Sim::FromToml(IntakeConfig(key, value));
+    try {
+      sim.add<demo::Intake>("intake");
+      ADD_FAILURE() << "constructed";
+    } catch (const std::invalid_argument& error) {
+      const std::string expected = key == "sensor" ? "missing_di" : key;
+      EXPECT_NE(std::string{error.what()}.find(expected), std::string::npos)
+          << error.what();
+    }
+  }
 }
 
 }  // namespace

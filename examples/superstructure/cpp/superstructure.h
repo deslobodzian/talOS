@@ -50,9 +50,12 @@ class Superstructure {
     const bool fresh = intake_fresh && elevator_.fresh();
     // Cancellation never waits for a dependency. Forget an interrupted step:
     // recovery must start from fresh observations, not resume an old eject.
+    // Trust has_piece only while the beam break is connected: RollerWithSensor
+    // latches has_piece across a disconnect, which would trap Superstructure
+    // in HOLDING or SCORING without live sensing (REQ-SAFE-46).
     if (command == SuperstructureCommand::STOW || !fresh)
-      sm_.go(intake_fresh && intake_->has_piece() ? State::HOLDING
-                                                  : State::STOWED);
+      sm_.go(intake_fresh && intake_has_piece() ? State::HOLDING
+                                                : State::STOWED);
     else
       advance(command);
 
@@ -93,7 +96,7 @@ class Superstructure {
   }
 
   void advance(SuperstructureCommand command) {
-    const bool has_piece = intake_->has_piece();
+    const bool has_piece = intake_has_piece();
     switch (sm_.state()) {
       case State::STOWED:
         if (has_piece)
@@ -120,6 +123,10 @@ class Superstructure {
         if (!has_piece) sm_.go(State::STOWED);
         break;
     }
+  }
+
+  bool intake_has_piece() const {
+    return intake_->sensor_connected() && intake_->has_piece();
   }
 
   // at_goal for *this* height, not a goal the elevator reached earlier.

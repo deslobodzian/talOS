@@ -8,6 +8,7 @@
 #include <initializer_list>
 #include <set>
 #include <sstream>
+#include <system_error>
 #include <utility>
 
 #include "talOS/introspection/names.h"
@@ -729,6 +730,12 @@ DashboardLayout ParseDashboardLayoutString(std::string_view toml,
 }
 
 DashboardLayout ParseDashboardLayout(const std::filesystem::path& file) {
+  std::error_code ec;
+  if (std::filesystem::is_directory(file, ec)) {
+    throw DashboardLayoutError(file.string() +
+                               ": cannot open the dashboard "
+                               "layout");
+  }
   std::ifstream input(file, std::ios::binary);
   if (!input) {
     throw DashboardLayoutError(file.string() +
@@ -737,6 +744,11 @@ DashboardLayout ParseDashboardLayout(const std::filesystem::path& file) {
   }
   std::ostringstream text;
   text << input.rdbuf();
+  if (input.bad()) {
+    throw DashboardLayoutError(file.string() +
+                               ": cannot open the dashboard "
+                               "layout");
+  }
   return ParseDashboardLayoutString(text.str(), file);
 }
 

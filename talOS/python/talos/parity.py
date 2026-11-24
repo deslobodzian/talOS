@@ -45,6 +45,7 @@ fails, naming the step.
 
 import struct
 
+from talos import _abi
 from talos.testing import Sim, SimHardware
 
 _NS = 1_000_000_000
@@ -64,7 +65,8 @@ class Rig:
         self.generations = {}
         self.ticks = []
         self._observe = observe
-        self._period_ns = round(self.sim.node(node).period * _NS)
+        self._period_ns = _abi.value(
+            _abi.lib.talos_node_period_ns(self.sim.node(node)._handle), 0)
         # Where advance() last left the clock.
         self._advanced_to_ns = self.sim.now_ns
 
@@ -82,12 +84,22 @@ class Rig:
         """Advances the clock by `seconds`, observing at each boundary of
         the node's period it reaches."""
         self.check_clock("Rig.advance")
+        delta_ns = _abi.duration_ns(seconds, "seconds")
+        if seconds < 0 or delta_ns < 0:
+            raise ValueError(
+                f"Rig.advance: seconds must be non-negative, got {seconds!r}")
         now = self.sim.now_ns
-        end = now + round(seconds * _NS)
+        if self._period_ns <= 0:
+            if delta_ns > 0:
+                self.sim._step_ns(delta_ns)
+                now = self.sim.now_ns
+            self._advanced_to_ns = now
+            return
+        end = now + delta_ns
         while now < end:
             boundary = (now // self._period_ns + 1) * self._period_ns
             stop = min(boundary, end)
-            self.sim.step((stop - now) / _NS)
+            self.sim._step_ns(stop - now)
             now = self.sim.now_ns
             if now == boundary:
                 self.ticks.append((now, self.observe()))

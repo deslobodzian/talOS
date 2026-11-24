@@ -32,9 +32,9 @@ def tree(**overrides):
     files = {
         "docs/REQUIREMENTS.md": catalogue(
             row("REQ-SAFE-01", "P0"),
-            row("REQ-SAFE-02", "P1", source='BR "Link timing"'),
+            row("REQ-SAFE-02", "P1", tier='bringup (BR "Link timing")'),
             row("REQ-CONTRACT-01", "P2", tier="contract (gap: TODO ARCH-2)"),
-            row("REQ-RT-01", "P0", source="BENCH.md loop stall check"),
+            row("REQ-RT-01", "P0", tier="bench (BENCH.md loop stall check)"),
             row("REQ-OPS-01", "P1")),
         "TODO.md": "## Open\n\n- [ ] **ARCH-2 — Layers are unchecked.**\n",
         "docs/BENCH.md": "# Bench\n## Loop stall check\n",
@@ -751,6 +751,57 @@ class TraceTest(unittest.TestCase):
         failures, out = check(tree(**{"docs/REQUIREMENTS.md": fenced_cat}))
         self.assertEqual(failures, 1, out)
         self.assertIn("REQ-SAFE-98", out)
+
+    # REQ-DEV-30: BR "..." and BENCH.md references in the Source/Doc column
+    # (such as REQ-SAFE-44 and REQ-DEV-33) or alongside a runnable Cheapest
+    # tier must never silently exempt a requirement from needing tagged tests.
+    def test_doc_column_and_runnable_tier_citations_do_not_exempt_tests(self):
+        cases = (
+            ("doc_column_bench_with_component_tier",
+             row("REQ-SAFE-44", "P0",
+                 source='code Foo.cpp; BENCH.md "Loop stall check"',
+                 tier="component"),
+             "REQ-SAFE-44"),
+            ("doc_column_bringup_with_unit_tier",
+             row("REQ-DEV-33", "P0",
+                 source='RULES 4; BR "Link timing"; TEST §9',
+                 tier="unit"),
+             "REQ-DEV-33"),
+            ("doc_column_bringup_even_with_non_runnable_tier",
+             row("REQ-SAFE-45", "P0",
+                 source='BR "Link timing"',
+                 tier="bringup"),
+             "REQ-SAFE-45"),
+            ("doc_column_bench_even_with_non_runnable_tier",
+             row("REQ-SAFE-46", "P0",
+                 source="BENCH.md loop stall check",
+                 tier="bench"),
+             "REQ-SAFE-46"),
+            ("runnable_plus_bench_citation_in_tier",
+             row("REQ-RT-24", "P0",
+                 tier="unit + bench (BENCH.md loop stall check)"),
+             "REQ-RT-24"),
+        )
+        for name, extra_row, req_id in cases:
+            with self.subTest(name=name):
+                failures, out = check(tree(**{
+                    "docs/REQUIREMENTS.md": catalogue(
+                        row("REQ-SAFE-01", "P0"), extra_row),
+                }))
+                self.assertEqual(failures, 1, out)
+                self.assertIn(f"{req_id} (P0,", out)
+                self.assertIn("has no tagged test", out)
+
+        # A purely non-runnable Cheapest tier citing a real BRINGUP.md or
+        # BENCH.md heading in the Cheapest tier column itself passes.
+        failures, out = check(tree(**{
+            "docs/REQUIREMENTS.md": catalogue(
+                row("REQ-SAFE-01", "P0"),
+                row("REQ-SAFE-50", "P0", tier='bringup (BR "Link timing")'),
+                row("REQ-SAFE-51", "P0",
+                    tier="bench (BENCH.md loop stall check)")),
+        }))
+        self.assertEqual(failures, 0, out)
 
 
 if __name__ == "__main__":

@@ -73,3 +73,15 @@ py_test(
     ],
     deps = ["@rules_python//python/runfiles"],
 )
+
+# REQ-RT-24: the RoboRIO loop (Robot.cpp) makes no Driver Station NetComm call.
+py_test(
+    name = "rio_loop_netcomm_test",
+    size = "small",
+    srcs = ["rio_loop_netcomm_test.py"],
+    data = ["src/main/cpp/Robot.cpp"],
+    env = {
+        "RIO_ROBOT_CPP": "$(rlocationpath src/main/cpp/Robot.cpp)",
+    },
+    deps = ["@rules_python//python/runfiles"],
+)

@@ -801,5 +801,83 @@ TEST(GpuSparseClustersTest, RejectsOutOfBoundsParentLabels) {
   image_u8_destroy(threshim);
 }
 
+TEST(GpuSparseClustersTest, RejectsNullBufShortStrideAndDimensionOverflow) {
+  auto destroy_clusters = [](zarray_t* clusters) {
+    for (int i = 0; i < zarray_size(clusters); ++i) {
+      zarray_t* c = nullptr;
+      zarray_get(clusters, i, reinterpret_cast<void*>(&c));
+      zarray_destroy(c);
+    }
+    zarray_destroy(clusters);
+  };
+
+  constexpr int kWidth = 8;
+  constexpr int kHeight = 8;
+  constexpr uint32_t kTotal = static_cast<uint32_t>(kWidth * kHeight);
+  std::vector<uint32_t> parents(kTotal, 0u);
+  std::vector<uint32_t> sizes(kTotal, 30u);
+  const uint32_t candidate = 2u | (2u << 14) | (1u << 28);
+
+  // 1. threshim->buf == nullptr must return empty without dereferencing buf.
+  {
+    image_u8_t null_buf_im{
+        .width = kWidth, .height = kHeight, .stride = kWidth, .buf = nullptr};
+    zarray_t* clusters = BuildSparseClustersFromGpuLabels(
+        &null_buf_im, kWidth, kHeight, kWidth, parents.data(), sizes.data(),
+        &candidate, 1);
+    ASSERT_NE(clusters, nullptr);
+    EXPECT_EQ(zarray_size(clusters), 0);
+    destroy_clusters(clusters);
+  }
+
+  // 2. Stride smaller than width (ts < w) must be rejected cleanly.
+  {
+    std::vector<uint8_t> raw(static_cast<size_t>(kWidth) * kHeight, 0);
+    raw[2 * kWidth + 3] = 255;
+    image_u8_t short_stride_im{
+        .width = kWidth, .height = kHeight, .stride = 4, .buf = raw.data()};
+    zarray_t* clusters = BuildSparseClustersFromGpuLabels(
+        &short_stride_im, kWidth, kHeight, /*ts=*/kWidth - 1, parents.data(),
+        sizes.data(), &candidate, 1);
+    ASSERT_NE(clusters, nullptr);
+    EXPECT_EQ(zarray_size(clusters), 0);
+    destroy_clusters(clusters);
+  }
+
+  // 3. 65536x65536 overflows uint32_t pixel count: must return empty without
+  // overflowing total or allocating a multi-GB clustermap.
+  {
+    uint8_t dummy = 127;
+    image_u8_t huge_im{
+        .width = 65536, .height = 65536, .stride = 65536, .buf = &dummy};
+    zarray_t* clusters = BuildSparseClustersFromGpuLabels(
+        &huge_im, 65536, 65536, 65536, parents.data(), sizes.data(), &candidate,
+        1);
+    ASSERT_NE(clusters, nullptr);
+    EXPECT_EQ(zarray_size(clusters), 0);
+    destroy_clusters(clusters);
+  }
+
+  // 4. Subsequent valid call on the same thread succeeds cleanly (thread_local
+  // state remains clean).
+  {
+    image_u8_t* threshim = image_u8_create(kWidth, kHeight);
+    ASSERT_NE(threshim, nullptr);
+    std::memset(threshim->buf, 127,
+                static_cast<size_t>(threshim->stride) * kHeight);
+    threshim->buf[2 * threshim->stride + 2] = 0;
+    threshim->buf[2 * threshim->stride + 3] = 255;
+    parents[2 * kWidth + 2] = 0;
+    parents[2 * kWidth + 3] = 1;
+    zarray_t* clusters = BuildSparseClustersFromGpuLabels(
+        threshim, kWidth, kHeight, threshim->stride, parents.data(),
+        sizes.data(), &candidate, 1);
+    ASSERT_NE(clusters, nullptr);
+    EXPECT_EQ(zarray_size(clusters), 1);
+    destroy_clusters(clusters);
+    image_u8_destroy(threshim);
+  }
+}
+
 }  // namespace
 }  // namespace talos::vision::metal

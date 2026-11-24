@@ -58,11 +58,11 @@ class MetalAprilTagBackend : public talos::vision::ComputeBackend {
       double tag_size_meters);
 
   void SetOptions(const talos::vision::apriltag::DetectorOptions& options);
-  const talos::vision::apriltag::DetectorOptions& options() const;
+  talos::vision::apriltag::DetectorOptions options() const;
 
   // Stage timings (grayscale_us, threshold_us, quad_us, decode_us,
   // pose_us, total_us)
-  const talos::vision::StageTimings& last_timings() const;
+  talos::vision::StageTimings last_timings() const;
   bool is_fallback() const;
 
   // GPU-accelerated Tile-Based Adaptive Thresholding

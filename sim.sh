@@ -53,10 +53,12 @@ JOYSTICK_SCHEDULE=""
 ALLIANCE=""
 GATEWAY_ARGS=()
 CONFIG=""
-# HTTP port only: the telemetry topic lives in the robot config
-# ([subsystems.telemetry] topic), read by the nodes that own each end, so this
-# script never spells it twice.
-HTTP_PORT=5800
+# HTTP port only: defaults to the resolved config's [studio] http_port (else
+# 5800) unless --http-port overrides it; the telemetry topic lives in the
+# robot config ([subsystems.telemetry] topic), read by the nodes that own
+# each end, so this script never spells it twice.
+HTTP_PORT=""
+HTTP_PORT_EXPLICIT=0
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31msim.sh:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -101,7 +103,7 @@ Options:
                     requires --sim-gateway, which always enables --physics)
   --no-open         start Studio but do not open a browser
   --duration-s N    pass --duration-s N to the launcher
-  --http-port N     Studio HTTP port (default 5800)
+  --http-port N     Studio HTTP port (default: config [studio] http_port, else 5800)
   -h, --help        this message
 
 Each run's session logs go to /tmp/talos_logs/<session_id> (override the root
@@ -127,7 +129,11 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --no-open)     WANT_OPEN=0 ;;
-    --duration-s)  DURATION="$2"; shift ;;
+    --duration-s)
+      [ $# -ge 2 ] || { echo "sim.sh: --duration-s needs an argument" >&2; exit 2; }
+      DURATION="$2"
+      shift
+      ;;
     --mode-schedule)
       [ $# -ge 2 ] || { echo "sim.sh: --mode-schedule needs an argument" >&2; exit 2; }
       MODE_SCHEDULE="$2"
@@ -143,7 +149,12 @@ while [ $# -gt 0 ]; do
       ALLIANCE="$2"
       shift
       ;;
-    --http-port)   HTTP_PORT="$2"; shift ;;
+    --http-port)
+      [ $# -ge 2 ] || { echo "sim.sh: --http-port needs an argument" >&2; exit 2; }
+      HTTP_PORT="$2"
+      HTTP_PORT_EXPLICIT=1
+      shift
+      ;;
     -h|--help)     usage; exit 0 ;;
     *) echo "sim.sh: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
   esac
@@ -248,8 +259,14 @@ print("nodes", *config["nodes"])
 print("hardware_node", robot.get("hardware_node", "//talOS/bridge:hardware_node"))
 print("sim_gateway", robot.get("sim_gateway", ""))
 print("studio_bridge", studio.get("bridge", "//studio/bridge:studio_bridge"))
+http_port = studio.get("http_port")
+print("studio_http_port", 5800 if http_port is None else http_port)
 ')" || die "cannot resolve $CONFIG"
 target() { printf '%s\n' "$TARGETS" | sed -n "s|^$1 ||p"; }
+if [ "$HTTP_PORT_EXPLICIT" != "1" ]; then
+  HTTP_PORT="$(target studio_http_port)"
+  [ -n "$HTTP_PORT" ] || HTTP_PORT=5800
+fi
 if [ "$WANT_GATEWAY" = "1" ] && [ -z "$(target sim_gateway)" ]; then
   die "$CONFIG sets no [robot] sim_gateway for --sim-gateway to start"
 fi
@@ -326,7 +343,9 @@ cleanup() {
   wait 2>/dev/null
   echo "sim.sh: session logs in $SESSION_DIR (launcher/RIO output in $LOG_DIR)"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 track() { PIDS="$PIDS $1"; NAMES="$NAMES $2"; }
 
@@ -429,7 +448,7 @@ LAUNCH_ARGS=(--config "$CONFIG" --sim --session-id "$SESSION_ID" --output-dir "$
 # for it and forwards the HTTP port override.
 if [ "$WANT_STUDIO" = "1" ]; then
   LAUNCH_ARGS+=(--start-studio-bridge)
-  [ "$HTTP_PORT" != "5800" ] && LAUNCH_ARGS+=(--studio-http-port "$HTTP_PORT")
+  [ "$HTTP_PORT_EXPLICIT" = "1" ] && LAUNCH_ARGS+=(--studio-http-port "$HTTP_PORT")
 fi
 # The lightweight sim gateway stands in for the controller processor only
 # in mode 3 (--sim-gateway). In mode 1 WPILib publishes /hw/state; in mode 2

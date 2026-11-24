@@ -141,6 +141,10 @@ class ConfigPersister {
   uint32_t Tick(bool disabled);
 
  private:
+  // Test-only access to mutex_ so tests can hold it deterministically while
+  // verifying Tick() never blocks on it (REQ-CONTRACT-06).
+  friend struct ConfigPersisterTestPeer;
+
   // One configuration's ConfigurationId and persisted bytes in fixed storage.
   struct Persisted {
     uint64_t id{0};

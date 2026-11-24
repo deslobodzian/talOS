@@ -9,7 +9,7 @@ import math
 import os
 import threading
 
-_EXPECTED_ABI_VERSION = 39
+_EXPECTED_ABI_VERSION = 40
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int8, c_uint8, c_int16 = (ctypes.c_int8, ctypes.c_uint8, ctypes.c_int16)
@@ -278,6 +278,7 @@ _SIGNATURES = {
     "talos_position_mechanism_stop": (c_int32, [c_void_p, c_int64]),
     "talos_position_mechanism_update": (c_int32, [c_void_p, c_int64]),
     "talos_position_mechanism_clear_fault": (c_int32, [c_void_p, c_int64]),
+    "talos_position_mechanism_homed": (c_int32, [c_void_p, c_int64]),
     "talos_position_mechanism_state": (c_int32, [
         c_void_p, c_int64, _P(PositionMechanismState), c_void_p, c_uint32]),
     "talos_velocity_mechanism_open": (c_int64, [c_void_p, c_char_p]),

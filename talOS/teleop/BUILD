@@ -86,6 +86,16 @@ py_test(
 )
 
 cc_test(
+    name = "deadband_test",
+    size = "small",
+    srcs = ["deadband_test.cc"],
+    deps = [
+        ":deadband",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "node_test",
     size = "small",
     srcs = ["node_test.cc"],

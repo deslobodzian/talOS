@@ -156,5 +156,71 @@ TEST(Scheduler, DisablingAPeriodicTimerStopsIt) {
   EXPECT_FALSE(scheduler.pop_expired(at(10'000), expiration));
 }
 
+TEST(Scheduler, ShiftSaturatesAtTimeBoundsAndPreservesHeapOrder) {
+  Scheduler upper;
+  upper.schedule(2, MonotonicTime::max() - Duration{5});
+  upper.schedule(1, MonotonicTime::max() - Duration{1});
+  upper.shift(Duration{10});
+  EXPECT_EQ(upper.next_deadline(), MonotonicTime::max());
+  // Both saturated to MonotonicTime::max(), so tie-breaking must fire id 1
+  // before id 2.
+  EXPECT_EQ(drain(upper, MonotonicTime::max()),
+            (std::vector<std::uint16_t>{1, 2}));
+  EXPECT_TRUE(upper.empty());
+
+  Scheduler lower;
+  lower.schedule(1, MonotonicTime::min() + Duration{5});
+  lower.shift(Duration{-10});
+  EXPECT_EQ(lower.next_deadline(), MonotonicTime::min());
+  EXPECT_EQ(drain(lower, MonotonicTime::min()),
+            (std::vector<std::uint16_t>{1}));
+}
+
+TEST(Scheduler, PeriodicTimerNearMaxStopsRearmingInsteadOfOverflowing) {
+  {
+    Scheduler scheduler;
+    const MonotonicTime deadline = MonotonicTime::max() - Duration{5};
+    scheduler.schedule(1, deadline, Duration{10});
+
+    Expiration expiration{};
+    ASSERT_TRUE(scheduler.pop_expired(MonotonicTime::max(), expiration));
+    EXPECT_EQ(expiration.id, 1u);
+    EXPECT_EQ(expiration.deadline, deadline);
+    EXPECT_EQ(expiration.cycles, 1u);
+    // Next phase would exceed MonotonicTime::max(), so it stops re-arming
+    // instead of wrapping negative and looping forever.
+    EXPECT_TRUE(scheduler.empty());
+    EXPECT_FALSE(scheduler.pop_expired(MonotonicTime::max(), expiration));
+  }
+
+  {
+    Scheduler scheduler;
+    const MonotonicTime deadline = MonotonicTime::max() - Duration{10};
+    scheduler.schedule(1, deadline, Duration{10});
+
+    Expiration expiration{};
+    ASSERT_TRUE(scheduler.pop_expired(deadline, expiration));
+    EXPECT_EQ(expiration.deadline, deadline);
+    EXPECT_EQ(expiration.cycles, 1u);
+    EXPECT_EQ(scheduler.next_deadline(), MonotonicTime::max());
+
+    ASSERT_TRUE(scheduler.pop_expired(MonotonicTime::max(), expiration));
+    EXPECT_EQ(expiration.deadline, MonotonicTime::max());
+    EXPECT_EQ(expiration.cycles, 1u);
+    EXPECT_TRUE(scheduler.empty());
+  }
+
+  {
+    Scheduler scheduler;
+    scheduler.schedule(1, MonotonicTime::min(), Duration{10});
+
+    Expiration expiration{};
+    ASSERT_TRUE(scheduler.pop_expired(MonotonicTime::max(), expiration));
+    EXPECT_EQ(expiration.deadline, MonotonicTime::min());
+    EXPECT_GT(expiration.cycles, 1u);
+    EXPECT_TRUE(scheduler.empty());
+  }
+}
+
 }  // namespace
 }  // namespace talos::event

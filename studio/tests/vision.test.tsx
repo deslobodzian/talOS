@@ -140,3 +140,42 @@ test('vision compares against sim truth only when sim has finite data', () => {
     assert.ok(html.includes(reference), `sim x ${simX}`);
   }
 });
+
+// REQ-OPS-36, REQ-OPS-37: non-finite camera health and estimator validity
+// samples (NaN, +/-Infinity) must render as unknown badges, never HEALTHY/VALID.
+test('vision renders non-finite camera health and estimator validity as unknown', () => {
+  for (const bad of [NaN, Infinity, -Infinity]) {
+    const channels: Record<string, number> = {
+      'front_camera/state/pose/x_m': 1,
+      'front_camera/state/pose/y_m': 2,
+      'front_camera/state/x_std_m': 0.05,
+      'front_camera/state/tag_count': 2,
+      'front_camera/status/healthy': bad,
+      'pose_estimator/state/pose/x_m': 1,
+      'pose_estimator/state/pose/y_m': 2,
+      'pose_estimator/state/valid': bad,
+      'pose_estimator/state/observation_accepted_count': 5
+    };
+    const studio = createStaticStudio({
+      frames: [{
+        stream_id: '1', sequence_id: '0', timestamp_ns: '1000000000', dictionary_id: 0,
+        chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+        channels,
+        units: Object.fromEntries(Object.keys(channels).map(k => [k, ''])),
+        labels: {}
+      }],
+      playback: {mode: 'PAUSED', cursor_ns: '1000000000'}
+    });
+    const html = renderToStaticMarkup(
+        <StudioProvider studio={studio}>
+          <visionPanel.component config={visionPanel.defaultConfig}
+                                 setConfig={() => {}} instanceId="test"/>
+        </StudioProvider>);
+    assert.doesNotMatch(html, />HEALTHY</, `non-finite healthy rendered HEALTHY for ${bad}`);
+    assert.doesNotMatch(html, />UNHEALTHY</, `non-finite healthy rendered UNHEALTHY for ${bad}`);
+    assert.doesNotMatch(html, />VALID</, `non-finite valid rendered VALID for ${bad}`);
+    assert.doesNotMatch(html, />INVALID</, `non-finite valid rendered INVALID for ${bad}`);
+    assert.equal((html.match(/>unknown</g) ?? []).length, 2,
+                 `expected two unknown badges for ${bad}: ${html}`);
+  }
+});

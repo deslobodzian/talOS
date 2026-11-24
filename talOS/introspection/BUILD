@@ -25,6 +25,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//talOS/events:events_core",
+        "//talOS/schema:identity",
         "//talOS/schema:verify",
         "@flatbuffers//:runtime_cc",
     ],

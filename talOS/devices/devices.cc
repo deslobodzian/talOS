@@ -1274,10 +1274,10 @@ class DriverStationLink {
     if (boots_.retired(next.boot_id)) return;
     if (!boots_.current(next.boot_id)) {
       boots_.Enter(next.boot_id);
-    } else if (next.sample_time_us > 0 && data_.sample_time_us > 0 &&
-               (next.sample_time_us < data_.sample_time_us ||
-                (next.mode_since_us != 0 &&
-                 next.mode_since_us < data_.mode_since_us))) {
+    } else if ((data_.sample_time_us > 0 &&
+                next.sample_time_us <= data_.sample_time_us) ||
+               (data_.mode_since_us > 0 &&
+                next.mode_since_us < data_.mode_since_us)) {
       return;
     }
     const Time published =

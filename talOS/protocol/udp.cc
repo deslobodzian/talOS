@@ -73,6 +73,14 @@ bool SetNonBlocking(uintptr_t socket_handle) {
   const int flags = fcntl(fd, F_GETFL, 0);
   return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
+
+#if !defined(SOCK_CLOEXEC)
+bool SetCloseOnExec(uintptr_t socket_handle) {
+  const NativeSocket fd = static_cast<NativeSocket>(socket_handle);
+  const int flags = fcntl(fd, F_GETFD, 0);
+  return flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
+}
+#endif
 #endif
 
 // A send that fails returns its error, never SIGPIPE: MSG_NOSIGNAL on every
@@ -120,7 +128,7 @@ RuntimeUdpPeer::RuntimeUdpPeer(RuntimeUdpPeer&& other) noexcept
       stats_(other.stats_),
       tx_buffer_(other.tx_buffer_),
       rx_buffer_(other.rx_buffer_),
-      opened_(other.opened_),
+      opened_(std::exchange(other.opened_, false)),
       local_address_(other.local_address_),
       local_port_(other.local_port_),
       remote_address_(other.remote_address_),
@@ -137,7 +145,7 @@ RuntimeUdpPeer& RuntimeUdpPeer::operator=(RuntimeUdpPeer&& other) noexcept {
     stats_ = other.stats_;
     tx_buffer_ = other.tx_buffer_;
     rx_buffer_ = other.rx_buffer_;
-    opened_ = other.opened_;
+    opened_ = std::exchange(other.opened_, false);
     local_address_ = other.local_address_;
     local_port_ = other.local_port_;
     remote_address_ = other.remote_address_;
@@ -164,7 +172,8 @@ UdpStatus RuntimeUdpPeer::Open(const char* local_address, uint16_t local_port,
   bool remote_ok = false;
   const sockaddr_in remote =
       MakeAddress(remote_address, remote_port, &remote_ok);
-  if (!remote_ok || remote.sin_addr.s_addr == htonl(INADDR_ANY)) {
+  if (!remote_ok || remote.sin_addr.s_addr == htonl(INADDR_ANY) ||
+      (options.connect_peer && remote_port == 0)) {
     return UdpStatus::kInvalidArgument;
   }
   local_address_ = local.sin_addr.s_addr;
@@ -194,8 +203,13 @@ UdpStatus RuntimeUdpPeer::Reopen() {
 }
 
 UdpStatus RuntimeUdpPeer::OpenSocket() {
+#if defined(SOCK_CLOEXEC)
+  const uintptr_t new_socket = static_cast<uintptr_t>(
+      socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP));
+#else
   const uintptr_t new_socket =
       static_cast<uintptr_t>(socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+#endif
   if (new_socket == kInvalidSocket) {
     return UdpStatus::kSocketError;
   }
@@ -412,6 +426,11 @@ UdpStatus RuntimeUdpPeer::TryReceive(DecodedFrame* out) {
 }
 
 UdpStatus RuntimeUdpPeer::ConfigureSocket(const UdpSocketOptions& options) {
+#if !defined(_WIN32) && !defined(SOCK_CLOEXEC)
+  if (!SetCloseOnExec(socket_)) {
+    return UdpStatus::kSocketError;
+  }
+#endif
 #if defined(SO_NOSIGPIPE)
   int no_sigpipe = 1;
   if (setsockopt(ToNativeSocket(socket_), SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe,
@@ -481,7 +500,7 @@ UdpStatus RuntimeUdpPeer::ConfigureSocket(const UdpSocketOptions& options) {
 // here: Send() returns it as kWouldBlock.
 bool SendErrorNeedsNewSocket(int error) {
 #if defined(_WIN32)
-  return error == WSAESHUTDOWN || error == WSAENOTCONN ||
+  return error == WSAEBADF || error == WSAESHUTDOWN || error == WSAENOTCONN ||
          error == WSAEDESTADDRREQ || error == WSAEADDRNOTAVAIL ||
          error == WSAENETUNREACH || error == WSAENOTSOCK;
 #else
