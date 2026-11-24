@@ -11,8 +11,10 @@ It holds a C++ node (`roller/`) and a Python node (`gate/`), written as
 teleop and telemetry nodes, all listed in `robot.toml`. talOS's own
 `bazel build //...` skips this directory (`.bazelignore`); it is a separate
 workspace. `talos_checks/` checks talOS itself from a dependent repository
-(`session_report` on a session talOS's fixture records), nothing of this
-robot's.
+(`session_report` on a session talOS's fixture records, `rio_gradlew_test`
+for `@talos//controller_processor/rio:gradlew`, and
+`tomlplusplus_compile_check` for `@talos//third_party:tomlplusplus`), nothing
+of this robot's.
 
 It is also the template of a team's robot repository:
 `bazel run //tools:new_robot -- <name> --standalone DIR`, from a talOS
@@ -27,7 +29,7 @@ this fixture means saying there whether a robot repository gets the file.
 
 ```sh
 cd examples/robot_repo
-bazel test //...                       # graph test, node tests, sim smoke, Studio, bundle install, pin, trace and session_report tests
+bazel test //...                       # graph test, node tests, sim smoke, Studio, bundle install, pin, trace and talos_checks (session_report, rio_gradlew_test, tomlplusplus_compile_check)
 bazel build //:robot_bundle            # the deployable bundle (--config=release records the revision)
 bazel run //:sim -- --duration-s 10    # the robot against the simulator
 bazel run //:sim -- --start-studio-bridge   # with Studio (below)

@@ -32,7 +32,7 @@ RULES.md 3, docs/TESTING.md §6.1 and §8.1, docs/METHODOLOGY.md §9 and §10
   `condition_variable[_any]`, `pthread_mutex_lock`; Python
   `threading.Lock`/`RLock`/`Semaphore`/`BoundedSemaphore`/`Condition`);
 - `retry`: `flaky = True` or `--flaky_test_attempts` in a BUILD or `.bzl`
-  file, `.bazelrc`, a workflow or a shell script.
+  file, `.bazelrc` (or any `*.bazelrc`), a workflow or a shell script.
 
 A test source is a `*_test.cc`, `*_test.cpp`, `*_test.py`, `test_*.py`,
 `test.cc`, `test.cpp` or `test.py` file (`*_test.cpp`: the RoboRIO program's
@@ -214,8 +214,8 @@ def is_studio_test(path):
 
 def is_retry_config(path):
     name = os.path.basename(path)
-    return (name in ("BUILD", "BUILD.bazel", ".bazelrc") or
-            name.endswith((".bzl", ".sh")) or
+    return (name in ("BUILD", "BUILD.bazel") or
+            name.endswith((".bazelrc", ".bzl", ".sh")) or
             (path.startswith(".github/workflows/") and
              name.endswith((".yaml", ".yml"))))
 
@@ -223,6 +223,7 @@ def is_retry_config(path):
 def _build_declares_node(text):
     """True when a BUILD file invokes any node macro (directly or via an
     aliased `load()`). Falls back to regex on SyntaxError to fail closed."""
+    text = text.removeprefix("\ufeff")
     try:
         tree = ast.parse(text)
     except SyntaxError:
@@ -557,6 +558,7 @@ def _strip_hash_comments(text, python_strings=True, strip_strings=False):
 
 
 def _strip_comments_with_lines(text, path, strip_strings=False):
+    text = text.removeprefix("\ufeff")
     if path.endswith(C_COMMENT_SUFFIXES):
         return _strip_c_comments_with_lines(
             text, is_ts=path.endswith((".ts", ".tsx")),
@@ -586,8 +588,9 @@ def _line_starts(text):
 
 def scan(files, read):
     """{(path, kind): [line numbers]} of every hit in `files`."""
+    read_clean = lambda p: read(p).removeprefix("\ufeff")
     hits = {}
-    packages = node_packages(files, read)
+    packages = node_packages(files, read_clean)
     build_dirs = {
         os.path.dirname(path)
         for path in files
@@ -613,7 +616,7 @@ def scan(files, read):
                 patterns["lock"] = PY_NODE_LOCK_PATTERN
         if is_test or is_node:
             stripped, line_map = _strip_comments_with_lines(
-                read(path), path, strip_strings=True)
+                read_clean(path), path, strip_strings=True)
             aliases = {a or b for a, b in CLOCK_ALIAS.findall(stripped)}
             if is_node:
                 aliases |= {
@@ -633,7 +636,8 @@ def scan(files, read):
         if not patterns:
             continue
         if stripped is None:
-            stripped, line_map = _strip_comments_with_lines(read(path), path)
+            stripped, line_map = _strip_comments_with_lines(
+                read_clean(path), path)
         starts = None if line_map is not None else _line_starts(stripped)
         for kind, pattern in patterns.items():
             lines = []
@@ -656,6 +660,7 @@ ALLOWED_KINDS = ("sleep", "clock", "random", "io", "lock", "retry")
 
 def parse_allowlist(text):
     """({(path, kind): count or None}, [errors]) from the allowlist's text."""
+    text = text.removeprefix("\ufeff")
     entries, errors = {}, []
     for number, line in enumerate(text.splitlines(), 1):
         line = line.strip()
@@ -748,7 +753,7 @@ def tracked_files():
 
 def read_file(path):
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
+        with open(path, encoding="utf-8-sig", errors="replace") as f:
             return f.read()
     except (FileNotFoundError, IsADirectoryError):
         return ""

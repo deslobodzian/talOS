@@ -694,15 +694,20 @@ def plan_repository(talos_root, target_dir, name, fixture=None):
     checkout at `talos_root`."""
     if problem := check_robot_name(name):
         raise Refused(problem)
+    typed = os.path.abspath(target_dir)
+    if os.path.islink(typed):
+        raise Refused(f"{target_dir} is a symbolic link")
     talos_real = os.path.realpath(talos_root)
-    target = os.path.realpath(target_dir)
+    target = os.path.realpath(typed)
     if target == talos_real or target.startswith(talos_real + os.sep):
         raise Refused(f"{target_dir} is inside the talOS checkout "
                       f"{talos_real}; a robot repository is a workspace "
                       "of its own, outside it")
-    if os.path.lexists(target) and (not os.path.isdir(target)
-                                    or os.listdir(target)):
-        raise Refused(f"{target_dir} already exists and is not empty")
+    if os.path.lexists(typed):
+        if not os.path.isdir(typed):
+            raise Refused(f"{target_dir} already exists and is not a directory")
+        if os.listdir(typed):
+            raise Refused(f"{target_dir} already exists and is not empty")
     fixture = fixture or os.path.join(talos_real, FIXTURE)
     talos, _ = talos_path(talos_real, target)
     files = {}
@@ -722,7 +727,6 @@ def plan_repository(talos_root, target_dir, name, fixture=None):
     # file by its path relative to that same target, and a user reads the
     # directory they named. The real path serves only the checks above and
     # talOS's path from it.
-    typed = os.path.abspath(target_dir)
     return [(os.path.join(typed, path), content)
             for path, content in sorted(files.items())]
 
@@ -732,20 +736,27 @@ def write_repository(target, writes):
     `target`, all or nothing: into a hidden sibling, renamed into place
     (over an empty `target`) at the end, and removed on failure. An OSError
     is Refused."""
-    parent = os.path.dirname(os.path.abspath(target))
+    typed = os.path.abspath(target)
+    if os.path.lexists(typed):
+        if os.path.islink(typed):
+            raise Refused(f"cannot write {target}: target is a symbolic link")
+        if not os.path.isdir(typed):
+            raise Refused(
+                f"cannot write {target}: target already exists and is not a directory")
+    parent = os.path.dirname(typed)
     scratch = None
     try:
         os.makedirs(parent, exist_ok=True)
         scratch = tempfile.mkdtemp(
-            prefix=f".{os.path.basename(target)}.new-", dir=parent)
+            prefix=f".{os.path.basename(typed)}.new-", dir=parent)
         for path, content in writes:
-            full = os.path.join(scratch, os.path.relpath(path, target))
+            full = os.path.join(scratch, os.path.relpath(path, typed))
             os.makedirs(os.path.dirname(full), exist_ok=True)
             with open(full, "w", encoding="utf-8", newline="\n") as f:
                 f.write(content)
         # mkdtemp's 0700, as a directory made by hand would be.
         os.chmod(scratch, 0o777 & ~current_umask())
-        os.rename(scratch, target)
+        os.rename(scratch, typed)
     except OSError as err:
         if scratch is not None:
             shutil.rmtree(scratch, ignore_errors=True)
