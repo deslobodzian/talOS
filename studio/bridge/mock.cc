@@ -80,8 +80,9 @@ int main(int argc, char** argv) try {
                           Talos::Telemetry::ChannelKind_Double});
   }
   std::optional<RTMSQueue> pieces;
+  RTMSQueue* pieces_queue = nullptr;
   if (with_pieces) {
-    pieces.emplace(
+    pieces_queue = &pieces.emplace(
         ::sim::topics::kPieces, sizeof(::sim::GamePieces),
         alignof(::sim::GamePieces), talos::schema::Of<::sim::GamePieces>(),
         talos::hardware::sim::kPiecesSlots,
@@ -165,7 +166,7 @@ int main(int argc, char** argv) try {
                        const talos::telemetry::PageSpan&) { publish(page); })) {
       throw std::logic_error("mock: a value page outgrew its bound");
     }
-    if (pieces && seq % 10 == 0) {
+    if (pieces_queue != nullptr && seq % 10 == 0) {
       constexpr std::uint32_t kPieces = 504;
       const auto moved = static_cast<float>(seq) * 0.001F;
       ::sim::GamePieces message{};
@@ -183,8 +184,9 @@ int main(int argc, char** argv) try {
         message.mutable_z_m()->Mutate(at, 0.075F);
         message.mutable_in_play()->Mutate(at, i < 456);
       }
-      if (pieces->write(std::as_bytes(std::span<const ::sim::GamePieces, 1>{
-              &message, 1})) != WriteResult::SUCCESS) {
+      if (pieces_queue->write(std::as_bytes(
+              std::span<const ::sim::GamePieces, 1>{&message, 1})) !=
+          WriteResult::SUCCESS) {
         throw std::runtime_error("mock: failed to write pieces slot");
       }
     }
