@@ -37,19 +37,21 @@ std::map<pid_t, int>& ProcessLifetimes() {
   return lifetimes;
 }
 
-// Closes every descriptor but `keep`. System calls only, so it is safe in a
-// forked child of a multithreaded process.
-void CloseDescriptorsExcept(int keep) {
+// Closes every descriptor except `keep_a` and `keep_b`. System calls only, so
+// it is safe in a forked child of a multithreaded process.
+void CloseDescriptorsExcept(int keep_a, int keep_b) {
 #if defined(__linux__) && defined(SYS_close_range)
-  // Linux 5.9+: two calls, however high RLIMIT_NOFILE is.
-  const auto kept = static_cast<unsigned>(keep);
-  if ((keep == 0 || ::syscall(SYS_close_range, 0u, kept - 1, 0u) == 0) &&
-      ::syscall(SYS_close_range, kept + 1, ~0u, 0u) == 0)
+  // Linux 5.9+: at most three calls, however high RLIMIT_NOFILE is.
+  const unsigned lo = static_cast<unsigned>(keep_a < keep_b ? keep_a : keep_b);
+  const unsigned hi = static_cast<unsigned>(keep_a < keep_b ? keep_b : keep_a);
+  if ((lo == 0 || ::syscall(SYS_close_range, 0u, lo - 1, 0u) == 0) &&
+      (hi <= lo + 1 || ::syscall(SYS_close_range, lo + 1, hi - 1, 0u) == 0) &&
+      ::syscall(SYS_close_range, hi + 1, ~0u, 0u) == 0)
     return;
 #endif
   const int limit = ::getdtablesize();
   for (int fd = 0; fd < limit; ++fd) {
-    if (fd != keep) ::close(fd);
+    if (fd != keep_a && fd != keep_b) ::close(fd);
   }
 }
 
@@ -348,11 +350,13 @@ pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
     IgnoreSignal(SIGINT);
     IgnoreSignal(SIGTERM);
     IgnoreSignal(SIGHUP);
-    ::close(errors[1]);
     // Unlike the node it never execs, so any other descriptor of the
     // launcher's process, close-on-exec or not, would stay open for as long
     // as the node runs: another thread's registry lock would stay locked.
-    CloseDescriptorsExcept(lifetime[0]);
+    // Close them before releasing errors[1] so EOF on errors[0] strictly
+    // guarantees the guardian holds only lifetime[0] when SpawnProcess returns.
+    CloseDescriptorsExcept(lifetime[0], errors[1]);
+    ::close(errors[1]);
     char unused;
     for (;;) {
       const ssize_t got = ::read(lifetime[0], &unused, 1);
