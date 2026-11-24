@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -125,13 +126,39 @@ void EncodeColorConvert(MTL::ComputeCommandEncoder* enc,
 // overhead exceeds the relocated fits; blur/pick/combos dominate and stay
 // CPU). Quad fitting therefore stays on CPU by measurement, not by default.
 
+// Validates dimensions/stride and computes the effective row stride without
+// signed 32-bit overflow. Rejects negative stride, stride < width * bpp,
+// stride > INT_MAX, or total byte size overflow.
+bool ComputeValidatedStride(int width, int height, int stride,
+                            PixelFormat format, int* actual_stride) {
+  if (width <= 0 || height <= 0 || stride < 0) {
+    return false;
+  }
+  const size_t bpp = BytesPerPixel(format);
+  const size_t min_stride = static_cast<size_t>(width) * bpp;
+  if (min_stride > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return false;
+  }
+  if (stride > 0 && static_cast<size_t>(stride) < min_stride) {
+    return false;
+  }
+  const size_t effective_stride =
+      (stride > 0) ? static_cast<size_t>(stride) : min_stride;
+  if (effective_stride >
+      std::numeric_limits<size_t>::max() / static_cast<size_t>(height)) {
+    return false;
+  }
+  *actual_stride = static_cast<int>(effective_stride);
+  return true;
+}
+
 }  // namespace
 
 struct MetalAprilTagBackend::Impl {
   talos::vision::apriltag::DetectorOptions options;
-  // Recursive: Detect() holds the lock while invoking RunGpuThreshold(),
-  // which also locks to protect the shared cached buffers.
-  std::recursive_mutex mutex;
+  // Recursive: Execute()/Detect() hold the lock while invoking Detect() and
+  // RunGpuThreshold(), which also lock to protect shared cached buffers.
+  mutable std::recursive_mutex mutex;
   apriltag_family_t* tf{nullptr};
   apriltag_detector_t* td{nullptr};
   std::string active_family;
@@ -334,12 +361,16 @@ struct MetalAprilTagBackend::Impl {
       PixelFormat format,
       const talos::vision::apriltag::CameraIntrinsics* p_intrinsics,
       double tag_size_meters) {
-    const int row_stride = stride > 0
-                               ? stride
-                               : static_cast<int>(static_cast<size_t>(width) *
-                                                  BytesPerPixel(format));
+    int row_stride = 0;
+    if (data == nullptr ||
+        !ComputeValidatedStride(width, height, stride, format, &row_stride)) {
+      return {};
+    }
     Frame frame(0, 0, 0, event::steady_now(), width, height, format,
                 row_stride);
+    if (!frame.holds_image() || frame.mutable_data() == nullptr) {
+      return {};
+    }
     std::memcpy(frame.mutable_data(), data,
                 static_cast<size_t>(row_stride) * height);
     const auto result = compute_cpu_backend->Execute(frame);
@@ -371,30 +402,31 @@ struct MetalAprilTagBackend::Impl {
       PixelFormat format,
       const talos::vision::apriltag::CameraIntrinsics* p_intrinsics,
       double tag_size_meters) {
-    if (data == nullptr || width <= 0 || height <= 0) {
+    int actual_stride = 0;
+    if (data == nullptr || !ComputeValidatedStride(width, height, stride,
+                                                   format, &actual_stride)) {
       return {};
     }
 
     std::lock_guard<std::recursive_mutex> detect_lock(mutex);
     last_cpu_fallback = false;
+    last_timings = talos::vision::StageTimings{};
+    if (!apriltag_image_dimensions_supported(td, width, height)) {
+      return {};
+    }
     if (is_fallback || options.quad_sigma != 0 ||
         (options.quad_decimate != 1 && options.quad_decimate != 2)) {
-      return CpuDetect(data, width, height, stride, format, p_intrinsics,
+      return CpuDetect(data, width, height, actual_stride, format, p_intrinsics,
                        tag_size_meters);
     }
 
 #if defined(__APPLE__)
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
 
-    // Fresh counters every frame: threshold/CCL accumulate with += below,
-    // so stale values must not carry over.
-    last_timings = talos::vision::StageTimings{};
-
-    const size_t bpp = BytesPerPixel(format);
-    const int actual_stride =
-        (stride > 0) ? stride : width * static_cast<int>(bpp);
-    const size_t in_bytes = static_cast<size_t>(actual_stride) * height;
-    const size_t gray_bytes = static_cast<size_t>(width) * height;
+    const size_t in_bytes =
+        static_cast<size_t>(actual_stride) * static_cast<size_t>(height);
+    const size_t gray_bytes =
+        static_cast<size_t>(width) * static_cast<size_t>(height);
 
     MTL::Buffer* in_buf = nullptr;
     bool in_buf_needs_release = false;
@@ -490,10 +522,14 @@ struct MetalAprilTagBackend::Impl {
     if (pso_tile_min_max_4x4 != nullptr &&
         pso_tile_blur_and_threshold != nullptr && detect_gray_buf != nullptr &&
         detect_w >= 4 && detect_h >= 4) {
+      const uint32_t min_diff =
+          td->qtp.min_white_black_diff > 0
+              ? static_cast<uint32_t>(td->qtp.min_white_black_diff)
+              : 0u;
       const bool threshold_ok = RunGpuThreshold(
           cmd_buf, detect_gray_buf, nullptr, static_cast<uint32_t>(detect_w),
           static_cast<uint32_t>(detect_h), static_cast<uint32_t>(detect_w),
-          static_cast<uint32_t>(td->qtp.min_white_black_diff), enc);
+          min_diff, enc);
       enc->memoryBarrier(MTL::BarrierScopeBuffers);
       if (threshold_ok && cached_thresh.buffer != nullptr &&
           cached_thresh.buffer->contents() != nullptr) {
@@ -808,17 +844,25 @@ MetalAprilTagBackend& MetalAprilTagBackend::operator=(
     MetalAprilTagBackend&&) noexcept = default;
 
 std::string MetalAprilTagBackend::device_info() const {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
   return std::format(
       "Metal GPU AprilTag [{}] (threads={}, decimate={:.1f}, sigma={:.1f})",
       impl_->device_name, impl_->options.threads, impl_->options.quad_decimate,
       impl_->options.quad_sigma);
 }
 
-bool MetalAprilTagBackend::supports_gpu() const { return !impl_->is_fallback; }
+bool MetalAprilTagBackend::supports_gpu() const {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+  return !impl_->is_fallback;
+}
 
-bool MetalAprilTagBackend::is_fallback() const { return impl_->is_fallback; }
+bool MetalAprilTagBackend::is_fallback() const {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+  return impl_->is_fallback;
+}
 
-const talos::vision::StageTimings& MetalAprilTagBackend::last_timings() const {
+talos::vision::StageTimings MetalAprilTagBackend::last_timings() const {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
   return impl_->last_timings;
 }
 
@@ -827,8 +871,8 @@ void MetalAprilTagBackend::SetOptions(
   impl_->SetOptions(options);
 }
 
-const talos::vision::apriltag::DetectorOptions& MetalAprilTagBackend::options()
-    const {
+talos::vision::apriltag::DetectorOptions MetalAprilTagBackend::options() const {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
   return impl_->options;
 }
 
@@ -879,6 +923,8 @@ talos::vision::BackendExecutionResult MetalAprilTagBackend::Execute(
     return result;
   }
 
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+
   // The fused GPU path implements exactly 1x/2x and no Gaussian filter.
   // Preserve requested semantics for every other setting, including color
   // input.
@@ -886,10 +932,21 @@ talos::vision::BackendExecutionResult MetalAprilTagBackend::Execute(
       (impl_->options.quad_decimate != 1.0f &&
        impl_->options.quad_decimate != 2.0f)) {
     result = impl_->compute_cpu_backend->Execute(frame);
+    impl_->last_timings = result.timings;
+    impl_->last_cpu_fallback = true;
     result.fallback_reason = impl_->is_fallback
                                  ? "Metal device unavailable"
                                  : "Metal supports decimation 1 or 2 with "
                                    "sigma 0; using CPU for requested settings";
+    return result;
+  }
+
+  constexpr uint32_t kMaxInt =
+      static_cast<uint32_t>(std::numeric_limits<int>::max());
+  if (frame.width() > kMaxInt || frame.height() > kMaxInt ||
+      frame.stride() > kMaxInt) {
+    result.effective_backend = "metal";
+    result.success = true;
     return result;
   }
 
