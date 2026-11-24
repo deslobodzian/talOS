@@ -106,7 +106,8 @@ runfiles is refused, naming the field.
 Its flags are `sim_gateway`'s, with these differences:
 
 - `--physics` is implied and accepted;
-- `--start-pose` also places the robot on the field;
+- `--start-pose`, or without it the config's `[simulation.start_pose]`,
+  also places the robot on the field;
 - when the model owns the chassis (its root body has a free joint), a
   nonzero `--wheel-radius-error` or `--wheel-slip-gain` is refused, naming
   the flag, and so are `[simulation] wheel_radius_m`,
@@ -123,7 +124,9 @@ naming the key, flag, file, element or actuator.
 The model compiles before the gateway's socket and registry row exist, so
 it counts against the launcher's start-up grace for a process with no
 registry row; the 2026 field with its FUEL compiles in a small fraction of
-it. On start the program prints `sim_gateway: backend=mujoco`, and on its
+it. On start the program prints `sim_gateway: backend=mujoco
+start_pose=X,Y,YAW (SOURCE)`, the pose and where it came from
+(`--start-pose`, `config` or `default`), and on its
 first tick, after the gateway bound the plant, the binding table (below),
 to stderr. While it runs it prints to stderr, at most
 once a wall second each, the plant's clock when plant time was dropped
@@ -199,8 +202,12 @@ the joint asks for it (`align="true"`, or `align="auto"` with
 chassis frame away from the model's origin, so it is refused, naming the
 joint (fix: `align="false"`).
 
-**Start pose.** `--start-pose` places a frame on the field at (x, y) turned
-by the yaw; the root body's own `pos` and `quat` compose after it. A model
+**Start pose.** The gateway's start pose (`--start-pose` when given, else
+the config's `[simulation.start_pose]`, else (2, 2, 0);
+[keys](../../hardware/README.md#configuration)) places a frame on the field
+at (x, y) turned by the yaw; the root body's own `pos` and `quat` compose
+after it. Config load refuses a `[simulation.start_pose]` off the floor of
+the config's `field`; `--start-pose` is not checked against the field. A model
 authored at the origin facing +x starts at the start pose, at its authored
 height.
 

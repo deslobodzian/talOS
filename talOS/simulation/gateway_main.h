@@ -100,6 +100,16 @@ class GatewayExtension {
   virtual void Finish() = 0;
 };
 
+// Where the physics backend starts the robot: `flag` (the `--start-pose`
+// given) when set, else the config's `[simulation.start_pose]`, else
+// config::SimulationStartPose's defaults (2, 2, 0). Writes it into
+// `options` and returns where it came from, "--start-pose", "config" or
+// "default", which the gateway prints on its backend line.
+std::string_view ApplyStartPose(
+    const config::RobotConfig& config,
+    const std::optional<config::SimulationStartPose>& flag,
+    hardware::sim::PhysicsOptions& options);
+
 struct GatewayProgramInfo {
   std::string_view target;        // --describe and registry target
   std::string_view backend_name;  // stderr "backend=" for the physics backend

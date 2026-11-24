@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -112,8 +113,7 @@ double FiniteNumber(const std::string& text) {
   return value;
 }
 
-void StartPose(const std::string& text,
-               talos::hardware::sim::PhysicsOptions& options) {
+talos::config::SimulationStartPose StartPose(const std::string& text) {
   const auto first = text.find(',');
   const auto second =
       first == std::string::npos ? first : text.find(',', first + 1);
@@ -121,9 +121,16 @@ void StartPose(const std::string& text,
       text.find(',', second + 1) != std::string::npos) {
     throw std::invalid_argument("--start-pose needs X_M,Y_M,YAW_RAD");
   }
-  options.start_x_m = FiniteNumber(text.substr(0, first));
-  options.start_y_m = FiniteNumber(text.substr(first + 1, second - first - 1));
-  options.start_yaw_rad = FiniteNumber(text.substr(second + 1));
+  return {.x_m = FiniteNumber(text.substr(0, first)),
+          .y_m = FiniteNumber(text.substr(first + 1, second - first - 1)),
+          .yaw_rad = FiniteNumber(text.substr(second + 1))};
+}
+
+std::string Shortest(double value) {
+  std::array<char, 32> text{};
+  const auto result =
+      std::to_chars(text.data(), text.data() + text.size(), value);
+  return {text.data(), result.ptr};
 }
 
 double Seconds(const std::string& text) {
@@ -268,8 +275,9 @@ int Run(int argc, char** argv,
     // Where a harness writes the node-clock time the schedules count from;
     // unset, they count from the loop's start.
     std::optional<std::string> schedule_start_file;
-    talos::hardware::sim::PhysicsOptions options{.start_x_m = 2.0,
-                                                 .start_y_m = 2.0};
+    talos::hardware::sim::PhysicsOptions options;
+    // --start-pose's pose; unset, the config's or the default applies.
+    std::optional<talos::config::SimulationStartPose> start_pose_flag;
     const char* config_path = nullptr;
     // 0 until a flag sets one; unset, the config's port applies.
     uint16_t port_flag = 0;
@@ -288,7 +296,7 @@ int Run(int argc, char** argv,
         physics = true;
       } else if (arg == "--start-pose" && i + 1 < argc) {
         physics_options = true;
-        StartPose(argv[++i], options);
+        start_pose_flag = StartPose(argv[++i]);
       } else if (arg == "--wheel-radius-error" && i + 1 < argc) {
         physics_options = true;
         options.wheel_radius_error_frac = FiniteNumber(argv[++i]);
@@ -371,6 +379,7 @@ int Run(int argc, char** argv,
     std::optional<talos::hardware::sim::ChassisDynamics> chassis_dynamics;
     std::vector<talos::hardware::sim::MechanismSpec> mechanisms;
     const auto robot_config = talos::config::ParseRobotConfig(config_path);
+    std::string_view start_pose_source;
     if (extension == nullptr && robot_config.simulation.mujoco) {
       std::fprintf(stderr,
                    "sim_gateway: ignoring [simulation.mujoco]; "
@@ -380,6 +389,8 @@ int Run(int argc, char** argv,
       ports = talos::simulation::ResolveGatewayPorts(robot_config, port_flag,
                                                      remote_port_flag);
       options.wheel_radius_m = robot_config.simulation.wheel_radius_m;
+      start_pose_source = talos::simulation::ApplyStartPose(
+          robot_config, start_pose_flag, options);
       hw_config = robot_config.hardware;
       hw_config.commissioned = true;
       home_switches.reserve(hw_config.digital_inputs.size());
@@ -440,7 +451,18 @@ int Run(int argc, char** argv,
                 : static_cast<talos::hardware::Backend&>(ideal);
     const std::string backend_name =
         physics ? std::string{program.backend_name} : std::string{"ideal"};
-    std::fprintf(stderr, "sim_gateway: backend=%s\n", backend_name.c_str());
+    if (physics) {
+      // Shortest round-trip text, so the line repeats the pose exactly.
+      const std::string pose = Shortest(options.start_x_m) + "," +
+                               Shortest(options.start_y_m) + "," +
+                               Shortest(options.start_yaw_rad);
+      std::fprintf(stderr, "sim_gateway: backend=%s start_pose=%s (%.*s)\n",
+                   backend_name.c_str(), pose.c_str(),
+                   static_cast<int>(start_pose_source.size()),
+                   start_pose_source.data());
+    } else {
+      std::fprintf(stderr, "sim_gateway: backend=%s\n", backend_name.c_str());
+    }
     std::random_device random;
     // One boot id for the State and the Driver Station packets alike.
     const uint64_t boot_id = (uint64_t{random()} << 32) | random() | 1;
@@ -718,6 +740,25 @@ int Run(int argc, char** argv,
 }  // namespace
 
 namespace talos::simulation {
+
+std::string_view ApplyStartPose(
+    const config::RobotConfig& config,
+    const std::optional<config::SimulationStartPose>& flag,
+    hardware::sim::PhysicsOptions& options) {
+  std::string_view source = "default";
+  config::SimulationStartPose pose;
+  if (flag) {
+    pose = *flag;
+    source = "--start-pose";
+  } else if (config.simulation.start_pose) {
+    pose = *config.simulation.start_pose;
+    source = "config";
+  }
+  options.start_x_m = pose.x_m;
+  options.start_y_m = pose.y_m;
+  options.start_yaw_rad = pose.yaw_rad;
+  return source;
+}
 
 int RunSimGateway(int argc, char** argv, const GatewayProgramInfo& program,
                   GatewayExtension* extension) {
