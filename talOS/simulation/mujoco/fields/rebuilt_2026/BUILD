@@ -51,8 +51,10 @@ filegroup(
 # the official AprilTag poses, and fuel behaviour at rest, through the hub,
 # out of the chute and against every wall. About 2 s unsanitized.
 # Five shards, so each has its own timeout under --config=tsan: gtest gives
-# case i to shard i % 5, which leaves StagedFuelIsAtRest (case 4, 2 s of the
-# whole field) with only two cheap cases and keeps the hub cases apart.
+# case i, in run order (the file's TESTs, then its TEST_P instances), to
+# shard i % 5, which leaves StagedFuelIsAtRest (case 4, 2 s of the whole
+# field) with only two cheap cases and keeps the hub cases apart. A case
+# added above it moves every later one.
 cc_test(
     name = "field_test",
     size = "small",
@@ -130,8 +132,10 @@ cc_library(
 # preloads, the match report and Driver Station stamp, the seeded stream,
 # bit-identical runs and no allocation.
 # Six shards, so each has its own timeout under --config=tsan: gtest gives
-# case i to shard i % 6, which puts each two-scenario case
-# (RunsAreBitIdentical, TheSeedMatters) beside one cheap case.
+# case i, in run order (the file's TESTs, then its TEST_P instances), to
+# shard i % 6, which puts each two-scenario case (RunsAreBitIdentical,
+# TheSeedMatters) beside one cheap case. A case added above them moves
+# every later one.
 cc_test(
     name = "rules_test",
     size = "small",
