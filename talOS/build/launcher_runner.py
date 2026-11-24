@@ -105,11 +105,13 @@ def workspace(tmp, launcher, config_rlocation):
     bazel_bin = os.path.join(work_dir, "bazel-bin")
     os.makedirs(bazel_bin)
     for entry in os.listdir(main_dir):
+        if entry == "bazel-bin":
+            continue
         src = os.path.join(main_dir, entry)
         os.symlink(src, os.path.join(work_dir, entry))
-        os.symlink(src, os.path.join(bazel_bin, entry))
-    if not os.path.exists(os.path.join(bazel_bin, "external")):
-        os.symlink(root, os.path.join(bazel_bin, "external"))
+        if entry != "external":
+            os.symlink(src, os.path.join(bazel_bin, entry))
+    os.symlink(root, os.path.join(bazel_bin, "external"))
     env = dict(os.environ, **(r.EnvVars() if r else {}))
     env["RUNFILES_DIR"] = root
     env.pop("PYTHONPATH", None)
@@ -174,18 +176,43 @@ def sim(launcher, config_rlocation, launcher_args):
         work_dir, config, env = workspace(tmp, launcher, config_rlocation)
         command = [launcher, "--config", config, "--sim",
                    "--start-sim-gateway", "--sim-gateway-arg", "--physics"]
-        child = subprocess.Popen(command + from_invocation(launcher_args),
-                                 cwd=work_dir, env=env)
+        child = None
+        pending = []
 
-        # The launcher stops its session in order on SIGINT or SIGTERM; the
-        # runner passes either on and waits, so the work directory outlives
-        # the session.
+        # The launcher stops its session in order on SIGINT, SIGTERM, or SIGHUP
+        # (REQ-OPS-33); install handlers before Popen so an early signal never
+        # tears down the work directory while the launcher runs, and forward
+        # any signal that arrives during Popen.
         def forward(signum, _):
-            child.send_signal(signum)
+            if child is not None:
+                try:
+                    child.send_signal(signum)
+                except ProcessLookupError:
+                    pass
+            else:
+                pending.append(signum)
 
-        signal.signal(signal.SIGINT, forward)
-        signal.signal(signal.SIGTERM, forward)
-        return child.wait()
+        forwarded = [signal.SIGINT, signal.SIGTERM]
+        if (hasattr(signal, "SIGHUP")
+                and signal.getsignal(signal.SIGHUP) != signal.SIG_IGN):
+            forwarded.append(signal.SIGHUP)
+        previous = {sig: signal.signal(sig, forward) for sig in forwarded}
+        try:
+            if pending:
+                return 128 + pending[0]
+            child = subprocess.Popen(command + from_invocation(launcher_args),
+                                     cwd=work_dir, env=env)
+            for sig in pending:
+                try:
+                    child.send_signal(sig)
+                except ProcessLookupError:
+                    pass
+            pending.clear()
+            rc = child.wait()
+            return 128 + (-rc) if rc < 0 else rc
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
 
 
 def main(argv):
