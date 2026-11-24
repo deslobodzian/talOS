@@ -39,6 +39,10 @@ class Flattener {
             const FlattenOptions& options, std::vector<Channel>& channels)
       : schema_{schema},
         topic_{topic},
+        is_status_topic_{topic.starts_with('/')
+                             ? naming::Role(topic) == "status"
+                             : naming::Role("/" + std::string{topic}) ==
+                                   "status"},
         options_{options},
         channels_{channels},
         open_(schema.objects()->size()) {}
@@ -228,10 +232,11 @@ class Flattener {
     channels_.push_back(std::move(channel));
   }
 
-  bool IsStatusTopic() const { return naming::Role(topic_) == "status"; }
+  bool IsStatusTopic() const { return is_status_topic_; }
 
   const reflection::Schema& schema_;
   std::string_view topic_;
+  bool is_status_topic_{false};
   const FlattenOptions& options_;
   std::vector<Channel>& channels_;
   std::size_t kept_{0};
@@ -337,8 +342,10 @@ std::vector<Channel> EnvelopeChannels(std::string_view topic,
   active.offset = schema::kEnvelopeActiveOffset;
   active.base = reflection::BaseType::Bool;
   channels.push_back(std::move(active));
+  FlattenOptions options;
+  options.max_channels = kMaxTopicChannels - channels.size();
   for (Channel& channel :
-       FlattenTopic(std::string{topic} + "/message", inner, bfbs)) {
+       FlattenTopic(std::string{topic} + "/message", inner, bfbs, options)) {
     if (channel.offset > std::numeric_limits<std::size_t>::max() -
                              schema::kEnvelopeHeaderBytes) {
       throw std::invalid_argument("telemetry: schema for topic '" +

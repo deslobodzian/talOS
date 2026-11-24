@@ -1,12 +1,14 @@
 """Integration: the simulator alone, with no launcher or robot graph.
 
 Each case runs `//talOS/simulation:sim_gateway` as a child process: its
-`--describe` output and flag validation, a run without a config, and the
+`--describe` output and flag validation, a run without a config, the
 Driver Station and State datagrams it sends over loopback UDP for a config
-the case writes itself.
+the case writes itself, and its `/sim/state` RTMS publication under `--physics`.
 """
 
 import json
+import math
+import mmap
 import os
 import signal
 import socket
@@ -18,11 +20,98 @@ import time
 import unittest
 from pathlib import Path
 
+from _posixshmem import shm_open, shm_unlink
 from python.runfiles import runfiles
+from talOS.build.udp_ports import udp_ports
+from talOS.memory.shm_name import shm_name
+
+# talOS/hardware/messages.h GatewayProgram::kSimGateway.
+GATEWAY_PROGRAM_SIM_GATEWAY = 3
+
+# talOS/rtms/rtms.h shared-memory ring header layout (version 9).
+RTMS_MAGIC = 0x32534D54534F4C41
+RTMS_VERSION = 9
+RTMS_HEADER_BYTES = 2368
+RTMS_WRITER_SEQ_OFFSET = 256
+
+# geometry::OdometrySample (talOS/msgs/geometry.fbs): u64 sample_time_ns,
+# Pose2d (x_m, y_m, yaw_rad), Twist2d (vx_mps, vy_mps, omega_radps).
+ODOMETRY_SAMPLE_FORMAT = "<Qdddddd"
+ODOMETRY_SAMPLE_BYTES = struct.calcsize(ODOMETRY_SAMPLE_FORMAT)
+
+SIM_STATE_TOPIC = "/sim/state"
+REGISTRY_TOPIC = "/talos_registry.6"
 
 
 def binary():
     return runfiles.Create().Rlocation(os.environ["SIM_GATEWAY"])
+
+
+def _unlink_shm(topic, namespace):
+    try:
+        shm_unlink(shm_name(topic, namespace))
+    except FileNotFoundError:
+        pass
+
+
+def _isolated_env(test_case, namespace):
+    test_case.addCleanup(_unlink_shm, SIM_STATE_TOPIC, namespace)
+    test_case.addCleanup(_unlink_shm, REGISTRY_TOPIC, namespace)
+    env = os.environ.copy()
+    env["TALOS_SHM_NAMESPACE"] = namespace
+    return env
+
+
+def _decode_state_build(packet):
+    """Return (revision, program, dirty) from a State frame (type 20)."""
+    return struct.unpack_from("<QBB", packet, 40 + 56)
+
+
+class _RtmsRingView:
+    """Read-only view of a live RTMS shared-memory segment."""
+
+    def __init__(self, mm):
+        self._mm = mm
+        (self.magic, self.version, self.segment_id, self.total_bytes,
+         self.slots, self.message_bytes, self.message_alignment,
+         self.data_offset, self.slot_stride, self.schema_hash) = (
+             struct.unpack_from("<10Q", mm, 0))
+        self.schema_name = mm[80:208].split(b"\0", 1)[0].decode("ascii")
+
+    def writer_sequence(self):
+        return struct.unpack_from("<Q", self._mm, RTMS_WRITER_SEQ_OFFSET)[0]
+
+    def read_odometry(self, seq):
+        slot_index = seq & (self.slots - 1)
+        offset = self.data_offset + slot_index * self.slot_stride
+        return struct.unpack_from(ODOMETRY_SAMPLE_FORMAT, self._mm, offset)
+
+    def close(self):
+        self._mm.close()
+
+
+def _try_open_rtms_readonly(topic, namespace):
+    """Map an existing initialized RTMS segment read-only, or return None."""
+    try:
+        fd = shm_open(shm_name(topic, namespace), os.O_RDONLY, 0)
+    except FileNotFoundError:
+        return None
+    try:
+        size = os.fstat(fd).st_size
+        if size < RTMS_HEADER_BYTES:
+            return None
+        mm = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ)
+    finally:
+        os.close(fd)
+    magic = struct.unpack_from("<Q", mm, 0)[0]
+    if magic != RTMS_MAGIC:
+        mm.close()
+        return None
+    view = _RtmsRingView(mm)
+    if size < view.total_bytes:
+        view.close()
+        return None
+    return view
 
 
 class SimGatewayStartup(unittest.TestCase):
@@ -66,6 +155,7 @@ class SimGatewayStartup(unittest.TestCase):
             text=True, timeout=30)
         self.assertNotEqual(proc.returncode, 0)
 
+    # REQ-CONTRACT-30
     def test_scheduled_modes_and_generations(self):
         with tempfile.TemporaryDirectory() as tmp, socket.socket(
                 socket.AF_INET, socket.SOCK_DGRAM) as receiver:
@@ -79,9 +169,7 @@ class SimGatewayStartup(unittest.TestCase):
             # session or test is already running on the host.
             receiver.bind(("127.0.0.1", 0))
             receiver.settimeout(0.1)
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
-                reserve.bind(("127.0.0.1", 0))
-                gateway_port = reserve.getsockname()[1]
+            gateway_port, _ = udp_ports()
             with subprocess.Popen(
                     [str(binary()), "--config", str(config),
                      "--port", str(gateway_port),
@@ -91,11 +179,13 @@ class SimGatewayStartup(unittest.TestCase):
                      "0:axes=0,0,0;buttons=0;pov=-1|"
                      "0.3:axes=0,-0.5,0;buttons=5;pov=90",
                      "--duration-s", "0.6", "--alliance", "red"],
+                    env=_isolated_env(self, tmp),
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True) as proc:
                 phases = []
                 joystick_samples = []
                 boots = set()
+                state_builds = set()
                 previous_sample = None
                 deadline = time.monotonic() + 10
                 try:
@@ -110,6 +200,9 @@ class SimGatewayStartup(unittest.TestCase):
                         # with sample time, mode generation, boot id, flags,
                         # alliance.
                         frame_type = struct.unpack_from("<H", packet, 12)[0]
+                        if frame_type == 20:
+                            state_builds.add(_decode_state_build(packet))
+                            continue
                         if frame_type != 24:
                             continue
                         sample, generation, boot, flags, alliance = (
@@ -144,6 +237,8 @@ class SimGatewayStartup(unittest.TestCase):
                         proc.kill()
                         proc.communicate()
                 self.assertEqual(proc.returncode, 0, stdout + stderr)
+                self.assertEqual(state_builds,
+                                 {(0, GATEWAY_PROGRAM_SIM_GATEWAY, 0)})
                 self.assertEqual([flags for flags, _ in phases], [1, 13, 21])
                 self.assertEqual(len(boots), 1)
                 generations = [generation for _, generation in phases]
@@ -176,14 +271,13 @@ class SimGatewayStartup(unittest.TestCase):
                 encoding="utf-8")
             receiver.bind(("127.0.0.1", 0))
             receiver.settimeout(0.1)
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
-                reserve.bind(("127.0.0.1", 0))
-                gateway_port = reserve.getsockname()[1]
+            gateway_port, _ = udp_ports()
             with subprocess.Popen(
                     [str(binary()), "--config", str(config), "--physics",
                      "--port", str(gateway_port),
                      "--remote-port", str(receiver.getsockname()[1]),
                      "--duration-s", "0.3"],
+                    env=_isolated_env(self, tmp),
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True) as proc:
                 inputs = None
@@ -266,9 +360,7 @@ class SimGatewayStartup(unittest.TestCase):
                 encoding="utf-8")
             peer.bind(("127.0.0.1", 0))
             peer.settimeout(0.1)
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
-                reserve.bind(("127.0.0.1", 0))
-                gateway_port = reserve.getsockname()[1]
+            gateway_port, _ = udp_ports()
             # Sorted device names assign logical ids:
             # 1: back_left_drive, 2: back_left_steer, 3: back_right_drive,
             # 4: back_right_steer, 5: front_left_drive, 6: front_left_steer,
@@ -288,6 +380,7 @@ class SimGatewayStartup(unittest.TestCase):
                      "--port", str(gateway_port),
                      "--remote-port", str(peer.getsockname()[1]),
                      "--duration-s", "0.4"],
+                    env=_isolated_env(self, tmp),
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True) as proc:
                 cmd_seq = 0
@@ -404,14 +497,13 @@ class SimGatewayStartup(unittest.TestCase):
                 encoding="utf-8")
             peer.bind(("127.0.0.1", 0))
             peer.settimeout(0.1)
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
-                reserve.bind(("127.0.0.1", 0))
-                gateway_port = reserve.getsockname()[1]
+            gateway_port, _ = udp_ports()
             with subprocess.Popen(
                     [str(binary()), "--config", str(overlay), "--physics",
                      "--port", str(gateway_port),
                      "--remote-port", str(peer.getsockname()[1]),
                      "--duration-s", "0.5"],
+                    env=_isolated_env(self, tmp),
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True) as proc:
                 cmd_seq = 0
@@ -544,15 +636,14 @@ class SimGatewayStartup(unittest.TestCase):
                 encoding="utf-8")
             receiver.bind(("127.0.0.1", 0))
             receiver.settimeout(0.1)
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
-                reserve.bind(("127.0.0.1", 0))
-                gateway_port = reserve.getsockname()[1]
+            gateway_port, _ = udp_ports()
             before_us = time.clock_gettime_ns(node_clock) // 1000
             with subprocess.Popen(
                     [str(binary()), "--config", str(config),
                      "--port", str(gateway_port),
                      "--remote-port", str(receiver.getsockname()[1]),
                      "--duration-s", "0.5"],
+                    env=_isolated_env(self, tmp),
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True) as proc:
                 state_samples = []
@@ -654,6 +745,321 @@ class SimGatewayStartup(unittest.TestCase):
                 period_us,
                 f"catch-up burst in post-pause pair: gaps = {post_pause_gaps[:15]}",
             )
+
+    # REQ-DEV-10, REQ-CONTRACT-30
+    def test_physics_sim_state_publishes_start_pose_and_modelled_errors(self):
+        """`sim_gateway --physics` publishes `geometry.OdometrySample` truth on
+        `/sim/state` starting at `--start-pose`, applies `--wheel-radius-error`,
+        `--wheel-slip-gain`, and `--gyro-drift-radps` deterministically relative
+        to UDP `State`, and stamps `GatewayProgram::kSimGateway` on every State.
+        """
+        wheel_radius_m = 0.0508
+        start_x_m = 3.25
+        start_y_m = -1.5
+        start_yaw_rad = 0.5
+        wheel_radius_error_frac = 0.2
+        wheel_slip_gain = 0.5
+        gyro_drift_radps = 0.25
+        with tempfile.TemporaryDirectory() as tmp, socket.socket(
+                socket.AF_INET, socket.SOCK_DGRAM) as peer:
+            config = Path(tmp) / "robot.toml"
+            config.write_text(
+                '[robot]\nname = "sim_truth_errors_test"\nperiod_us = 5000\n'
+                'command_timeout_us = 500000\n'
+                'controller_address = "127.0.0.1"\n'
+                '[subsystems.drive.motors]\n'
+                'back_left_drive = { can_id = 1 }\n'
+                'back_left_steer = { can_id = 2 }\n'
+                'back_right_drive = { can_id = 3 }\n'
+                'back_right_steer = { can_id = 4 }\n'
+                'front_left_drive = { can_id = 5 }\n'
+                'front_left_steer = { can_id = 6 }\n'
+                'front_right_drive = { can_id = 7 }\n'
+                'front_right_steer = { can_id = 8 }\n'
+                '[subsystems.drive.sensors.imu]\n'
+                'type = "Pigeon2"\ncan_id = 9\n'
+                '[simulation]\n'
+                f'wheel_radius_m = {wheel_radius_m}\n'
+                '[[simulation.swerve_modules]]\n'
+                'drive = "front_left_drive"\nsteer = "front_left_steer"\n'
+                'x_m = 0.30\ny_m = 0.30\n'
+                '[[simulation.swerve_modules]]\n'
+                'drive = "front_right_drive"\nsteer = "front_right_steer"\n'
+                'x_m = 0.30\ny_m = -0.30\n'
+                '[[simulation.swerve_modules]]\n'
+                'drive = "back_left_drive"\nsteer = "back_left_steer"\n'
+                'x_m = -0.30\ny_m = 0.30\n'
+                '[[simulation.swerve_modules]]\n'
+                'drive = "back_right_drive"\nsteer = "back_right_steer"\n'
+                'x_m = -0.30\ny_m = -0.30\n',
+                encoding="utf-8")
+            peer.bind(("127.0.0.1", 0))
+            peer.settimeout(0.1)
+            gateway_port, _ = udp_ports()
+            # Sorted motor ids: 1, 3, 5, 7 are drives; 2, 4, 6, 8 are steers.
+            # Equal forward duty on all four drives with zero steer drives
+            # straight along start_yaw_rad with zero true angular velocity.
+            motor_demands = [
+                (1, 1, 0.25), (2, 0, 0.0),
+                (3, 1, 0.25), (4, 0, 0.0),
+                (5, 1, 0.25), (6, 0, 0.0),
+                (7, 1, 0.25), (8, 0, 0.0),
+            ]
+            ring = None
+            state_builds = set()
+            states_by_seq = {}
+            try:
+                with subprocess.Popen(
+                        [str(binary()), "--config", str(config), "--physics",
+                         "--start-pose",
+                         f"{start_x_m},{start_y_m},{start_yaw_rad}",
+                         "--wheel-radius-error", str(wheel_radius_error_frac),
+                         "--wheel-slip-gain", str(wheel_slip_gain),
+                         "--gyro-drift-radps", str(gyro_drift_radps),
+                         "--port", str(gateway_port),
+                         "--remote-port", str(peer.getsockname()[1]),
+                         "--duration-s", "10"],
+                        env=_isolated_env(self, tmp),
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True) as proc:
+                    cmd_seq = 0
+                    first_driven_us = None
+                    prev_drive_vel_rps = None
+                    try:
+                        for _ in range(1200):
+                            try:
+                                packet = peer.recv(4096)
+                            except socket.timeout:
+                                if proc.poll() is not None:
+                                    break
+                                continue
+                            if struct.unpack_from("<H", packet, 12)[0] != 20:
+                                continue
+                            if ring is None:
+                                ring = _try_open_rtms_readonly(
+                                    SIM_STATE_TOPIC, tmp)
+                            state_builds.add(_decode_state_build(packet))
+                            (config_id, boot_id, epoch, sample_time_us,
+                             last_cmd_seq, _, state_seq) = struct.unpack_from(
+                                 "<QQQQQQQ", packet, 40)
+                            motors, sensors = struct.unpack_from(
+                                "<HH", packet, 40 + 70)
+                            self.assertEqual((motors, sensors), (8, 1))
+                            _, _, drive_pos_rot, drive_vel_rps = (
+                                struct.unpack_from("<HBdd", packet, 40 + 84))
+                            s_off = 40 + 84 + 45 * motors
+                            _, s_valid, pigeon_pos_rot, pigeon_vel_rps = (
+                                struct.unpack_from("<HBdd", packet, s_off))
+                            self.assertEqual(s_valid, 1)
+                            states_by_seq[state_seq] = (
+                                sample_time_us, last_cmd_seq, drive_pos_rot,
+                                drive_vel_rps, pigeon_pos_rot, pigeon_vel_rps)
+                            if first_driven_us is None and drive_vel_rps > 1.0:
+                                first_driven_us = sample_time_us
+                            steady = (
+                                ring is not None
+                                and first_driven_us is not None
+                                and (sample_time_us - first_driven_us) >= 350_000
+                                and drive_vel_rps > 25.0
+                                and prev_drive_vel_rps is not None
+                                and abs(drive_vel_rps - prev_drive_vel_rps) < 0.05
+                            )
+                            prev_drive_vel_rps = drive_vel_rps
+                            if steady:
+                                proc.send_signal(signal.SIGTERM)
+                                break
+                            cmd_seq += 1
+                            payload = bytearray(struct.pack(
+                                "<QQQQHHH", config_id, boot_id, epoch,
+                                sample_time_us, len(motor_demands), 0, 0))
+                            for motor_id, mode, demand in motor_demands:
+                                payload += struct.pack(
+                                    "<HBBdd", motor_id, mode, 0, demand, 0.0)
+                            frame = (
+                                packet[:12]
+                                + struct.pack("<HHQQII", 21, 0, cmd_seq,
+                                              sample_time_us, len(payload), 0)
+                                + payload
+                            )
+                            peer.sendto(frame, ("127.0.0.1", gateway_port))
+                        stdout, stderr = proc.communicate(timeout=5)
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+                            proc.communicate()
+                self.assertEqual(proc.returncode, 0, stdout + stderr)
+                self.assertEqual(state_builds,
+                                 {(0, GATEWAY_PROGRAM_SIM_GATEWAY, 0)})
+                self.assertIsNotNone(
+                    ring, "/sim/state RTMS segment was never published")
+                self.assertEqual(ring.magic, RTMS_MAGIC)
+                self.assertEqual(ring.version, RTMS_VERSION)
+                self.assertEqual(ring.message_bytes, ODOMETRY_SAMPLE_BYTES)
+                self.assertEqual(ring.schema_name, "geometry.OdometrySample")
+                truth_count = ring.writer_sequence()
+                self.assertGreaterEqual(truth_count, 20)
+                self.assertLess(truth_count, ring.slots)
+                truth = [ring.read_odometry(i) for i in range(truth_count)]
+            finally:
+                if ring is not None:
+                    ring.close()
+
+            # Initial /sim/state sample (tick 1, before any command arrived)
+            # carries the exact --start-pose with zero velocity.
+            t0_ns, x0, y0, yaw0, vx0, vy0, omega0 = truth[0]
+            self.assertGreater(t0_ns, 0)
+            self.assertAlmostEqual(x0, start_x_m, places=9)
+            self.assertAlmostEqual(y0, start_y_m, places=9)
+            self.assertAlmostEqual(yaw0, start_yaw_rad, places=9)
+            self.assertAlmostEqual(vx0, 0.0, places=9)
+            self.assertAlmostEqual(vy0, 0.0, places=9)
+            self.assertAlmostEqual(omega0, 0.0, places=9)
+            for earlier, later in zip(truth, truth[1:]):
+                self.assertGreater(later[0], earlier[0])
+
+            # Gateway::Tick increments state.sequence from 0 to 1 on tick 1
+            # and truth_publisher writes slot 0 on that same tick, so State
+            # sequence k pairs 1:1 with truth[k - 1].
+            driven_seqs = sorted(
+                seq for seq, row in states_by_seq.items()
+                if row[3] > 1.0 and seq <= truth_count)
+            self.assertTrue(
+                driven_seqs, "drive motors never accelerated under commands")
+            first_seq = driven_seqs[0]
+            last_seq = driven_seqs[-1]
+            driven_s = (
+                states_by_seq[last_seq][0] - states_by_seq[first_seq][0]
+            ) * 1e-6
+            self.assertGreaterEqual(
+                driven_s, 0.32,
+                f"expected >= 0.32 s of driven ticks, got {driven_s:.3f} s")
+
+            # During initial acceleration, --wheel-slip-gain suppresses true
+            # ground speed well below surface speed.
+            _, _, _, first_drive_vel, _, _ = states_by_seq[first_seq]
+            _, _, _, _, first_vx, first_vy, _ = truth[first_seq - 1]
+            first_surface_speed = (
+                first_drive_vel * (2.0 * math.pi) * wheel_radius_m
+                * (1.0 + wheel_radius_error_frac))
+            self.assertLess(
+                math.hypot(first_vx, first_vy), 0.5 * first_surface_speed)
+
+            # At steady state, --wheel-radius-error scales true ground speed
+            # above wheel odometry, cumulative slip leaves true travel strictly
+            # below no-slip scaled odometry, motion follows start_yaw_rad
+            # (catching swapped x/y or ignored start yaw), and --gyro-drift-radps
+            # diverges UDP Pigeon yaw/rate while true yaw stays fixed.
+            (_, _, drive_pos_end, drive_vel_end,
+             pigeon_pos_end, pigeon_vel_end) = states_by_seq[last_seq]
+            _, x_end, y_end, yaw_end, vx_end, vy_end, omega_end = (
+                truth[last_seq - 1])
+            dx = x_end - start_x_m
+            dy = y_end - start_y_m
+            self.assertGreater(dx, 0.5)
+            self.assertGreater(dy, 0.25)
+            self.assertAlmostEqual(math.atan2(dy, dx), start_yaw_rad, places=5)
+            self.assertAlmostEqual(yaw_end, start_yaw_rad, places=6)
+            self.assertAlmostEqual(omega_end, 0.0, places=6)
+
+            self.assertGreater(drive_vel_end, 20.0)
+            odom_speed = drive_vel_end * (2.0 * math.pi) * wheel_radius_m
+            truth_speed = math.hypot(vx_end, vy_end)
+            self.assertAlmostEqual(
+                truth_speed / odom_speed,
+                1.0 + wheel_radius_error_frac,
+                delta=0.02)
+
+            odom_dist = drive_pos_end * (2.0 * math.pi) * wheel_radius_m
+            no_slip_dist = odom_dist * (1.0 + wheel_radius_error_frac)
+            truth_dist = math.hypot(dx, dy)
+            self.assertLess(
+                truth_dist, 0.95 * no_slip_dist,
+                f"expected wheel-slip deficit: truth={truth_dist:.4f} m vs "
+                f"no_slip={no_slip_dist:.4f} m")
+
+            self.assertAlmostEqual(
+                pigeon_vel_end, gyro_drift_radps / (2.0 * math.pi), places=5)
+            self.assertGreater(pigeon_pos_end * (2.0 * math.pi), 0.05)
+
+    # REQ-DEV-05, REQ-CONTRACT-30
+    def test_physics_fault_schedule_injects_and_recovers_faults_in_state(self):
+        """`sim_gateway --physics --fault-schedule` injects scheduled
+        motor_disconnect and supply_voltage faults into emitted UDP `State`
+        datagrams and clears them when their intervals end."""
+        fault_voltage_v = 6.2
+        with tempfile.TemporaryDirectory() as tmp, socket.socket(
+                socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+            config = Path(tmp) / "robot.toml"
+            config.write_text(
+                '[robot]\nname = "fault_schedule_test"\nperiod_us = 5000\n'
+                'controller_address = "127.0.0.1"\n'
+                '[subsystems.test.motors.lift]\ncan_id = 1\n'
+                '[subsystems.test.sensors.imu]\ntype = "Pigeon2"\ncan_id = 2\n',
+                encoding="utf-8")
+            receiver.bind(("127.0.0.1", 0))
+            receiver.settimeout(0.1)
+            gateway_port, _ = udp_ports()
+            with subprocess.Popen(
+                    [str(binary()), "--config", str(config), "--physics",
+                     "--port", str(gateway_port),
+                     "--remote-port", str(receiver.getsockname()[1]),
+                     "--fault-schedule",
+                     f"0.08:0.20:motor_disconnect:lift|"
+                     f"0.12:0.26:supply_voltage:all:{fault_voltage_v}",
+                     "--duration-s", "0.45"],
+                    env=_isolated_env(self, tmp),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True) as proc:
+                state_builds = set()
+                motor_valid_transitions = []
+                supply_drop_transitions = []
+                normal_voltages = []
+                try:
+                    for _ in range(400):
+                        try:
+                            packet = receiver.recv(4096)
+                        except socket.timeout:
+                            if proc.poll() is not None:
+                                break
+                            continue
+                        if struct.unpack_from("<H", packet, 12)[0] != 20:
+                            continue
+                        state_builds.add(_decode_state_build(packet))
+                        motors, sensors = struct.unpack_from(
+                            "<HH", packet, 40 + 70)
+                        self.assertEqual((motors, sensors), (1, 1))
+                        _, m_valid_byte, m_pos, m_vel, m_volts = (
+                            struct.unpack_from("<HBddd", packet, 40 + 84))
+                        m_valid = m_valid_byte == 1
+                        if not m_valid:
+                            self.assertEqual((m_pos, m_vel, m_volts),
+                                             (0.0, 0.0, 0.0))
+                        health_off = 40 + 84 + 45 * motors + 27 * sensors
+                        health_valid, battery_v = struct.unpack_from(
+                            "<?d", packet, health_off)
+                        self.assertTrue(health_valid)
+                        if (not motor_valid_transitions
+                                or motor_valid_transitions[-1] != m_valid):
+                            motor_valid_transitions.append(m_valid)
+                        dropped = abs(battery_v - fault_voltage_v) < 1e-6
+                        if not dropped:
+                            normal_voltages.append(battery_v)
+                        if (not supply_drop_transitions
+                                or supply_drop_transitions[-1] != dropped):
+                            supply_drop_transitions.append(dropped)
+                    stdout, stderr = proc.communicate(timeout=5)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.communicate()
+                self.assertEqual(proc.returncode, 0, stdout + stderr)
+                self.assertEqual(state_builds,
+                                 {(0, GATEWAY_PROGRAM_SIM_GATEWAY, 0)})
+                self.assertEqual(motor_valid_transitions, [True, False, True])
+                self.assertEqual(supply_drop_transitions, [False, True, False])
+                self.assertTrue(normal_voltages)
+                for volts in normal_voltages:
+                    self.assertGreater(volts, 12.0)
 
 
 if __name__ == "__main__":

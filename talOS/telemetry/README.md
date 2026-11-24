@@ -114,7 +114,9 @@ refuses a dictionary past `kMaxChannels`, naming the topics with the most
 channels to exclude; pages the dictionary once and refuses, by name, a channel
 whose entry alone cannot fit one dictionary page, as well as a dictionary whose
 combined dictionary-resend tick (`dictionary_pages + value_pages`) exceeds the
-64-slot `/talos/telemetry` ring; and for a graph reports the
+63-page burst limit of the 64-slot `/talos/telemetry` ring (64 pages in one
+tick would lap dictionary page 0 under overwrite-oldest); and for a graph
+reports the
 pages a tick takes. Studio
 refuses a whole dictionary over one channel it cannot decode, so construction
 also refuses, by name, a channel whose name, unit or label exceeds the
@@ -154,7 +156,7 @@ to 8 are the node's own.
    `UInt`; `float` and `double` are `Double`.
 3. **Units from suffix**: Numeric units are derived directly from field name
    suffixes (via `talOS/schema/unit_suffix.h`), such as `_mps` (`m/s`),
-   `_rad` (`rad`), `_s` (`s`). Fields without recognized unit suffixes have empty units.
+   `_rad` (`rad`), `_us` (`us`). Fields without recognized unit suffixes have empty units.
 4. **Enum labels**: Enum fields extract string labels automatically from FlatBuffers
    schema reflection (`reflection::Schema`). An enum whose values would need
    more labels than the dictionary label limit, or that has no non-negative

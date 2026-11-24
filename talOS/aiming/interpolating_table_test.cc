@@ -129,6 +129,7 @@ TEST(InterpolatingTable, ValidationErrors) {
 
   const std::array<Row, 2> nan_key = {{{1.0, {0.0, 0.0}}, {kNaN, {0.0, 0.0}}}};
   EXPECT_EQ(Table::Validate(nan_key).error, TableError::kNonFiniteKey);
+  EXPECT_EQ(Table::Validate(nan_key).row_index, 1u);
 
   const std::array<Row, 2> inf_value = {
       {{1.0, {0.0, 0.0}}, {2.0, {kInf, 0.0}}}};
@@ -142,19 +143,26 @@ TEST(InterpolatingTable, ValidationErrors) {
   EXPECT_EQ(Table::Validate(too_many).error, TableError::kTooManyRows);
 
   EXPECT_THROW(Table(std::span<const Row>{}), std::invalid_argument);
-  EXPECT_THROW(Table{unsorted}, std::invalid_argument);
-  EXPECT_THROW(Table{duplicate}, std::invalid_argument);
   EXPECT_THROW(Table{too_many}, std::invalid_argument);
-  try {
-    const Table table(duplicate);
-    FAIL() << "expected a throw";
-  } catch (const std::invalid_argument& e) {
-    EXPECT_NE(std::string(e.what()).find("row 1"), std::string::npos);
-  }
+  const auto expect_throw_with_row = [](std::span<const Row> bad_rows,
+                                        const char* expected_row) {
+    try {
+      const Table table(bad_rows);
+      FAIL() << "expected a throw for " << expected_row;
+    } catch (const std::invalid_argument& e) {
+      EXPECT_NE(std::string(e.what()).find(expected_row), std::string::npos)
+          << e.what();
+    }
+  };
+  expect_throw_with_row(unsorted, "row 2");
+  expect_throw_with_row(duplicate, "row 1");
+  expect_throw_with_row(nan_key, "row 1");
+  expect_throw_with_row(inf_value, "row 1");
 }
 
-// the shot table names its columns and refuses a time of
-// flight that is not positive.
+// the shot table names its columns, clamps and flags out-of-range and NaN
+// distances, and refuses a time of flight that is not finite and positive.
+// REQ-DEV-16
 TEST(ShotTable, NamedColumnsAndPositiveTimeOfFlight) {
   const std::array<ShotRow, 2> rows = {{
       {2.0, 40.0, 0.2, 0.6},
@@ -166,16 +174,42 @@ TEST(ShotTable, NamedColumnsAndPositiveTimeOfFlight) {
   EXPECT_DOUBLE_EQ(mid.flywheel_rps, 50.0);
   EXPECT_DOUBLE_EQ(mid.hood_rad, 0.3);
   EXPECT_DOUBLE_EQ(mid.time_of_flight_s, 0.8);
-  EXPECT_FALSE(table.at(5.0).in_range);
-  EXPECT_DOUBLE_EQ(table.at(5.0).flywheel_rps, 60.0);
+
+  const Shot below = table.at(1.0);
+  EXPECT_FALSE(below.in_range);
+  EXPECT_DOUBLE_EQ(below.flywheel_rps, 40.0);
+  EXPECT_DOUBLE_EQ(below.hood_rad, 0.2);
+  EXPECT_DOUBLE_EQ(below.time_of_flight_s, 0.6);
+
+  const Shot above = table.at(5.0);
+  EXPECT_FALSE(above.in_range);
+  EXPECT_DOUBLE_EQ(above.flywheel_rps, 60.0);
+  EXPECT_DOUBLE_EQ(above.hood_rad, 0.4);
+  EXPECT_DOUBLE_EQ(above.time_of_flight_s, 1.0);
+
+  const Shot nan_shot = table.at(kNaN);
+  EXPECT_FALSE(nan_shot.in_range);
+  EXPECT_DOUBLE_EQ(nan_shot.flywheel_rps, 40.0);
+  EXPECT_DOUBLE_EQ(nan_shot.hood_rad, 0.2);
+  EXPECT_DOUBLE_EQ(nan_shot.time_of_flight_s, 0.6);
+
   EXPECT_EQ(table.min_distance_m(), 2.0);
   EXPECT_EQ(table.max_distance_m(), 4.0);
 
-  const std::array<ShotRow, 2> zero_flight = {{
-      {2.0, 40.0, 0.2, 0.6},
-      {4.0, 60.0, 0.4, 0.0},
-  }};
-  EXPECT_THROW(ShotTable{zero_flight}, std::invalid_argument);
+  for (const double bad_tof : {0.0, -1.0, kNaN, kInf, -kInf}) {
+    SCOPED_TRACE(bad_tof);
+    const std::array<ShotRow, 2> bad_flight = {{
+        {2.0, 40.0, 0.2, 0.6},
+        {4.0, 60.0, 0.4, bad_tof},
+    }};
+    try {
+      const ShotTable invalid(bad_flight);
+      FAIL() << "expected a throw for time_of_flight_s=" << bad_tof;
+    } catch (const std::invalid_argument& e) {
+      EXPECT_NE(std::string(e.what()).find("row 1"), std::string::npos)
+          << e.what();
+    }
+  }
   const std::vector<ShotRow> too_many(ShotTable::kCapacity + 1,
                                       ShotRow{1.0, 1.0, 1.0, 1.0});
   EXPECT_THROW(ShotTable{too_many}, std::invalid_argument);

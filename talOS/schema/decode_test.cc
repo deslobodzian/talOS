@@ -343,5 +343,179 @@ TEST(Decode, RejectsDiamondDagAndTwoFieldSelfCycle) {
   }
 }
 
+// Guards against scalar-array amplification OOM via overlapping fields or
+// shallow diamond DAGs over array leaves (REQ-OPS-15, REQ-CONTRACT-20).
+TEST(Decode, BoundsTotalScalarElementsAgainstArrayAmplification) {
+  // 1. Two overlapping [ubyte:65535] fields at offset 0 in a 65535-byte struct.
+  {
+    flatbuffers::FlatBufferBuilder builder;
+    const auto obj_name = builder.CreateString("bad.Amp");
+    std::vector<flatbuffers::Offset<reflection::Field>> fields;
+    for (int k = 0; k < 2; ++k) {
+      const auto field_name = builder.CreateString(k == 0 ? "a" : "b");
+      reflection::TypeBuilder tb(builder);
+      tb.add_base_type(reflection::BaseType::Array);
+      tb.add_element(reflection::BaseType::UByte);
+      tb.add_fixed_length(65535);
+      const auto ft = tb.Finish();
+      reflection::FieldBuilder fb(builder);
+      fb.add_name(field_name);
+      fb.add_type(ft);
+      fb.add_id(static_cast<std::uint16_t>(k));
+      fb.add_offset(0);
+      fields.push_back(fb.Finish());
+    }
+    const auto fvec = builder.CreateVector(fields);
+    reflection::ObjectBuilder ob(builder);
+    ob.add_name(obj_name);
+    ob.add_fields(fvec);
+    ob.add_is_struct(true);
+    ob.add_minalign(1);
+    ob.add_bytesize(65535);
+    const auto obj = ob.Finish();
+    const auto objects = builder.CreateVector(&obj, 1);
+    const auto enums = builder.CreateVector(
+        std::vector<flatbuffers::Offset<reflection::Enum>>{});
+    reflection::SchemaBuilder sb(builder);
+    sb.add_objects(objects);
+    sb.add_enums(enums);
+    reflection::FinishSchemaBuffer(builder, sb.Finish());
+
+    Identity id;
+    id.name = "bad.Amp";
+    id.bfbs.assign(reinterpret_cast<const char*>(builder.GetBufferPointer()),
+                   builder.GetSize());
+    const std::vector<std::byte> payload(65535, std::byte{0});
+    EXPECT_EQ(DecodeToText(id, payload), "<invalid struct schema>");
+  }
+
+  // 2. Exact boundary: 16384 scalar elements succeeds; adding one overlapping
+  //    scalar (16385 total) fails cleanly.
+  {
+    auto build_boundary = [](bool add_extra_scalar) {
+      flatbuffers::FlatBufferBuilder builder;
+      const auto obj_name = builder.CreateString("bound.Arr");
+      std::vector<flatbuffers::Offset<reflection::Field>> fields;
+      {
+        const auto field_name = builder.CreateString("a");
+        reflection::TypeBuilder tb(builder);
+        tb.add_base_type(reflection::BaseType::Array);
+        tb.add_element(reflection::BaseType::UByte);
+        tb.add_fixed_length(16384);
+        const auto ft = tb.Finish();
+        reflection::FieldBuilder fb(builder);
+        fb.add_name(field_name);
+        fb.add_type(ft);
+        fb.add_id(0);
+        fb.add_offset(0);
+        fields.push_back(fb.Finish());
+      }
+      if (add_extra_scalar) {
+        const auto field_name = builder.CreateString("b");
+        reflection::TypeBuilder tb(builder);
+        tb.add_base_type(reflection::BaseType::UByte);
+        const auto ft = tb.Finish();
+        reflection::FieldBuilder fb(builder);
+        fb.add_name(field_name);
+        fb.add_type(ft);
+        fb.add_id(1);
+        fb.add_offset(0);
+        fields.push_back(fb.Finish());
+      }
+      const auto fvec = builder.CreateVector(fields);
+      reflection::ObjectBuilder ob(builder);
+      ob.add_name(obj_name);
+      ob.add_fields(fvec);
+      ob.add_is_struct(true);
+      ob.add_minalign(1);
+      ob.add_bytesize(16384);
+      const auto obj = ob.Finish();
+      const auto objects = builder.CreateVector(&obj, 1);
+      const auto enums = builder.CreateVector(
+          std::vector<flatbuffers::Offset<reflection::Enum>>{});
+      reflection::SchemaBuilder sb(builder);
+      sb.add_objects(objects);
+      sb.add_enums(enums);
+      reflection::FinishSchemaBuffer(builder, sb.Finish());
+      Identity id;
+      id.name = "bound.Arr";
+      id.bfbs.assign(reinterpret_cast<const char*>(builder.GetBufferPointer()),
+                     builder.GetSize());
+      return id;
+    };
+
+    const std::vector<std::byte> payload(16384, std::byte{0});
+    const std::string at_cap = DecodeToText(build_boundary(false), payload);
+    EXPECT_NE(at_cap, "<invalid struct schema>");
+    EXPECT_EQ(at_cap.rfind("{a: [0, 0, ", 0), 0U);
+    EXPECT_EQ(DecodeToText(build_boundary(true), payload),
+              "<invalid struct schema>");
+  }
+
+  // 3. Cumulative cap across a 10-level diamond DAG (1023 struct visits < 4096,
+  //    512 leaves) over a leaf with a small [ubyte:33] array (16896 elements >
+  //    16384).
+  {
+    flatbuffers::FlatBufferBuilder builder;
+    constexpr int kLevels = 10;
+    std::vector<flatbuffers::Offset<reflection::Object>> objs;
+    objs.reserve(kLevels);
+    for (int i = 0; i < kLevels; ++i) {
+      const auto obj_name =
+          builder.CreateString("ampdag.o" + std::to_string(i));
+      std::vector<flatbuffers::Offset<reflection::Field>> fields;
+      if (i + 1 == kLevels) {
+        const auto field_name = builder.CreateString("leaf");
+        reflection::TypeBuilder tb(builder);
+        tb.add_base_type(reflection::BaseType::Array);
+        tb.add_element(reflection::BaseType::UByte);
+        tb.add_fixed_length(33);
+        const auto ft = tb.Finish();
+        reflection::FieldBuilder fb(builder);
+        fb.add_name(field_name);
+        fb.add_type(ft);
+        fb.add_offset(0);
+        fields.push_back(fb.Finish());
+      } else {
+        for (int k = 0; k < 2; ++k) {
+          const auto field_name = builder.CreateString(k == 0 ? "a" : "b");
+          reflection::TypeBuilder tb(builder);
+          tb.add_base_type(reflection::BaseType::Obj);
+          tb.add_index(i + 1);
+          const auto ft = tb.Finish();
+          reflection::FieldBuilder fb(builder);
+          fb.add_name(field_name);
+          fb.add_type(ft);
+          fb.add_id(static_cast<std::uint16_t>(k));
+          fb.add_offset(0);
+          fields.push_back(fb.Finish());
+        }
+      }
+      const auto fvec = builder.CreateVector(fields);
+      reflection::ObjectBuilder ob(builder);
+      ob.add_name(obj_name);
+      ob.add_fields(fvec);
+      ob.add_is_struct(true);
+      ob.add_minalign(1);
+      ob.add_bytesize(33);
+      objs.push_back(ob.Finish());
+    }
+    const auto objects = builder.CreateVector(objs);
+    const auto enums = builder.CreateVector(
+        std::vector<flatbuffers::Offset<reflection::Enum>>{});
+    reflection::SchemaBuilder sb(builder);
+    sb.add_objects(objects);
+    sb.add_enums(enums);
+    reflection::FinishSchemaBuffer(builder, sb.Finish());
+
+    Identity id;
+    id.name = "ampdag.o0";
+    id.bfbs.assign(reinterpret_cast<const char*>(builder.GetBufferPointer()),
+                   builder.GetSize());
+    const std::vector<std::byte> payload(33, std::byte{0});
+    EXPECT_EQ(DecodeToText(id, payload), "<invalid struct schema>");
+  }
+}
+
 }  // namespace
 }  // namespace talos::schema

@@ -58,7 +58,7 @@ instead of opening a camera:
 - Camera controls are accepted and ignored.
 
 Under `testing::Sim`, construct the source with `Pacing::kManual` through the
-node's source factory and call `DeliverUntil(sim.now())` between steps: no
-thread, no wall clock, and the same frames at the same simulated instants on
+node's source factory and call `DeliverUntil(sim.now().nanos())` between steps:
+no thread, no wall clock, and the same frames at the same simulated instants on
 every run (`playback_test.cc` steps a source so; the 2026 robot's
 `recorded_footage_test` runs its camera node on one).

@@ -395,9 +395,8 @@ TEST(SE2, AdjointAndRightJacobian) {
   }
 }
 
-// REQ-CONTRACT-01: SO3::RightJacobianOfExp and SE3::LeftV must avoid
-// catastrophic cancellation near sqrt(eps) where theta >= sqrt(eps) but
-// theta^2 < sqrt(eps).
+// SO3::RightJacobianOfExp and SE3::LeftV must avoid catastrophic cancellation
+// near sqrt(eps) where theta >= sqrt(eps) but theta^2 < sqrt(eps).
 TEST(SO3, SmallAngleRightJacobianAndSE3LeftVAvoidCancellation) {
   for (const double theta : {1.5e-8, 5e-8, 1e-7, 1e-6, 1e-5, 1e-4}) {
     SCOPED_TRACE(theta);

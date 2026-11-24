@@ -16,6 +16,16 @@
 namespace talos::vision::calibrate {
 namespace {
 std::map<std::string, std::string> Values(const Result& r) {
+  if (r.camera.empty() || r.camera.rows != 3 || r.camera.cols != 3 ||
+      r.camera.type() != CV_64F) {
+    throw std::runtime_error("Invalid camera matrix: expected 3x3 CV_64F");
+  }
+  if (r.distortion.empty() || r.distortion.type() != CV_64F ||
+      r.distortion.dims > 2 || r.distortion.total() < 5) {
+    throw std::runtime_error(
+        "Invalid distortion matrix: expected CV_64F with at least 5 "
+        "coefficients");
+  }
   std::map<std::string, std::string> values;
   auto put = [&](std::string key, double value) {
     if (!std::isfinite(value)) {

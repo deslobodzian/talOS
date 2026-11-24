@@ -141,6 +141,10 @@ class CpuAprilTagBackend {
                                              const CameraIntrinsics& intrinsics,
                                              double tag_size_meters) const;
 
+  // Test seam for inspecting the underlying detector's worker pool after
+  // Detect().
+  apriltag_detector* detector_for_testing() const;
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

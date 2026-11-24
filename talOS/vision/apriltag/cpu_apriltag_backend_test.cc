@@ -488,6 +488,35 @@ TEST(CpuAprilTagBackendTest, DetectorPoolThreadsRunAtBackgroundPriority) {
   EXPECT_EQ(probe.background, 3);
 }
 
+// REQ-RT-10: CpuAprilTagBackend::Detect configures its AprilTag worker-pool
+// threads at background priority without callers invoking
+// EnsureBackgroundWorkerPool directly.
+TEST(CpuAprilTagBackendTest, DetectConfiguresPoolThreadsAtBackgroundPriority) {
+  DetectorOptions options;
+  options.family_name = "tag36h11";
+  options.quad_decimate = 1.0f;
+  options.threads = 3;
+  CpuAprilTagBackend backend(options);
+
+  const std::vector<uint8_t> image(std::size_t{64} * 64, 128);
+  (void)backend.Detect(image.data(), 64, 64, 64);
+
+  apriltag_detector_t* td = backend.detector_for_testing();
+  ASSERT_NE(td, nullptr);
+  ASSERT_NE(td->wp, nullptr);
+  EXPECT_EQ(workerpool_get_nthreads(td->wp), 3);
+
+  PoolProbe probe;
+  probe.threads = 3;
+  for (int i = 0; i < 3; ++i) {
+    workerpool_add_task(td->wp, ProbeThread, &probe);
+  }
+  workerpool_run(td->wp);
+
+  EXPECT_EQ(probe.arrived, 3);
+  EXPECT_EQ(probe.background, 3);
+}
+
 TEST(CpuAprilTagBackendTest, RejectsPositiveStrideSmallerThanWidth) {
   const long raw_page = ::sysconf(_SC_PAGESIZE);
   ASSERT_GT(raw_page, 0);
