@@ -19,13 +19,16 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -329,50 +332,136 @@ TEST(PositionMechanism, NonFiniteDemandGoesNeutral) {
   arm.ExpectNeutral();
 }
 
-// A request outside update() (here a message callback, which would act on
-// a goal no Target selected) is refused for set_goal(), hold() and
-// clear_fault(), naming the mechanism.
+// Requests, clear_fault(), and update() are refused outside update() (the
+// constructor, an every() timer, a message callback, and off the loop thread
+// while update() is running), throwing std::logic_error naming the mechanism.
 // REQ-SAFE-36
 TEST(PositionMechanism, RequestOutsideUpdateThrows) {
-  enum class Action { kSetGoal, kHold, kClearFault };
-  for (const Action action :
-       {Action::kSetGoal, Action::kHold, Action::kClearFault}) {
-    SCOPED_TRACE(static_cast<int>(action));
+  struct Case {
+    const char* name;
+    void (*call)(PositionMechanism&);
+  };
+  static constexpr std::array<Case, 6> kCases{{
+      {"set_goal", [](PositionMechanism& m) { m.set_goal(0.2); }},
+      {"set_goal_units", [](PositionMechanism& m) { m.set_goal_units(0.2); }},
+      {"hold", [](PositionMechanism& m) { m.hold(); }},
+      {"stop", [](PositionMechanism& m) { m.stop(); }},
+      {"clear_fault", [](PositionMechanism& m) { m.clear_fault(); }},
+      {"update", [](PositionMechanism& m) { m.update(); }},
+  }};
+  constexpr std::string_view kExpectedName = "PositionMechanism 'arm'";
+
+  // Constructor (before the event loop runs update()).
+  {
+    struct CtorNode {
+      explicit CtorNode(Node& node) : mech{node, "arm"} {
+        for (std::size_t i = 0; i < kCases.size(); ++i) {
+          try {
+            kCases[i].call(mech);
+            errors[i] = "accepted";
+          } catch (const std::logic_error& e) {
+            errors[i] = e.what();
+          }
+        }
+      }
+      void update() { mech.update(); }
+      PositionMechanism mech;
+      std::array<std::string, kCases.size()> errors{};
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    const auto& node = sim.add<CtorNode>("arm");
+    for (std::size_t i = 0; i < kCases.size(); ++i) {
+      SCOPED_TRACE(std::string{"constructor: "} + kCases[i].name);
+      EXPECT_NE(node.errors[i].find(kExpectedName), std::string::npos)
+          << node.errors[i];
+    }
+  }
+
+  // every() timer callback.
+  for (const Case& c : kCases) {
+    SCOPED_TRACE(std::string{"every: "} + c.name);
+    struct TimerNode {
+      explicit TimerNode(Node& node) : mech{node, "arm"} {
+        node.every(20ms, [this] { call(mech); });
+      }
+      void update() { mech.update(); }
+      PositionMechanism mech;
+      void (*call)(PositionMechanism&) = nullptr;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    sim.add<TimerNode>("arm").call = c.call;
+    try {
+      sim.step(50ms);
+      ADD_FAILURE() << c.name << " from every() was accepted";
+    } catch (const std::logic_error& e) {
+      EXPECT_NE(std::string{e.what()}.find(kExpectedName), std::string::npos)
+          << e.what();
+    }
+  }
+
+  // Subscription callback (which would act on a goal no Target selected).
+  for (const Case& c : kCases) {
+    SCOPED_TRACE(std::string{"callback: "} + c.name);
     struct CallbackNode {
       explicit CallbackNode(Node& node)
           : mech{node, "arm"},
             goal{node.subscribe<control::PositionTarget>(
-                "/test/goal", [this](const control::PositionTarget& t) {
-                  switch (action) {
-                    case Action::kSetGoal:
-                      mech.set_goal(t.position_rot());
-                      break;
-                    case Action::kHold:
-                      mech.hold(t.feedforward_v());
-                      break;
-                    case Action::kClearFault:
-                      mech.clear_fault();
-                      break;
-                  }
-                })} {}
+                "/test/goal",
+                [this](const control::PositionTarget&) { call(mech); })} {}
       void update() { mech.update(); }
       PositionMechanism mech;
-      Action action = Action::kSetGoal;
+      void (*call)(PositionMechanism&) = nullptr;
       Subscription<control::PositionTarget> goal;
     };
     auto sim = Sim::FromToml(kRobotToml);
-    sim.add<CallbackNode>("arm").action = action;
+    sim.add<CallbackNode>("arm").call = c.call;
     SimHardware hw{sim};
     hw.enable();
     sim.step(10ms);
     sim.publish("/test/goal", control::PositionTarget{0.2, 0.0});
     try {
       sim.step(10ms);
-      ADD_FAILURE() << "request from a callback was accepted";
+      ADD_FAILURE() << c.name << " from a callback was accepted";
     } catch (const std::logic_error& e) {
-      EXPECT_NE(std::string{e.what()}.find("PositionMechanism 'arm'"),
-                std::string::npos)
+      EXPECT_NE(std::string{e.what()}.find(kExpectedName), std::string::npos)
           << e.what();
+    }
+  }
+
+  // Off the loop thread while update() is running (joined before update()
+  // returns so there is no concurrent access to node or mechanism state).
+  {
+    struct ThreadedNode {
+      explicit ThreadedNode(Node& node) : mech{node, "arm"} {}
+      void update() {
+        if (!ran) {
+          ran = true;
+          std::thread other{[this] {
+            for (std::size_t i = 0; i < kCases.size(); ++i) {
+              try {
+                kCases[i].call(mech);
+                errors[i] = "accepted";
+              } catch (const std::logic_error& e) {
+                errors[i] = e.what();
+              }
+            }
+          }};
+          other.join();
+        }
+        mech.update();
+      }
+      PositionMechanism mech;
+      bool ran = false;
+      std::array<std::string, kCases.size()> errors{};
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    const auto& node = sim.add<ThreadedNode>("arm");
+    sim.step(10ms);
+    ASSERT_TRUE(node.ran);
+    for (std::size_t i = 0; i < kCases.size(); ++i) {
+      SCOPED_TRACE(std::string{"off-thread: "} + kCases[i].name);
+      EXPECT_NE(node.errors[i].find(kExpectedName), std::string::npos)
+          << node.errors[i];
     }
   }
 }
