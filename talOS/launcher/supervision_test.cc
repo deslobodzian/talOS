@@ -6629,8 +6629,10 @@ TEST(Supervision, QuiescedBridgeDecouplesActuatorStopFromLogFlushTimeout) {
     std::jthread driver{[&](const std::stop_token& stop) {
       const testing::SteppedClock::ReleaseOnExit release_clock{clock};
       if (!WaitFor(stop, [&] {
+            const auto init_hw = ManifestRuns(ReadFile(live), "hardware_node");
             return ReadLines(ready).size() == 3 &&
-                   Registered("hardware_node", session);
+                   Registered("hardware_node", session) && !init_hw.empty() &&
+                   init_hw.back().find("\"running\"") != std::string::npos;
           })) {
         std::ofstream{release_hw}.close();
         ::kill(::getpid(), SIGTERM);
@@ -6732,8 +6734,10 @@ TEST(Supervision, QuiescedBridgeDecouplesActuatorStopFromLogFlushTimeout) {
     std::jthread driver{[&](const std::stop_token& stop) {
       const testing::SteppedClock::ReleaseOnExit release_clock{clock};
       if (!WaitFor(stop, [&] {
+            const auto init_hw = ManifestRuns(ReadFile(live), "hardware_node");
             return ReadLines(ready).size() == 3 &&
-                   Registered("hardware_node", session);
+                   Registered("hardware_node", session) && !init_hw.empty() &&
+                   init_hw.back().find("\"running\"") != std::string::npos;
           })) {
         ::kill(::getpid(), SIGTERM);
         return;
@@ -6832,8 +6836,10 @@ TEST(Supervision, QuiescedBridgeDecouplesActuatorStopFromLogFlushTimeout) {
     std::jthread driver{[&](const std::stop_token& stop) {
       const testing::SteppedClock::ReleaseOnExit release_clock{clock};
       if (!WaitFor(stop, [&] {
+            const auto init_hw = ManifestRuns(ReadFile(live), "hardware_node");
             return ReadLines(ready).size() == 3 &&
-                   Registered("hardware_node", session);
+                   Registered("hardware_node", session) && !init_hw.empty() &&
+                   init_hw.back().find("\"running\"") != std::string::npos;
           })) {
         ::kill(::getpid(), SIGTERM);
         return;
