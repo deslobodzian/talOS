@@ -1,4 +1,4 @@
-load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//talOS/build:contract.bzl", "talos_messages")
 
 package(default_visibility = ["//visibility:public"])
@@ -18,10 +18,11 @@ talos_messages(
     include_prefix = "control",
 )
 
-# Compile-time checks: building it is the check (layout_asserts.cc).
-cc_library(
-    name = "layout_asserts",
-    testonly = True,
+# Compile-time checks: building and running this test verifies every shared
+# message's sizeof/alignof and talos::Message contract (layout_asserts.cc).
+cc_test(
+    name = "layout_asserts_test",
+    size = "small",
     srcs = ["layout_asserts.cc"],
     deps = [
         ":control",

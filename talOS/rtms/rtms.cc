@@ -90,9 +90,19 @@ void ThrowIfVersionMismatch(const std::string& path) {
 // will be" without masking either.
 constexpr int kInitAttempts = 200;
 constexpr useconds_t kInitRetryUs = 250;
-// How often open() waits for the last holder of a closing segment to unlink
-// it before deciding that holder died first.
-constexpr int kOpenAttempts = 200;
+// How many times in all, kInitRetryUs apart (at least 1 s), one open() waits
+// for live claimants of closing segments to unlink them before giving up
+// (RTMSQueue::claimant_wait_attempts_, which tests lower).
+// Not a death test -- among processes of one build a live claimant is never
+// superseded however long it is descheduled -- only a bound on the wait for
+// one that never proceeds (stopped).
+constexpr int kClaimantWaitAttempts = 4000;
+// How many times a session owner claims and unlinks a standalone segment, or
+// loses the race to claim one, before it stops replacing the name and lets
+// its create report the name as taken. A pass that waits for a live claimant
+// does not count. Without a sleep between passes: only a name recreated as
+// fast as it is replaced reaches it.
+constexpr int kSessionReplacePasses = 200;
 
 std::string ValidatePath(std::string_view path) {
   std::string_view name = path;
@@ -152,17 +162,29 @@ bool WaitInitialized(const RTMSHeader& header) {
   return false;
 }
 
-// A read-only mapping of the header of an existing segment, or nothing when
-// the name is absent or too small to hold a header within the wait.
+// A mapping of the header of an existing segment (read-only unless opened
+// with Access::kWrite), or nothing when the name is absent or too small to
+// hold a header within the wait, or when it could not be checked (failed()).
 class HeaderView {
  public:
-  explicit HeaderView(const std::string& path) {
-    const int fd = ::shm_open(ShmObjectName(path).c_str(), O_RDONLY, 0666);
-    if (fd == -1) return;
+  enum class Access { kRead, kWrite };
+
+  explicit HeaderView(const std::string& path, Access access = Access::kRead) {
+    const bool write = access == Access::kWrite;
+    const int fd = ::shm_open(ShmObjectName(path).c_str(),
+                              write ? O_RDWR : O_RDONLY, 0666);
+    if (fd == -1) {
+      failed_ = errno != ENOENT;
+      return;
+    }
+    present_ = true;
     struct stat info {};
     bool sized = false;
     for (int attempt = 0; attempt < kInitAttempts; ++attempt) {
-      if (::fstat(fd, &info) < 0) break;
+      if (::fstat(fd, &info) < 0) {
+        failed_ = true;
+        break;
+      }
       if (info.st_size >= 0 &&
           static_cast<std::uint64_t>(info.st_size) >= sizeof(RTMSHeader)) {
         sized = true;
@@ -172,41 +194,105 @@ class HeaderView {
     }
     if (sized) {
       void* mapped =
-          ::mmap(nullptr, sizeof(RTMSHeader), PROT_READ, MAP_SHARED, fd, 0);
+          ::mmap(nullptr, sizeof(RTMSHeader),
+                 write ? PROT_READ | PROT_WRITE : PROT_READ, MAP_SHARED, fd, 0);
       if (mapped != MAP_FAILED) {
-        header_ = static_cast<const RTMSHeader*>(mapped);
+        header_ = static_cast<RTMSHeader*>(mapped);
+        writable_ = write;
+      } else {
+        failed_ = true;
       }
     }
     ::close(fd);
   }
   ~HeaderView() {
     if (header_ != nullptr) {
-      ::munmap(const_cast<RTMSHeader*>(header_), sizeof(RTMSHeader));
+      ::munmap(header_, sizeof(RTMSHeader));
     }
   }
   HeaderView(const HeaderView&) = delete;
   HeaderView& operator=(const HeaderView&) = delete;
 
-  // Null when the segment is too small to be an RTMS segment.
+  // Null when the segment is too small to be an RTMS segment, absent, or
+  // could not be checked.
   const RTMSHeader* header() const { return header_; }
+  // header(), writable; null unless opened with Access::kWrite.
+  RTMSHeader* writable_header() const { return writable_ ? header_ : nullptr; }
+  // Whether the name held a segment when it was opened.
+  bool present() const { return present_; }
+  // Whether the name could not be checked: shm_open failed other than for
+  // an absent name, or fstat or mmap failed.
+  bool failed() const { return failed_; }
 
  private:
-  const RTMSHeader* header_{nullptr};
+  RTMSHeader* header_{nullptr};
+  bool writable_{false};
+  bool present_{false};
+  bool failed_{false};
 };
 
+// Why a session owner cannot replace `path`: the claimant `claimant` (a
+// process word) counts as still unlinking the segment `name` holds. A
+// claimant this process cannot check counts as running whether or not it
+// does (process_liveness.h), and its pid may name another process here, so
+// the remedy names its pid only when ProcessAlive() looked that pid up.
+std::runtime_error SessionClaimantError(const std::string& path,
+                                        const std::string& name,
+                                        std::uint64_t claimant) {
+  const std::string pid = std::to_string(claimant & kProcessPidMask);
+  if (talos::ProcessWordCheckable(claimant)) {
+    return std::runtime_error("RTMS: a session cannot replace " + path +
+                              ": its claimant, pid " + pid +
+                              ", is still unlinking it (stop pid " + pid +
+                              " or wait for it to exit, then start the "
+                              "session again)");
+  }
+  return std::runtime_error(
+      "RTMS: a session cannot replace " + path + ": its claimant, pid " + pid +
+      ", which this process cannot check (another pid namespace, or /proc is "
+      "not this one's), counts as still unlinking it (once that process is "
+      "gone, shm_unlink " +
+      name + ", then start the session again)");
+}
+
 // Unlinks `path` only while it still names the segment `segment_id`: a
-// session may have replaced it, or an opener recovered it from a killed
-// closer, since this process mapped it, and that newer segment is not ours
-// to remove.
-void UnlinkIfSame(const std::string& path, std::uint64_t segment_id) {
-  bool same = false;
+// session may have replaced it since this process mapped it, and that newer
+// segment is not ours to remove. Returns whether the name no longer holds
+// `segment_id`: true when the name is absent, holds another segment or one
+// still being created, or the unlink succeeded; false when the name could
+// not be checked or shm_unlink failed.
+//
+// Run by a closing segment's claimant (kLifetimeClaimantMask) and by a
+// session owner's close(). Among processes of one build only the claimant
+// unlinks a closing segment, and a session owner's open() replaces a
+// standalone segment only as its claimant (RTMSQueue::replace_for_session),
+// so none of them can replace the name between the check and the unlink; an
+// shm_unlink from outside talOS in that interval is not excluded.
+// `on_verified` is RTMSQueue::on_unlink_verified_.
+bool UnlinkIfSame(const std::string& path, std::uint64_t segment_id,
+                  void (*on_verified)(std::uint64_t)) {
   {
     const HeaderView view{path};
-    same = view.header() != nullptr &&
-           view.header()->magic.load(std::memory_order_acquire) == kRtmsMagic &&
-           view.header()->segment_id == segment_id;
+    if (view.failed()) return false;
+    const bool same =
+        view.header() != nullptr &&
+        view.header()->magic.load(std::memory_order_acquire) == kRtmsMagic &&
+        view.header()->segment_id == segment_id;
+    if (!same) return true;
   }
-  if (same) ::shm_unlink(ShmObjectName(path).c_str());
+  if (on_verified != nullptr) on_verified(segment_id);
+  return ::shm_unlink(ShmObjectName(path).c_str()) == 0 || errno == ENOENT;
+}
+
+// Run by a claimant whose UnlinkIfSame() returned false, while it still maps
+// the segment: gives up this process's claim, leaving the segment closing
+// with no claimant, so a later opener claims and unlinks it rather than wait
+// for this process to exit.
+void GiveUpClaim(RTMSHeader& header) noexcept {
+  std::uint64_t claimed = kLifetimeClosing | OwnProcess();
+  header.lifetime.compare_exchange_strong(claimed, kLifetimeClosing,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire);
 }
 
 std::uint64_t NewSegmentId() {
@@ -227,15 +313,21 @@ bool HeldByLiveProcess(const RTMSHeader& header) {
 }
 
 // Releases one counted attachment to a standalone segment using the CAS
-// close protocol. Returns true when this caller dropped the count to zero and
-// marked the segment closing, so it must unlink the segment after unmapping.
+// close protocol. Returns true when this caller dropped the count to zero,
+// marking the segment closing with this process as its claimant in the same
+// step, so it must unlink the segment (and, if that fails, give up the claim
+// while it still maps it). Called once per counted attachment, by the process
+// that took the count (owner_process_). A closing word here was claimed from
+// the count by a session owner replacing the name
+// (RTMSQueue::replace_for_session), which unlinks the segment: the release
+// leaves it as it is and returns false.
 bool ReleaseCountedLifetime(RTMSHeader& header) noexcept {
   std::uint64_t word = header.lifetime.load(std::memory_order_acquire);
   for (;;) {
+    if ((word & kLifetimeClosing) != 0) return false;
     const std::uint64_t count = word & kLifetimeCountMask;
     const std::uint64_t next =
-        count <= 1 ? ((word & ~kLifetimeCountMask) | kLifetimeClosing)
-                   : word - 1;
+        count <= 1 ? (kLifetimeClosing | OwnProcess()) : word - 1;
     if (header.lifetime.compare_exchange_weak(
             word, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
       return count <= 1;
@@ -246,6 +338,9 @@ bool ReleaseCountedLifetime(RTMSHeader& header) noexcept {
 }  // namespace
 
 void (*RTMSQueue::on_reclaim_wait_)(std::uint64_t, int) = nullptr;
+void (*RTMSQueue::on_unlink_verified_)(std::uint64_t) = nullptr;
+void (*RTMSQueue::on_session_claimed_)(std::uint64_t) = nullptr;
+int RTMSQueue::claimant_wait_attempts_ = kClaimantWaitAttempts;
 
 RTMSQueue::RTMSQueue(std::string_view path, std::size_t message_size,
                      std::size_t message_alignment,
@@ -318,15 +413,13 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
   };
 
   if (options_.session_owner) {
-    // A new session replaces whatever the name held: a segment of a
-    // previous session that ended without cleaning up, or a standalone run's.
-    ::shm_unlink(ShmObjectName(path_).c_str());
+    replace_for_session();
   }
 
-  std::optional<std::uint64_t> closing_segment_id;
-  int closing_waits = 0;
-  int reclaim_waits = 0;
-  bool reclaimed = false;
+  // How often this open() has waited for a live claimant, whatever segment,
+  // and the closing segment it last claimed and tried to unlink.
+  int claimant_waits = 0;
+  std::optional<std::uint64_t> unlinked_segment_id;
   for (;;) {
     if (!options_.session_owner) {
       ThrowIfVersionMismatch(path_);
@@ -437,48 +530,48 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
     }
     if (closing) {
       const std::uint64_t segment_id = header->segment_id;
-      if (!closing_segment_id.has_value() ||
-          *closing_segment_id != segment_id) {
-        closing_segment_id = segment_id;
-        closing_waits = 0;
-        reclaim_waits = 0;
-        reclaimed = false;
-      }
-      // Its last holder is unlinking it; the next shm_open creates a fresh
-      // segment once the name is gone.
-      if (!reclaimed && closing_waits + 1 < kOpenAttempts) {
-        ++closing_waits;
-        ::usleep(kInitRetryUs);
-        continue;
-      }
-      // A holder killed after marking it closing never will. Its count
-      // reached zero, so no queue is attached; once the wait is spent this
-      // segment -- never a newer one under the name -- is unlinked here by
-      // whichever opener claims kLifetimeReclaiming, unless a live process
-      // still holds its writer claim or a reader slot. Concurrent openers
-      // that lose the claim wait up to kOpenAttempts retries for the winner's
-      // unlink before superseding a winner that died before UnlinkIfSame().
-      if (!reclaimed && !HeldByLiveProcess(*header)) {
-        const std::uint64_t prior = header->lifetime.fetch_or(
-            kLifetimeReclaiming, std::memory_order_acq_rel);
-        const bool won_claim = (prior & kLifetimeReclaiming) == 0;
-        if (won_claim || reclaim_waits >= kOpenAttempts) {
-          std::fprintf(stderr,
-                       "rtms: reclaiming shared memory %s, whose %s died "
-                       "before unlinking it\n",
-                       path_.c_str(), won_claim ? "last holder" : "reclaimer");
-          UnlinkIfSame(path_, segment_id);
-          reclaimed = true;
-          continue;
-        }
-        ++reclaim_waits;
+      // This opener tried to unlink it, yet the name still holds it: give up.
+      if (unlinked_segment_id == segment_id) break;
+      // Its claimant, the last holder or an opener that took it over, is the
+      // one process that unlinks it; the next shm_open creates a fresh
+      // segment once the name is gone. Among processes of one build a live
+      // claimant is waited for however long it is descheduled, never
+      // superseded: an unlink in its place could race its own and remove a
+      // segment created meanwhile.
+      const std::uint64_t claimant = word & kLifetimeClaimantMask;
+      if (claimant != 0 && ProcessAlive(claimant)) {
+        if (claimant_waits >= claimant_wait_attempts_) break;
+        ++claimant_waits;
         if (on_reclaim_wait_ != nullptr) {
-          on_reclaim_wait_(segment_id, reclaim_waits);
+          on_reclaim_wait_(segment_id, claimant_waits);
         }
         ::usleep(kInitRetryUs);
         continue;
       }
-      break;
+      // A claimant killed before unlinking it never will, and one whose
+      // unlink failed gave its claim up. The count reached zero, so no queue
+      // is attached (unless a session owner claimed it from its holders and
+      // was killed before unlinking it, or gave its claim up when its unlink
+      // failed): unless a live process still holds
+      // its writer claim or a reader slot, this opener claims it from the
+      // dead claimant (or from none) and unlinks it, under UnlinkIfSame()'s
+      // condition only this segment and not a newer one under the name. An
+      // opener that loses the claim retries and finds the winner, alive,
+      // unlinking it.
+      if (HeldByLiveProcess(*header)) break;
+      if (header->lifetime.compare_exchange_strong(
+              word, kLifetimeClosing | OwnProcess(), std::memory_order_acq_rel,
+              std::memory_order_acquire)) {
+        std::fprintf(stderr,
+                     "rtms: reclaiming shared memory %s, whose claimant "
+                     "died or gave up before unlinking it\n",
+                     path_.c_str());
+        if (!UnlinkIfSame(path_, segment_id, on_unlink_verified_)) {
+          GiveUpClaim(*header);
+        }
+        unlinked_segment_id = segment_id;
+      }
+      continue;
     }
     if (options_.publisher) {
       try {
@@ -486,10 +579,11 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
       } catch (...) {
         if (counted_) {
           const std::uint64_t segment_id = header->segment_id;
-          const bool unlink = ReleaseCountedLifetime(*header);
           counted_ = false;
-          ptr = SharedMemoryPtr{};
-          if (unlink) UnlinkIfSame(path_, segment_id);
+          if (ReleaseCountedLifetime(*header) &&
+              !UnlinkIfSame(path_, segment_id, on_unlink_verified_)) {
+            GiveUpClaim(*header);
+          }
         }
         throw;
       }
@@ -501,7 +595,74 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
     return;
   }
   throw std::runtime_error(
-      "RTMS: " + path_ + " stayed closing; its last holder never unlinked it");
+      "RTMS: " + path_ +
+      " stayed closing; its claimant never unlinked it, or a live process "
+      "still holds it" +
+      Remedy(path_));
+}
+
+void RTMSQueue::replace_for_session() {
+  const std::string name = ShmObjectName(path_);
+  // How often this open() has waited for a live claimant, whatever segment,
+  // and how many other passes it has made (kSessionReplacePasses).
+  int claimant_waits = 0;
+  int replace_passes = 0;
+  for (;;) {
+    const HeaderView view{path_, HeaderView::Access::kWrite};
+    if (!view.present() && !view.failed()) return;  // nothing to replace
+    RTMSHeader* header = view.writable_header();
+    // Not a segment whose lifetime word this build can read (it could not be
+    // checked, is too small, never published its magic, or is of another
+    // version), or a previous session's: no standalone claimant of this
+    // build unlinks it, so the session does.
+    if (header == nullptr || !WaitInitialized(*header) ||
+        header->version != kRtmsVersion) {
+      ::shm_unlink(name.c_str());
+      return;
+    }
+    std::uint64_t word = header->lifetime.load(std::memory_order_acquire);
+    if ((word & kLifetimeSessionOwned) != 0) {
+      ::shm_unlink(name.c_str());
+      return;
+    }
+    // A standalone segment. Its live claimant is the one process that
+    // unlinks it, and is waited for as an opener waits for it, never
+    // superseded: its unlink could follow this session's segment's creation.
+    const std::uint64_t segment_id = header->segment_id;
+    const std::uint64_t claimant = word & kLifetimeClaimantMask;
+    if ((word & kLifetimeClosing) != 0 && claimant != 0 &&
+        ProcessAlive(claimant)) {
+      if (claimant_waits >= claimant_wait_attempts_) {
+        throw SessionClaimantError(path_, name, claimant);
+      }
+      ++claimant_waits;
+      if (on_reclaim_wait_ != nullptr) {
+        on_reclaim_wait_(segment_id, claimant_waits);
+      }
+      ::usleep(kInitRetryUs);
+      continue;
+    }
+    // Attached queues (a count), or a claimant that died or gave its claim
+    // up: this session owner becomes the claimant, so no holder that closes
+    // afterwards unlinks the name (ReleaseCountedLifetime), and unlinks it.
+    // Holders keep their mapping of the unlinked segment until they close.
+    if (++replace_passes > kSessionReplacePasses) return;
+    if (!header->lifetime.compare_exchange_strong(
+            word, kLifetimeClosing | OwnProcess(), std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+      continue;
+    }
+    if (on_session_claimed_ != nullptr) on_session_claimed_(segment_id);
+    // On failure the name may still hold it, and open() then fails as it
+    // does on a name taken while the session creates it.
+    if (!UnlinkIfSame(path_, segment_id, on_unlink_verified_)) {
+      GiveUpClaim(*header);
+      return;
+    }
+    // The name no longer holds the claimed segment, but may hold one created
+    // since (its claimant unlinked it before this claim, and an opener
+    // created another): look again until the name is free.
+  }
 }
 
 void RTMSQueue::close() noexcept {
@@ -527,12 +688,16 @@ void RTMSQueue::close() noexcept {
       unlink = ReleaseCountedLifetime(*header_);
     }
   }
+  // Unlinked while still mapped, so a claim whose unlink failed can be given
+  // up (a session-owned segment has no claim to give up).
+  if (unlink && !UnlinkIfSame(path_, segment_id, on_unlink_verified_)) {
+    GiveUpClaim(*header_);
+  }
   registered_.fill(0);
   header_ = nullptr;
   counted_ = false;
   owner_process_ = 0;
   ptr_ = SharedMemoryPtr{};
-  if (unlink) UnlinkIfSame(path_, segment_id);
 }
 
 RTMSQueue::RTMSQueue(RTMSQueue&& other) noexcept

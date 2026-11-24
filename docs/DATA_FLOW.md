@@ -301,7 +301,8 @@ For published position P and slot sequence s, readers require P − s < slots,
 except that equality is accepted when the reliable-publication marker equals P.
 Overwriting writers invalidate this marker before modifying slot bytes. Every
 attach, publisher or reader, rejects a segment of another version, layout or
-schema. A new session owner replaces any prior segment.
+schema. A new session owner replaces a prior segment as the
+[RTMS segment lifetime](../talOS/rtms/README.md#segment-lifetime) states.
 Writer and reader claims in the header record one 64-bit process word: the pid
 (22 bits), the low 20 bits of the process start time (Linux clock ticks, macOS
 milliseconds) and a 20-bit pid-namespace code (`kProcessPidBits` in

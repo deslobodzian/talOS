@@ -113,7 +113,8 @@ A launch that starts the roster (anything but `--describe-only` and
 `--replay-inputs`, which use no shared memory) first takes the session lock of
 its shared-memory namespace (`session_lock.h`), before it writes anything. A
 session owns its namespace: it replaces every declared topic's segment at
-startup and unlinks them at its end, so a second launcher there would remove a
+startup ([segment lifetime](../rtms/README.md#segment-lifetime)) and unlinks
+them at its end, so a second launcher there would remove a
 running session's topics, and that session's restarted nodes would attach to
 segments its other nodes no longer share. The second launch is refused instead:
 

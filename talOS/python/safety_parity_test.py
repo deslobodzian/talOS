@@ -12,6 +12,7 @@ Covers:
 
 import ctypes
 from datetime import timedelta
+import gc
 import io
 import math
 import os
@@ -683,6 +684,8 @@ class SafetyParityTest(unittest.TestCase):
         with self.assertRaises(talos.TalosError):
             hw.enable(True)
         with self.assertRaises(talos.TalosError):
+            hw.set_gateway_clock(offset=1.0)
+        with self.assertRaises(talos.TalosError):
             hw.motor_request("roller", "wheel")
 
     # REQ-RT-05: Sim.resume() rejects re-entrant Sim.remove() inside overdue
@@ -842,6 +845,67 @@ channel = 0
             self.assertEqual(
                 hw.applied_motor("shooter", "flywheel").mode,
                 talos.Mode.NEUTRAL)
+    # REQ-CONTRACT-14: an unreachable GC cycle holding Sim, a hosted node, and
+    # SimHardware must destroy SimHardware before Sim even though PEP 442 clears
+    # weakrefs before __del__, and any teardown call on hw after Sim destruction
+    # must raise TalosError rather than UAF freed Sim.
+    def test_cyclic_gc_destroys_and_invalidates_sim_hardware_before_sim(self):
+        events = []
+        probe_calls = []
+
+        class CycleProbe:
+            def __init__(self, node):
+                self.hw = None
+
+            def __del__(self):
+                if self.hw is None:
+                    return
+                sim_dead = getattr(self.hw._sim, "_handle", None) is None
+                try:
+                    self.hw.set_gateway_clock(offset=1.0)
+                except talos.TalosError:
+                    probe_calls.append(("raised", sim_dead))
+                else:
+                    probe_calls.append(("ok", sim_dead))
+
+        real_hw_destroy = _abi.lib.talos_sim_hardware_destroy
+        real_sim_destroy = _abi.lib.talos_sim_destroy
+
+        def tracked_hw_destroy(handle):
+            events.append("hw_destroy")
+            return real_hw_destroy(handle)
+
+        def tracked_sim_destroy(handle):
+            events.append("sim_destroy")
+            return real_sim_destroy(handle)
+
+        gc.collect()
+        with mock.patch.object(
+            _abi.lib, "talos_sim_hardware_destroy",
+            side_effect=tracked_hw_destroy,
+        ), mock.patch.object(
+            _abi.lib, "talos_sim_destroy",
+            side_effect=tracked_sim_destroy,
+        ):
+            sim = Sim.from_toml(ROBOT_TOML)
+            probe = sim.add(CycleProbe, "planner")
+            hw = SimHardware(sim)
+            probe.hw = hw  # cycle: sim -> _nodes -> probe -> hw -> _sim -> sim
+            del sim, probe, hw
+            gc.collect()
+
+        self.assertEqual(events, ["hw_destroy", "sim_destroy"])
+        self.assertEqual(len(probe_calls), 1)
+        # Never allowed to succeed once Sim's handle is gone.
+        self.assertNotIn(("ok", True), probe_calls)
+
+        # Normal SimHardware GC while Sim stays alive destroys hw immediately
+        # and drops its entry from sim._hardwares.
+        sim2 = Sim.from_toml(ROBOT_TOML)
+        hw2 = SimHardware(sim2)
+        self.assertEqual(len(sim2._hardwares), 1)
+        del hw2
+        self.assertEqual(len(sim2._hardwares), 0)
 
 
 if __name__ == "__main__":

@@ -711,6 +711,34 @@ static void destroy_clusters(zarray_t* clusters) {
   zarray_destroy(clusters);
 }
 
+bool apriltag_image_dimensions_supported(const apriltag_detector_t* td,
+                                         int width, int height) {
+  if (td == NULL || width < 4 || height < 4 || width >= 32768 ||
+      height >= 32768) {
+    return false;
+  }
+  int quad_w = width;
+  int quad_h = height;
+  if (td->quad_decimate > 1.0f) {
+    if (td->quad_decimate == 1.5f) {
+      quad_w = (width / 3) * 2;
+      quad_h = (height / 3) * 2;
+    } else if (td->quad_decimate >= 32768.0f) {
+      return false;
+    } else {
+      const int factor = (int)td->quad_decimate;
+      if (factor > 1) {
+        quad_w = 1 + (width - 1) / factor;
+        quad_h = 1 + (height - 1) / factor;
+      }
+    }
+  }
+  // apriltag_quad_thresh's threshold() divides dimensions by tilesz=4 and
+  // indexes im_max[(th - 1) * tw + ...], overflowing heap buffers if < 4.
+  // struct pt stores 2x coordinates in uint16_t, overflowing if >= 32768.
+  return quad_w >= 4 && quad_h >= 4 && quad_w < 32768 && quad_h < 32768;
+}
+
 // Takes ownership of external_uf (destroys it on return); NULL builds the
 // union-find via CPU connected_components, mirroring upstream ownership.
 static zarray_t* quad_thresh_from_threshim_and_uf(apriltag_detector_t* td,
@@ -718,7 +746,8 @@ static zarray_t* quad_thresh_from_threshim_and_uf(apriltag_detector_t* td,
                                                   image_u8_t* threshim,
                                                   unionfind_t* external_uf) {
   if (td == NULL || im == NULL || threshim == NULL || im->buf == NULL ||
-      threshim->buf == NULL || im->width <= 0 || im->height <= 0 ||
+      threshim->buf == NULL || im->width < 4 || im->height < 4 ||
+      im->width >= 32768 || im->height >= 32768 || im->stride < im->width ||
       im->width != threshim->width || im->height != threshim->height ||
       threshim->stride < threshim->width) {
     if (external_uf != NULL) unionfind_destroy(external_uf);
@@ -924,7 +953,9 @@ zarray_t* apriltag_quad_thresh_from_gpu_labels(apriltag_detector_t* td,
 zarray_t* apriltag_quad_thresh_from_gpu_clusters(apriltag_detector_t* td,
                                                  image_u8_t* im,
                                                  zarray_t* clusters) {
-  if (td == NULL || im == NULL || clusters == NULL) {
+  if (td == NULL || im == NULL || clusters == NULL || im->buf == NULL ||
+      im->width < 4 || im->height < 4 || im->width >= 32768 ||
+      im->height >= 32768 || im->stride < im->width) {
     destroy_clusters(clusters);
     return NULL;
   }
@@ -949,6 +980,12 @@ static zarray_t* detect_with_external_stages(apriltag_detector_t* td,
   if (td == NULL || im_orig == NULL) {
     destroy_clusters(external_clusters);
     return NULL;
+  }
+  if (im_orig->buf == NULL || im_orig->stride < im_orig->width ||
+      !apriltag_image_dimensions_supported(td, im_orig->width,
+                                           im_orig->height)) {
+    destroy_clusters(external_clusters);
+    return zarray_create(sizeof(apriltag_detection_t*));
   }
   if (threshim == NULL) {
     destroy_clusters(external_clusters);
@@ -1306,6 +1343,11 @@ static zarray_t* detect_with_external_stages(apriltag_detector_t* td,
 }
 
 image_u8_t* apriltag_threshold_cpu(apriltag_detector_t* td, image_u8_t* im) {
+  if (td == NULL || im == NULL || im->buf == NULL || im->width < 4 ||
+      im->height < 4 || im->width >= 32768 || im->height >= 32768 ||
+      im->stride < im->width) {
+    return NULL;
+  }
   if (!ensure_workerpool(td)) {
     return NULL;
   }

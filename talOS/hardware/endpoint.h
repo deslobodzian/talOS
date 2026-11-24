@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cerrno>
 #include <cstdio>
 #include <functional>
 #include <string>
@@ -65,6 +66,13 @@ class Endpoint {
   // in Tick(); a nonzero errno fails that receive with kSocketError and that
   // error, so tests can reach OS receive errors loopback never produces.
   void SetReceiveErrorSeam(int (*seam)()) { receive_error_seam_ = seam; }
+  // Test seam (null in production): when set, asked before each SendFrame() in
+  // Send(); EAGAIN/EWOULDBLOCK fails that send with kWouldBlock, any other
+  // nonzero errno fails it with kSocketError and records that error, so tests
+  // can reach send-error combinations loopback never produces.
+  void SetSendErrorSeam(int (*seam)(protocol::FrameType)) {
+    send_error_seam_ = seam;
+  }
   // Link fault injection drops outbound traffic, never inbound commands or
   // gateway safety ticks. Suppressed datagrams are not queued for recovery.
   void SetSendEnabled(bool enabled) { send_enabled_ = enabled; }
@@ -73,9 +81,11 @@ class Endpoint {
   // of each later Tick until a send succeeds or a newer transfer completes
   // (its ACK replaces it, or, while its configure is pending, none is sent),
   // so only the newest completed transfer's ACK ever goes out (the bridge
-  // would otherwise wait for its next push). Returns the State send's
-  // status, or, when that succeeded, the first failed ACK send's: either way a
-  // send that found the socket unable to send reaches the caller. If State
+  // would otherwise wait for its next push). If an ACK send already failed
+  // with a permanent socket error (SendErrorNeedsNewSocket), skips sending
+  // State so its fatal status and errno reach the caller intact. Otherwise
+  // sends State and returns the worse status (kSocketError wins over
+  // kWouldBlock; else State's unless it succeeded, then the ACK's). If State
   // fails to encode, no kHardwareState frame is sent and kInvalidArgument is
   // returned unless an ACK send already failed.
   protocol::UdpStatus Tick(uint64_t now_us, bool enabled) {
@@ -103,6 +113,10 @@ class Endpoint {
     }
     // This one, or one whose send failed on an earlier tick.
     auto ack_status = SendAck(now_us);
+    const auto ack_needs_new_socket = [&] {
+      return ack_status == protocol::UdpStatus::kSocketError &&
+             protocol::SendErrorNeedsNewSocket(last_send_error_);
+    };
     // Only the newest command of the drained batch reaches the gateway: after
     // a stall the socket holds a backlog, and applying each queued command
     // would replay superseded demands back-to-back as CAN bursts.
@@ -190,7 +204,9 @@ class Endpoint {
             }
           }
           QueueAck(ack);
-          ack_status = Worse(ack_status, SendAck(now_us));
+          if (!ack_needs_new_socket()) {
+            ack_status = Worse(ack_status, SendAck(now_us));
+          }
         } else if (status != ConfigAssembler::Status::kIncomplete) {
           ConfigAckPayload ack{};
           ack.config_id = assembler_.config_id();
@@ -203,7 +219,9 @@ class Endpoint {
           }
           std::snprintf(ack.reason, sizeof(ack.reason), "%s", err.data());
           QueueAck(ack);
-          ack_status = Worse(ack_status, SendAck(now_us));
+          if (!ack_needs_new_socket()) {
+            ack_status = Worse(ack_status, SendAck(now_us));
+          }
         }
         continue;
       }
@@ -223,6 +241,9 @@ class Endpoint {
       drained_.present = true;
       drained_.observed_time_us = newest.observed_time_us;
       drained_.accepted = gateway_.Accept(newest, command_sequence, now_us);
+    }
+    if (ack_needs_new_socket()) {
+      return ack_status;
     }
     auto state = gateway_.snapshot();
     state.clock_probe_time_us = clock_probe_time_us;
@@ -252,12 +273,32 @@ class Endpoint {
   protocol::UdpStatus Send(protocol::FrameType type, uint64_t now_us,
                            const void* payload, std::size_t payload_size) {
     if (!send_enabled_) return protocol::UdpStatus::kOk;
-    return peer_.SendFrame(type, protocol::kFlagNone, now_us, payload,
-                           payload_size);
+    if (send_error_seam_ != nullptr) {
+      const int err = send_error_seam_(type);
+      if (err == EAGAIN || err == EWOULDBLOCK) {
+        return protocol::UdpStatus::kWouldBlock;
+      }
+      if (err != 0) {
+        last_send_error_ = err;
+        return protocol::UdpStatus::kSocketError;
+      }
+    }
+    const auto status = peer_.SendFrame(type, protocol::kFlagNone, now_us,
+                                        payload, payload_size);
+    if (status == protocol::UdpStatus::kSocketError) {
+      last_send_error_ = peer_.stats().last_send_error;
+    }
+    return status;
   }
-  // `first` unless it succeeded, then `second`.
+  // `kSocketError` wins over any other status (so a broken socket is never
+  // masked behind `kWouldBlock`); otherwise `first` unless it succeeded, then
+  // `second`.
   static protocol::UdpStatus Worse(protocol::UdpStatus first,
                                    protocol::UdpStatus second) {
+    if (first == protocol::UdpStatus::kSocketError ||
+        second == protocol::UdpStatus::kSocketError) {
+      return protocol::UdpStatus::kSocketError;
+    }
     return first != protocol::UdpStatus::kOk ? first : second;
   }
   // Replaces any ACK not yet sent: the newest answers the bridge's newest
@@ -278,8 +319,10 @@ class Endpoint {
   static constexpr int kReceiveBudget = 64;
   bool send_enabled_{true};
   int (*receive_error_seam_)(){nullptr};
+  int (*send_error_seam_)(protocol::FrameType){nullptr};
   protocol::UdpStatus last_receive_status_{protocol::UdpStatus::kOk};
   int last_receive_error_{0};
+  int last_send_error_{0};
   PeerContact contact_;
   DrainedCommand drained_;
   uint64_t pending_probe_time_us_{};

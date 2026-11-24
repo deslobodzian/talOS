@@ -1883,8 +1883,9 @@ homing_timeout_us = 3000000
 homing_stall_rps = 0.05
 homing_stall_us = 500000
 # The switch reading closed with the zeroed motor more than this from it is a
-# stuck or miswired switch: the @NAME@ stops, neutral.
-home_margin_rot = 0.5
+# stuck or miswired switch: the @NAME@ stops, neutral. PLACEHOLDER: must be
+# less than the travel from home_rot to the far limit; raise with max_rot.
+home_margin_rot = 0.0005
 # The switch zeroes the motor only after reading closed on this many
 # consecutive ticks, so one glitched sample mid-travel does not.
 home_samples = 3
@@ -2068,7 +2069,7 @@ homing_v = -0.5
 homing_timeout_us = 3000000
 homing_stall_rps = 0.05
 homing_stall_us = 500000
-home_margin_rot = 0.5
+home_margin_rot = 0.0005
 home_samples = 3
 
 [motors.@NAME@]
@@ -4158,6 +4159,7 @@ autonomous = []
 # The simulated travel.
 [{sub}.{name}]
 max_rot = 2.0
+home_margin_rot = 0.5
 """
         push = "the homing push" if raw else "homing_v"
         return block + travel + f"""\
