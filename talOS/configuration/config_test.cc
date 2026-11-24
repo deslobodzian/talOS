@@ -2698,10 +2698,10 @@ TEST_F(ManifestTest,
   }
 }
 
-// REQ-CONTRACT-31, REQ-OPS-39, REQ-CONTRACT-17: config files must declare
-// relative [trajectories] and [studio] dashboard paths (no absolute paths or
-// embedded NUL bytes).
-TEST_F(ManifestTest, RejectsAbsoluteAndNulTrajectoryAndDashboardPathsInFiles) {
+// REQ-CONTRACT-31, REQ-OPS-39, REQ-CONTRACT-17: [trajectories] and [studio]
+// dashboard paths reject embedded NUL bytes before the data callback runs,
+// while preserving existing absolute-path resolution for test/temp configs.
+TEST_F(ManifestTest, RejectsNulTrajectoryAndDashboardPathsInFiles) {
   Write("existing.traj", "{}\n");
   Write("existing_dashboard.toml", "[dashboard]\n");
   const std::string abs_traj = (dir_ / "existing.traj").generic_string();
@@ -2709,34 +2709,38 @@ TEST_F(ManifestTest, RejectsAbsoluteAndNulTrajectoryAndDashboardPathsInFiles) {
       (dir_ / "existing_dashboard.toml").generic_string();
 
   Write("robot.toml",
-        "[[subsystems]]\nname = \"auto\"\npath = \"subsystems/auto.toml\"\n");
+        "[[subsystems]]\nname = \"auto\"\npath = \"subsystems/auto.toml\"\n"
+        "[studio]\ndashboard = \"" +
+            abs_dash + "\"\n");
   Write("subsystems/auto.toml",
         "[subsystem]\nname = \"auto\"\n[trajectories]\ntaxi = \"" + abs_traj +
             "\"\n[motors.m]\ncan_id = 1\n");
-  try {
-    static_cast<void>(ParseRobotConfig(Robot()));
-    ADD_FAILURE() << "accepted absolute trajectory path in subsystem file";
-  } catch (const std::invalid_argument& error) {
-    const std::string what = error.what();
-    EXPECT_NE(what.find("subsystems/auto.toml"), std::string::npos) << what;
-    EXPECT_NE(what.find("trajectories.taxi"), std::string::npos) << what;
-  }
-
-  Write("robot.toml",
-        "[studio]\ndashboard = \"" + abs_dash + "\"\n" + std::string(kMotor));
-  try {
-    static_cast<void>(ParseRobotConfig(Robot()));
-    ADD_FAILURE() << "accepted absolute [studio] dashboard path in file";
-  } catch (const std::invalid_argument& error) {
-    const std::string what = error.what();
-    EXPECT_NE(what.find("robot.toml"), std::string::npos) << what;
-    EXPECT_NE(what.find("[studio] dashboard"), std::string::npos) << what;
-  }
+  const toml::table resolved =
+      ResolveRobotConfig(Robot(), detail::ParseTomlFile);
+  EXPECT_EQ(resolved["studio"]["dashboard"].value_or(std::string{}),
+            (dir_ / "existing_dashboard.toml").lexically_normal().string());
+  EXPECT_EQ(resolved["subsystems"]["auto"]["trajectories"]["taxi"].value_or(
+                std::string{}),
+            (dir_ / "existing.traj").lexically_normal().string());
+  EXPECT_NO_THROW(static_cast<void>(ParseRobotConfig(Robot())));
 
   // NUL bytes fail before the ResolveRobotConfig data callback is invoked.
   Write("robot.toml",
         "[studio]\ndashboard = \"a\\u0000b.toml\"\n" + std::string(kMotor));
   bool data_called = false;
+  EXPECT_THROW(
+      static_cast<void>(ResolveRobotConfig(
+          Robot(), detail::ParseTomlFile,
+          [&](const std::string&, const std::string&) { data_called = true; })),
+      std::invalid_argument);
+  EXPECT_FALSE(data_called);
+
+  Write("robot.toml",
+        "[[subsystems]]\nname = \"auto\"\npath = \"subsystems/auto.toml\"\n");
+  Write("subsystems/auto.toml",
+        "[subsystem]\nname = \"auto\"\n[trajectories]\ntaxi = "
+        "\"a\\u0000b.traj\"\n[motors.m]\ncan_id = 1\n");
+  data_called = false;
   EXPECT_THROW(
       static_cast<void>(ResolveRobotConfig(
           Robot(), detail::ParseTomlFile,

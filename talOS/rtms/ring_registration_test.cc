@@ -1747,6 +1747,12 @@ TEST(RingRegistration, SessionOwnerWaitsForLiveClaimantUnderSignalDelivery) {
         if (thread.joinable()) thread.join();
       }
     } join_guard{stop, signaler};
+    // Ensure the signaler thread is scheduled and actively delivering SIGUSR1
+    // before entering OpenSessionPublisher so a fast claimant wait never races
+    // ahead of thread startup.
+    while (g_sigusr1_count.load(std::memory_order_acquire) == 0) {
+      std::this_thread::yield();
+    }
     return OpenSessionPublisher(path, kSlots);
   });
 

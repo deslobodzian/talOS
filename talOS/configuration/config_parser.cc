@@ -325,13 +325,10 @@ void RebaseTrajectories(toml::table& holder, const std::string& file,
   if (section == nullptr) return;
   for (auto& [name, path] : entries) {
     const fs::path rel{path};
-    if (rel.is_absolute()) {
-      throw std::invalid_argument(
-          where + ": trajectories." + name +
-          " must be relative to the file that sets it, not '" + path + "'");
-    }
     const std::string resolved =
-        (base.empty() ? rel : base / rel).lexically_normal().string();
+        (rel.is_absolute() || base.empty() ? rel : base / rel)
+            .lexically_normal()
+            .string();
     section->insert_or_assign(name, resolved);
     sources.insert_or_assign(name, where);
   }
@@ -369,16 +366,10 @@ std::string RebaseStudioDashboard(toml::table& document,
   CheckNoNulByte(*value, file + ": [studio] dashboard");
   const std::filesystem::path base = std::filesystem::path(file).parent_path();
   const std::filesystem::path rel{*value};
-  if (rel.is_absolute()) {
-    throw std::invalid_argument(
-        file +
-        ": [studio] dashboard must be relative to the file that sets it, not "
-        "'" +
-        *value + "'");
-  }
   studio->insert_or_assign(
-      "dashboard",
-      (base.empty() ? rel : base / rel).lexically_normal().string());
+      "dashboard", (rel.is_absolute() || base.empty() ? rel : base / rel)
+                       .lexically_normal()
+                       .string());
   return file;
 }
 
