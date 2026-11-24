@@ -142,8 +142,9 @@ class RuntimeUdpPeer {
 // does, so only a new one can (Reopen): EPIPE, ENOTCONN, EDESTADDRREQ, EBADF,
 // ENOTSOCK, and the socket's source address gone from the host, which Linux
 // reports as ENETUNREACH and macOS as EADDRNOTAVAIL (both are in the set on
-// every OS; on Windows the WSA equivalents: WSAESHUTDOWN, WSAENOTCONN,
-// WSAEDESTADDRREQ, WSAENOTSOCK, WSAENETUNREACH, WSAEADDRNOTAVAIL). Any other
+// every OS; on Windows the WSA equivalents: WSAEBADF, WSAESHUTDOWN,
+// WSAENOTCONN, WSAEDESTADDRREQ, WSAENOTSOCK, WSAENETUNREACH,
+// WSAEADDRNOTAVAIL). Any other
 // error clears by itself on the same socket. Both ends' callers (the bridge's
 // HardwareNode, the RoboRIO program) decide with this one function.
 bool SendErrorNeedsNewSocket(int error);

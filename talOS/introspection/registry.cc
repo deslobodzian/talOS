@@ -353,13 +353,15 @@ NodeRegistration::NodeRegistration(Identity identity, std::string_view path,
   }
   generation_ = record_->generation.load(std::memory_order_acquire);
   pid_ = record_->pid;
+  if (test_hooks != nullptr) releasing_hook_ = test_hooks->releasing;
 }
 
 NodeRegistration::~NodeRegistration() { release(); }
 
 void NodeRegistration::publish(const event::Manifest& manifest) {
-  write_sources(manifest,
-                [](std::size_t, std::string_view) { return std::uint32_t{0}; });
+  write_sources(manifest, [](std::size_t, std::uint16_t, std::string_view) {
+    return std::uint32_t{0};
+  });
 }
 
 void NodeRegistration::set_recording(bool failed, bool capped, bool gap) {
@@ -443,16 +445,22 @@ void NodeRegistration::check_names(const event::Manifest& manifest) {
 
 void NodeRegistration::release() {
   if (record_ != nullptr) {
-    // Only free what is still ours: the slot may have been swept and
-    // reclaimed after this owner went quiet (see sweep_stale), and freeing
-    // it then would yank the new owner's row out from under it. The row
-    // keeps its last sample, sources included, until a claim takes it
-    // (claim says which first): the launcher reads a reaped run's final
-    // delivery loss and event log flags there (DeliveryLossOf; TODO.md
-    // RT-7).
-    if (owns_slot()) {
-      record_->state.store(static_cast<std::uint64_t>(SlotState::FREE),
-                           std::memory_order_release);
+    // Only free what is still ours, under RegistryLock so a concurrent claim
+    // cannot sweep and reclaim a stale slot between owns_slot() and the FREE
+    // store and then have its live ACTIVE slot overwritten. Never throw from
+    // destruction: if the lock cannot be acquired, leave the slot for the next
+    // claim's sweep rather than risking a reclaimed slot. The row keeps its
+    // last sample, sources included, until a claim takes it (claim says which
+    // first): the launcher reads a reaped run's final delivery loss and event
+    // log flags there (DeliveryLossOf; TODO.md RT-7).
+    try {
+      const RegistryLock lock{mapping_.path()};
+      if (owns_slot()) {
+        if (releasing_hook_ != nullptr) releasing_hook_(record_);
+        record_->state.store(static_cast<std::uint64_t>(SlotState::FREE),
+                             std::memory_order_release);
+      }
+    } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch)
     }
     record_ = nullptr;
   }

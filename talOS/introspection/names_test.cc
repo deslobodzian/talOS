@@ -208,6 +208,19 @@ TEST(NodeTarget, MatchesThePackageLeafRepositoryOrRule) {
            {"node", "@wrist//pkg:node", true},
            {"canon", "@@canon//:node", true},
            {"wrist", "@@wrist+//:node", true},
+           {"arm", "@@//arm:node", true},
+           {"node", "@@//:node", true},
+           {"wrist", "@@wrist~//:node", true},
+           {"wrist", "@@wrist+1.0//:node", true},
+           {"wrist", "@@wrist~1.2.3//:node", true},
+           {"wrist", "@@wrist~override+ext//:node", true},
+           {"arm", "@//arm:node", false},
+           {"arm", "@@//:node", false},
+           {"wrist", "@@+//:node", false},
+           {"wrist", "@@~//:node", false},
+           {"wrist", "@@wrist+bad/seg//:node", false},
+           {"wrist", "@@wrist+bad:seg//:node", false},
+           {"wrist", "@@@wrist//:node", false},
            {"shooter", "//2026-robot/main_processor/odometry:node", false},
            {"wrist", "@wrist//pkg:other", false},
            {"odometry", "@talos_odometry//:node", false},
@@ -1021,6 +1034,108 @@ TEST(LintGraph, AlertFieldsAreBoolsOfAKnownLevelInAStatusTopic) {
     const auto diagnostics = LintGraph(nodes);
     EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
   }
+  {
+    // REQ-CONTRACT-09: corrupt or mismatched bfbs must fail closed with
+    // Severity::ERROR rather than silently bypassing alert inspection.
+    SCOPED_TRACE("corrupt bfbs is an error");
+    SourceShape corrupt = Sender("/shooter/status");
+    corrupt.schema = good.name;
+    corrupt.schema_hash = good.hash;
+    corrupt.bfbs = "not-a-valid-bfbs";
+    const std::vector<NodeShape> nodes = {
+        {"shooter", "//robot/shooter:node", {corrupt}},
+        {"odometry", "//robot/odometry:node", {Watcher("/shooter/status")}},
+    };
+    const auto diagnostics = LintGraph(nodes);
+    const auto* err = Find(diagnostics, Severity::ERROR, "/shooter/status");
+    ASSERT_NE(err, nullptr) << Describe(diagnostics);
+    EXPECT_TRUE(Names(err->message, "shooter")) << err->message;
+  }
+  {
+    SCOPED_TRACE("bfbs missing declared root struct is an error");
+    SourceShape mismatched = Sender("/shooter/status");
+    mismatched.schema = "schema_test.DoesNotExist";
+    mismatched.schema_hash = good.hash;
+    mismatched.bfbs = good.bfbs;
+    const std::vector<NodeShape> nodes = {
+        {"shooter", "//robot/shooter:node", {mismatched}},
+        {"odometry", "//robot/odometry:node", {Watcher("/shooter/status")}},
+    };
+    const auto diagnostics = LintGraph(nodes);
+    const auto* err = Find(diagnostics, Severity::ERROR, "/shooter/status");
+    ASSERT_NE(err, nullptr) << Describe(diagnostics);
+    EXPECT_TRUE(Names(err->message, "shooter")) << err->message;
+  }
+  {
+    // REQ-CONTRACT-09, REQ-OPS-17: target lanes wrap their payload struct in
+    // talos.TargetEnvelope<M> while carrying M's bfbs. AlertPrefixedFields
+    // unwraps the envelope so valid target lanes pass, illegal alerts inside
+    // target payloads are caught, and malformed/missing inner structs fail
+    // closed.
+    const schema::Identity plain_target =
+        schema::Envelope(schema::Of<schema_test::Mixed>());
+    {
+      SCOPED_TRACE("valid target lane with TargetEnvelope passes");
+      const std::vector<NodeShape> nodes = {
+          {"driver",
+           "//robot/driver:node",
+           {with(Sender("/shooter/target/teleop"), plain_target)}},
+          {"shooter",
+           "//robot/shooter:node",
+           {with(Watcher("/shooter/target/teleop"), plain_target)}},
+      };
+      const auto diagnostics = LintGraph(nodes, {{"shooter", {"teleop"}}});
+      EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
+    }
+    {
+      SCOPED_TRACE("alert fields inside TargetEnvelope payload are rejected");
+      const schema::Identity alert_target = schema::Envelope(good);
+      const std::vector<NodeShape> nodes = {
+          {"driver",
+           "//robot/driver:node",
+           {with(Sender("/shooter/target/teleop"), alert_target)}},
+          {"shooter",
+           "//robot/shooter:node",
+           {with(Watcher("/shooter/target/teleop"), alert_target)}},
+      };
+      const auto diagnostics = LintGraph(nodes, {{"shooter", {"teleop"}}});
+      const auto findings =
+          alert_findings(diagnostics, "/shooter/target/teleop");
+      ASSERT_EQ(findings.size(), 3u) << Describe(diagnostics);
+      for (const auto* field :
+           {"alert_error_link_lost", "alert_warning_hot", "alert_info_homed"}) {
+        const auto it = std::find_if(
+            findings.begin(), findings.end(), [field](const Diagnostic& d) {
+              return d.message.find(field) != std::string::npos;
+            });
+        ASSERT_NE(it, findings.end()) << field << Describe(findings);
+        EXPECT_EQ(it->severity, Severity::ERROR) << field;
+      }
+    }
+    for (const auto* bad_envelope :
+         {"talos.TargetEnvelope<schema_test.DoesNotExist>",
+          "talos.TargetEnvelope<>"}) {
+      SCOPED_TRACE(std::string{"malformed envelope fails closed: "} +
+                   bad_envelope);
+      SourceShape bad_sender = Sender("/shooter/target/teleop");
+      bad_sender.schema = bad_envelope;
+      bad_sender.schema_hash = plain_target.hash;
+      bad_sender.bfbs = plain_target.bfbs;
+      SourceShape bad_watcher = Watcher("/shooter/target/teleop");
+      bad_watcher.schema = bad_envelope;
+      bad_watcher.schema_hash = plain_target.hash;
+      bad_watcher.bfbs = plain_target.bfbs;
+      const std::vector<NodeShape> nodes = {
+          {"driver", "//robot/driver:node", {bad_sender}},
+          {"shooter", "//robot/shooter:node", {bad_watcher}},
+      };
+      const auto diagnostics = LintGraph(nodes, {{"shooter", {"teleop"}}});
+      const auto* err =
+          Find(diagnostics, Severity::ERROR, "/shooter/target/teleop");
+      ASSERT_NE(err, nullptr) << Describe(diagnostics);
+      EXPECT_TRUE(Names(err->message, "driver")) << err->message;
+    }
+  }
 }
 
 TEST(LintGraph, ErrorsSortAheadOfWarnings) {
@@ -1776,7 +1891,9 @@ TEST(AlertPrefixedFields, RejectsOutOfRangeBaseTypeWithoutUb) {
     const std::string_view bfbs{
         reinterpret_cast<const char*>(builder.GetBufferPointer()),
         builder.GetSize()};
-    EXPECT_TRUE(detail::AlertPrefixedFields(bfbs, "bad.Status").empty());
+    const auto result = detail::AlertPrefixedFields(bfbs, "bad.Status");
+    EXPECT_TRUE(result.fields.empty());
+    EXPECT_FALSE(result.error.empty());
   }
 }
 
@@ -1821,8 +1938,9 @@ TEST(AlertPrefixedFields, DeepObjectChainAndSeededMutationsDoNotCrash) {
         reinterpret_cast<const char*>(builder.GetBufferPointer()),
         builder.GetSize()};
     const auto found = detail::AlertPrefixedFields(bfbs, "c.o0");
-    EXPECT_FALSE(found.empty());
-    EXPECT_LE(found.size(), 64u);
+    EXPECT_TRUE(found.error.empty()) << found.error;
+    EXPECT_FALSE(found.fields.empty());
+    EXPECT_LE(found.fields.size(), 64u);
   }
 
   // Deterministic seeded mutations over AlertPrefixedFields.

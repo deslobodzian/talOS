@@ -82,6 +82,7 @@ cc_test(
     name = "log_test",
     size = "small",
     srcs = ["log/log_test.cc"],
+    shard_count = 3,
     deps = [
         ":events_log",
         ":gap_testing",

@@ -180,6 +180,7 @@ cc_test(
         "//talOS/hardware:merge",
         "//talOS/ipc",
         "//talOS/process",
+        "//talOS/process:host_qualification",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],

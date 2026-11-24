@@ -13,17 +13,30 @@ class ShmNameTest(unittest.TestCase):
     # REQ-CONTRACT-22
     def test_matches_shm_object_name(self):
         probe = runfiles.Create().Rlocation("_main/talOS/memory/shm_name_probe")
+        hashed = shm_name("/hw/state", "session-1")
         for namespace, topic in (
                 ("/tmp/bazel/_tmp/abc", "/talos_registry.6"),
                 ("session-1", "/drivetrain/target/teleop"),
                 ("session-1", "//hw/request/lift"),
                 ("session-1", "hw/state"),
-                ("tést", "/hw/state/driver_station")):
+                ("tést", "/hw/state/driver_station"),
+                ("", "/hw/state"),
+                ("", "/hw/state/driver_station"),
+                ("", "//hw/request/lift"),
+                ("", "hw/state"),
+                ("", "/talos_registry.6"),
+                ("session-1", "/~0123456789abcdef"),
+                ("", "/~0123456789abcdef"),
+                ("other-session", hashed)):
             with self.subTest(namespace=namespace, topic=topic):
                 expected = subprocess.run([probe, namespace, topic],
                                           capture_output=True, text=True,
                                           check=True).stdout.strip()
-                self.assertRegex(expected, r"^/~[0-9a-f]{16}$")
+                if namespace or topic.startswith("/~"):
+                    self.assertRegex(expected, r"^/~[0-9a-f]{16}$")
+                else:
+                    self.assertTrue(expected.startswith("/"))
+                    self.assertNotIn("/", expected[1:])
                 self.assertEqual(shm_name(topic, namespace), expected)
 
 
