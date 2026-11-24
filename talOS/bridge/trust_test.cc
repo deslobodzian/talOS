@@ -12,10 +12,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include "bridge/bridge_status_generated.h"
@@ -33,6 +36,8 @@
 #include "talOS/ipc/subscriber.h"
 
 namespace talos::hardware {
+int RunHardwareNodeMain(int argc, char** argv);
+
 namespace {
 using namespace bridge_test;  // NOLINT(google-build-using-namespace)
 
@@ -2011,7 +2016,7 @@ TEST(HardwareNodeTrustTest, StatusAlertsFollowTheirConditions) {
   ASSERT_TRUE(node.is_subsystem_timed_out("drivetrain"));
   EXPECT_EQ(Alerts(node.Status(1062000)), Names{});
 
-  // No State for longer than the command timeout, while both owners keep
+  // No State for at least the command timeout, while both owners keep
   // publishing on the last one: the link alert alone, from its boundary.
   uint64_t now_us = 1062000;
   for (; now_us + 5000 <= 1062000 + timeout_us; now_us += 5000) {
@@ -2019,8 +2024,8 @@ TEST(HardwareNodeTrustTest, StatusAlertsFollowTheirConditions) {
     request(intake_pub, 2, 62000);
     node.Tick(now_us + 5000);
   }
-  EXPECT_EQ(Alerts(node.Status(1062000 + timeout_us)), Names{});
-  EXPECT_EQ(Alerts(node.Status(1062000 + timeout_us + 1)), Names{"link_lost"});
+  EXPECT_EQ(Alerts(node.Status(1062000 + timeout_us - 1)), Names{});
+  EXPECT_EQ(Alerts(node.Status(1062000 + timeout_us)), Names{"link_lost"});
   now_us = 1062000 + timeout_us + 2000;
   request(drive_pub, 2, 200000);
   request(intake_pub, 2, 200000);
@@ -2756,6 +2761,176 @@ TEST(HardwareNodeTrustTest, NextDutyAndPassGuardBackwardAndNearMaxClocks) {
   EXPECT_GE(duty, kNearMax);
   const HardwareNode::Wait wait = node.Pass(kNearMax);
   EXPECT_GE(wait.until_us, kNearMax);
+}
+
+// At state_age_us == command_timeout_us, StateFresh() becomes false (clearing
+// freshness-gated alerts like hardware_fault and disabling link_ready_);
+// alert_error_link_lost must flip true at that exact same boundary so there is
+// no 1 us window where the link is stale yet link_lost is still false.
+// REQ-OPS-20, REQ-SAFE-02
+TEST(HardwareNodeTrustTest, LinkLostAlertMatchesStateFreshBoundary) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint64_t timeout_us = cfg.hardware.command_timeout_us;
+  Bridge rig{cfg};
+  HardwareNode& node = rig.node;
+  InProcessGateway& gateway = rig.gateway;
+
+  constexpr uint64_t kStartUs = 1'000'000;
+  Acknowledge(rig, config_id, kStartUs - 500);
+  State faulted = TrustState(config_id, 11, 1, 1'000);
+  faulted.flags |= kHardwareFault;
+  ASSERT_TRUE(gateway.Deliver(faulted, kStartUs));
+
+  const auto fresh = node.Status(kStartUs + timeout_us - 1);
+  EXPECT_FALSE(fresh.alert_error_link_lost());
+  EXPECT_TRUE(fresh.alert_error_hardware_fault());
+
+  const auto exact = node.Status(kStartUs + timeout_us);
+  EXPECT_TRUE(exact.alert_error_link_lost());
+  EXPECT_FALSE(exact.alert_error_hardware_fault());
+}
+
+// When ConfigAck(kOk) precedes the first State of the session and that State
+// already carries our config_id, the bridge stays configured and must not push
+// the configuration redundantly. A subsequent boot change, a mismatched first
+// State, or an unacknowledged first State still pushes immediately.
+// REQ-CONTRACT-04
+TEST(HardwareNodeTrustTest, ConfigAckBeforeFirstStateSuppressesRedundantPush) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  constexpr uint64_t kStartUs = 1'000'000;
+
+  // 1. ConfigAck(kOk) before first State matching config_id: no redundant push,
+  // then a real boot change (boot 11 -> 12) clears configured and pushes once.
+  {
+    Bridge rig{cfg};
+    Acknowledge(rig, config_id, kStartUs - 500);
+    ASSERT_TRUE(rig.node.is_configured());
+    (void)rig.gateway.TakeSent();
+
+    ASSERT_TRUE(
+        rig.gateway.Deliver(TrustState(config_id, 11, 1, 1'000), kStartUs));
+    EXPECT_TRUE(rig.node.is_configured());
+    EXPECT_EQ(ConfigPushes(rig.gateway.TakeSent()), 0u);
+
+    ASSERT_TRUE(rig.gateway.Deliver(TrustState(config_id, 12, 1, 1'000),
+                                    kStartUs + 1'000));
+    EXPECT_FALSE(rig.node.is_configured());
+    EXPECT_EQ(ConfigPushes(rig.gateway.TakeSent()), 1u);
+  }
+
+  // 2. ConfigAck(kOk) before first State naming another config_id: clears
+  // configured and pushes immediately.
+  {
+    Bridge rig{cfg};
+    Acknowledge(rig, config_id, kStartUs - 500);
+    (void)rig.gateway.TakeSent();
+
+    ASSERT_TRUE(
+        rig.gateway.Deliver(TrustState(config_id + 1, 11, 1, 1'000), kStartUs));
+    EXPECT_FALSE(rig.node.is_configured());
+    EXPECT_EQ(ConfigPushes(rig.gateway.TakeSent()), 1u);
+  }
+
+  // 3. No prior ConfigAck: first State matching config_id still pushes once.
+  {
+    Bridge rig{cfg};
+    (void)rig.gateway.TakeSent();
+
+    ASSERT_TRUE(
+        rig.gateway.Deliver(TrustState(config_id, 11, 1, 1'000), kStartUs));
+    EXPECT_FALSE(rig.node.is_configured());
+    EXPECT_EQ(ConfigPushes(rig.gateway.TakeSent()), 1u);
+  }
+}
+
+// hardware_node CLI numeric flags (--duration-s, --log-max-bytes, --session-id)
+// must parse the entire string strictly as a non-negative integer, rejecting
+// negative values, trailing garbage, whitespace, leading '+', empty strings,
+// and overflow with a clean nonzero exit.
+// REQ-CONTRACT-17
+TEST(HardwareNodeTrustTest, CliRejectsMalformedAndNegativeNumericFlags) {
+  const std::filesystem::path config_path =
+      std::filesystem::path{::testing::TempDir()} /
+      ("bridge_cli_test_" + std::to_string(::getpid()) + ".toml");
+  {
+    std::ofstream out(config_path);
+    ASSERT_TRUE(out.is_open());
+    out << kTrustToml;
+  }
+
+  const auto run_cli = [](std::vector<std::string> args) {
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (auto& arg : args) argv.push_back(arg.data());
+    argv.push_back(nullptr);
+    ::testing::internal::CaptureStdout();
+    ::testing::internal::CaptureStderr();
+    const int rc =
+        RunHardwareNodeMain(static_cast<int>(args.size()), argv.data());
+    const std::string out = ::testing::internal::GetCapturedStdout();
+    const std::string err = ::testing::internal::GetCapturedStderr();
+    return std::tuple<int, std::string, std::string>{rc, out, err};
+  };
+
+  // Positive controls: valid non-negative integers succeed under --describe.
+  {
+    const auto [rc, out, err] = run_cli(
+        {"hardware_node", "--config", config_path.string(), "--describe",
+         "--duration-s", "0", "--log-max-bytes", "0", "--session-id", "0"});
+    EXPECT_EQ(rc, 0) << err;
+    EXPECT_NE(out.find("\"describe_version\""), std::string::npos) << out;
+  }
+  {
+    const auto [rc, out, err] =
+        run_cli({"hardware_node", "--config", config_path.string(),
+                 "--describe", "--duration-s", "30", "--log-max-bytes",
+                 "1048576", "--session-id", "18446744073709551615"});
+    EXPECT_EQ(rc, 0) << err;
+    EXPECT_NE(out.find("\"describe_version\""), std::string::npos) << out;
+  }
+
+  struct BadCase {
+    const char* flag;
+    const char* value;
+  };
+  const BadCase bad_cases[] = {
+      {"--duration-s", "-5"},
+      {"--duration-s", "-1"},
+      {"--duration-s", "5abc"},
+      {"--duration-s", ""},
+      {"--duration-s", "+5"},
+      {"--duration-s", " 5"},
+      {"--duration-s", "5 "},
+      {"--duration-s", "99999999999999999999"},
+      {"--log-max-bytes", "-1"},
+      {"--log-max-bytes", "100abc"},
+      {"--log-max-bytes", ""},
+      {"--log-max-bytes", "+10"},
+      {"--log-max-bytes", " 10"},
+      {"--log-max-bytes", "10 "},
+      {"--log-max-bytes", "18446744073709551616"},
+      {"--session-id", "-1"},
+      {"--session-id", "42xyz"},
+      {"--session-id", ""},
+      {"--session-id", "+1"},
+      {"--session-id", " 1"},
+      {"--session-id", "1 "},
+      {"--session-id", "18446744073709551616"},
+  };
+  for (const BadCase& tc : bad_cases) {
+    SCOPED_TRACE(::testing::Message() << tc.flag << " '" << tc.value << "'");
+    const auto [rc, out, err] =
+        run_cli({"hardware_node", "--config", config_path.string(),
+                 "--describe", tc.flag, tc.value});
+    EXPECT_EQ(rc, 1);
+    EXPECT_TRUE(out.empty()) << out;
+    EXPECT_NE(err.find(tc.flag), std::string::npos) << err;
+  }
+
+  std::error_code ec;
+  std::filesystem::remove(config_path, ec);
 }
 
 }  // namespace
